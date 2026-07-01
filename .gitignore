@@ -9,3 +9,10 @@
 .env*
 .DS_Store
 Thumbs.db
+
+# BMAD Method artifacts — kept locally, not tracked in the repo
+/_bmad/
+/_bmad-output/
+/.agents/skills/bmad-*/
+/.github/agents/bmad-*
+/.opencode/commands/bmad-*

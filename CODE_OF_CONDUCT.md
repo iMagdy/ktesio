@@ -1,6 +1,6 @@
 # Code of Conduct
 
-Ktesio is a small open source project, and we want contribution to feel clear,
+Ktesio is a small source-available project, and we want contribution to feel clear,
 direct, and respectful.
 
 ## Our Standards

@@ -1,6 +1,6 @@
 # Sponsoring Ktesio
 
-Ktesio is an open source CLI for sharing, distributing, and installing agent skills.
+Ktesio is a source-available CLI for sharing, distributing, and installing agent skills.
 
 The goal of Ktesio is to make skills portable, discoverable, installable, and reusable across AI agents and developer workflows.
 
@@ -97,7 +97,7 @@ Company sponsorship is welcome.
 
 Companies can sponsor Ktesio to support:
 
-- Open source sustainability
+- Project sustainability
 - Tooling they depend on
 - Features useful to their teams
 - Security and reliability improvements
@@ -109,4 +109,4 @@ For larger sponsorships, please contact the maintainer to discuss the best path.
 
 Every sponsorship helps keep Ktesio moving forward.
 
-Thank you for supporting open source infrastructure for agent skills.
+Thank you for supporting independent, source-available infrastructure for agent skills.

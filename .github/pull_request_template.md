@@ -13,5 +13,5 @@
 
 - [ ] I kept the change focused.
 - [ ] I updated tests or docs where behavior changed.
-- [ ] Every commit includes a `Signed-off-by` line for DCO.
+- [ ] I have read and agree to the [Contributor License Agreement](https://github.com/iMagdy/ktesio/blob/main/CLA.md).
 - [ ] Security-sensitive changes were reviewed with extra care.
