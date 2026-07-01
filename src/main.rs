@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn test_cli_help_includes_license_and_repository() {
         let help = Cli::command().render_help().to_string();
-        assert!(help.contains("License: Apache-2.0"));
+        assert!(help.contains("License: PolyForm-Noncommercial-1.0.0"));
         assert!(help.contains("Repository: https://github.com/iMagdy/ktesio"));
     }
 

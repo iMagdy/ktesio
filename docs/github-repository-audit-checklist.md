@@ -5,7 +5,7 @@ description: Repository hardening checks and evidence for the public Ktesio GitH
 
 # GitHub Repository Audit Checklist
 
-Status date: 2026-05-31.
+Status date: 2026-07-01.
 
 This checklist tracks repository-level hardening for the public `iMagdy/ktesio`
 repository. Treat the GitHub API, workflow results, and repository files as the
@@ -18,13 +18,13 @@ source of truth.
 - [x] Wiki is disabled.
 - [x] Discussions are enabled for community Q&A.
 - [x] Projects are disabled until a public roadmap project is intentionally used.
-- [x] Forking remains enabled for open source contribution.
-- [x] Web commit sign-off is required.
+- [x] Forking remains enabled for community contribution.
+- [ ] Web commit sign-off requirement removed (DCO retired in favor of the CLA; disable this in repository settings).
 - [x] Delete branch on merge is enabled.
 - [x] Auto-merge and update-branch support are enabled.
 - [x] Merge commits and rebase merges are disabled.
 - [x] Squash merge is the only allowed merge method.
-- [x] Repository license is detected by GitHub as Apache-2.0.
+- [ ] Repository license is source-available (PolyForm Noncommercial 1.0.0); GitHub shows it as a non-standard license.
 
 Evidence:
 
@@ -44,7 +44,7 @@ Evidence:
   least two maintainers.
 - [x] Review conversations must be resolved.
 - [x] Required status checks are strict.
-- [x] Required checks include `dco`, `fmt`, `clippy`, `test`, `build`, `docs`, and `coverage`.
+- [ ] Required checks include `fmt`, `clippy`, `test`, `build`, `docs`, and `coverage` (remove the retired `dco` check from the branch ruleset).
 - [x] CodeQL code scanning is required for high-or-higher security alerts and errors.
 - [x] Code quality errors are blocked.
 - [x] Release tag ruleset is active for `v*` tags.
@@ -71,7 +71,7 @@ contribution flow into routine admin bypass.
 - [x] Default workflow token permissions are read-only.
 - [x] Workflows request write permissions only where needed.
 - [x] Third-party workflow actions are pinned by SHA.
-- [x] CI validates formatting, clippy, tests, build, docs, DCO, and coverage.
+- [x] CI validates formatting, clippy, tests, build, docs, and coverage.
 - [x] Release workflow uses the protected `release` environment.
 
 Evidence:
@@ -105,14 +105,14 @@ Evidence:
 - `gh api repos/iMagdy/ktesio/secret-scanning/alerts`
 - `gh api repos/iMagdy/ktesio/dependabot/alerts`
 
-## Open Source Community Files
+## Community Health Files
 
 - [x] `README.md` exists.
-- [x] `LICENSE` exists and is canonical Apache-2.0 text.
+- [x] `LICENSE` exists and contains the PolyForm Noncommercial 1.0.0 text with a commercial-use notice.
 - [x] `SECURITY.md` exists.
 - [x] `CONTRIBUTING.md` exists.
 - [x] `CODE_OF_CONDUCT.md` exists.
-- [x] `DCO.md` exists.
+- [x] `CLA.md` exists.
 - [x] `TRADEMARK.md` exists.
 - [x] `SUPPORT.md` exists.
 - [x] `SPONSORS.md` exists.

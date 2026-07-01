@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/iMagdy/ktesio/actions/workflows/ci.yml/badge.svg)](https://github.com/iMagdy/ktesio/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/ktesio.svg)](https://crates.io/crates/ktesio)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-orange.svg)](LICENSE)
 
 Ktesio is a tiny Rust CLI for installing and sharing agent skills. It makes reusable agent instructions portable across projects by keeping a simple `skills.json` manifest, a reproducible `skills.lock`, and installed skills under `.agents/skills/`.
 
@@ -144,4 +144,13 @@ Thank you to [Skills.sh](https://www.skills.sh/) for providing public skill sear
 
 ## License
 
-Licensed under [Apache-2.0](LICENSE).
+Ktesio is **source-available**, licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+- **Noncommercial use is free.** You may use, copy, modify, and share Ktesio for any noncommercial purpose under the terms of the license.
+- **Commercial use requires a separate license.** Any commercial use needs the prior written permission of the copyright holder, Islam Magdy. To request a commercial license, open an issue or contact the maintainer through the project's official channels.
+
+This is source-available software, not an OSI-approved open source license.
+
+## Contributing
+
+Contributions are welcome under the project's [Contributor License Agreement](CLA.md): anyone can contribute, but you assign copyright in your contribution to the project owner so Ktesio stays under unified ownership. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md) for details.

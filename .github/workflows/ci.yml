@@ -14,48 +14,6 @@ permissions:
   contents: read
 
 jobs:
-  dco:
-    name: dco
-    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Check commit sign-offs
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" > commits.json
-          python3 - <<'PY'
-          import json
-          import re
-          import sys
-
-          with open("commits.json", encoding="utf-8") as fh:
-              pages = json.load(fh)
-
-          commits = [commit for page in pages for commit in page]
-          signoff = re.compile(r"^Signed-off-by: .+ <[^>]+>$", re.IGNORECASE | re.MULTILINE)
-          missing = []
-
-          for commit in commits:
-              message = commit["commit"]["message"]
-              subject = message.splitlines()[0] if message.splitlines() else "(no subject)"
-              if not signoff.search(message):
-                  missing.append(f"{commit['sha'][:12]} {subject}")
-
-          if missing:
-              print("The following commits are missing DCO Signed-off-by lines:")
-              for item in missing:
-                  print(f"- {item}")
-              print("\nUse `git commit --amend --signoff` or `git rebase --signoff` and push again.")
-              sys.exit(1)
-          PY
-
   fmt:
     name: fmt
     runs-on: ubuntu-latest
