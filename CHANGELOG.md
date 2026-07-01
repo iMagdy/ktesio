@@ -4,6 +4,41 @@ All notable changes to Ktesio are generated from git history when a version tag 
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+## v0.5.0
+
+Comparison: [v0.4.0...v0.5.0](https://github.com/iMagdy/ktesio/compare/v0.4.0...v0.5.0)
+
+| Platform | Target | Archive | Checksum |
+|----------|--------|---------|----------|
+| macOS Intel | `x86_64-apple-darwin` | [ktesio-v0.5.0-x86_64-apple-darwin.tar.gz](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-x86_64-apple-darwin.tar.gz) | [sha256](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-x86_64-apple-darwin.tar.gz.sha256) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | [ktesio-v0.5.0-aarch64-apple-darwin.tar.gz](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-aarch64-apple-darwin.tar.gz) | [sha256](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-aarch64-apple-darwin.tar.gz.sha256) |
+| Windows x64 | `x86_64-pc-windows-msvc` | [ktesio-v0.5.0-x86_64-pc-windows-msvc.zip](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-x86_64-pc-windows-msvc.zip) | [sha256](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-x86_64-pc-windows-msvc.zip.sha256) |
+| Linux x64 | `x86_64-unknown-linux-gnu` | [ktesio-v0.5.0-x86_64-unknown-linux-gnu.tar.gz](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-x86_64-unknown-linux-gnu.tar.gz) | [sha256](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-x86_64-unknown-linux-gnu.tar.gz.sha256) |
+| All | checksums | [ktesio-v0.5.0-checksums.txt](https://github.com/iMagdy/ktesio/releases/download/v0.5.0/ktesio-v0.5.0-checksums.txt) | - |
+
+### Features
+
+- add fumadocs documentation site ([ba48fe0](https://github.com/iMagdy/ktesio/commit/ba48fe0))
+
+### Fixes
+
+- migrate ureq usage for cargo dependency updates (#44) ([29de3e8](https://github.com/iMagdy/ktesio/commit/29de3e8))
+
+### Documentation
+
+- update release notes for v0.4.0 (#37) ([3fdf921](https://github.com/iMagdy/ktesio/commit/3fdf921))
+
+### Maintenance
+
+- bump version to 0.5.0 ([08c20ec](https://github.com/iMagdy/ktesio/commit/08c20ec))
+- untrack BMAD artifacts and relicense under PolyForm Noncommercial 1.0.0 (#49) ([59c8d19](https://github.com/iMagdy/ktesio/commit/59c8d19))
+- bump the docs-dependencies group in /docs with 4 updates (#42) ([d977de7](https://github.com/iMagdy/ktesio/commit/d977de7))
+- bump actions/checkout from 6.0.2 to 6.0.3 in the github-actions group (#40) ([a90451b](https://github.com/iMagdy/ktesio/commit/a90451b))
+
+### Other Changes
+
+- ```text feat: add BMad Method v6.8.0 skills — agents, workflows, and core tools ([21a9ad1](https://github.com/iMagdy/ktesio/commit/21a9ad1))
+
 ## v0.4.0
 
 Comparison: [v0.3.1...v0.4.0](https://github.com/iMagdy/ktesio/compare/v0.3.1...v0.4.0)
