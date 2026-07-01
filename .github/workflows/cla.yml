@@ -34,4 +34,6 @@ jobs:
           # Signatures are stored on a dedicated, unprotected branch so the
           # built-in GITHUB_TOKEN can commit them (main is protected).
           branch: "cla-signatures"
-          allowlist: "dependabot[bot],github-actions[bot]"
+          # NB: entries are matched as patterns, so "[bot]" would be read as a
+          # regex character class — use the owner login + prefix wildcards.
+          allowlist: "iMagdy,dependabot*,github-actions*"
