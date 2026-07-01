@@ -5,7 +5,7 @@ description: Development setup, contribution workflow, pull request expectations
 
 # Contributing Guide
 
-This page is the hands-on development guide. For project rules and DCO details, see [../CONTRIBUTING.md](../CONTRIBUTING.md).
+This page is the hands-on development guide. For project rules and the Contributor License Agreement, see [../CONTRIBUTING.md](../CONTRIBUTING.md) and [../CLA.md](../CLA.md).
 
 ## Setup
 
@@ -41,6 +41,6 @@ Integration tests use local temporary git repositories through `tests/helpers/mo
 
 - Keep changes focused.
 - Use conventional commit messages.
-- Sign commits with `git commit -s`.
+- By opening a pull request, you agree to the [Contributor License Agreement](../CLA.md).
 - Include docs and tests in the same change when behavior changes.
 - Make sure CI passes before requesting review.

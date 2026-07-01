@@ -4,7 +4,7 @@ This document explains how the Ktesio name, logo, and related project identity m
 
 The goal is simple:
 
-- The Ktesio source code is open for use, contribution, and reuse under the project license.
+- The Ktesio source code is available for noncommercial use, contribution, and reuse under the project license; commercial use requires the owner's written permission.
 - The Ktesio name and official project identity remain controlled by the project maintainers.
 - Forks, integrations, articles, plugins, and community work are welcome, but they must not confuse users about what is official.
 
@@ -30,7 +30,7 @@ Unless stated otherwise, the current project owner and initial maintainer is:
 
 The project owner or maintainers may update this policy as the project evolves.
 
-## 3. What the open source license does and does not cover
+## 3. What the project license does and does not cover
 
 The project license covers use, copying, modification, and distribution of the source code.
 
