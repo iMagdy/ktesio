@@ -11,7 +11,7 @@ from pathlib import Path
 REPO = "iMagdy/ktesio"
 FORMULA_CLASS = "Ktesio"
 DESCRIPTION = "Agentic skills package manager"
-LICENSE = "Apache-2.0"
+LICENSE = "PolyForm-Noncommercial-1.0.0"
 HOMEBREW_TARGETS = [
     ("x86_64-apple-darwin", "tar.gz"),
     ("aarch64-apple-darwin", "tar.gz"),
