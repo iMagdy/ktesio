@@ -115,10 +115,10 @@ jobs:
               ;;
             404)
               if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-                echo "::error::Set a CARGO_REGISTRY_TOKEN secret with publish access to the ${crate_name} crate."
-                exit 1
+                echo "::notice::No CARGO_REGISTRY_TOKEN set; skipping crates.io publish for ${crate_name} ${crate_version}."
+              else
+                cargo publish --locked
               fi
-              cargo publish --locked
               ;;
             *)
               cat /tmp/crate-version.json
@@ -148,9 +148,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "::error::Set a HOMEBREW_TAP_TOKEN secret with contents:write access to the Homebrew tap repository."
-            exit 1
+            echo "::notice::No HOMEBREW_TAP_TOKEN set; skipping Homebrew tap update."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
           echo "repository=${HOMEBREW_TAP_REPOSITORY:-${GITHUB_REPOSITORY_OWNER}/homebrew-tap}" >> "$GITHUB_OUTPUT"
           echo "branch=${HOMEBREW_TAP_BRANCH:-main}" >> "$GITHUB_OUTPUT"
       - name: Create or update draft GitHub Release
@@ -181,6 +183,7 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           gh release edit "$tag" --draft=false --latest
       - name: Checkout Homebrew tap
+        if: steps.homebrew.outputs.enabled == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: ${{ steps.homebrew.outputs.repository }}
@@ -188,6 +191,7 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
       - name: Publish Homebrew formula
+        if: steps.homebrew.outputs.enabled == 'true'
         env:
           TAP_BRANCH: ${{ steps.homebrew.outputs.branch }}
         shell: bash
@@ -224,7 +228,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add CHANGELOG.md docs/RELEASE_NOTES.md
-          git commit -s -m "docs: update release notes for ${tag}"
+          git commit -m "docs: update release notes for ${tag}"
           git push --force-with-lease origin "$branch"
           if gh pr view "$branch" >/dev/null 2>&1; then
             gh pr edit "$branch" --title "docs: update release notes for ${tag}" --body "Updates generated release documentation for ${tag}."
