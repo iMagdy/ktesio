@@ -14,5 +14,6 @@ Thumbs.db
 /_bmad/
 /_bmad-output/
 /.agents/skills/bmad-*/
+/.claude/skills/bmad-*/
 /.github/agents/bmad-*
 /.opencode/commands/bmad-*

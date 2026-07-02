@@ -28,5 +28,4 @@ Welcome to the Ktesio docs. These pages explain how to install, use, contribute 
 - [Contributing](contributing.md)
 - [Release process](release-process.md)
 - [GitHub repository audit checklist](github-repository-audit-checklist.md)
-- [GitHub project sync](github-project-sync.md)
 - [Release notes](RELEASE_NOTES.md)

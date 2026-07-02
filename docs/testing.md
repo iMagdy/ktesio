@@ -16,7 +16,6 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 python3 scripts/check_docs.py
-python3 scripts/speckit_sync_issues.py --feature-dir tests/fixtures/speckit-sync-feature --dry-run
 python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ```
@@ -71,6 +70,5 @@ This verifies the release-note generator can handle a first-release style tag wh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ```
 
-These tests cover Speckit task parsing, safe checkbox pull behavior, GitHub
-Project ambiguity handling, release asset tables, installer dry-run decisions,
-and workflow expectations.
+These tests cover release-note and changelog rendering, Homebrew formula
+generation, installer dry-run decisions, and CI/workflow expectations.

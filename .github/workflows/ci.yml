@@ -100,8 +100,6 @@ jobs:
           fetch-depth: 0
       - name: Validate docs
         run: python3 scripts/check_docs.py
-      - name: Validate Speckit sync dry run
-        run: python3 scripts/speckit_sync_issues.py --feature-dir tests/fixtures/speckit-sync-feature --dry-run
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers
