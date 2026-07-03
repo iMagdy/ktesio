@@ -11,6 +11,11 @@ members = [
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
+# Minimum supported Rust version. Floor is set by the bundled-SQLite build:
+# rusqlite 0.40.1 → libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in
+# 1.96.1 (builds cleanly there; 1.94.1 fails with E0658). Members inherit via
+# `rust-version.workspace = true`.
+rust-version = "1.96.1"
 license = "PolyForm-Noncommercial-1.0.0"
 homepage = "https://github.com/iMagdy/ktesio"
 repository = "https://github.com/iMagdy/ktesio"
@@ -25,6 +30,10 @@ ktesio-adapter-api = { path = "crates/ktesio-adapter-api", version = "0.1.0" }
 
 # External dependencies (single source of truth for versions)
 clap = { version = "4", features = ["derive"] }
+# Engine state store (AD-6): bundled SQLite, no system dependency.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+# Cross-platform data-dir resolution; keeps engine path code cfg-free (OS-cfg gate).
+directories = "6"
 console = "0.16"
 miette = { version = "7", features = ["fancy"] }
 indicatif = "0.18"

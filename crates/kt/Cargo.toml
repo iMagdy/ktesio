@@ -4,6 +4,7 @@
 name = "ktesio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Agentic skills package manager"
 license.workspace = true
 homepage.workspace = true
@@ -38,6 +39,11 @@ zip = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test-only: seed a `running` instance directly into the engine's SQLite state
+# so the `kt agent remove` running-guard (AC5) can be exercised end-to-end.
+# Dev-only — excluded from the boundary gate (`cargo tree -e normal,build`), so
+# the shipping `kt` crate still never depends on SQLite.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

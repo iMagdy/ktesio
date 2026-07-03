@@ -99,10 +99,48 @@ pub fn create_local_skill_repo(path: &Path, name: &str, with_manifest: bool) {
     );
 }
 
+// Not every integration-test binary uses every helper; each compiles this
+// module independently, so allow dead code here (mirrors the allows above).
+#[allow(dead_code)]
 pub fn run_kt_command(args: &[&str], working_dir: &Path) -> Result<String, String> {
     run_kt_command_output(args, working_dir).map(|output| output.stdout)
 }
 
+/// Full result of a `kt` invocation, including the exit-success flag.
+///
+/// Unlike [`run_kt_command_output`], this never collapses a non-zero exit into
+/// an `Err` — agent tests need to assert exit codes AND inspect stderr on the
+/// failure paths (duplicate name, running-without-force).
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct KtRun {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run `kt` with `KTESIO_STATE_DIR` pinned to `state_dir` so the engine never
+/// touches the real user data dir. Also sets `KTESIO_NO_UPDATE_CHECK=1`.
+///
+/// Returns the full [`KtRun`] regardless of exit status.
+#[allow(dead_code)]
+pub fn run_kt_agent(args: &[&str], working_dir: &Path, state_dir: &Path) -> KtRun {
+    let output = Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(args)
+        .current_dir(working_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .output()
+        .expect("Failed to execute kt");
+
+    KtRun {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+#[allow(dead_code)]
 pub fn run_kt_command_output(args: &[&str], working_dir: &Path) -> Result<KtCommandOutput, String> {
     let output = Command::new(env!("CARGO_BIN_EXE_kt"))
         .args(args)

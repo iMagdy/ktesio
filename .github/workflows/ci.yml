@@ -213,6 +213,14 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Cache cargo-semver-checks binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-semver-checks so the armed gate
+          # does not rebuild it (~10 min) on every fresh runner (AI-1).
+          key: ${{ runner.os }}-cargo-semver-checks-bin
+          path: |
+            ~/.cargo/bin
       - name: Check public API semver (ktesio-engine, ktesio-adapter-api)
         shell: bash
         run: |
@@ -239,6 +247,30 @@ jobs:
                 ;;
             esac
           done
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install pinned MSRV toolchain
+        # Floor set by the bundled-SQLite build: rusqlite 0.40.1 →
+        # libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in 1.96.1. Keep in
+        # lockstep with rust-version in the root Cargo.toml [workspace.package].
+        run: rustup toolchain install 1.96.1 --profile minimal
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+      - name: Check workspace builds on the MSRV
+        run: cargo +1.96.1 check --workspace
 
   coverage:
     name: coverage

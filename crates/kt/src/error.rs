@@ -133,3 +133,45 @@ pub struct SearchFailed {
 pub struct SelfUpdateFailed {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::duplicate_name))]
+pub struct AgentDuplicateName {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::invalid_name))]
+pub struct AgentInvalidName {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::not_found))]
+pub struct AgentNotFound {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::running_requires_force))]
+pub struct AgentRunningRequiresForce {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::io))]
+pub struct AgentIo {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::store))]
+pub struct AgentStore {
+    pub message: String,
+}

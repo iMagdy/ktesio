@@ -12,13 +12,29 @@ Ktesio ships a single `kt` binary, built from a Cargo workspace. The CLI keeps d
 ```text
 crates/
 ├── kt/                     # package "ktesio" — the shipping kt CLI (all current behavior)
-├── ktesio-engine/          # engine library (reserved skeleton)
+├── ktesio-engine/          # engine library (registration engine live; more per story)
 ├── ktesio-adapter-api/     # adapter contract types (reserved skeleton)
 ├── ktesio-adapters-hermes/ # native adapter home (reserved skeleton)
 └── ktesio-conformance/     # adapter conformance test kit (reserved skeleton)
 ```
 
-The four non-CLI crates are intentionally empty skeletons that reserve the crate boundaries for in-progress work. `kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types); CI enforces that dependency boundary.
+`kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types); CI enforces that dependency boundary. The engine grows one capability at a time; the adapter/conformance crates remain reserved skeletons until their stories land.
+
+### Engine modules
+
+The engine follows a hexagonal layout (domain core + ports + backing implementations). The registration slice is live:
+
+```text
+crates/ktesio-engine/src/
+├── lib.rs      # re-exports the public API (the Embedding Interface)
+├── domain/     # core: LifecycleState, AgentInstance, InstanceName, RegistryError, the Registry service
+├── ports/      # hexagonal ports; StateStore trait + StoreError
+├── store/      # SQLite StateStore implementation + schema/migrations (internal)
+├── paths.rs    # engine-only path authority (state dir + Agent Home), resolved cross-platform
+└── time.rs     # RFC 3339 UTC timestamp formatting
+```
+
+The engine is the sole path authority: it computes the state-directory location and each Agent Home layout; `kt` receives paths from the API and never constructs them. All registry and lifecycle state lives in one SQLite database (WAL journaling, `synchronous=NORMAL`, foreign keys on) under the engine state directory; bulky per-instance artifacts live as files inside each Agent Home. Errors use `thiserror` inside the engine and are wrapped into `miette` diagnostics in `kt`.
 
 ## Modules
 

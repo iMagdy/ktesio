@@ -132,6 +132,24 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo install cargo-semver-checks --locked", ci)
         self.assertIn("cargo semver-checks check-release", ci)
         self.assertIn("000|429|5[0-9][0-9]", ci)
+        # Semver gate caches the source-installed binary so it is not rebuilt
+        # (~10 min) on every fresh runner (AI-1).
+        self.assertIn("${{ runner.os }}-cargo-semver-checks-bin", ci)
+
+    def test_ci_enforces_msrv_floor(self) -> None:
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        # MSRV job installs the pinned floor toolchain explicitly and checks the
+        # whole workspace against it. Keep the version in lockstep with
+        # rust-version in the root Cargo.toml [workspace.package].
+        self.assertIn("name: msrv", ci)
+        self.assertIn("rustup toolchain install 1.96.1 --profile minimal", ci)
+        self.assertIn("cargo +1.96.1 check --workspace", ci)
+
+        cargo_toml = (release_docs.ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn('rust-version = "1.96.1"', cargo_toml)
 
 
 class InstallerScriptTests(unittest.TestCase):

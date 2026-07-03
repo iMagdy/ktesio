@@ -11,10 +11,6 @@ mod skills_sh;
 mod ui;
 mod update_check;
 
-// Proves the AD-2 dependency edge (kt -> ktesio-engine) compiles; real engine
-// API usage arrives with stories 1-2 onward.
-use ktesio_engine as _;
-
 use clap::{CommandFactory, Parser, Subcommand};
 
 const HELP_FOOTER: &str = concat!(
@@ -121,6 +117,18 @@ Details:
 Examples:
   kt uninstall docs
   kt remove docs";
+
+const AGENT_AFTER_HELP: &str = "\
+Details:
+  Manages Agent Instances in the Fleet. register creates an isolated Agent Home
+  under a unique name; remove deletes the registry entry and, with --delete,
+  the Agent Home too (--retain, the default, keeps it); list shows the Fleet.
+  Removing a running instance requires --force.
+
+Examples:
+  kt agent register demo --kind mock
+  kt agent list
+  kt agent remove demo --delete";
 
 #[derive(Parser)]
 #[command(
@@ -251,6 +259,15 @@ enum Commands {
         /// Name of the skill to remove
         package_name: String,
     },
+    /// Manage Agent Instances in the Fleet
+    #[command(
+        about = "Manage Agent Instances in the Fleet",
+        after_help = AGENT_AFTER_HELP
+    )]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +279,34 @@ enum PublishCommands {
         /// Local file or directory path to publish
         path: String,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    /// Register a new Agent Instance under a unique name
+    Register {
+        /// Fleet-unique instance name (^[a-z0-9][a-z0-9_-]*$)
+        name: String,
+        /// Agent kind (adapter identity)
+        #[arg(long)]
+        kind: String,
+    },
+    /// Remove an Agent Instance from the Fleet
+    Remove {
+        /// Name of the Agent Instance to remove
+        name: String,
+        /// Delete the Agent Home directory as well
+        #[arg(long, conflicts_with = "retain")]
+        delete: bool,
+        /// Keep the Agent Home directory on disk (default)
+        #[arg(long)]
+        retain: bool,
+        /// Remove even if the instance is running
+        #[arg(long)]
+        force: bool,
+    },
+    /// List every Agent Instance in the Fleet
+    List,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -328,6 +373,20 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Doctor) => cli::doctor::run(),
         Some(Commands::Uninstall { package_name }) => cli::uninstall::run(&package_name),
+        Some(Commands::Agent { command }) => match command {
+            AgentCommands::Register { name, kind } => cli::agent::register(&name, &kind),
+            AgentCommands::Remove {
+                name,
+                delete,
+                retain,
+                force,
+            } => cli::agent::remove(
+                &name,
+                cli::agent::DispositionArg::from_flags(delete, retain),
+                force,
+            ),
+            AgentCommands::List => cli::agent::list(),
+        },
         None => {
             Cli::command().print_help()?;
             println!();
@@ -363,6 +422,18 @@ mod tests {
         assert!(cmd.find_subcommand("doctor").is_some());
         assert!(cmd.find_subcommand("uninstall").is_some());
         assert!(cmd.find_subcommand("remove").is_some());
+        assert!(cmd.find_subcommand("agent").is_some());
+    }
+
+    #[test]
+    fn test_agent_subcommands_exist() {
+        let cmd = Cli::command();
+        let agent = cmd
+            .find_subcommand("agent")
+            .expect("agent subcommand should exist");
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "register"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "remove"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
     }
 
     #[test]
@@ -390,6 +461,7 @@ mod tests {
             ("show", "Shows the repo URL"),
             ("doctor", "Validates skills.json"),
             ("uninstall", "Removes one skill"),
+            ("agent", "Manages Agent Instances"),
         ] {
             let mut cmd = Cli::command();
             let help = cmd

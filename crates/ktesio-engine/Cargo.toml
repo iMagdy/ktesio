@@ -2,6 +2,7 @@
 name = "ktesio-engine"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 description = "Ktesio agent-runner engine; its public API is the Embedding Interface"
 license.workspace = true
 homepage.workspace = true
@@ -12,6 +13,23 @@ publish = false
 
 [dependencies]
 ktesio-adapter-api = { workspace = true }
+# State store (AD-6): rusqlite with bundled SQLite (WAL, synchronous=NORMAL,
+# foreign_keys=ON). No system SQLite dependency; first build compiles it.
+rusqlite = { workspace = true }
+# Path authority (cfg-free): cross-platform data-dir resolution. All OS `cfg`
+# lives inside this crate, keeping the engine free of #[cfg(unix/windows)]
+# (OS-cfg CI gate).
+directories = { workspace = true }
+# thiserror in the engine lib (no miette here — conventions).
+thiserror = { workspace = true }
+# serde derives on domain types (LifecycleState wire form, etc.).
+serde = { workspace = true }
+
+[dev-dependencies]
+# Hermetic temp base dir for engine unit + integration tests.
+tempfile = { workspace = true }
+# Test-only: prove LifecycleState serde wire form matches the stored string.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
