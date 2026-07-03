@@ -5,23 +5,38 @@ description: A compact tour of Ktesio's Rust modules, install flow, and file-bas
 
 # Architecture
 
-Ktesio is a single-binary Rust CLI. It keeps domain logic small and file-based so users can understand and repair project state manually when needed.
+Ktesio ships a single `kt` binary, built from a Cargo workspace. The CLI keeps domain logic small and file-based so users can understand and repair project state manually when needed.
+
+## Workspace Layout
+
+```text
+crates/
+├── kt/                     # package "ktesio" — the shipping kt CLI (all current behavior)
+├── ktesio-engine/          # engine library (reserved skeleton)
+├── ktesio-adapter-api/     # adapter contract types (reserved skeleton)
+├── ktesio-adapters-hermes/ # native adapter home (reserved skeleton)
+└── ktesio-conformance/     # adapter conformance test kit (reserved skeleton)
+```
+
+The four non-CLI crates are intentionally empty skeletons that reserve the crate boundaries for in-progress work. `kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types); CI enforces that dependency boundary.
 
 ## Modules
 
 ```text
-src/
+crates/kt/src/
 ├── main.rs          # clap command parsing and dispatch
 ├── cli/             # command handlers
 ├── discovery.rs     # fallback local skill discovery
 ├── error.rs         # miette/thiserror diagnostics
 ├── git.rs           # git CLI wrapper functions
+├── install_channel.rs # detection of how kt was installed (cargo, Homebrew, manual)
 ├── install_target.rs # git URL, local path, and GitHub shorthand resolution
 ├── lockfile.rs      # skills.lock load/save/validation
 ├── manifest.rs      # skills.json load/save/validation
 ├── skills_sh.rs     # skills.sh search client, normalization, and retries
 ├── skill.rs         # copy and remove skill files
-└── ui.rs            # shared terminal colors, icons, statuses, and progress bars
+├── ui.rs            # shared terminal colors, icons, statuses, and progress bars
+└── update_check.rs  # cached latest-release check for update notices
 ```
 
 ## Command Flow

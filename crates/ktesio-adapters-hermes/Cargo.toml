@@ -1,0 +1,17 @@
+[package]
+name = "ktesio-adapters-hermes"
+version = "0.1.0"
+edition.workspace = true
+description = "Native Hermes agent adapter for Ktesio"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# TODO(story 7-4): remove `publish = false` when the boundary is proven and
+# the workspace crates are published to crates.io.
+publish = false
+
+[dependencies]
+ktesio-adapter-api = { workspace = true }
+
+[lints]
+workspace = true

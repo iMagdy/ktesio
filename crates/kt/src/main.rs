@@ -11,6 +11,10 @@ mod skills_sh;
 mod ui;
 mod update_check;
 
+// Proves the AD-2 dependency edge (kt -> ktesio-engine) compiles; real engine
+// API usage arrives with stories 1-2 onward.
+use ktesio_engine as _;
+
 use clap::{CommandFactory, Parser, Subcommand};
 
 const HELP_FOOTER: &str = concat!(

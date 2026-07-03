@@ -12,9 +12,9 @@ The test suite covers unit behavior, CLI workflows, and local git fixtures.
 Run these before opening a pull request:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 python3 scripts/check_docs.py
 python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
@@ -23,18 +23,18 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ## Unit and Integration Tests
 
 ```bash
-cargo test --all-targets
+cargo test --workspace --all-targets
 ```
 
 Integration tests create local temporary git repositories. They do not require network access.
 
 ## Coverage
 
-CI runs `cargo tarpaulin --fail-under 95` as the coverage gate. To run it locally:
+CI runs `cargo tarpaulin --workspace --fail-under 95` as the coverage gate. To run it locally:
 
 ```bash
 cargo install cargo-tarpaulin
-cargo tarpaulin --fail-under 95
+cargo tarpaulin --workspace --fail-under 95
 ```
 
 Generate an HTML report:

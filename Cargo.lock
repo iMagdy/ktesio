@@ -635,6 +635,7 @@ dependencies = [
  "dialoguer",
  "flate2",
  "indicatif",
+ "ktesio-engine",
  "miette",
  "regex",
  "semver",
@@ -648,6 +649,31 @@ dependencies = [
  "urlencoding",
  "walkdir",
  "zip",
+]
+
+[[package]]
+name = "ktesio-adapter-api"
+version = "0.1.0"
+
+[[package]]
+name = "ktesio-adapters-hermes"
+version = "0.1.0"
+dependencies = [
+ "ktesio-adapter-api",
+]
+
+[[package]]
+name = "ktesio-conformance"
+version = "0.1.0"
+dependencies = [
+ "ktesio-adapter-api",
+]
+
+[[package]]
+name = "ktesio-engine"
+version = "0.1.0"
+dependencies = [
+ "ktesio-adapter-api",
 ]
 
 [[package]]

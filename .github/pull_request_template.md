@@ -4,9 +4,9 @@
 
 ## Verification
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] `cargo test --all-targets`
+- [ ] `cargo fmt --all --check`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace --all-targets`
 - [ ] `python3 scripts/check_docs.py`
 
 ## Contributor Checklist

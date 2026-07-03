@@ -11,9 +11,9 @@ When working here:
   behavior (the `kt` skills CLI). Treat the runner pivot as in progress: do
   not document or ship runner features until their BMAD story lands.
 - Before handing off code changes, run:
-  - `cargo fmt --check`
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo test --all-targets`
+  - `cargo fmt --all --check`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test --workspace --all-targets`
   - `python3 scripts/check_docs.py`
 
 ## Durable engineering gates
@@ -24,7 +24,7 @@ pivot and are re-ratified as the BMAD PRD/architecture lands:
 - **CLI-first** — every feature is reachable via the `kt` CLI; output goes to
   stdout, diagnostics to stderr; all commands support `--help`/`--version`.
 - **Test coverage MUST stay ≥ 95%** — enforced in CI via
-  `cargo tarpaulin --fail-under 95`. New code ships with tests.
+  `cargo tarpaulin --workspace --fail-under 95`. New code ships with tests.
 - **Documentation currency** — update `docs/` and `README.md` in the same
   change as the code they describe; stale docs are treated as a bug.
 - **Cross-platform** — Linux, macOS, and Windows; use path-agnostic std APIs.

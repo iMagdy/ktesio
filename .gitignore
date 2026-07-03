@@ -5,6 +5,7 @@
 *.rlib
 *.prof*
 .idea/
+.vscode/
 *.log
 .env*
 .DS_Store

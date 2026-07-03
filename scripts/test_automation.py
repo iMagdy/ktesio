@@ -62,7 +62,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("generate_homebrew_formula.py", workflow)
         self.assertIn("HOMEBREW_TAP_TOKEN", workflow)
         self.assertIn("CARGO_REGISTRY_TOKEN", workflow)
-        self.assertIn("cargo publish --locked", workflow)
+        self.assertIn("cargo publish --locked -p ktesio", workflow)
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("oras-project/setup-oras", workflow)
         self.assertNotIn("oras push", workflow)
@@ -112,8 +112,26 @@ class ReleaseDocsTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("needs: [fmt, clippy, test, build, docs]", ci)
-        self.assertIn("cargo tarpaulin --fail-under 95", ci)
+        self.assertIn("needs: [fmt, clippy, test, build, docs, boundary, semver]", ci)
+        self.assertIn("cargo test --workspace --all-targets", ci)
+        self.assertIn("cargo tarpaulin --workspace --fail-under 95", ci)
+
+    def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("cargo check -p ktesio", ci)
+        self.assertIn("cargo tree -p ktesio -e normal,build --all-features", ci)
+        # Boundary gate is an allowlist: only these internal edges may exist.
+        self.assertIn("ktesio-(engine|adapter-api)", ci)
+        # OS-cfg gate uses the broadened class pattern (compound cfg forms).
+        self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
+        self.assertIn("crates/ktesio-engine/src/backends/", ci)
+        # Semver gate: lazy install inside the armed branch, transient skip.
+        self.assertIn("cargo install cargo-semver-checks --locked", ci)
+        self.assertIn("cargo semver-checks check-release", ci)
+        self.assertIn("000|429|5[0-9][0-9]", ci)
 
 
 class InstallerScriptTests(unittest.TestCase):
