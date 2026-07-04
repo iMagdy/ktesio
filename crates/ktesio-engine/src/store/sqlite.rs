@@ -234,6 +234,24 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
+    fn set_state(&self, name: &InstanceName, state: LifecycleState) -> Result<(), StoreError> {
+        // Persist the new Lifecycle State (as its wire string) and bump
+        // updated_at. A row-count of 0 means the instance is gone → NotFound.
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE agent_instances SET state = ?1, updated_at = ?2 WHERE name = ?3",
+                rusqlite::params![state.as_str(), crate::time::now_rfc3339(), name.as_str(),],
+            )
+            .map_err(backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                name: name.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn get_instance(&self, name: &InstanceName) -> Result<Option<AgentInstance>, StoreError> {
         self.conn
             .query_row(
@@ -350,6 +368,43 @@ mod tests {
     fn get_missing_returns_none() {
         let store = SqliteStore::open_in_memory().unwrap();
         assert!(store.get_instance(&name("nope")).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_state_updates_the_state_column() {
+        // Story 1.4: the supervisor persists lifecycle transitions via set_state.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        assert_eq!(
+            store.get_instance(&name("demo")).unwrap().unwrap().state,
+            LifecycleState::Registered
+        );
+        store
+            .set_state(&name("demo"), LifecycleState::Running)
+            .unwrap();
+        assert_eq!(
+            store.get_instance(&name("demo")).unwrap().unwrap().state,
+            LifecycleState::Running
+        );
+        // A further transition also persists.
+        store
+            .set_state(&name("demo"), LifecycleState::Stopped)
+            .unwrap();
+        assert_eq!(
+            store.get_instance(&name("demo")).unwrap().unwrap().state,
+            LifecycleState::Stopped
+        );
+    }
+
+    #[test]
+    fn set_state_on_missing_instance_is_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .set_state(&name("ghost"), LifecycleState::Running)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
     }
 
     #[test]

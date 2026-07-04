@@ -217,3 +217,17 @@ pub struct AgentNoMeteringSource {
 pub struct AgentNoCapabilities {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::invalid_transition))]
+pub struct AgentInvalidTransition {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::launch_failed))]
+pub struct AgentLaunchFailed {
+    pub message: String,
+}

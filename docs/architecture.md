@@ -22,14 +22,16 @@ crates/
 
 ### Engine modules
 
-The engine follows a hexagonal layout (domain core + ports + backing implementations). The registration slice is live:
+The engine follows a hexagonal layout (domain core + ports + backing implementations). Registration and the agent lifecycle (start/stop) are live:
 
 ```text
 crates/ktesio-engine/src/
 ├── lib.rs      # re-exports the public API (the Embedding Interface)
-├── adapter/    # adapter resolution: native builtins + manifest loader/validator (parses via adapter-api; executes nothing)
-├── domain/     # core: LifecycleState, AgentInstance, InstanceName, RegistryError, the Registry service
-├── ports/      # hexagonal ports; StateStore trait + StoreError
+├── engine.rs   # the async Engine handle + its blocking() facade (owns the tokio runtime + the supervisor)
+├── adapter/    # adapter resolution: native builtins + manifest loader/validator; also resolves the start launch (exec/args/env)
+├── domain/     # core: LifecycleState, the transition table + events, AgentInstance, the Registry service, the Supervisor
+├── ports/      # hexagonal ports: StateStore + ProcessBackend traits (+ SpawnSpec/StopOutcome/ProcessStatus/errors)
+├── backends/   # the ONLY OS-conditional code: unix/ (process groups + signals) and windows/ (Job Objects), selected per OS
 ├── store/      # SQLite StateStore implementation + schema/migrations (internal)
 ├── paths.rs    # engine-only path authority (state dir + Agent Home), resolved cross-platform
 └── time.rs     # RFC 3339 UTC timestamp formatting
@@ -37,7 +39,17 @@ crates/ktesio-engine/src/
 
 The engine is the sole path authority: it computes the state-directory location and each Agent Home layout; `kt` receives paths from the API and never constructs them. All registry and lifecycle state lives in one SQLite database (WAL journaling, `synchronous=NORMAL`, foreign keys on) under the engine state directory; bulky per-instance artifacts live as files inside each Agent Home. Errors use `thiserror` inside the engine and are wrapped into `miette` diagnostics in `kt`.
 
-Registration resolves an adapter before any state is written. A native adapter is selected by kind (`--kind`) from a small builtin table; a manifest adapter is loaded from a directory or file (`--manifest`), its `adapter.toml` parsed and validated by `ktesio-adapter-api`. The adapter's per-OS Capability Declaration and Metering Source are validated first — an adapter with no capabilities or no viable metering source is rejected, and nothing is written — then the row and Agent Home are created. The effective (current-OS) Capability Declaration is projected as data (via a runtime OS identifier, never conditional compilation) and persisted as a JSON snapshot in the Agent Home, so `kt agent show` can render it. Lifecycle execution (starting and stopping agents) is a later story; this slice stores and validates declarations and templates only.
+Registration resolves an adapter before any state is written. A native adapter is selected by kind (`--kind`) from a small builtin table; a manifest adapter is loaded from a directory or file (`--manifest`), its `adapter.toml` parsed and validated by `ktesio-adapter-api`. The adapter's per-OS Capability Declaration and Metering Source are validated first — an adapter with no capabilities or no viable metering source is rejected, and nothing is written — then the row and Agent Home are created. The effective (current-OS) Capability Declaration is projected as data (via a runtime OS identifier, never conditional compilation) and persisted as a JSON snapshot in the Agent Home, so `kt agent show` can render it.
+
+#### Async engine + blocking facade (AD-13)
+
+The engine runs its supervision core on a tokio multi-thread runtime. The public `Engine` API is asynchronous; blocking filesystem and SQLite work runs on tokio's blocking pool (`spawn_blocking`), since rusqlite is a synchronous C binding that must never stall an async worker. A thin `blocking()` facade wraps each async method in `runtime.block_on(...)`; `kt` uses that facade and stays a synchronous binary (no async main, no TTY or prompts inside the engine — interactivity lives only in `kt`). A Host embedding the engine with its own runtime calls the async methods directly.
+
+#### Lifecycle: transition table, supervisor, and per-OS process backends (AD-4, AD-15)
+
+The agent lifecycle is a data-driven state machine: one pure transition table maps `(state, command)` to the next state or a single uniform `InvalidTransition` error, so an invalid command (for example `stop` on a stopped instance) is rejected identically for every adapter — the rejection comes from the shared table before any adapter code runs. A supervisor owns the running instances' process handles in memory for the current engine lifetime and drives each transition: apply the table, spawn or stop via the process backend, persist the new state, and record a transition event. Each transition is recorded to a per-instance JSON-Lines event log in the Agent Home (the agent's own stdout/stderr are captured to a separate file), and the escalation from a graceful to a forced stop is recorded there too.
+
+All process control goes through one `ProcessBackend` port whose methods speak in domain terms, never OS syscalls. The per-OS implementations are the only place in the workspace that uses OS-conditional compilation: on Unix each agent is spawned into its own process group and stopped with `SIGTERM`, escalating to `SIGKILL` across the whole group after a configurable window (default 30s) so no child process survives; on Windows each agent runs in its own Job Object and is terminated with `TerminateJobObject`, killing every process in the job. Cross-restart adoption of processes started by a previous engine is a later story; this slice supervises within a single engine lifetime and cleans up its processes when the engine shuts down.
 
 ## Modules
 

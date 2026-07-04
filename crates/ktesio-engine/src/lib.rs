@@ -50,19 +50,24 @@
 //! [`StateStore`]: crate::ports::StateStore
 
 pub mod adapter;
+mod backends;
 pub mod domain;
+mod engine;
 pub mod paths;
 pub mod ports;
 mod store;
 mod time;
 
-// Re-export the registration capability's public surface at the crate root
-// (the Embedding Interface for this story).
+// Re-export the registration + lifecycle public surface at the crate root
+// (the Embedding Interface). `kt` drives the engine through the async [`Engine`]
+// and its `blocking()` facade (AD-13); `Registry` stays public for in-workspace
+// collaborators + tests but is no longer what `kt` uses directly.
 pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
-    AgentInstance, InstanceName, LifecycleState, NameError, Registry, RegistryError,
-    RemoveDisposition,
+    AgentInstance, EngineError, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
+    NameError, Registry, RegistryError, RemoveDisposition, TransitionCause, TransitionEvent,
 };
+pub use engine::{Blocking, Engine};
 
 // Re-export the adapter-contract types `kt` needs to render the effective
 // per-OS Capability Declaration (AD-2: `kt` names these types, not the schema).

@@ -12,7 +12,7 @@
 //! sync is the correct altitude now. The trait takes no runtime handle and
 //! holds no global state, keeping it facade-friendly for the 1.4 migration.
 
-use crate::domain::{AgentInstance, InstanceName};
+use crate::domain::{AgentInstance, InstanceName, LifecycleState};
 
 use super::StoreError;
 
@@ -27,6 +27,15 @@ pub trait StateStore {
     /// name already exists — enforced by the `UNIQUE` constraint on
     /// `agent_instances.name`, not a pre-check (which would race).
     fn create_instance(&self, instance: &AgentInstance) -> Result<(), StoreError>;
+
+    /// Update an instance's Lifecycle State (and its `updated_at`) in place.
+    ///
+    /// Called by the supervisor on every persisted lifecycle transition (story
+    /// 1.4). Domain-typed (a [`LifecycleState`], not a SQL string) — the SQLite
+    /// implementation maps it to the `state` column. Fails with
+    /// [`StoreError::NotFound`] if no such instance exists. The `state` column
+    /// already exists (schema v1); no migration is needed.
+    fn set_state(&self, name: &InstanceName, state: LifecycleState) -> Result<(), StoreError>;
 
     /// Fetch an instance by name, or `None` if absent.
     fn get_instance(&self, name: &InstanceName) -> Result<Option<AgentInstance>, StoreError>;

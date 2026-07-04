@@ -393,6 +393,62 @@ impl Registry {
         Ok(self.store.list_instances()?)
     }
 
+    // ---- Supervisor collaboration surface (story 1.4; crate-internal) ----
+    //
+    // The lifecycle supervisor drives transitions through these; they stay
+    // `pub(crate)` so the public Embedding Interface is only the Engine facade,
+    // not the raw store. All speak domain types (AD-1).
+
+    /// Look up an instance, mapping absence to [`RegistryError::NotFound`].
+    pub(crate) fn lookup(&self, name: &InstanceName) -> Result<AgentInstance, RegistryError> {
+        self.store
+            .get_instance(name)?
+            .ok_or_else(|| RegistryError::NotFound {
+                name: name.as_str().to_string(),
+            })
+    }
+
+    /// Persist a Lifecycle State change (supervisor transition). Bumps
+    /// `updated_at` in the store.
+    pub(crate) fn set_state(
+        &self,
+        name: &InstanceName,
+        state: LifecycleState,
+    ) -> Result<(), RegistryError> {
+        self.store.set_state(name, state)?;
+        Ok(())
+    }
+
+    /// The persisted adapter facts the supervisor needs to launch an instance:
+    /// its kind and (for a manifest adapter) the manifest path 1-3 recorded.
+    pub(crate) fn adapter_launch_facts(
+        &self,
+        name: &InstanceName,
+    ) -> Result<(String, Option<std::path::PathBuf>), RegistryError> {
+        let snapshot = self.read_adapter_snapshot(name)?;
+        let manifest_path = snapshot.manifest_path.map(std::path::PathBuf::from);
+        Ok((snapshot.kind, manifest_path))
+    }
+
+    /// The per-instance log directory inside the Agent Home (AD-12 seed).
+    pub(crate) fn instance_log_dir(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.paths.agent_home(name).join("logs")
+    }
+
+    /// The per-instance ENGINE log FILE — the JSON-Lines transition-event log
+    /// (AD-12/AD-14 seed). Engine-owned; distinct from the agent's own
+    /// stdout/stderr capture so the two never interleave.
+    pub(crate) fn instance_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("instance.log")
+    }
+
+    /// The per-instance AGENT output log FILE — the spawned process's
+    /// stdout/stderr capture (AD-12 seed). Kept separate from the engine event
+    /// log; full agent-out/agent-err attribution + rotation is Epic 4.
+    pub(crate) fn agent_output_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("agent.log")
+    }
+
     /// Count Usage Ledger events for an instance (used to prove empty ledgers).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {
         Ok(self.store.count_usage_events(name)?)

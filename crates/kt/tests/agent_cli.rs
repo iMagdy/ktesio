@@ -414,3 +414,252 @@ fn show_unknown_instance_exits_nonzero() {
         show.stderr
     );
 }
+
+// ---- Story 1.4: `kt agent start` / `kt agent stop` ----
+
+/// Locate the `fake_agent` helper binary: a sibling of the `kt` test binary in
+/// the same `target/<profile>/` dir (both are workspace bins built by
+/// `--all-targets`). Cross-crate `CARGO_BIN_EXE_*` is unavailable, so resolve by
+/// sibling path from `CARGO_BIN_EXE_kt`. If it is not present (e.g. under
+/// tarpaulin, which does not build sibling bins), build it on demand.
+fn fake_agent_bin() -> std::path::PathBuf {
+    let kt = std::path::PathBuf::from(env!("CARGO_BIN_EXE_kt"));
+    let dir = kt.parent().expect("kt bin has a parent dir");
+    let bin = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
+    if bin.exists() {
+        return bin;
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
+        .status();
+    assert!(
+        matches!(status, Ok(s) if s.success()) && bin.exists(),
+        "fake_agent not found at {} and on-demand build failed ({status:?})",
+        bin.display()
+    );
+    bin
+}
+
+/// Write a manifest whose `[lifecycle.start]` exec points at `fake_agent`.
+fn fake_agent_manifest(dir: &Path, args: &[&str]) -> std::path::PathBuf {
+    let m = dir.join("fake-agent-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fake"
+
+[lifecycle.start]
+exec = {exec:?}
+args = [{args_toml}]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+#[test]
+fn start_prints_running_state_and_exits_zero() {
+    // AC1 at the CLI: register a manifest agent, start it → the new state
+    // `running` is printed to stdout and the exit code is 0.
+    //
+    // NOTE (single-lifetime boundary): each `kt` invocation is its own engine
+    // lifetime; the started process is cleaned up on exit (kill-on-drop). A
+    // separate `kt agent stop` cannot re-attach to it (orphan adoption is story
+    // 1-6). This test asserts the START contract; the full start→stop→no-survivor
+    // proof lives in the engine's single-lifetime lifecycle integration test.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    assert!(run.success, "start should exit 0; stderr={}", run.stderr);
+    assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
+    assert!(run.stdout.contains("Started"), "stdout={}", run.stdout);
+}
+
+#[test]
+fn start_prints_single_lifetime_notice_to_stderr_only() {
+    // LOW-1: the success path is honest about single-lifetime supervision — a
+    // standalone `kt agent start` kills the agent when the CLI exits (durable
+    // supervision is story 1-6). That caveat is printed as a one-line NOTICE to
+    // STDERR (AD-12: results → stdout, notices → stderr), and the stdout result
+    // line (`running`) is UNCHANGED. This asserts both halves so a future change
+    // that either drops the notice or leaks it onto stdout is caught.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    assert!(run.success, "start should exit 0; stderr={}", run.stderr);
+    // stdout result line is unchanged (still shows `running`).
+    assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
+    // The notice is on stderr, and names story 1-6 as the durable-supervision
+    // follow-up.
+    assert!(
+        run.stderr
+            .contains("supervised only for this engine session"),
+        "single-lifetime notice must go to stderr; stderr={}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("1-6"), "stderr={}", run.stderr);
+    // The notice must NOT leak onto stdout (AD-12: stdout is the result only).
+    assert!(
+        !run.stdout
+            .contains("supervised only for this engine session"),
+        "notice must not appear on stdout; stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn start_missing_exec_lands_failed_with_preserved_diagnostic() {
+    // AC2 at the CLI: a manifest whose start exec does not exist → non-zero
+    // exit, the diagnostic is preserved on stderr, and the instance is `failed`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = ctx.project_dir.join("bad-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(
+        m.join("adapter.toml"),
+        r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "bad"
+[lifecycle.start]
+exec = "ktesio-no-such-binary-cli-1-4"
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+[metering]
+source = "self-reported"
+"#,
+    )
+    .unwrap();
+
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "bad",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "start", "bad"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "start of a bad exec should exit non-zero");
+    assert!(
+        run.stderr.contains("failed to launch"),
+        "stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("ktesio-no-such-binary-cli-1-4"),
+        "diagnostic preserved; stderr={}",
+        run.stderr
+    );
+    // The instance is now `failed`.
+    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(list.stdout.contains("failed"), "stdout={}", list.stdout);
+}
+
+#[test]
+fn stop_on_stopped_returns_uniform_invalid_transition() {
+    // AC4 at the CLI: `stop` on a freshly-registered (registered) instance —
+    // never started — returns the uniform invalid-transition diagnostic and a
+    // non-zero exit, identical wording regardless of adapter kind.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    // Native builtin.
+    run_kt_agent(
+        &["agent", "register", "nat", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "stop", "nat"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "stop on registered should exit non-zero");
+    assert!(
+        run.stderr.contains("cannot stop"),
+        "uniform invalid-transition; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn start_unknown_instance_exits_nonzero() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let run = run_kt_agent(&["agent", "start", "ghost"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "start of a missing instance should fail");
+    assert!(run.stderr.contains("ghost"), "stderr={}", run.stderr);
+}
+
+#[test]
+fn stop_accepts_timeout_flag() {
+    // The `--timeout <secs>` flag parses and drives the graceful window. Stop on
+    // a registered instance still rejects (AC4) but proves the flag is accepted.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "svc", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(
+        &["agent", "stop", "svc", "--timeout", "5"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Registered → stop is invalid, but the flag parsed (no clap error).
+    assert!(run.stderr.contains("cannot stop"), "stderr={}", run.stderr);
+}

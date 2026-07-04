@@ -124,14 +124,19 @@ Details:
   under a unique name from a native adapter (--kind) or a manifest adapter
   (--manifest <dir-or-file>), validating its Capability Declaration and Metering
   Source before any state is written; it prints the Agent Home path and the
-  effective per-OS Capability Declaration. remove deletes the registry entry
-  and, with --delete, the Agent Home too (--retain, the default, keeps it); list
-  shows the Fleet; show renders one instance's effective capabilities. Removing a
-  running instance requires --force.
+  effective per-OS Capability Declaration. start launches a registered instance
+  (its state becomes running); stop requests a graceful shutdown and escalates to
+  a forced kill after the window (--timeout <secs>, default 30), leaving no
+  surviving process. remove deletes the registry entry and, with --delete, the
+  Agent Home too (--retain, the default, keeps it); list shows the Fleet; show
+  renders one instance's effective capabilities. Removing a running instance
+  requires --force.
 
 Examples:
   kt agent register demo --kind mock
   kt agent register my-agent --manifest ./my-agent
+  kt agent start my-agent
+  kt agent stop my-agent --timeout 10
   kt agent show demo
   kt agent list
   kt agent remove demo --delete";
@@ -319,6 +324,19 @@ enum AgentCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Start a registered Agent Instance
+    Start {
+        /// Name of the Agent Instance to start
+        name: String,
+    },
+    /// Stop a running Agent Instance (graceful, then forced after the window)
+    Stop {
+        /// Name of the Agent Instance to stop
+        name: String,
+        /// Graceful-shutdown window in seconds before a forced kill (default 30)
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// List every Agent Instance in the Fleet
     List,
     /// Show an Agent Instance's effective per-OS Capability Declaration
@@ -411,6 +429,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 cli::agent::DispositionArg::from_flags(delete, retain),
                 force,
             ),
+            AgentCommands::Start { name } => cli::agent::start(&name),
+            AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
             AgentCommands::List => cli::agent::list(),
             AgentCommands::Show { name } => cli::agent::show(&name),
         },
@@ -460,8 +480,22 @@ mod tests {
             .expect("agent subcommand should exist");
         assert!(agent.get_subcommands().any(|c| c.get_name() == "register"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "remove"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "start"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "stop"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
+    }
+
+    #[test]
+    fn test_agent_start_stop_parse() {
+        // `start <name>` and `stop <name> [--timeout <secs>]` parse.
+        assert!(Cli::try_parse_from(["kt", "agent", "start", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc", "--timeout", "10"]).is_ok());
+        // start requires a name.
+        assert!(Cli::try_parse_from(["kt", "agent", "start"]).is_err());
+        // --timeout must be a number.
+        assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc", "--timeout", "abc"]).is_err());
     }
 
     #[test]

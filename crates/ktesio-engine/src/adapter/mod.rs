@@ -160,6 +160,101 @@ pub enum AdapterResolveError {
     },
 }
 
+/// The resolved `start` launch of an adapter (story 1.4): exec + args + env.
+///
+/// Built by [`resolve_start_launch`] from a manifest adapter's
+/// `[lifecycle.start]` [`OpTemplate`](ktesio_adapter_api::OpTemplate) or a native
+/// adapter's equivalent. The supervisor turns this into a
+/// [`SpawnSpec`](crate::ports::SpawnSpec) (adding the working dir + log file) and
+/// hands it to the [`ProcessBackend`](crate::ports::ProcessBackend).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartLaunch {
+    /// The executable to run (program name or path).
+    pub exec: String,
+    /// Positional arguments.
+    pub args: Vec<String>,
+    /// Environment overrides.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Why a `start` launch could not be resolved (story 1.4).
+#[derive(Debug, Error)]
+pub enum LaunchResolveError {
+    /// The stored manifest could not be read/parsed (corrupt or now-missing).
+    #[error("could not read the adapter manifest at {path}: {detail}")]
+    ManifestUnreadable {
+        /// The manifest path.
+        path: String,
+        /// The underlying detail.
+        detail: String,
+    },
+
+    /// The manifest parsed but declares no `[lifecycle.start]` `exec` (should not
+    /// happen for a manifest that passed registration validation, but guarded).
+    #[error("adapter manifest at {path} declares no `[lifecycle.start]` exec")]
+    NoStartTemplate {
+        /// The manifest path.
+        path: String,
+    },
+
+    /// The adapter is a native builtin with no launch command. Native builtins
+    /// (e.g. `mock`) carry no process to spawn this story; a launchable agent is
+    /// supplied as a manifest adapter whose `[lifecycle.start]` exec points at
+    /// the real program (AD-3). Names the kind.
+    #[error(
+        "native adapter kind '{kind}' has no launch command; supply a manifest adapter (its `[lifecycle.start]` exec) to start a real process"
+    )]
+    NativeHasNoLaunch {
+        /// The native kind.
+        kind: String,
+    },
+}
+
+/// Resolve the `start` launch for an adapter, given its persisted snapshot
+/// facts (story 1.4).
+///
+/// * A **manifest** adapter (`manifest_path` is `Some`) re-reads its
+///   `adapter.toml` and returns the `[lifecycle.start]` template's exec/args/env
+///   (reusing [`ktesio_adapter_api::Manifest`] — the same parser registration
+///   used). This is where 1-3's stored `OpTemplate` is finally EXECUTED (AD-3).
+/// * A **native** adapter (`manifest_path` is `None`) has no launch command this
+///   story (the builtin `mock` is inert) → [`LaunchResolveError::NativeHasNoLaunch`].
+///
+/// PARSE only — executes nothing here (the supervisor spawns).
+pub fn resolve_start_launch(
+    kind: &str,
+    manifest_path: Option<&Path>,
+) -> Result<StartLaunch, LaunchResolveError> {
+    let Some(manifest_path) = manifest_path else {
+        return Err(LaunchResolveError::NativeHasNoLaunch {
+            kind: kind.to_string(),
+        });
+    };
+    let text = std::fs::read_to_string(manifest_path).map_err(|e| {
+        LaunchResolveError::ManifestUnreadable {
+            path: manifest_path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        }
+    })?;
+    let manifest =
+        Manifest::from_toml_str(&text).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: manifest_path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    let start = manifest
+        .lifecycle
+        .as_ref()
+        .and_then(|l| l.start.as_ref())
+        .ok_or_else(|| LaunchResolveError::NoStartTemplate {
+            path: manifest_path.to_string_lossy().into_owned(),
+        })?;
+    Ok(StartLaunch {
+        exec: start.exec.clone(),
+        args: start.args.clone(),
+        env: start.env.clone(),
+    })
+}
+
 /// Resolve an [`AdapterRef`] into a validated [`ResolvedAdapter`].
 ///
 /// PARSE + VALIDATE only — executes nothing. On success the returned adapter is
@@ -456,6 +551,89 @@ source = "self-reported"
         assert!(
             matches!(err, AdapterResolveError::NoCapabilities { adapter } if adapter == "hollow"),
             "expected NoCapabilities"
+        );
+    }
+
+    // ---- Story 1.4: resolve_start_launch (the manifest OpTemplate → launch) ----
+
+    #[test]
+    fn resolve_start_launch_reads_the_manifest_start_template() {
+        // A manifest adapter's [lifecycle.start] exec/args/env become the launch.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+args = ["--serve", "--port", "0"]
+env = { MODE = "test" }
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let launch = resolve_start_launch("demo", Some(&path)).unwrap();
+        assert_eq!(launch.exec, "the-agent");
+        assert_eq!(launch.args, vec!["--serve", "--port", "0"]);
+        assert_eq!(launch.env.get("MODE").map(String::as_str), Some("test"));
+    }
+
+    #[test]
+    fn resolve_start_launch_native_has_no_launch_command() {
+        // A native adapter (manifest_path None) has no launch command this story.
+        let err = resolve_start_launch("mock", None).unwrap_err();
+        assert!(
+            matches!(&err, LaunchResolveError::NativeHasNoLaunch { kind } if kind == "mock"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("no launch command"));
+    }
+
+    #[test]
+    fn resolve_start_launch_unreadable_manifest_is_reported() {
+        // A manifest path that does not exist → ManifestUnreadable.
+        let missing = std::path::Path::new("/no/such/adapter.toml");
+        let err = resolve_start_launch("demo", Some(missing)).unwrap_err();
+        assert!(
+            matches!(err, LaunchResolveError::ManifestUnreadable { .. }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_start_launch_malformed_manifest_is_unreadable() {
+        // A manifest that fails to PARSE surfaces as ManifestUnreadable (the
+        // launch path re-reads it; a corrupt file cannot yield a launch).
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(tmp.path(), "not = = valid toml");
+        let err = resolve_start_launch("demo", Some(&path)).unwrap_err();
+        assert!(matches!(err, LaunchResolveError::ManifestUnreadable { .. }));
+    }
+
+    #[test]
+    fn resolve_start_launch_missing_start_template_is_reported() {
+        // A manifest with a [lifecycle] table but no start op → NoStartTemplate.
+        // (Parses fine — validate() would reject it at registration, but the
+        // launch resolver guards defensively.)
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "demo"
+[lifecycle.stop]
+exec = "stopper"
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_start_launch("demo", Some(&path)).unwrap_err();
+        assert!(
+            matches!(err, LaunchResolveError::NoStartTemplate { .. }),
+            "got {err}"
         );
     }
 

@@ -1,13 +1,16 @@
 //! Hexagonal ports (spine AD-1).
 //!
 //! Ports are the traits through which all variability enters the engine core.
-//! This story realizes exactly one: [`StateStore`] (the persistence port).
-//! Other ports (`AgentAdapter`, `MeteringSource`, `MemoryBacking`,
-//! `ProcessBackend`, `SecretResolver`) arrive with the stories that need them
-//! (entity-timing) — no speculative port trees.
+//! This crate realizes two: [`StateStore`] (persistence) and, from story 1.4,
+//! [`ProcessBackend`] (per-OS process control, AD-4 — its per-OS impls live in
+//! `backends/`, the sole allowlisted `#[cfg]` home). Other ports
+//! (`MeteringSource`, `MemoryBacking`, `SecretResolver`) arrive with the stories
+//! that need them (entity-timing) — no speculative port trees.
 
+mod process_backend;
 mod state_store;
 
+pub use process_backend::{BackendError, ProcessBackend, ProcessStatus, SpawnSpec, StopOutcome};
 pub use state_store::StateStore;
 
 use thiserror::Error;

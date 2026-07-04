@@ -172,6 +172,51 @@ pub fn probe_inert_start(adapter: &MockAdapter) -> AdapterError {
         .expect_err("mock start must be inert (unavailable) until story 1-4")
 }
 
+/// Locate the `fake_agent` test helper binary (story 1.4, AD-3).
+///
+/// The engine's start/stop integration tests point a manifest adapter's
+/// `[lifecycle.start]` `exec` at this binary so the supervisor spawns a REAL
+/// process. `CARGO_BIN_EXE_fake_agent` is only set for THIS crate's own targets,
+/// so a cross-crate test resolves the path from the running test executable's
+/// location instead: `fake_agent` sits next to the test-deps directory, in the
+/// same `debug`/`release` profile dir.
+///
+/// If the binary is not present (e.g. under `cargo tarpaulin`, which builds test
+/// targets but not sibling `[[bin]]` targets), it is BUILT on demand via
+/// `cargo build -p ktesio-conformance --bin fake_agent` so the process-spawning
+/// tests run under every harness. Panics with a clear message only if the build
+/// itself fails.
+///
+/// Kept a plain runtime path computation — no OS-conditional compilation (the
+/// executable suffix comes from [`std::env::consts::EXE_SUFFIX`], a runtime
+/// constant, so the OS-cfg gate stays green).
+pub fn fake_agent_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("locate the running test executable");
+    // .../target/<profile>/deps/<test-bin>  → go up to .../target/<profile>/
+    let mut dir = exe;
+    dir.pop(); // drop the test-bin file name
+    if dir.ends_with("deps") {
+        dir.pop(); // drop `deps`
+    }
+    let candidate = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
+    if candidate.exists() {
+        return candidate;
+    }
+    // Not built by this harness — build it on demand (e.g. tarpaulin).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
+        .status();
+    match status {
+        Ok(s) if s.success() && candidate.exists() => candidate,
+        other => panic!(
+            "fake_agent binary not found at {} and an on-demand build did not produce it \
+             (build status: {other:?}). Build `ktesio-conformance` first.",
+            candidate.display()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

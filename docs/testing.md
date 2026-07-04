@@ -26,11 +26,20 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 cargo test --workspace --all-targets
 ```
 
-Integration tests create local temporary git repositories. They do not require network access.
+Integration tests create local temporary git repositories. They do not require network access. The agent-lifecycle tests spawn a small cross-platform helper binary (`fake_agent`, in `ktesio-conformance`) as a real child process to prove start, stop, launch-failure, and no-survivor behavior end to end; it is a dev/test artifact and never ships.
+
+## Cross-platform testing (3-OS matrix)
+
+The per-OS process-control code lives only under `crates/ktesio-engine/src/backends/{unix,windows}` (the sole place OS-conditional compilation is allowed). This code cannot be verified on a single operating system — the Windows Job-Object backend does not even compile on Linux. The CI `test` job therefore runs on a matrix of `ubuntu-latest`, `macos-latest`, and `windows-latest`:
+
+- Linux and macOS run the Unix backend (process groups, `SIGTERM`/`SIGKILL`) on both Unixes.
+- Windows runs the Windows backend (Job Objects, `TerminateJobObject`), the only place its behavior — real spawn, terminate, and no-survivor assertions — is actually exercised.
+
+Only the `test` job matrixes; the other jobs (fmt, clippy, build, docs, boundary, semver, msrv, coverage) stay Linux-only.
 
 ## Coverage
 
-CI runs `cargo tarpaulin --workspace --fail-under 95` as the coverage gate. To run it locally:
+CI runs `cargo tarpaulin --workspace --fail-under 95` as the coverage gate, on Linux only. To run it locally:
 
 ```bash
 cargo install cargo-tarpaulin
@@ -42,6 +51,10 @@ Generate an HTML report:
 ```bash
 cargo tarpaulin --out Html
 ```
+
+### Coverage honesty for per-OS code
+
+`cargo tarpaulin` runs on Linux and cannot instrument `#[cfg(windows)]` code, so the 95% gate is measured on Linux against the OS-agnostic core plus the Unix backend (which compiles and runs on the Linux tarpaulin host, so its lines are covered). The Windows backend's lines are `cfg`-excluded on Linux and never enter the Linux coverage denominator, so the reported percentage is honest for what Linux can see. The Windows backend's correctness is proven instead by the `windows-latest` matrix `test` run passing — a real Job-Object spawn, terminate, and no-survivor check — not by a coverage number. The `fake_agent` helper binary runs only as a spawned subprocess, so it too is excluded from coverage (its behavior is proven by the tests that spawn and kill it).
 
 ## Documentation Checks
 

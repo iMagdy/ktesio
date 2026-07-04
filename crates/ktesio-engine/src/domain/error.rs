@@ -6,9 +6,10 @@
 
 use thiserror::Error;
 
-use crate::ports::StoreError;
+use crate::ports::{BackendError, StoreError};
 
 use super::name::NameError;
+use super::transition::LifecycleError;
 
 /// Errors from the registry service (`register` / `remove`).
 #[derive(Debug, Error)]
@@ -147,6 +148,83 @@ pub enum RegistryError {
     NoCapabilities {
         /// The adapter kind/identity that lacked capabilities.
         adapter: String,
+    },
+
+    /// A [`StateStore`](crate::ports::StateStore) operation failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Errors from the lifecycle supervision surface (`start` / `stop`, story 1.4).
+///
+/// Distinct from [`RegistryError`] (registration) so `kt` can map lifecycle
+/// failures — an invalid transition (AC4), a launch failure (AC2) — to their own
+/// diagnostics. Every variant names the instance + reason so `kt` can render a
+/// remediation (NFR-1). `thiserror`, never `miette` (conventions).
+#[derive(Debug, Error)]
+pub enum EngineError {
+    /// The instance is not registered. Names it.
+    #[error("no Agent Instance named '{name}' is registered")]
+    NotFound {
+        /// The missing instance name.
+        name: String,
+    },
+
+    /// The supplied name failed the naming rule.
+    #[error("invalid Agent Instance name '{name}': {reason}")]
+    InvalidName {
+        /// The rejected candidate string.
+        name: String,
+        /// The specific rule that failed.
+        reason: NameError,
+    },
+
+    /// A lifecycle command was invalid from the instance's current state (AC4).
+    /// The SAME error for every adapter (it comes from the shared transition
+    /// table before any adapter code runs).
+    #[error(transparent)]
+    InvalidTransition(#[from] LifecycleError),
+
+    /// The agent failed to launch (AC2): the adapter/process diagnostic is
+    /// PRESERVED in `detail`, the instance is left in `failed`, and no zombie
+    /// remains. Names the instance.
+    #[error("Agent Instance '{name}' failed to launch: {detail}")]
+    LaunchFailed {
+        /// The instance that failed to start.
+        name: String,
+        /// The preserved adapter/process diagnostic (verbatim, AC2).
+        detail: String,
+    },
+
+    /// The instance's adapter could not be re-resolved for launch (a corrupt or
+    /// now-missing manifest/snapshot). Names the instance + detail.
+    #[error("could not resolve the adapter for Agent Instance '{name}': {detail}")]
+    AdapterUnresolved {
+        /// The instance whose adapter failed to resolve.
+        name: String,
+        /// Why resolution failed.
+        detail: String,
+    },
+
+    /// A per-instance log I/O operation failed (AD-12 seed). Names the path.
+    #[error("could not write the instance log for '{name}' at {path}: {detail}")]
+    Log {
+        /// The instance the log is for.
+        name: String,
+        /// The log path.
+        path: String,
+        /// The underlying I/O detail.
+        detail: String,
+    },
+
+    /// A process-control backend operation failed unexpectedly (not a launch
+    /// failure — a signal/terminate/wait error). Names the instance.
+    #[error("process control failed for Agent Instance '{name}': {source}")]
+    Backend {
+        /// The instance the operation was for.
+        name: String,
+        /// The underlying backend error.
+        source: BackendError,
     },
 
     /// A [`StateStore`](crate::ports::StateStore) operation failed.

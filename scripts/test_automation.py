@@ -116,6 +116,24 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo test --workspace --all-targets", ci)
         self.assertIn("cargo tarpaulin --workspace --fail-under 95", ci)
 
+    def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
+        # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the
+        # per-OS ProcessBackend supervision code — in particular the Windows
+        # Job-Object backend, which does not even compile on Linux — is proven on
+        # a real Windows runner. Lock the matrix shape (mirrors the MSRV-floor
+        # lock in test_ci_enforces_msrv_floor). Coverage stays Linux-only; the
+        # matrix is the parity-honesty mechanism, not tarpaulin.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", ci)
+        self.assertIn("runs-on: ${{ matrix.os }}", ci)
+        self.assertIn("fail-fast: false", ci)
+        # Only the `test` job matrixes; the other jobs stay ubuntu-only. The
+        # coverage job still stays Linux-only (a single tarpaulin run).
+        self.assertIn("name: coverage", ci)
+
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"

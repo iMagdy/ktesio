@@ -70,6 +70,18 @@ pub fn error(message: impl Display) {
     eprintln!("{}", error_text(message));
 }
 
+/// Print an informational NOTICE to stderr (AD-12: results → stdout,
+/// diagnostics/notices → stderr). A notice is neither a warning nor an error —
+/// it is a neutral, dimmed "note:" line (e.g. the single-lifetime supervision
+/// caveat on `kt agent start`).
+pub fn note(message: impl Display) {
+    eprintln!("{}", note_text(message));
+}
+
+pub fn note_text(message: impl Display) -> String {
+    format!("{} {}", style(format!("{INFO} note:")).dim(), message)
+}
+
 pub(crate) fn update_notice(current_version: &str, latest_version: &str) {
     eprintln!("{}", update_notice_text(current_version, latest_version));
 }

@@ -12,14 +12,16 @@
 //! only — conventions). Output discipline (AD-12): command results to stdout,
 //! diagnostics/notices to stderr.
 
+use std::time::Duration;
+
 use ktesio_engine::{
-    AdapterRef, EffectiveCapabilities, Registry, RegistryError, RemoveDisposition,
+    AdapterRef, EffectiveCapabilities, Engine, EngineError, RegistryError, RemoveDisposition,
 };
 
 use crate::error::{
-    AgentDuplicateName, AgentInvalidName, AgentIo, AgentManifestInvalid, AgentManifestNotFound,
-    AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound,
-    AgentRunningRequiresForce, AgentStore, AgentUnknownKind,
+    AgentDuplicateName, AgentInvalidName, AgentInvalidTransition, AgentIo, AgentLaunchFailed,
+    AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities,
+    AgentNoMeteringSource, AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -115,8 +117,9 @@ impl AdapterArg {
 /// stdout. On an adapter/validation failure, nothing is written and a miette
 /// diagnostic naming the problem goes to stderr.
 pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = open_registry()?;
-    match registry.register_with_adapter(name, &adapter.to_ref()) {
+    let engine = open_engine()?;
+    let engine = engine.blocking();
+    match engine.register_with_adapter(name, &adapter.to_ref()) {
         Ok(instance) => {
             ui::success(format!(
                 "Registered Agent Instance {} ({})",
@@ -129,7 +132,7 @@ pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::err
             // Surface the effective per-OS Capability Declaration (AC1). Read it
             // back from the just-persisted snapshot so what we print is exactly
             // what `kt agent show` will render.
-            match registry.effective_capabilities(instance.name.as_str()) {
+            match engine.effective_capabilities(instance.name.as_str()) {
                 Ok(caps) => render_capabilities(instance.name.as_str(), &caps),
                 // A render read-back failure must not fail a successful
                 // registration; note it to stderr and move on.
@@ -148,8 +151,11 @@ pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::err
 ///
 /// Human-readable only; `--json` is out of scope (FR-4 / story 1.7).
 pub fn show(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = open_registry()?;
-    let caps = registry.effective_capabilities(name).map_err(map_error)?;
+    let engine = open_engine()?;
+    let caps = engine
+        .blocking()
+        .effective_capabilities(name)
+        .map_err(map_error)?;
     render_capabilities(name, &caps);
     Ok(())
 }
@@ -190,8 +196,8 @@ pub fn remove(
     // `--force` is only meaningful for a running instance. If the caller did
     // not choose a disposition we default to retain (safe — never destroys data
     // silently); see DispositionArg docs.
-    let registry = open_registry()?;
-    match registry.remove(name, disposition.resolve(), force) {
+    let engine = open_engine()?;
+    match engine.blocking().remove(name, disposition.resolve(), force) {
         Ok(()) => {
             let verb = match disposition.resolve() {
                 RemoveDisposition::Delete => "removed (Agent Home deleted)",
@@ -209,8 +215,8 @@ pub fn remove(
 /// A `--json` variant is out of scope here (Fleet visibility with `--json` is
 /// FR-4 / story 1.7); a human table suffices. Deferral noted.
 pub fn list() -> Result<(), Box<dyn std::error::Error>> {
-    let registry = open_registry()?;
-    let instances = registry.list().map_err(map_error)?;
+    let engine = open_engine()?;
+    let instances = engine.blocking().list().map_err(map_error)?;
 
     if instances.is_empty() {
         ui::info("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
@@ -238,12 +244,78 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Open the engine registry using the default (or env-overridden) state dir.
+/// `kt agent start <name>` — start a registered Agent Instance (AC1/AC2).
+///
+/// Opens the engine, drives `start` through the blocking facade, and prints the
+/// new Lifecycle State (`running`) to stdout on success. On a launch failure the
+/// instance lands in `failed`, and a miette diagnostic preserving the adapter's
+/// diagnostic goes to stderr (AC2). Output discipline (AD-12): result → stdout,
+/// diagnostics/notices → stderr.
+///
+/// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5 / durable
+/// supervision is story 1-6): the engine supervises the started process only for
+/// the lifetime of THIS engine session. Because the backend kills the process
+/// group / job on handle drop, a standalone `kt agent start <name>` stops the
+/// agent when this CLI process exits — the persisted `running` row then outlives
+/// the live process. Re-attaching across CLI invocations (orphan adoption by
+/// pid + start-time fingerprint) and crash detection arrive with story 1-6. To
+/// keep the operator honest about this at the point of pain, the success path
+/// prints a one-line notice to STDERR (never stdout — existing tests assert the
+/// stdout result line).
+pub fn start(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    match engine.blocking().start(name) {
+        Ok(instance) => {
+            ui::success(format!(
+                "Started Agent Instance {}",
+                ui::skill_name(instance.name.as_str())
+            ));
+            // Command result to stdout: the new Lifecycle State.
+            println!("{}", instance.state);
+            // Honest single-lifetime notice to STDERR (AD-12: notices → stderr,
+            // never stdout). Durable cross-invocation supervision is story 1-6.
+            ui::note(
+                "the started process is supervised only for this engine session; \
+                 durable supervision across CLI invocations arrives with orphan \
+                 adoption (story 1-6).",
+            );
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// `kt agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
+/// (AC3/AC4).
+///
+/// Opens the engine and drives `stop` through the blocking facade with the
+/// graceful window (default 30s, or `--timeout <secs>`). Prints the final state
+/// (`stopped`) to stdout, or the uniform invalid-transition diagnostic (e.g.
+/// stop on `stopped`, AC4) to stderr.
+pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let window = timeout_secs.map(Duration::from_secs);
+    match engine.blocking().stop(name, window) {
+        Ok(instance) => {
+            ui::success(format!(
+                "Stopped Agent Instance {}",
+                ui::skill_name(instance.name.as_str())
+            ));
+            // Command result to stdout: the final Lifecycle State.
+            println!("{}", instance.state);
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// Open the engine using the default (or env-overridden) state dir.
 ///
 /// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
-/// the platform data dir — the engine remains the sole path authority.
-fn open_registry() -> Result<Registry, Box<dyn std::error::Error>> {
-    Registry::open(None).map_err(map_error)
+/// the platform data dir — the engine remains the sole path authority. The
+/// engine owns its tokio runtime; `kt` drives it through the blocking facade.
+fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
+    Engine::open(None).map_err(map_error)
 }
 
 /// Translate a [`RegistryError`] into a `miette` diagnostic carrying a
@@ -348,6 +420,66 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
         }
         .into(),
         RegistryError::Store(inner) => AgentStore {
+            message: format!("State store error: {inner}. The state database may be inaccessible."),
+        }
+        .into(),
+    }
+}
+
+/// Translate an [`EngineError`] (lifecycle: start / stop) into a `miette`
+/// diagnostic with a remediation hint (NFR-1). The invalid-transition class
+/// (AC4) and the launch-failed diagnostic (AC2) get their own codes; the shared
+/// registry-shaped variants (NotFound / InvalidName / Store) reuse the existing
+/// agent diagnostics for a consistent surface.
+fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
+    match err {
+        EngineError::NotFound { name } => AgentNotFound {
+            message: format!(
+                "No Agent Instance named '{name}' is registered. List the Fleet with: kt agent list"
+            ),
+        }
+        .into(),
+        EngineError::InvalidName { name, reason } => AgentInvalidName {
+            message: format!(
+                "Invalid Agent Instance name '{name}': {reason}. Names must match \
+                 ^[a-z0-9][a-z0-9_-]*$ (lowercase letters, digits, '_' or '-', not starting \
+                 with '_' or '-')."
+            ),
+        }
+        .into(),
+        // AC4: the ONE uniform invalid-transition class, identical for every
+        // adapter (it comes from the shared transition table).
+        EngineError::InvalidTransition(inner) => AgentInvalidTransition {
+            message: format!("{inner}. Check the instance's current state with: kt agent list"),
+        }
+        .into(),
+        // AC2: the adapter/process diagnostic is preserved verbatim; the instance
+        // is left in `failed`.
+        EngineError::LaunchFailed { name, detail } => AgentLaunchFailed {
+            message: format!(
+                "Agent Instance '{name}' failed to launch: {detail}. The instance is now in the \
+                 'failed' state; fix the adapter's launch command and try starting it again."
+            ),
+        }
+        .into(),
+        EngineError::AdapterUnresolved { name, detail } => AgentLaunchFailed {
+            message: format!(
+                "Could not resolve the adapter to start Agent Instance '{name}': {detail}."
+            ),
+        }
+        .into(),
+        EngineError::Log { name, path, detail } => AgentIo {
+            message: format!(
+                "Could not write the instance log for '{name}' at '{path}': {detail}. Check \
+                 directory permissions and available disk space."
+            ),
+        }
+        .into(),
+        EngineError::Backend { name, source } => AgentIo {
+            message: format!("Process control failed for Agent Instance '{name}': {source}."),
+        }
+        .into(),
+        EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
         .into(),
