@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
+use ktesio_adapter_api::{Capability, OsId, SupportLevel};
+
 use crate::adapter::{self, LaunchResolveError};
 use crate::backends;
 use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnSpec};
@@ -232,6 +234,158 @@ impl Supervisor {
         self.transition(registry, &name, stopping, LifecycleState::Stopped, cause)?;
 
         registry.lookup(&name).map_err(registry_to_engine)
+    }
+
+    /// Pause a running Agent Instance with honest, per-OS semantics (story 1-5,
+    /// AC1/AC2/AC3/AC5 — the "surfaced not silent" HONESTY command).
+    ///
+    /// Order mirrors [`Supervisor::stop`], except the middle step DISPATCHES on
+    /// the effective (current-OS) pause `SupportLevel` read from the persisted
+    /// snapshot (AC5), rather than always calling the backend:
+    /// 1. name → [`InstanceName`]; look up the instance,
+    /// 2. transition gate `next_state(state, Pause)?` — an invalid transition
+    ///    (e.g. pause on `stopped`/`paused`) rejects HERE with the uniform
+    ///    [`LifecycleError::InvalidTransition`] (AC4), before any side effect or
+    ///    level read,
+    /// 3. read the effective pause level (AC5) and dispatch:
+    ///    * **Guaranteed** → `backend.pause(handle)` (real SIGSTOP suspension on
+    ///      Unix), then persist `running→paused` + a plain
+    ///      [`TransitionCause::Command`] (`"pause"`) — no qualifier,
+    ///    * **BestEffort** → persist `running→paused` + a
+    ///      [`TransitionCause::PauseBestEffort`] qualifier (the machine-readable
+    ///      half of "surfaced not silent"); the process may keep running,
+    ///    * **Unsupported** → FAIL FAST with
+    ///      [`EngineError::CapabilityUnsupported`], NO transition, NO backend
+    ///      call, NOTHING persisted (AC3).
+    pub fn pause(&mut self, registry: &Registry, name: &str) -> Result<AgentInstance, EngineError> {
+        self.suspend_or_resume(registry, name, LifecycleCommand::Pause)
+    }
+
+    /// Resume a paused Agent Instance (story 1-5, AC1/AC2).
+    ///
+    /// The symmetric counterpart of [`Supervisor::pause`]: the transition gate is
+    /// `next_state(state, Resume)?` (`paused → running`; anything else rejects
+    /// with the uniform invalid-transition, AC4), and the dispatch is on the same
+    /// effective pause level:
+    /// * **Guaranteed** → `backend.resume(handle)` (SIGCONT), then `paused→running`
+    ///   + a plain `resume` command cause,
+    /// * **BestEffort** → `paused→running` + a [`TransitionCause::ResumeBestEffort`]
+    ///   qualifier,
+    /// * **Unsupported** → fail fast (defensive; a `paused` instance implies pause
+    ///   was allowed, so this is not normally reachable — see the note on the
+    ///   symmetric dispatch below).
+    pub fn resume(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+    ) -> Result<AgentInstance, EngineError> {
+        self.suspend_or_resume(registry, name, LifecycleCommand::Resume)
+    }
+
+    /// Shared pause/resume driver (the three-level dispatch), keyed on `command`
+    /// (`Pause` or `Resume`). Kept as one method so the pause and resume paths
+    /// cannot drift: the transition gate, the level read, and the three-way
+    /// dispatch are identical; only the target state and the cause differ.
+    fn suspend_or_resume(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        command: LifecycleCommand,
+    ) -> Result<AgentInstance, EngineError> {
+        debug_assert!(
+            matches!(command, LifecycleCommand::Pause | LifecycleCommand::Resume),
+            "suspend_or_resume only handles Pause/Resume"
+        );
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let instance = registry.lookup(&name).map_err(registry_to_engine)?;
+
+        // (1) Transition gate (AC4): pause on stopped/paused, resume on running,
+        // etc. reject HERE with the uniform InvalidTransition, before any level
+        // read or side effect.
+        let new_state = next_state(instance.state, command)?;
+
+        // (2) Read the effective (current-OS) pause level from the persisted
+        // snapshot (AC5). Projected at read time onto OsId::current(); NOT
+        // re-derived from the manifest, NOT frozen at register time.
+        let level = registry
+            .effective_support(&name, Capability::Pause)
+            .map_err(registry_to_engine)?;
+        let os = OsId::current();
+
+        // (3) Dispatch on the level.
+        match level {
+            // FAIL FAST (AC3): no transition, no backend call, nothing persisted.
+            SupportLevel::Unsupported => Err(EngineError::CapabilityUnsupported {
+                name: name.as_str().to_string(),
+                capability: Capability::Pause.as_str().to_string(),
+                os: os.as_str().to_string(),
+                level: level.as_str().to_string(),
+            }),
+            // GUARANTEED (AC1): real suspension via the backend, then a plain
+            // command-cause transition (no qualifier — it is a true suspension).
+            SupportLevel::Guaranteed => {
+                self.ensure_log_dir(registry, &name)?;
+                self.signal_backend(&name, command)?;
+                self.transition(
+                    registry,
+                    &name,
+                    instance.state,
+                    new_state,
+                    TransitionCause::command(command.as_str()),
+                )?;
+                registry.lookup(&name).map_err(registry_to_engine)
+            }
+            // BEST-EFFORT (AC2): transition + a VISIBLE qualifier cause, never a
+            // silent success. No backend suspension is guaranteed here (on Unix a
+            // best-effort declaration is unusual, but we still do NOT SIGSTOP — the
+            // declared level is the contract; the qualifier is the honesty).
+            SupportLevel::BestEffort => {
+                self.ensure_log_dir(registry, &name)?;
+                let detail = format!(
+                    "{} is best-effort for '{}' on {} (adapter-cooperative); the process may keep running",
+                    Capability::Pause.as_str(),
+                    name.as_str(),
+                    os.as_str(),
+                );
+                let cause = match command {
+                    LifecycleCommand::Pause => TransitionCause::pause_best_effort(detail),
+                    _ => TransitionCause::resume_best_effort(detail),
+                };
+                self.transition(registry, &name, instance.state, new_state, cause)?;
+                registry.lookup(&name).map_err(registry_to_engine)
+            }
+        }
+    }
+
+    /// Signal the running process for a GUARANTEED pause/resume, via the in-memory
+    /// handle map (same `self.running.get_mut(&name)` pattern as `stop`).
+    ///
+    /// Cross-lifetime honesty (single-lifetime boundary, AD-5 is story 1-6): if
+    /// the row says `running`/`paused` but THIS engine holds no handle (e.g. the
+    /// process was started by a prior engine), we cannot signal a process we do
+    /// not hold — so this is a no-op that still lets the state transition proceed.
+    /// The chosen behavior is documented: for the guaranteed path with no handle,
+    /// treat the signal as a best-effort no-op (we can neither SIGSTOP nor verify
+    /// a process outside this engine's custody). A real held process IS signalled.
+    fn signal_backend(
+        &mut self,
+        name: &InstanceName,
+        command: LifecycleCommand,
+    ) -> Result<(), EngineError> {
+        let Some(handle) = self.running.get_mut(name) else {
+            return Ok(());
+        };
+        let result = match command {
+            LifecycleCommand::Pause => self.backend.pause(handle),
+            _ => self.backend.resume(handle),
+        };
+        result.map_err(|source| EngineError::Backend {
+            name: name.as_str().to_string(),
+            source,
+        })
     }
 
     /// Read the recorded [`TransitionEvent`]s for an instance from its log

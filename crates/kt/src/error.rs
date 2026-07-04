@@ -231,3 +231,10 @@ pub struct AgentInvalidTransition {
 pub struct AgentLaunchFailed {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::capability_unsupported))]
+pub struct AgentCapabilityUnsupported {
+    pub message: String,
+}

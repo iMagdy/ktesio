@@ -36,6 +36,23 @@
 //! graceful (`forced == false`). Richer graceful mechanisms (a
 //! `CTRL_BREAK_EVENT` to the process group, or an adapter-specific shutdown
 //! request) are a later refinement; the no-survivor guarantee is unchanged.
+//!
+//! ## Cooperative best-effort pause/resume (documented `[ASSUMPTION]`, AD-4)
+//!
+//! Windows has NO clean GUARANTEED whole-process suspend from `std`: the closest
+//! primitives (`NtSuspendProcess`, or per-thread `SuspendThread` enumeration) are
+//! undocumented / brittle, and `std::process::Command` does not even expose the
+//! child's thread handles. Per AD-4 the honest Windows pause is therefore
+//! **adapter-cooperative only** — never an undocumented suspend API. So
+//! [`WindowsBackend::pause`] / [`WindowsBackend::resume`] succeed WITHOUT a hard
+//! suspension: they are no-ops that report success. This is honest because the
+//! engine only ever calls the backend pause/resume on the GUARANTEED dispatch
+//! path; on Windows the mock/manifest declare pause `best-effort`, which the
+//! SUPERVISOR handles by transitioning state AND emitting a VISIBLE best-effort
+//! qualifier (a `pause-best-effort` transition cause + a CLI stderr note) — the
+//! qualifier, not a silent fake in the backend, is what makes it "surfaced not
+//! silent". These methods are BEHAVIOR-verified only on the `windows-latest` CI
+//! matrix; on Unix hosts they are compile-checked only.
 
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -244,6 +261,23 @@ impl ProcessBackend for WindowsBackend {
 
     fn poll(&self, handle: &mut Self::Handle) -> Result<ProcessStatus, BackendError> {
         handle.reap_if_exited()
+    }
+
+    fn pause(&self, handle: &mut Self::Handle) -> Result<(), BackendError> {
+        // Cooperative best-effort pause on Windows (AD-4): NO guaranteed
+        // whole-process suspend is available from std, and we do NOT reach for an
+        // undocumented API (see the module `[ASSUMPTION]` block). Succeed without
+        // a hard suspension — the VISIBLE best-effort qualifier the supervisor/CLI
+        // emit (never a silent fake here) carries the honesty. We still touch the
+        // liveness guard for parity with the Unix body and to reap a gone child.
+        let _ = handle.reap_if_exited()?;
+        Ok(())
+    }
+
+    fn resume(&self, handle: &mut Self::Handle) -> Result<(), BackendError> {
+        // Cooperative best-effort resume on Windows — the counterpart of `pause`.
+        let _ = handle.reap_if_exited()?;
+        Ok(())
     }
 
     fn pid(&self, handle: &Self::Handle) -> u32 {

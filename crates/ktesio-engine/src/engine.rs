@@ -231,6 +231,38 @@ impl Engine {
         .await
     }
 
+    /// Pause a running Agent Instance with honest, per-OS semantics (story 1-5,
+    /// AC1/AC2/AC3). Drives the supervisor's three-level dispatch on the effective
+    /// (current-OS) pause `SupportLevel`: guaranteed → real SIGSTOP suspension +
+    /// `running→paused`; best-effort → `running→paused` with a visible
+    /// `pause-best-effort` qualifier in the transition event; unsupported → fail
+    /// fast ([`EngineError::CapabilityUnsupported`]) with no state change. Returns
+    /// the instance in its new state.
+    pub async fn pause(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.pause(&registry, &name)
+        })
+        .await
+    }
+
+    /// Resume a paused Agent Instance (story 1-5, AC1/AC2). The symmetric
+    /// counterpart of [`Engine::pause`]: guaranteed → SIGCONT + `paused→running`;
+    /// best-effort → `paused→running` with a `resume-best-effort` qualifier.
+    pub async fn resume(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.resume(&registry, &name)
+        })
+        .await
+    }
+
     /// Read the recorded transition events for an instance from its log (AC1
     /// "each transition emits an event"; AC3 escalation recorded). Test/embedding
     /// observation helper — this is the AD-14 seed, NOT the 7-2 subscription bus.
@@ -322,6 +354,16 @@ impl Blocking<'_> {
     /// Blocking [`Engine::stop`].
     pub fn stop(&self, name: &str, window: Option<Duration>) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.stop(name, window))
+    }
+
+    /// Blocking [`Engine::pause`].
+    pub fn pause(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.engine.rt.block_on(self.engine.pause(name))
+    }
+
+    /// Blocking [`Engine::resume`].
+    pub fn resume(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.engine.rt.block_on(self.engine.resume(name))
     }
 
     /// Blocking [`Engine::transition_events`].

@@ -111,12 +111,14 @@ pub enum BackendError {
         code: i32,
     },
 
-    /// A stop/kill/poll syscall failed unexpectedly. Carries the operation and
-    /// detail. (A process that is already gone is NOT an error — that is the
-    /// desired end state for stop.)
+    /// A stop/kill/poll/pause/resume syscall failed unexpectedly. Carries the
+    /// operation and detail. (A process that is already gone is NOT an error —
+    /// that is the desired end state for stop; a SIGSTOP/SIGCONT to a gone group
+    /// likewise resolves to success via `ESRCH`, see the Unix backend.)
     #[error("process control operation '{op}' failed: {detail}")]
     Control {
-        /// The operation that failed (`"signal"`, `"wait"`, `"terminate"`, …).
+        /// The operation that failed (`"signal"`, `"wait"`, `"terminate"`,
+        /// `"pause"`, `"resume"`, …).
         op: &'static str,
         /// The underlying detail.
         detail: String,
@@ -156,6 +158,36 @@ pub trait ProcessBackend {
     /// (used for the `starting→running` readiness check and, later,
     /// crash detection). Never blocks.
     fn poll(&self, handle: &mut Self::Handle) -> Result<ProcessStatus, BackendError>;
+
+    /// Suspend the process (group/job) — the GUARANTEED-path pause primitive
+    /// (story 1-5, AC1). On Unix this delivers `SIGSTOP` to the whole process
+    /// group, an uncatchable, verifiable suspension. On Windows there is no clean
+    /// guaranteed whole-process suspend from `std` (AD-4), so the Windows body is
+    /// the cooperative best-effort form (it succeeds without a hard suspension —
+    /// the VISIBLE best-effort qualifier emitted by the supervisor/CLI, not the
+    /// backend, is what keeps that honest).
+    ///
+    /// IMPORTANT — this method is only invoked by the supervisor on the
+    /// GUARANTEED dispatch path (pause `SupportLevel::Guaranteed` on the current
+    /// OS). The best-effort and unsupported levels never reach a backend call:
+    /// the three-level DISPATCH is the supervisor's job, keyed on the declared
+    /// per-OS `SupportLevel`, not the backend's. Sync (called via
+    /// `spawn_blocking`, like `stop`/`spawn`/`poll`). Domain terms only.
+    ///
+    /// A process that has already exited is not an error (parity with `stop`):
+    /// the desired suspended-or-gone end state already holds. Reports
+    /// [`BackendError::Control`] (op `"pause"`/`"signal"`) only on an unexpected
+    /// syscall failure.
+    fn pause(&self, handle: &mut Self::Handle) -> Result<(), BackendError>;
+
+    /// Resume the process (group/job) — the GUARANTEED-path resume primitive
+    /// (story 1-5, AC1). On Unix this delivers `SIGCONT` to the whole process
+    /// group; on Windows it is the cooperative best-effort counterpart of
+    /// [`ProcessBackend::pause`]. Same dispatch contract, sync semantics, and
+    /// already-exited tolerance as [`ProcessBackend::pause`]. Reports
+    /// [`BackendError::Control`] (op `"resume"`/`"signal"`) only on an unexpected
+    /// syscall failure.
+    fn resume(&self, handle: &mut Self::Handle) -> Result<(), BackendError>;
 
     /// The OS process id of the spawned child (for the [`ProcessHandle`]
     /// fingerprint / diagnostics). A stable accessor so the supervisor can log

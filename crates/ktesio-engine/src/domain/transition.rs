@@ -11,10 +11,10 @@
 //!
 //! ## Command-driven vs event-driven edges (documented shape)
 //!
-//! `Start` and `Stop` are OPERATOR **commands** — the rows in [`next_state`].
-//! The remaining edges this story reaches are SUPERVISOR reactions to process
-//! events, not commands, and are applied directly by the supervisor (each still
-//! persisting + emitting the AD-14 event):
+//! `Start`, `Stop`, `Pause`, and `Resume` are OPERATOR **commands** — the rows
+//! in [`next_state`]. The remaining edges this story reaches are SUPERVISOR
+//! reactions to process events, not commands, and are applied directly by the
+//! supervisor (each still persisting + emitting the AD-14 event):
 //!
 //! * `starting → running`  — adapter ready (process spawned and not immediately dead)
 //! * `starting → failed`   — launch error
@@ -22,18 +22,20 @@
 //!
 //! Modeling only the command edges here keeps the AC4 uniform-error contract
 //! precise: `InvalidTransition` is returned for a rejected COMMAND (e.g. `Stop`
-//! on `stopped`, `Start` on `running`), and the event-driven edges never reject
-//! (the supervisor only applies them when the corresponding process event has
-//! actually happened).
+//! on `stopped`, `Start` on `running`, `Pause` on `stopped`, `Resume` on
+//! `running`), and the event-driven edges never reject (the supervisor only
+//! applies them when the corresponding process event has actually happened).
 //!
-//! ## Reachable this story
+//! ## Reachable this story (1-5 wires `paused`)
 //!
 //! `registered → starting → running → stopping → stopped`, plus
 //! `starting → failed` (launch error) and the `stopped → starting` restart of a
 //! previously stopped instance (FR-5: start applies to registered *or* stopped).
-//! `paused` (story 1-5) and the `running → failed` crash edge + Restart Policy
-//! (story 1-6) are intentionally NOT wired; the table lists them as commented
-//! future rows so the shape is complete.
+//! Story 1-5 wires `paused`: `running --Pause--> paused`,
+//! `paused --Resume--> running`, and `paused --Stop--> stopping` (the spine
+//! state diagram's `paused --> stopping`, so a paused instance is stoppable).
+//! The `running → failed` crash edge + Restart Policy (story 1-6) are
+//! intentionally NOT wired; the table's doc lists them so the shape is complete.
 
 use thiserror::Error;
 
@@ -41,18 +43,20 @@ use super::lifecycle::LifecycleState;
 
 /// An operator lifecycle command (spine AD-15 verbs).
 ///
-/// Seed set for this story: [`LifecycleCommand::Start`] and
-/// [`LifecycleCommand::Stop`]. `Pause`/`Resume` arrive with story 1-5; they are
-/// deliberately absent so an attempt to reach `paused` cannot even be expressed
-/// yet.
+/// The full operator command set through story 1-5: [`LifecycleCommand::Start`],
+/// [`LifecycleCommand::Stop`], [`LifecycleCommand::Pause`], and
+/// [`LifecycleCommand::Resume`] (the ratified AD-15 verbs). `Pause`/`Resume` join
+/// the table in story 1-5, making `paused` reachable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleCommand {
     /// Start a registered (or previously stopped) instance.
     Start,
-    /// Stop a running instance.
+    /// Stop a running (or paused) instance.
     Stop,
-    // Pause,  // story 1-5 — not wired here.
-    // Resume, // story 1-5 — not wired here.
+    /// Pause a running instance (story 1-5).
+    Pause,
+    /// Resume a paused instance (story 1-5).
+    Resume,
 }
 
 impl LifecycleCommand {
@@ -61,6 +65,8 @@ impl LifecycleCommand {
         match self {
             LifecycleCommand::Start => "start",
             LifecycleCommand::Stop => "stop",
+            LifecycleCommand::Pause => "pause",
+            LifecycleCommand::Resume => "resume",
         }
     }
 }
@@ -109,8 +115,12 @@ pub fn next_state(
         // (FR-5: start applies to registered OR stopped instances).
         (Registered, Start) => Ok(Starting),
         (Stopped, Start) => Ok(Starting),
-        // Stop a running instance.
+        // Stop a running OR paused instance (spine diagram: paused --> stopping).
         (Running, Stop) => Ok(Stopping),
+        (Paused, Stop) => Ok(Stopping),
+        // Pause a running instance; resume a paused one (story 1-5, AC4).
+        (Running, Pause) => Ok(Paused),
+        (Paused, Resume) => Ok(Running),
         // Every other (state, command) pair is an invalid COMMAND transition.
         // The event-driven edges (starting→running, starting→failed,
         // stopping→stopped) are applied by the supervisor on process events, not
@@ -144,18 +154,31 @@ mod tests {
     #[test]
     fn invalid_command_pairs_all_yield_the_same_error_class() {
         // A representative set of invalid pairs (AC4). Each must be the ONE
-        // uniform InvalidTransition class, naming from + command.
+        // uniform InvalidTransition class, naming from + command. NOTE: as of
+        // story 1-5, (Paused, Stop), (Running, Pause) and (Paused, Resume) are
+        // VALID rows and are asserted in the exhaustive test below.
         let invalid = [
-            (Stopped, Stop),    // stop on stopped
-            (Running, Start),   // start on running
-            (Registered, Stop), // stop on registered
-            (Starting, Start),  // start while starting
-            (Starting, Stop),   // stop while starting
-            (Stopping, Start),  // start while stopping
-            (Stopping, Stop),   // stop while stopping
-            (Failed, Stop),     // stop on failed
-            (Paused, Start),    // start on paused (paused unreachable this story)
-            (Paused, Stop),     // stop on paused
+            (Stopped, Stop),      // stop on stopped
+            (Running, Start),     // start on running
+            (Registered, Stop),   // stop on registered
+            (Starting, Start),    // start while starting
+            (Starting, Stop),     // stop while starting
+            (Stopping, Start),    // start while stopping
+            (Stopping, Stop),     // stop while stopping
+            (Failed, Stop),       // stop on failed
+            (Paused, Start),      // start on paused
+            (Stopped, Pause),     // pause on stopped (1-5)
+            (Registered, Pause),  // pause on registered (1-5)
+            (Paused, Pause),      // pause on paused (1-5)
+            (Starting, Pause),    // pause while starting (1-5)
+            (Stopping, Pause),    // pause while stopping (1-5)
+            (Failed, Pause),      // pause on failed (1-5)
+            (Running, Resume),    // resume on running (1-5)
+            (Stopped, Resume),    // resume on stopped (1-5)
+            (Registered, Resume), // resume on registered (1-5)
+            (Starting, Resume),   // resume while starting (1-5)
+            (Stopping, Resume),   // resume while stopping (1-5)
+            (Failed, Resume),     // resume on failed (1-5)
         ];
         for (from, command) in invalid {
             let err = next_state(from, command).unwrap_err();
@@ -175,7 +198,7 @@ mod tests {
         let all_states = [
             Registered, Starting, Running, Paused, Stopping, Stopped, Failed,
         ];
-        let all_commands = [Start, Stop];
+        let all_commands = [Start, Stop, Pause, Resume];
         for from in all_states {
             for command in all_commands {
                 let result = next_state(from, command);
@@ -183,11 +206,23 @@ mod tests {
                     (Registered, Start) => Ok(Starting),
                     (Stopped, Start) => Ok(Starting),
                     (Running, Stop) => Ok(Stopping),
+                    (Paused, Stop) => Ok(Stopping),
+                    (Running, Pause) => Ok(Paused),
+                    (Paused, Resume) => Ok(Running),
                     (from, command) => Err(LifecycleError::InvalidTransition { from, command }),
                 };
                 assert_eq!(result, expected, "({from:?}, {command:?})");
             }
         }
+    }
+
+    #[test]
+    fn pause_resume_stop_from_paused_are_the_wired_1_5_edges() {
+        // AC4 (1-5): the three edges story 1-5 adds are the ONLY new Ok rows.
+        assert_eq!(next_state(Running, Pause), Ok(Paused));
+        assert_eq!(next_state(Paused, Resume), Ok(Running));
+        // A paused instance must be stoppable (spine diagram: paused --> stopping).
+        assert_eq!(next_state(Paused, Stop), Ok(Stopping));
     }
 
     #[test]
@@ -202,6 +237,10 @@ mod tests {
     fn command_labels_are_stable() {
         assert_eq!(Start.as_str(), "start");
         assert_eq!(Stop.as_str(), "stop");
+        assert_eq!(Pause.as_str(), "pause");
+        assert_eq!(Resume.as_str(), "resume");
         assert_eq!(Start.to_string(), "start");
+        assert_eq!(Pause.to_string(), "pause");
+        assert_eq!(Resume.to_string(), "resume");
     }
 }

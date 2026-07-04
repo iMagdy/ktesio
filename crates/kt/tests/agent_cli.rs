@@ -663,3 +663,259 @@ fn stop_accepts_timeout_flag() {
     // Registered → stop is invalid, but the flag parsed (no clap error).
     assert!(run.stderr.contains("cannot stop"), "stderr={}", run.stderr);
 }
+
+// ---- Story 1.5: `kt agent pause` / `kt agent resume` (AC6) ----
+
+/// The wire key for the current OS's `[capabilities.pause]` entry. Runtime data
+/// (matches the engine's `OsId::current()` mapping), not conditional compilation.
+fn current_os_pause_key() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => "other",
+    }
+}
+
+/// Write a `fake_agent` manifest whose CURRENT-OS pause level is `pause_level`.
+fn fake_agent_manifest_with_pause(
+    dir: &Path,
+    args: &[&str],
+    pause_level: &str,
+) -> std::path::PathBuf {
+    let m = dir.join("pause-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fake"
+
+[lifecycle.start]
+exec = {exec:?}
+args = [{args_toml}]
+
+[capabilities.pause]
+{os} = "{pause_level}"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        os = current_os_pause_key(),
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+#[test]
+fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
+    // AC6 + AC1 at the CLI (Unix guaranteed): pause prints the new state
+    // `paused` to stdout with exit 0. Runtime-skip on Windows (guaranteed pause
+    // is Unix-only); NO cfg — data-driven skip.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_pause(
+        &ctx.project_dir,
+        &["--heartbeat-ms", "50", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+
+    let paused = run_kt_agent(&["agent", "pause", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        paused.success,
+        "guaranteed pause should exit 0; stderr={}",
+        paused.stderr
+    );
+    assert!(paused.stdout.contains("paused"), "stdout={}", paused.stdout);
+    assert!(paused.stdout.contains("Paused"), "stdout={}", paused.stdout);
+    // A guaranteed pause emits NO best-effort qualifier on stderr.
+    assert!(
+        !paused.stderr.contains("best-effort"),
+        "guaranteed pause must not print a best-effort note; stderr={}",
+        paused.stderr
+    );
+
+    // Resume prints `running`.
+    let resumed = run_kt_agent(&["agent", "resume", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        resumed.success,
+        "resume should exit 0; stderr={}",
+        resumed.stderr
+    );
+    assert!(
+        resumed.stdout.contains("running"),
+        "stdout={}",
+        resumed.stdout
+    );
+
+    // Teardown.
+    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn pause_best_effort_prints_qualifier_note_to_stderr_only() {
+    // AC2 + AC6 at the CLI: a best-effort pause prints the new state `paused` to
+    // STDOUT and a VISIBLE qualifier NOTE to STDERR (never silent, never on
+    // stdout). Mirrors the LOW-1 stdout/stderr-discipline assertion from 1-4.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m =
+        fake_agent_manifest_with_pause(&ctx.project_dir, &["--linger-ms", "600000"], "best-effort");
+    run_kt_agent(
+        &["agent", "register", "be", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(&["agent", "start", "be"], &ctx.project_dir, state_dir);
+
+    let paused = run_kt_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
+    assert!(
+        paused.success,
+        "best-effort pause should exit 0; stderr={}",
+        paused.stderr
+    );
+    // Result line on stdout.
+    assert!(paused.stdout.contains("paused"), "stdout={}", paused.stdout);
+    // The qualifier note is on STDERR and names best-effort.
+    assert!(
+        paused.stderr.contains("best-effort"),
+        "best-effort qualifier must be on stderr; stderr={}",
+        paused.stderr
+    );
+    // The qualifier must NOT leak onto stdout (AD-12: stdout is the result only).
+    assert!(
+        !paused.stdout.contains("best-effort"),
+        "qualifier must not appear on stdout; stdout={}",
+        paused.stdout
+    );
+
+    // Teardown.
+    run_kt_agent(&["agent", "stop", "be"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn pause_unsupported_exits_nonzero_quoting_the_declaration() {
+    // AC3 + AC6 at the CLI: a pause that is `unsupported` on this OS fails fast
+    // with a non-zero exit and a diagnostic (on STDERR) that QUOTES the
+    // declaration (names pause, the OS, the level) and points at `kt agent show`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // Declare pause only for an OS that is NOT the current one → current-OS
+    // projection is Unsupported.
+    let other = if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    let m = fake_agent_manifest_with_pause(&ctx.project_dir, &["--linger-ms", "600000"], "ignored");
+    // Overwrite the manifest so pause is declared ONLY for the other OS.
+    let bin = fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "fake"
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000"]
+[capabilities.pause]
+{other} = "guaranteed"
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        other = other,
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+
+    run_kt_agent(
+        &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(&["agent", "start", "un"], &ctx.project_dir, state_dir);
+
+    let paused = run_kt_agent(&["agent", "pause", "un"], &ctx.project_dir, state_dir);
+    assert!(
+        !paused.success,
+        "unsupported pause must exit non-zero; stdout={}",
+        paused.stdout
+    );
+    assert!(
+        paused.stderr.contains("cannot pause"),
+        "stderr must quote the declaration; stderr={}",
+        paused.stderr
+    );
+    assert!(
+        paused.stderr.contains("unsupported"),
+        "stderr must name the level; stderr={}",
+        paused.stderr
+    );
+    assert!(
+        paused.stderr.contains("kt agent show un"),
+        "stderr must point at kt agent show; stderr={}",
+        paused.stderr
+    );
+    // The instance is UNCHANGED (still running).
+    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(list.stdout.contains("running"), "stdout={}", list.stdout);
+
+    // Teardown.
+    run_kt_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn pause_on_registered_returns_uniform_invalid_transition() {
+    // AC4 at the CLI: pause on a registered (never started) instance returns the
+    // uniform invalid-transition diagnostic and a non-zero exit.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "nat", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "pause", "nat"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "pause on registered should exit non-zero");
+    assert!(
+        run.stderr.contains("cannot pause"),
+        "uniform invalid-transition; stderr={}",
+        run.stderr
+    );
+}

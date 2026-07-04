@@ -23,6 +23,19 @@ use super::lifecycle::LifecycleState;
 /// Bumped only on an incompatible change to the event shape. 7-2 / `--json`
 /// negotiate on this; seeding it now means those consumers never see an
 /// unversioned event.
+///
+/// NOTE (additive vs breaking): story 1-5 ADDS `TransitionCause` variants
+/// (`pause-best-effort` / `resume-best-effort`). Adding a new closed-vocabulary
+/// variant is a backward-ADDITIVE change: a NEW reader parses every OLD event,
+/// and no field is renamed or removed, so the version is NOT bumped. (The
+/// converse — an OLD reader meeting a NEW cause — is a separate forward-compat
+/// question: because `TransitionCause` is `#[serde(tag = "kind")]` with no
+/// `#[serde(other)]` fallback, an old reader that hits an unknown tag ERRORS
+/// rather than silently skipping it. That is acceptable precisely because 7-2 /
+/// `--json` negotiate on THIS version field — a consumer that understands
+/// version N knows exactly which cause tags exist at N, so it never meets a tag
+/// it cannot match.) Only a shape change (renaming/removing a field, or an
+/// incompatible restructure) would bump the version.
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// Why a lifecycle transition happened (the transition event's `cause`).
@@ -54,6 +67,27 @@ pub enum TransitionCause {
         /// The escalation detail recorded in the instance log (AC3).
         detail: String,
     },
+    /// A pause that was BEST-EFFORT, not a real suspension (story 1-5, AC2):
+    /// `running → paused` on an OS/adapter where pause is
+    /// [`SupportLevel::BestEffort`](ktesio_adapter_api::SupportLevel). This is the
+    /// machine-readable half of "surfaced not silent" — a dedicated, matchable
+    /// wire tag (`pause-best-effort`) so log/`--json`/7-2 consumers can tell a
+    /// cooperative pause from a guaranteed one. A GUARANTEED pause emits a plain
+    /// [`TransitionCause::Command`] (`"pause"`), never this. Carries a detail
+    /// (the OS + declared level) for the record.
+    PauseBestEffort {
+        /// The best-effort detail (names the OS + declared level) recorded in the
+        /// instance log (AC2).
+        detail: String,
+    },
+    /// A resume that was BEST-EFFORT, the counterpart of [`TransitionCause::PauseBestEffort`]
+    /// (story 1-5, AC2): `paused → running` on a best-effort OS/adapter. Wire tag
+    /// `resume-best-effort`.
+    ResumeBestEffort {
+        /// The best-effort detail (names the OS + declared level) recorded in the
+        /// instance log (AC2).
+        detail: String,
+    },
 }
 
 impl TransitionCause {
@@ -74,6 +108,20 @@ impl TransitionCause {
     /// A forced-stop cause recording the escalation `detail`.
     pub fn stop_forced(detail: impl Into<String>) -> Self {
         TransitionCause::StopForced {
+            detail: detail.into(),
+        }
+    }
+
+    /// A best-effort PAUSE cause recording `detail` (the OS + declared level).
+    pub fn pause_best_effort(detail: impl Into<String>) -> Self {
+        TransitionCause::PauseBestEffort {
+            detail: detail.into(),
+        }
+    }
+
+    /// A best-effort RESUME cause recording `detail` (the OS + declared level).
+    pub fn resume_best_effort(detail: impl Into<String>) -> Self {
+        TransitionCause::ResumeBestEffort {
             detail: detail.into(),
         }
     }
@@ -179,10 +227,33 @@ mod tests {
             (TransitionCause::launch_error("x"), "launch-error"),
             (TransitionCause::StopGraceful, "stop-graceful"),
             (TransitionCause::stop_forced("x"), "stop-forced"),
+            (TransitionCause::pause_best_effort("x"), "pause-best-effort"),
+            (
+                TransitionCause::resume_best_effort("x"),
+                "resume-best-effort",
+            ),
         ];
         for (cause, tag) in cases {
             let json = serde_json::to_string(&cause).unwrap();
             assert!(json.contains(&format!("\"kind\":\"{tag}\"")), "{json}");
+        }
+    }
+
+    #[test]
+    fn pause_best_effort_cause_carries_the_detail_and_round_trips() {
+        // AC2: the best-effort qualifier rides IN the event payload (the
+        // machine-readable half of "surfaced not silent") and survives a JSON
+        // round-trip through the instance log.
+        let cause = TransitionCause::pause_best_effort("pause is best-effort on windows");
+        let json = serde_json::to_string(&cause).unwrap();
+        assert!(json.contains("\"kind\":\"pause-best-effort\""), "{json}");
+        let back: TransitionCause = serde_json::from_str(&json).unwrap();
+        match back {
+            TransitionCause::PauseBestEffort { detail } => {
+                assert!(detail.contains("best-effort"), "{detail}");
+                assert!(detail.contains("windows"), "{detail}");
+            }
+            other => panic!("expected PauseBestEffort, got {other:?}"),
         }
     }
 

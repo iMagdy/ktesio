@@ -180,6 +180,29 @@ impl ProcessBackend for UnixBackend {
         handle.reap_if_exited()
     }
 
+    fn pause(&self, handle: &mut Self::Handle) -> Result<(), BackendError> {
+        // GUARANTEED pause on Unix (AC1): SIGSTOP the WHOLE process group. SIGSTOP
+        // cannot be caught or ignored, so the suspension is real and verifiable
+        // (the group freezes — a heartbeat stops growing). Guard for liveness
+        // first (parity with `stop`): a process that already exited cannot be
+        // paused, and that is a harmless no-op — the desired end state already
+        // holds (and SIGSTOP to a gone group would resolve to ESRCH→Ok anyway).
+        if handle.reap_if_exited()?.is_exited() {
+            return Ok(());
+        }
+        signal_group(handle.pgid, Signal::SIGSTOP)
+    }
+
+    fn resume(&self, handle: &mut Self::Handle) -> Result<(), BackendError> {
+        // GUARANTEED resume on Unix (AC1): SIGCONT the whole group, waking every
+        // process the SIGSTOP suspended. Same already-exited tolerance as
+        // `pause` — a resume of a gone process is a harmless no-op.
+        if handle.reap_if_exited()?.is_exited() {
+            return Ok(());
+        }
+        signal_group(handle.pgid, Signal::SIGCONT)
+    }
+
     fn pid(&self, handle: &Self::Handle) -> u32 {
         handle.pid
     }
@@ -480,6 +503,109 @@ mod tests {
             "a SIGTERM-ignoring process must be force-killed (escalation)"
         );
         assert!(backend.poll(&mut proc).unwrap().is_exited());
+    }
+
+    #[test]
+    fn pause_freezes_the_process_then_resume_wakes_it() {
+        // AC1 (Unix guaranteed): spawn `fake_agent --heartbeat-ms 50`, which
+        // prints an incrementing `heartbeat <n>` line to its log every ~50ms.
+        // While SIGSTOP'd the process freezes, so the log's line count STOPS
+        // growing; SIGCONT resumes it and the count grows again. This is the
+        // cross-Unix-safe suspension proof (no /proc dependency).
+        let dir = tempfile::tempdir().unwrap();
+        let agent_log = dir.path().join("agent.log");
+        let bin = fake_agent_path();
+        let mut s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--heartbeat-ms".to_string(),
+                "50".to_string(),
+                "--linger-ms".to_string(),
+                "600000".to_string(),
+            ],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(agent_log.clone()),
+        };
+        s.env.clear();
+
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&s).expect("spawn fake_agent --heartbeat-ms");
+
+        // Wait for the heartbeat to actually start ticking (a couple of lines).
+        let line_count = |path: &std::path::Path| -> usize {
+            std::fs::read_to_string(path)
+                .map(|c| c.lines().filter(|l| l.starts_with("heartbeat ")).count())
+                .unwrap_or(0)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if line_count(&agent_log) >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "heartbeat never started");
+            sleep(Duration::from_millis(20));
+        }
+
+        // Pause: SIGSTOP the group, then confirm the heartbeat is FROZEN.
+        //
+        // Robustness under scheduler jitter (LOW-3): rather than compare two
+        // instantaneous samples (fragile when a loaded runner delays a read, or
+        // when the child's in-flight 25ms poll lands one last line right after
+        // pause returns), we settle briefly, snapshot a BASELINE, then watch
+        // across a LONG window (1s ≫ many 50ms intervals) and require the count
+        // NEVER exceeds baseline. A stuck-but-alive scheduler cannot make a
+        // SUSPENDED process emit, so this tolerates jitter; yet it stays a
+        // GENUINE proof — if the `pause()` (SIGSTOP) were removed, a live 50ms
+        // heartbeat would emit ~20 lines here and exceed baseline on the first
+        // poll, firing the assert. (Resume below further requires renewed growth.)
+        backend.pause(&mut proc).expect("pause");
+        sleep(Duration::from_millis(200)); // let SIGSTOP + any in-flight line settle
+        let baseline = line_count(&agent_log);
+        let watch_until = Instant::now() + Duration::from_millis(1000);
+        while Instant::now() < watch_until {
+            let now = line_count(&agent_log);
+            assert!(
+                now <= baseline,
+                "heartbeat must NOT grow while paused (SIGSTOP) — baseline {baseline}, saw {now}"
+            );
+            sleep(Duration::from_millis(50));
+        }
+        let paused_after = line_count(&agent_log);
+        assert_eq!(
+            paused_after, baseline,
+            "heartbeat count must be unchanged across the paused window: {baseline} → {paused_after}"
+        );
+
+        // Resume: SIGCONT the group; the heartbeat must grow again.
+        backend.resume(&mut proc).expect("resume");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if line_count(&agent_log) > paused_after {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "heartbeat must resume growing after SIGCONT (stuck at {paused_after})"
+            );
+            sleep(Duration::from_millis(20));
+        }
+
+        // Teardown.
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn pause_and_resume_on_an_already_exited_process_are_harmless_no_ops() {
+        // A dead process cannot be paused/resumed; both are harmless no-ops
+        // (parity with stop-on-dead). `true` exits immediately.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        sleep(Duration::from_millis(50));
+        // Reap it via poll so the handle knows it exited.
+        assert!(backend.poll(&mut proc).unwrap().is_exited());
+        backend.pause(&mut proc).expect("pause on dead is Ok");
+        backend.resume(&mut proc).expect("resume on dead is Ok");
     }
 
     #[test]

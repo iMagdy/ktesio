@@ -185,6 +185,27 @@ pub enum EngineError {
     #[error(transparent)]
     InvalidTransition(#[from] LifecycleError),
 
+    /// A capability (this story: pause) is UNSUPPORTED for this Agent Instance on
+    /// the current OS (story 1-5, AC3): the effective Capability Declaration
+    /// projects to `Unsupported`, so the command FAILS FAST — quoting the
+    /// declaration (the level + OS), with NO state change, NO process signal, and
+    /// no fake attempt. Names the instance + capability + OS + declared level so
+    /// `kt` can quote the declaration and point at `kt agent show`.
+    #[error(
+        "Agent Instance '{name}' cannot {capability}: this adapter declares {capability} '{level}' on {os} (see its Capability Declaration)"
+    )]
+    CapabilityUnsupported {
+        /// The instance the command targeted.
+        name: String,
+        /// The capability that is unsupported (`"pause"`).
+        capability: String,
+        /// The current OS the declaration was projected onto.
+        os: String,
+        /// The declared support level for that capability on that OS
+        /// (`"unsupported"`).
+        level: String,
+    },
+
     /// The agent failed to launch (AC2): the adapter/process diagnostic is
     /// PRESERVED in `detail`, the instance is left in `failed`, and no zombie
     /// remains. Names the instance.

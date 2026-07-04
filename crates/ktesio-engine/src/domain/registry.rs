@@ -14,7 +14,9 @@
 
 use std::path::Path;
 
-use ktesio_adapter_api::{CapabilityDeclaration, EffectiveCapabilities, OsId};
+use ktesio_adapter_api::{
+    Capability, CapabilityDeclaration, EffectiveCapabilities, OsId, SupportLevel,
+};
 
 use crate::adapter::{self, AdapterRef, ResolvedAdapter};
 use crate::paths::EnginePaths;
@@ -428,6 +430,24 @@ impl Registry {
         let snapshot = self.read_adapter_snapshot(name)?;
         let manifest_path = snapshot.manifest_path.map(std::path::PathBuf::from);
         Ok((snapshot.kind, manifest_path))
+    }
+
+    /// The effective (current-OS) [`SupportLevel`] for `capability` on an
+    /// instance (story 1-5, AC5). Reads the persisted [`AdapterSnapshot`]'s FULL
+    /// per-OS declaration and projects it onto [`OsId::current`] at READ time (the
+    /// F3 mechanism `effective_capabilities` uses) — it does NOT re-parse the
+    /// manifest or re-resolve the adapter, and it does NOT freeze a level at
+    /// register time. This is THE read the supervisor uses to pick the pause
+    /// dispatch level. An absent declaration for the current OS projects to
+    /// [`SupportLevel::Unsupported`] — the honest default (a manifest that omits
+    /// pause for this OS correctly fails fast).
+    pub(crate) fn effective_support(
+        &self,
+        name: &InstanceName,
+        capability: Capability,
+    ) -> Result<SupportLevel, RegistryError> {
+        let snapshot = self.read_adapter_snapshot(name)?;
+        Ok(snapshot.declaration.support(capability, OsId::current()))
     }
 
     /// The per-instance log directory inside the Agent Home (AD-12 seed).
@@ -1116,6 +1136,73 @@ source = "self-reported"
         } else {
             assert_eq!(pause, Some(expected), "read-time projection for current OS");
         }
+    }
+
+    #[test]
+    fn effective_support_reads_the_current_os_pause_level_at_read_time() {
+        // AC5 (1-5): effective_support projects the FULL persisted declaration
+        // onto OsId::current() at READ time. Overwrite the snapshot with a
+        // declaration that distinguishes every OS and assert the current OS's
+        // level is returned — proving it is read, not re-derived or frozen.
+        use ktesio_adapter_api::{Capability, SupportLevel};
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        let declaration = CapabilityDeclaration::new()
+            .with(Capability::Pause, OsId::Linux, SupportLevel::Guaranteed)
+            .with(Capability::Pause, OsId::Macos, SupportLevel::Guaranteed)
+            .with(Capability::Pause, OsId::Windows, SupportLevel::BestEffort);
+        let snapshot = AdapterSnapshot {
+            kind: "demo".to_string(),
+            metering_source: "self-reported".to_string(),
+            manifest_path: None,
+            declaration,
+        };
+        std::fs::write(
+            reg.adapter_snapshot_path(&name),
+            serde_json::to_string_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let level = reg.effective_support(&name, Capability::Pause).unwrap();
+        let expected = match OsId::current() {
+            OsId::Linux | OsId::Macos => SupportLevel::Guaranteed,
+            OsId::Windows => SupportLevel::BestEffort,
+            OsId::Other => SupportLevel::Unsupported,
+        };
+        assert_eq!(level, expected, "read-time projection for the current OS");
+    }
+
+    #[test]
+    fn effective_support_defaults_to_unsupported_when_capability_absent_for_this_os() {
+        // AC5/AC3 default: a declaration that omits pause for the current OS
+        // projects to Unsupported (the honest default that drives fail-fast).
+        use ktesio_adapter_api::{Capability, SupportLevel};
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        // Declare pause only for OsId::Other so no modeled host has an entry.
+        let declaration = CapabilityDeclaration::new().with(
+            Capability::Interaction,
+            OsId::current(),
+            SupportLevel::Guaranteed,
+        );
+        let snapshot = AdapterSnapshot {
+            kind: "demo".to_string(),
+            metering_source: "self-reported".to_string(),
+            manifest_path: None,
+            declaration,
+        };
+        std::fs::write(
+            reg.adapter_snapshot_path(&name),
+            serde_json::to_string_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let level = reg.effective_support(&name, Capability::Pause).unwrap();
+        assert_eq!(level, SupportLevel::Unsupported);
     }
 
     #[test]

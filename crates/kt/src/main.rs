@@ -127,15 +127,21 @@ Details:
   effective per-OS Capability Declaration. start launches a registered instance
   (its state becomes running); stop requests a graceful shutdown and escalates to
   a forced kill after the window (--timeout <secs>, default 30), leaving no
-  surviving process. remove deletes the registry entry and, with --delete, the
-  Agent Home too (--retain, the default, keeps it); list shows the Fleet; show
-  renders one instance's effective capabilities. Removing a running instance
-  requires --force.
+  surviving process. pause/resume suspend and resume a running instance with
+  honest per-OS semantics: a guaranteed pause really suspends the process (SIGSTOP
+  on Unix), a best-effort pause proceeds cooperatively and prints a visible
+  qualifier note, and an unsupported pause fails fast quoting the Capability
+  Declaration. remove deletes the registry entry and, with --delete, the Agent
+  Home too (--retain, the default, keeps it); list shows the Fleet; show renders
+  one instance's effective capabilities. Removing a running instance requires
+  --force.
 
 Examples:
   kt agent register demo --kind mock
   kt agent register my-agent --manifest ./my-agent
   kt agent start my-agent
+  kt agent pause my-agent
+  kt agent resume my-agent
   kt agent stop my-agent --timeout 10
   kt agent show demo
   kt agent list
@@ -337,6 +343,16 @@ enum AgentCommands {
         #[arg(long)]
         timeout: Option<u64>,
     },
+    /// Pause a running Agent Instance (honest per-OS: guaranteed/best-effort/unsupported)
+    Pause {
+        /// Name of the Agent Instance to pause
+        name: String,
+    },
+    /// Resume a paused Agent Instance
+    Resume {
+        /// Name of the Agent Instance to resume
+        name: String,
+    },
     /// List every Agent Instance in the Fleet
     List,
     /// Show an Agent Instance's effective per-OS Capability Declaration
@@ -431,6 +447,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             ),
             AgentCommands::Start { name } => cli::agent::start(&name),
             AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
+            AgentCommands::Pause { name } => cli::agent::pause(&name),
+            AgentCommands::Resume { name } => cli::agent::resume(&name),
             AgentCommands::List => cli::agent::list(),
             AgentCommands::Show { name } => cli::agent::show(&name),
         },
@@ -482,6 +500,8 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "remove"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "start"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "stop"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "pause"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "resume"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
     }
@@ -496,6 +516,16 @@ mod tests {
         assert!(Cli::try_parse_from(["kt", "agent", "start"]).is_err());
         // --timeout must be a number.
         assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc", "--timeout", "abc"]).is_err());
+    }
+
+    #[test]
+    fn test_agent_pause_resume_parse() {
+        // `pause <name>` and `resume <name>` parse (story 1-5).
+        assert!(Cli::try_parse_from(["kt", "agent", "pause", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "resume", "svc"]).is_ok());
+        // Both require a name.
+        assert!(Cli::try_parse_from(["kt", "agent", "pause"]).is_err());
+        assert!(Cli::try_parse_from(["kt", "agent", "resume"]).is_err());
     }
 
     #[test]

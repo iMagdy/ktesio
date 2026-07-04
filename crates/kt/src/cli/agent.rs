@@ -15,13 +15,15 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, EffectiveCapabilities, Engine, EngineError, RegistryError, RemoveDisposition,
+    AdapterRef, Capability, EffectiveCapabilities, Engine, EngineError, RegistryError,
+    RemoveDisposition, SupportLevel,
 };
 
 use crate::error::{
-    AgentDuplicateName, AgentInvalidName, AgentInvalidTransition, AgentIo, AgentLaunchFailed,
-    AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities,
-    AgentNoMeteringSource, AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentDuplicateName, AgentInvalidName, AgentInvalidTransition,
+    AgentIo, AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound,
+    AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound,
+    AgentRunningRequiresForce, AgentStore, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -309,6 +311,87 @@ pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::er
     }
 }
 
+/// `kt agent pause <name>` — pause a running Agent Instance with honest, per-OS
+/// semantics (AC2/AC3/AC6 — "surfaced not silent").
+///
+/// Drives `pause` through the blocking facade. On success prints the new state
+/// (`paused`) to stdout; then — per the AC2 honesty contract — re-reads the
+/// effective Capability Declaration and, if pause is `BestEffort` on this OS,
+/// emits a VISIBLE qualifier NOTE to STDERR (never a silent success; the
+/// machine-readable half rides in the transition event's `pause-best-effort`
+/// cause). On `unsupported` the engine fails fast and we render
+/// [`AgentCapabilityUnsupported`] quoting the declaration to stderr with a
+/// non-zero exit (AC3). Output discipline (AD-12): result → stdout, the
+/// qualifier note/diagnostics → stderr.
+pub fn pause(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+    match facade.pause(name) {
+        Ok(instance) => {
+            ui::success(format!(
+                "Paused Agent Instance {}",
+                ui::skill_name(instance.name.as_str())
+            ));
+            // Command result to stdout: the new Lifecycle State.
+            println!("{}", instance.state);
+            // AC2 honesty: if pause is best-effort on this OS, surface the
+            // qualifier to STDERR (the human half of "surfaced not silent").
+            note_if_best_effort(&facade, name, "pause");
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// `kt agent resume <name>` — resume a paused Agent Instance (AC2/AC6).
+///
+/// The symmetric counterpart of [`pause`]: prints the new state (`running`) to
+/// stdout, and if pause is best-effort on this OS emits the resume qualifier note
+/// to stderr.
+pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+    match facade.resume(name) {
+        Ok(instance) => {
+            ui::success(format!(
+                "Resumed Agent Instance {}",
+                ui::skill_name(instance.name.as_str())
+            ));
+            // Command result to stdout: the new Lifecycle State.
+            println!("{}", instance.state);
+            note_if_best_effort(&facade, name, "resume");
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// After a successful best-effort-eligible pause/resume, re-read the effective
+/// Capability Declaration and, if pause is [`SupportLevel::BestEffort`] on the
+/// current OS, print a one-line qualifier NOTE to STDERR (AD-12: notices →
+/// stderr, never stdout). This is the RECOMMENDED best-effort detection (a cheap
+/// extra read via the same `effective_capabilities` mechanism `kt agent show`
+/// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
+/// it must never turn a successful pause into a CLI error (the state already
+/// changed and the machine-readable qualifier is already in the event log).
+fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &str) {
+    let Ok(caps) = facade.effective_capabilities(name) else {
+        return;
+    };
+    let pause_level = caps
+        .entries
+        .iter()
+        .find(|(c, _)| *c == Capability::Pause)
+        .map(|(_, level)| *level);
+    if pause_level == Some(SupportLevel::BestEffort) {
+        ui::note(format!(
+            "{op} for '{name}' is best-effort on {os} (adapter-cooperative); \
+             the process may keep running.",
+            os = caps.os,
+        ));
+    }
+}
+
 /// Open the engine using the default (or env-overridden) state dir.
 ///
 /// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
@@ -459,6 +542,20 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' failed to launch: {detail}. The instance is now in the \
                  'failed' state; fix the adapter's launch command and try starting it again."
+            ),
+        }
+        .into(),
+        // AC3: pause is UNSUPPORTED on this OS — fail fast QUOTING the declaration
+        // (the level + OS) and pointing at `kt agent show`. No state changed.
+        EngineError::CapabilityUnsupported {
+            name,
+            capability,
+            os,
+            level,
+        } => AgentCapabilityUnsupported {
+            message: format!(
+                "Agent Instance '{name}' cannot {capability}: this agent declares {capability} \
+                 '{level}' on {os}. Inspect its Capability Declaration with: kt agent show {name}"
             ),
         }
         .into(),

@@ -24,6 +24,12 @@
 //!   OS-cfg, which the gate forbids here). With no `--linger-ms` the process
 //!   loops effectively forever (a very long sleep), so a normal graceful stop
 //!   still ends it promptly via the kill.
+//! * `--heartbeat-ms <ms>`  print an incrementing `heartbeat <n>` line to stdout
+//!   every `<ms>` and flush (story 1-5). When the process is SIGSTOP'd the whole
+//!   process freezes, so its captured log STOPS growing; SIGCONT resumes it — the
+//!   OBSERVABLE suspension proof for the guaranteed pause path. With no
+//!   `--heartbeat-ms` the loop is a quiet sleep (existing 1-4 tests that only
+//!   assert `ready`/lifecycle are unaffected). Pure `std`, NO OS-cfg.
 //!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
@@ -47,6 +53,8 @@ struct Opts {
     spawn_child: bool,
     linger: Duration,
     marker: Option<PathBuf>,
+    /// Heartbeat interval (story 1-5). `None` = no heartbeat (quiet sleep loop).
+    heartbeat: Option<Duration>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -58,6 +66,7 @@ fn parse() -> Opts {
     // fallback so a stray test never leaks a truly immortal process.
     let mut linger = Duration::from_secs(3600);
     let mut marker = None;
+    let mut heartbeat = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -70,6 +79,11 @@ fn parse() -> Opts {
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
                     linger = Duration::from_millis(ms);
+                }
+            }
+            "--heartbeat-ms" => {
+                if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    heartbeat = Some(Duration::from_millis(ms));
                 }
             }
             "--marker" => {
@@ -87,6 +101,7 @@ fn parse() -> Opts {
         spawn_child,
         linger,
         marker,
+        heartbeat,
     }
 }
 
@@ -131,10 +146,25 @@ fn main() {
     let _ = stdout.flush();
     write_marker(&opts.marker, "ready");
 
-    // Loop-sleep until we are killed, or until the linger window elapses (the
-    // self-exit fallback). A short poll keeps the process responsive to signals.
+    // Loop until we are killed, or until the linger window elapses (the self-exit
+    // fallback). When a heartbeat interval is set, print an incrementing
+    // `heartbeat <n>` line every interval and flush — while SIGSTOP'd the whole
+    // process freezes, so the captured log stops growing (the story-1-5
+    // observable-suspension proof); SIGCONT resumes it. With no heartbeat this is
+    // a quiet short-poll sleep (unchanged 1-4 behavior). A short poll keeps the
+    // process responsive to signals in both modes.
     let deadline = Instant::now() + opts.linger;
+    let mut beats: u64 = 0;
+    let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     while Instant::now() < deadline {
+        if let (Some(interval), Some(due)) = (opts.heartbeat, next_beat) {
+            if Instant::now() >= due {
+                let _ = writeln!(stdout, "heartbeat {beats}");
+                let _ = stdout.flush();
+                beats += 1;
+                next_beat = Some(due + interval);
+            }
+        }
         sleep(Duration::from_millis(25));
     }
     // Lingered the whole window without being killed: exit cleanly.
