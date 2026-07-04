@@ -9,7 +9,8 @@
 use std::path::PathBuf;
 
 use ktesio_engine::{
-    AgentInstance, InstanceName, LifecycleState, Registry, RegistryError, RemoveDisposition,
+    AdapterRef, AgentInstance, InstanceName, LifecycleState, Registry, RegistryError,
+    RemoveDisposition,
 };
 use tempfile::TempDir;
 
@@ -74,7 +75,9 @@ fn duplicate_registration_surfaces_typed_error_via_public_api() {
     let tmp = TempDir::new().unwrap();
     let reg = open(&tmp);
     reg.register("demo", "mock").unwrap();
-    let err = reg.register("demo", "other").unwrap_err();
+    // Re-register the same NAME (kind must resolve, so reuse `mock`); the
+    // duplicate is detected after adapter resolution passes (story 1.3).
+    let err = reg.register("demo", "mock").unwrap_err();
     assert!(matches!(err, RegistryError::DuplicateName { name } if name == "demo"));
 }
 
@@ -95,4 +98,128 @@ fn state_persists_across_reopen() {
         .map(|i| i.name.into())
         .collect();
     assert_eq!(names, vec!["persisted".to_string()]);
+}
+
+// ---- Story 1.3: adapter resolution via the PUBLIC API only ----
+
+/// A complete valid `adapter.toml` written into a manifest directory fixture.
+const FIXTURE_MANIFEST: &str = r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fixture"
+
+[lifecycle.start]
+exec = "fixture-agent"
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#;
+
+#[test]
+fn register_native_and_manifest_and_read_effective_declaration_via_public_api() {
+    // AD-2 proof: register a native `mock` AND a manifest adapter through the
+    // public API only, then read back each effective declaration.
+    let tmp = TempDir::new().unwrap();
+    let reg = open(&tmp);
+
+    // Native mock.
+    let mock = reg.register("demo", "mock").unwrap();
+    assert_eq!(mock.kind, "mock");
+    let mock_caps = reg.effective_capabilities("demo").unwrap();
+    assert!(!mock_caps.is_empty());
+
+    // Manifest adapter from a temp directory fixture.
+    let manifest_dir = TempDir::new().unwrap();
+    std::fs::write(manifest_dir.path().join("adapter.toml"), FIXTURE_MANIFEST).unwrap();
+    let m = reg
+        .register_with_adapter(
+            "m",
+            &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+        )
+        .unwrap();
+    assert_eq!(m.kind, "fixture");
+    assert_eq!(m.state, LifecycleState::Registered);
+    let m_caps = reg.effective_capabilities("m").unwrap();
+    assert!(!m_caps.is_empty());
+    // The projection is for the running OS (data-driven, works on every host).
+    assert_eq!(m_caps.os, ktesio_engine::OsId::current());
+}
+
+#[test]
+fn manifest_no_metering_rejected_via_public_api_leaves_no_partial_state() {
+    // AC4 hard line proven through the public API.
+    let tmp = TempDir::new().unwrap();
+    let reg = open(&tmp);
+
+    let manifest_dir = TempDir::new().unwrap();
+    let body = FIXTURE_MANIFEST.replace("[metering]\nsource = \"self-reported\"\n", "");
+    std::fs::write(manifest_dir.path().join("adapter.toml"), body).unwrap();
+
+    let err = reg
+        .register_with_adapter(
+            "m",
+            &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("[metering]"), "got {err}");
+    assert!(
+        reg.list().unwrap().is_empty(),
+        "no partial state on AC4 reject"
+    );
+}
+
+#[test]
+fn conformance_mock_fixture_matches_builtin_shape() {
+    // F2 — the REAL mock-drift guard. The shipping builtin `mock` (resolved via
+    // the engine's public API) and the reusable conformance `MockAdapter` fixture
+    // (a DEV-dependency here) MUST declare the identical per-OS Capability
+    // Declaration. This is the single cross-boundary equality that protects the
+    // whole BuiltinMock/MockAdapter duplication: if either drifts, this fails.
+    //
+    // Both are compared directly (both derive PartialEq) AND cell-by-cell across
+    // Capability::ALL × OsId::MODELED, so a divergence on any OS/capability is
+    // caught even on a single-OS CI runner (the matrix is data).
+    use ktesio_adapter_api::{AgentAdapter, Capability, OsId};
+
+    // The shipping builtin's declaration, obtained through the public resolve
+    // path (kt never depends on conformance; this test is the dev-side guard).
+    let builtin = ktesio_engine::adapter::resolve(&AdapterRef::Native("mock".to_string()))
+        .expect("builtin mock resolves");
+    let builtin_declaration = builtin.declaration();
+
+    // The conformance fixture's declaration.
+    let fixture = ktesio_conformance::MockAdapter::new();
+    let fixture_declaration = fixture.capabilities();
+
+    // Whole-declaration equality (PartialEq) — the primary guard.
+    assert_eq!(
+        builtin_declaration, fixture_declaration,
+        "shipping builtin `mock` and the conformance MockAdapter fixture declarations diverged"
+    );
+
+    // Cell-by-cell across every capability × modeled OS, as data (belt and
+    // suspenders — pinpoints WHICH cell drifted if the equality above ever fails).
+    for capability in Capability::ALL {
+        for os in OsId::MODELED {
+            assert_eq!(
+                builtin_declaration.support(capability, os),
+                fixture_declaration.support(capability, os),
+                "mock drift at capability={capability} os={os}"
+            );
+        }
+    }
+
+    // The fixture is inert this story (execution is 1-4).
+    assert!(fixture.scripted_fake_agent().is_inert());
 }

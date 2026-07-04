@@ -94,6 +94,61 @@ pub enum RegistryError {
         rollback_error: String,
     },
 
+    /// A native adapter `kind` was requested that no builtin provides (story
+    /// 1.3). Carries the unrecognized kind so `kt` can suggest alternatives.
+    #[error("unknown adapter kind '{kind}'")]
+    UnknownAdapterKind {
+        /// The unrecognized native kind string.
+        kind: String,
+    },
+
+    /// A manifest adapter was requested but no `adapter.toml` was found at the
+    /// resolved path (story 1.3). Names the path searched.
+    #[error("no adapter.toml found at {path}")]
+    ManifestNotFound {
+        /// The path searched (the file, or `<dir>/adapter.toml`).
+        path: String,
+    },
+
+    /// A manifest adapter's `adapter.toml` exists but could not be read (an I/O
+    /// error — e.g. permissions, or the path is a directory). Distinct from
+    /// [`RegistryError::ManifestInvalid`] because the operator's remediation is
+    /// different: check existence/readability, not "fix the section" (F4).
+    #[error("could not read adapter.toml at {path}: {detail}")]
+    ManifestUnreadable {
+        /// The manifest path that could not be read.
+        path: String,
+        /// The underlying I/O error.
+        detail: String,
+    },
+
+    /// A manifest adapter's `adapter.toml` failed to parse or validate (story
+    /// 1.3). `detail` NAMES the failing section (AC2) so the diagnostic can
+    /// quote it.
+    #[error("adapter.toml at {path} is invalid: {detail}")]
+    ManifestInvalid {
+        /// The manifest path.
+        path: String,
+        /// The section-naming validation detail.
+        detail: String,
+    },
+
+    /// An adapter declared no viable Metering Source and was rejected at
+    /// registration (story 1.3; FR-19 hard line, AC4). Names the adapter.
+    #[error("adapter '{adapter}' declares no viable Metering Source; add a `[metering]` section")]
+    NoMeteringSource {
+        /// The adapter kind/identity that lacked a source.
+        adapter: String,
+    },
+
+    /// An adapter declared no capabilities and was rejected at registration
+    /// (story 1.3; AC2). Names the adapter.
+    #[error("adapter '{adapter}' declares no capabilities; add a `[capabilities]` section")]
+    NoCapabilities {
+        /// The adapter kind/identity that lacked capabilities.
+        adapter: String,
+    },
+
     /// A [`StateStore`](crate::ports::StateStore) operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

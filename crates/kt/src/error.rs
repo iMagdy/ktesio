@@ -175,3 +175,45 @@ pub struct AgentIo {
 pub struct AgentStore {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::unknown_kind))]
+pub struct AgentUnknownKind {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::manifest_not_found))]
+pub struct AgentManifestNotFound {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::manifest_invalid))]
+pub struct AgentManifestInvalid {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::manifest_unreadable))]
+pub struct AgentManifestUnreadable {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::no_metering_source))]
+pub struct AgentNoMeteringSource {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::no_capabilities))]
+pub struct AgentNoCapabilities {
+    pub message: String,
+}

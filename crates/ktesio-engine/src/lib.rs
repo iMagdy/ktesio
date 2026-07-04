@@ -4,19 +4,30 @@
 //! logic live here, behind a public API that *is* the Embedding Interface
 //! (architecture spine AD-1, AD-2, AD-13).
 //!
-//! ## What this crate exposes (story 1.2)
+//! ## What this crate exposes (stories 1.2–1.3)
 //!
-//! The first real engine slice: **the registration capability** (FR-1/FR-2/
-//! FR-3). The public surface is deliberately small — the registry service plus
-//! the domain types it returns:
+//! The registration capability (FR-1/FR-2/FR-3), now with adapter resolution
+//! and validation (story 1.3, FR-1 path registration / FR-19 metering / FR-27
+//! contract seed). The public surface is deliberately small — the registry
+//! service, the domain types it returns, and the adapter-contract types `kt`
+//! renders:
 //!
-//! - [`Registry`] — `open`, `register`, `remove`, `list` (the Embedding
-//!   Interface for registration; `kt` drives these directly).
+//! - [`Registry`] — `open`, `register`, `register_with_adapter`, `remove`,
+//!   `list`, `get` (the Embedding Interface for registration; `kt` drives these
+//!   directly).
+//! - [`AdapterRef`] — a native-kind or manifest-path adapter request;
+//!   [`ResolvedAdapter`] — the validated adapter view registration persists.
 //! - [`RemoveDisposition`] — retain-or-delete choice for `remove`.
 //! - [`AgentInstance`], [`InstanceName`], [`LifecycleState`] — returned domain
 //!   types.
+//! - [`CapabilityDeclaration`], [`EffectiveCapabilities`], [`Capability`],
+//!   [`SupportLevel`], [`MeteringSource`], [`OsId`] — re-exported from
+//!   `ktesio-adapter-api` so `kt` can render the effective per-OS declaration.
 //! - [`RegistryError`] / [`NameError`] — the `thiserror` error surface `kt`
 //!   wraps into `miette` diagnostics (no `miette` in this lib — conventions).
+//!
+//! Adapter resolution PARSES + VALIDATES only; it executes no lifecycle op
+//! (story 1.4 owns the manifest executor and process launch).
 //!
 //! Everything else — the [`StateStore`] port, its SQLite implementation, and
 //! the path authority — stays crate-internal (AD-1/AD-2). The `ports` module is
@@ -38,10 +49,7 @@
 //!
 //! [`StateStore`]: crate::ports::StateStore
 
-// Prove the AD-2 dependency edge (engine -> ktesio-adapter-api) compiles; real
-// adapter-contract usage arrives with story 1.3.
-use ktesio_adapter_api as _;
-
+pub mod adapter;
 pub mod domain;
 pub mod paths;
 pub mod ports;
@@ -50,7 +58,14 @@ mod time;
 
 // Re-export the registration capability's public surface at the crate root
 // (the Embedding Interface for this story).
+pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     AgentInstance, InstanceName, LifecycleState, NameError, Registry, RegistryError,
     RemoveDisposition,
+};
+
+// Re-export the adapter-contract types `kt` needs to render the effective
+// per-OS Capability Declaration (AD-2: `kt` names these types, not the schema).
+pub use ktesio_adapter_api::{
+    Capability, CapabilityDeclaration, EffectiveCapabilities, MeteringSource, OsId, SupportLevel,
 };

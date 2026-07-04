@@ -121,12 +121,18 @@ Examples:
 const AGENT_AFTER_HELP: &str = "\
 Details:
   Manages Agent Instances in the Fleet. register creates an isolated Agent Home
-  under a unique name; remove deletes the registry entry and, with --delete,
-  the Agent Home too (--retain, the default, keeps it); list shows the Fleet.
-  Removing a running instance requires --force.
+  under a unique name from a native adapter (--kind) or a manifest adapter
+  (--manifest <dir-or-file>), validating its Capability Declaration and Metering
+  Source before any state is written; it prints the Agent Home path and the
+  effective per-OS Capability Declaration. remove deletes the registry entry
+  and, with --delete, the Agent Home too (--retain, the default, keeps it); list
+  shows the Fleet; show renders one instance's effective capabilities. Removing a
+  running instance requires --force.
 
 Examples:
   kt agent register demo --kind mock
+  kt agent register my-agent --manifest ./my-agent
+  kt agent show demo
   kt agent list
   kt agent remove demo --delete";
 
@@ -287,9 +293,17 @@ enum AgentCommands {
     Register {
         /// Fleet-unique instance name (^[a-z0-9][a-z0-9_-]*$)
         name: String,
-        /// Agent kind (adapter identity)
+        /// Native adapter kind (e.g. mock). Mutually exclusive with --manifest.
+        #[arg(
+            long,
+            conflicts_with = "manifest",
+            required_unless_present = "manifest"
+        )]
+        kind: Option<String>,
+        /// Path to a manifest adapter directory (or adapter.toml file).
+        /// Mutually exclusive with --kind.
         #[arg(long)]
-        kind: String,
+        manifest: Option<String>,
     },
     /// Remove an Agent Instance from the Fleet
     Remove {
@@ -307,6 +321,11 @@ enum AgentCommands {
     },
     /// List every Agent Instance in the Fleet
     List,
+    /// Show an Agent Instance's effective per-OS Capability Declaration
+    Show {
+        /// Name of the Agent Instance to inspect
+        name: String,
+    },
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -374,7 +393,14 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Doctor) => cli::doctor::run(),
         Some(Commands::Uninstall { package_name }) => cli::uninstall::run(&package_name),
         Some(Commands::Agent { command }) => match command {
-            AgentCommands::Register { name, kind } => cli::agent::register(&name, &kind),
+            AgentCommands::Register {
+                name,
+                kind,
+                manifest,
+            } => {
+                let adapter = cli::agent::AdapterArg::from_flags(kind, manifest)?;
+                cli::agent::register(&name, &adapter)
+            }
             AgentCommands::Remove {
                 name,
                 delete,
@@ -386,6 +412,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 force,
             ),
             AgentCommands::List => cli::agent::list(),
+            AgentCommands::Show { name } => cli::agent::show(&name),
         },
         None => {
             Cli::command().print_help()?;
@@ -434,6 +461,31 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "register"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "remove"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
+    }
+
+    #[test]
+    fn test_agent_register_requires_kind_or_manifest() {
+        // Neither flag → clap error (required_unless_present).
+        assert!(Cli::try_parse_from(["kt", "agent", "register", "demo"]).is_err());
+        // --kind alone parses.
+        assert!(Cli::try_parse_from(["kt", "agent", "register", "demo", "--kind", "mock"]).is_ok());
+        // --manifest alone parses.
+        assert!(
+            Cli::try_parse_from(["kt", "agent", "register", "demo", "--manifest", "./a"]).is_ok()
+        );
+        // Both together → conflict error.
+        assert!(Cli::try_parse_from([
+            "kt",
+            "agent",
+            "register",
+            "demo",
+            "--kind",
+            "mock",
+            "--manifest",
+            "./a"
+        ])
+        .is_err());
     }
 
     #[test]

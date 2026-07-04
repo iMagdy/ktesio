@@ -12,13 +12,13 @@ Ktesio ships a single `kt` binary, built from a Cargo workspace. The CLI keeps d
 ```text
 crates/
 ├── kt/                     # package "ktesio" — the shipping kt CLI (all current behavior)
-├── ktesio-engine/          # engine library (registration engine live; more per story)
-├── ktesio-adapter-api/     # adapter contract types (reserved skeleton)
+├── ktesio-engine/          # engine library (registration + adapter resolution live)
+├── ktesio-adapter-api/     # Adapter Contract: trait, per-OS capability + metering types, manifest schema
 ├── ktesio-adapters-hermes/ # native adapter home (reserved skeleton)
-└── ktesio-conformance/     # adapter conformance test kit (reserved skeleton)
+└── ktesio-conformance/     # adapter conformance fixtures (mock adapter + scripted fake agent)
 ```
 
-`kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types); CI enforces that dependency boundary. The engine grows one capability at a time; the adapter/conformance crates remain reserved skeletons until their stories land.
+`kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types); CI enforces that dependency boundary. `ktesio-adapter-api` depends on nothing internal — it owns the Adapter Contract types and the `adapter.toml` manifest schema (with validation), versioned under a contract-version constant. The engine consumes that crate's parsed form and defines no schema of its own. The `ktesio-conformance` mock adapter is a dev/test fixture: the engine and `kt` reference it as a dev-dependency only, so it never appears in the shipping dependency graph (a normal edge would trip the boundary gate). The `hermes` adapter crate stays a reserved skeleton until epic 6.
 
 ### Engine modules
 
@@ -27,6 +27,7 @@ The engine follows a hexagonal layout (domain core + ports + backing implementat
 ```text
 crates/ktesio-engine/src/
 ├── lib.rs      # re-exports the public API (the Embedding Interface)
+├── adapter/    # adapter resolution: native builtins + manifest loader/validator (parses via adapter-api; executes nothing)
 ├── domain/     # core: LifecycleState, AgentInstance, InstanceName, RegistryError, the Registry service
 ├── ports/      # hexagonal ports; StateStore trait + StoreError
 ├── store/      # SQLite StateStore implementation + schema/migrations (internal)
@@ -35,6 +36,8 @@ crates/ktesio-engine/src/
 ```
 
 The engine is the sole path authority: it computes the state-directory location and each Agent Home layout; `kt` receives paths from the API and never constructs them. All registry and lifecycle state lives in one SQLite database (WAL journaling, `synchronous=NORMAL`, foreign keys on) under the engine state directory; bulky per-instance artifacts live as files inside each Agent Home. Errors use `thiserror` inside the engine and are wrapped into `miette` diagnostics in `kt`.
+
+Registration resolves an adapter before any state is written. A native adapter is selected by kind (`--kind`) from a small builtin table; a manifest adapter is loaded from a directory or file (`--manifest`), its `adapter.toml` parsed and validated by `ktesio-adapter-api`. The adapter's per-OS Capability Declaration and Metering Source are validated first — an adapter with no capabilities or no viable metering source is rejected, and nothing is written — then the row and Agent Home are created. The effective (current-OS) Capability Declaration is projected as data (via a runtime OS identifier, never conditional compilation) and persisted as a JSON snapshot in the Agent Home, so `kt agent show` can render it. Lifecycle execution (starting and stopping agents) is a later story; this slice stores and validates declarations and templates only.
 
 ## Modules
 

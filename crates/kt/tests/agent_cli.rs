@@ -55,6 +55,16 @@ fn register_prints_home_path_and_exits_zero() {
     // every other `kt` command's `ui::success` usage. AD-12 reserves stderr for
     // diagnostics/notices; a completed-successfully confirmation is not one.
     assert!(run.stdout.contains("Registered"));
+    // AC1: the effective per-OS Capability Declaration is surfaced on stdout
+    // (the mock declares `pause` and `interaction`).
+    assert!(
+        run.stdout.contains("Capabilities for demo"),
+        "stdout should render capabilities; stdout={}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("pause"), "stdout={}", run.stdout);
+    // The adapter snapshot is persisted in the Agent Home.
+    assert!(home.join("adapter.json").is_file());
 }
 
 #[test]
@@ -70,8 +80,9 @@ fn duplicate_registration_exits_nonzero_with_diagnostic() {
     );
     assert!(first.success);
 
+    // Re-register the same NAME (kind must resolve, so reuse `mock`).
     let second = run_kt_agent(
-        &["agent", "register", "demo", "--kind", "other"],
+        &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
@@ -224,4 +235,182 @@ fn remove_running_without_force_exits_nonzero_and_with_force_succeeds() {
     );
     let home = state_dir.join("agents").join("live");
     assert!(!home.exists());
+}
+
+// ---- Story 1.3: manifest adapters + `kt agent show` ----
+
+/// A complete valid `adapter.toml` for a manifest-adapter directory fixture.
+const VALID_MANIFEST: &str = r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "demo-manifest"
+
+[lifecycle.start]
+exec = "demo-agent"
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[metering]
+source = "self-reported"
+"#;
+
+/// Write an `adapter.toml` into a fresh subdirectory of `dir` and return it.
+fn manifest_dir(dir: &Path, body: &str) -> std::path::PathBuf {
+    let m = dir.join("manifest-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+#[test]
+fn register_manifest_exits_zero_and_shows_capabilities() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = manifest_dir(&ctx.project_dir, VALID_MANIFEST);
+
+    let run = run_kt_agent(
+        &["agent", "register", "m", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        run.success,
+        "manifest register should exit 0; stderr={}",
+        run.stderr
+    );
+    // The instance kind comes from the manifest's [adapter] kind.
+    assert!(
+        run.stdout.contains("demo-manifest"),
+        "stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("Capabilities for m"),
+        "stdout={}",
+        run.stdout
+    );
+    // Home + adapter snapshot exist.
+    let home = state_dir.join("agents").join("m");
+    assert!(home.join("adapter.json").is_file());
+}
+
+#[test]
+fn register_invalid_manifest_exits_nonzero_naming_section() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // Drop [metering] → invalid, naming the section.
+    let body = VALID_MANIFEST.replace("[metering]\nsource = \"self-reported\"\n", "");
+    let m = manifest_dir(&ctx.project_dir, &body);
+
+    let run = run_kt_agent(
+        &["agent", "register", "m", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!run.success, "invalid manifest should exit non-zero");
+    assert!(
+        run.stderr.contains("[metering]"),
+        "diagnostic should name the section; stderr={}",
+        run.stderr
+    );
+    // No partial state.
+    assert!(!state_dir.join("agents").join("m").exists());
+}
+
+#[test]
+fn register_manifest_not_found_exits_nonzero() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let missing = ctx.project_dir.join("no-such-dir");
+
+    let run = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "m",
+            "--manifest",
+            missing.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!run.success, "missing manifest should exit non-zero");
+    assert!(
+        run.stderr.contains("adapter.toml") || run.stderr.contains("No adapter.toml"),
+        "stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn register_unknown_kind_exits_nonzero() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "register", "x", "--kind", "no-such-kind"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!run.success, "unknown kind should exit non-zero");
+    assert!(
+        run.stderr.contains("Unknown adapter kind"),
+        "stderr={}",
+        run.stderr
+    );
+    assert!(!state_dir.join("agents").join("x").exists());
+}
+
+#[test]
+fn register_requires_kind_or_manifest() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // Neither --kind nor --manifest → clap rejects before the engine runs.
+    let run = run_kt_agent(&["agent", "register", "x"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "register with no adapter flag should fail");
+}
+
+#[test]
+fn show_renders_effective_capabilities() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let show = run_kt_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("Capabilities for demo"),
+        "stdout={}",
+        show.stdout
+    );
+    assert!(show.stdout.contains("pause"), "stdout={}", show.stdout);
+}
+
+#[test]
+fn show_unknown_instance_exits_nonzero() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let show = run_kt_agent(&["agent", "show", "ghost"], &ctx.project_dir, state_dir);
+    assert!(!show.success, "show of a missing instance should fail");
+    assert!(
+        show.stderr.contains("No Agent Instance named 'ghost'"),
+        "stderr={}",
+        show.stderr
+    );
 }
