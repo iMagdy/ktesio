@@ -20,6 +20,14 @@ python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ```
 
+### Toolchain
+
+The workspace ships a root `rust-toolchain.toml` pinning the toolchain to the MSRV (Rust **1.96.1**, with `clippy` + `rustfmt`), so a bare `cargo` — `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt` — uses 1.96.1 without typing `cargo +1.96.1`. The explicit `+1.96.1` form still works and remains the escape hatch. Keep the pinned `channel` in lockstep with `rust-version` in the root `Cargo.toml`.
+
+One caveat: rustup only honors the file when nothing higher-precedence overrides it. A `RUSTUP_TOOLCHAIN` environment variable, an active `rustup override`, or a version manager that shims `cargo` (e.g. **mise** or asdf, which export `RUSTUP_TOOLCHAIN`) all win over `rust-toolchain.toml`. If bare `cargo --version` in the repo does not report 1.96.1, check `rustup show` (it names the active override) and either `unset RUSTUP_TOOLCHAIN` / drop the version-manager rust pin, or just use `cargo +1.96.1`.
+
+CI is deliberately explicit the other way: its "latest stable" jobs run `cargo +stable …` so they still catch future stable regressions, while the dedicated `msrv` job proves the 1.96.1 floor with `cargo +1.96.1`. (This means local bare `cargo` lints/tests on the MSRV while those CI jobs use latest stable — an intentional split, so an occasional new-stable clippy or rustfmt nit can surface in CI that a local MSRV run did not; reproduce it with `cargo +stable clippy …` / `cargo +stable fmt …` if needed.)
+
 ## Unit and Integration Tests
 
 ```bash

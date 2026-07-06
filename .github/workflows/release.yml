@@ -39,7 +39,10 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        # Explicit +stable: the root rust-toolchain.toml pins bare `cargo` to the
+        # MSRV (1.96.1) for local convenience; shipped release artifacts must be
+        # built with latest stable, and a +toolchain argument overrides the file.
+        run: cargo +stable build --release --target ${{ matrix.target }}
       - name: Package Unix
         if: runner.os != 'Windows'
         shell: bash
@@ -104,7 +107,10 @@ jobs:
           # The workspace has five member packages and `cargo metadata` order is
           # unspecified; select the shipping crates.io package explicitly.
           crate_name="ktesio"
-          crate_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "ktesio"))')"
+          # Explicit +stable throughout this job (see the build job): the root
+          # rust-toolchain.toml pins bare cargo to the MSRV locally; release
+          # publish/metadata run on latest stable.
+          crate_version="$(cargo +stable metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "ktesio"))')"
           if [ "$crate_version" != "${tag#v}" ]; then
             echo "::error::Cargo package version ${crate_version} must match release tag ${tag}."
             exit 1
@@ -120,7 +126,7 @@ jobs:
                 echo "::error::Set a CARGO_REGISTRY_TOKEN secret with publish access to the ${crate_name} crate."
                 exit 1
               fi
-              cargo publish --locked -p ktesio
+              cargo +stable publish --locked -p ktesio
               ;;
             *)
               cat /tmp/crate-version.json

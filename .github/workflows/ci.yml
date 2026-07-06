@@ -24,7 +24,11 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
       - name: Check formatting
-        run: cargo fmt --all --check
+        # Explicit +stable: the root rust-toolchain.toml pins bare `cargo` to the
+        # MSRV (1.96.1); this job intentionally exercises latest stable, and a
+        # +toolchain argument overrides the toolchain file. The dedicated `msrv`
+        # job proves the 1.96.1 floor.
+        run: cargo +stable fmt --all --check
 
   clippy:
     name: clippy
@@ -45,7 +49,9 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # Explicit +stable (see fmt job): pin covers local bare cargo; CI stays
+        # on latest stable here, MSRV floor proven by the `msrv` job.
+        run: cargo +stable clippy --workspace --all-targets -- -D warnings
 
   test:
     name: test
@@ -80,7 +86,9 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Run tests
-        run: cargo test --workspace --all-targets
+        # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable
+        # on each OS; the pin governs only local bare cargo. MSRV floor: `msrv` job.
+        run: cargo +stable test --workspace --all-targets
 
   build:
     name: build
@@ -101,7 +109,9 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Build release binary
-        run: cargo build --release
+        # Explicit +stable (see fmt job): CI build sanity on latest stable; the
+        # root pin governs only local bare cargo.
+        run: cargo +stable build --release
 
   docs:
     name: docs
@@ -142,12 +152,14 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Check kt against its declared crate graph
-        run: cargo check -p ktesio
+        # Explicit +stable (see fmt job): boundary gate runs on latest stable; the
+        # root rust-toolchain.toml pins only local bare cargo. MSRV floor: `msrv` job.
+        run: cargo +stable check -p ktesio
       - name: Enforce kt dependency law (AD-2)
         shell: bash
         run: |
           set -euo pipefail
-          tree="$(cargo tree -p ktesio -e normal,build --all-features)"
+          tree="$(cargo +stable tree -p ktesio -e normal,build --all-features)"
           echo "$tree"
           # Allowlist, not blocklist: any internal ktesio-* edge other than
           # ktesio-engine / ktesio-adapter-api fails, so future internal
@@ -246,8 +258,10 @@ jobs:
               200)
                 # Install lazily inside the armed branch: skips the ~10-minute
                 # build while the gate is dormant (no published baseline yet).
-                command -v cargo-semver-checks >/dev/null 2>&1 || cargo install cargo-semver-checks --locked
-                cargo semver-checks check-release -p "$crate"
+                # Explicit +stable (see fmt job): keep the semver gate on latest
+                # stable; the root pin governs only local bare cargo.
+                command -v cargo-semver-checks >/dev/null 2>&1 || cargo +stable install cargo-semver-checks --locked
+                cargo +stable semver-checks check-release -p "$crate"
                 ;;
               404)
                 echo "::notice::${crate} has no published baseline on crates.io yet; the semver gate arms at first publish (story 7-4)."
@@ -306,6 +320,8 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        # Explicit +stable (see fmt job): coverage runs on latest stable; the root
+        # rust-toolchain.toml pins only local bare cargo.
+        run: cargo +stable install cargo-tarpaulin
       - name: Enforce coverage
-        run: cargo tarpaulin --workspace --fail-under 95
+        run: cargo +stable tarpaulin --workspace --fail-under 95

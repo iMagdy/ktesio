@@ -62,7 +62,10 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("generate_homebrew_formula.py", workflow)
         self.assertIn("HOMEBREW_TAP_TOKEN", workflow)
         self.assertIn("CARGO_REGISTRY_TOKEN", workflow)
-        self.assertIn("cargo publish --locked -p ktesio", workflow)
+        # Release publish is explicit about its toolchain: the root
+        # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), but shipped
+        # artifacts and the crates.io publish run on latest stable (AI-17).
+        self.assertIn("cargo +stable publish --locked -p ktesio", workflow)
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("oras-project/setup-oras", workflow)
         self.assertNotIn("oras push", workflow)
@@ -113,8 +116,12 @@ class ReleaseDocsTests(unittest.TestCase):
         )
 
         self.assertIn("needs: [fmt, clippy, test, build, docs, boundary, semver]", ci)
-        self.assertIn("cargo test --workspace --all-targets", ci)
-        self.assertIn("cargo tarpaulin --workspace --fail-under 95", ci)
+        # Stable jobs are explicit about their toolchain: the root
+        # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), so these jobs
+        # select +stable to keep exercising latest stable (AI-17). The `msrv` job
+        # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
+        self.assertIn("cargo +stable test --workspace --all-targets", ci)
+        self.assertIn("cargo +stable tarpaulin --workspace --fail-under 95", ci)
 
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the
@@ -139,16 +146,18 @@ class ReleaseDocsTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("cargo check -p ktesio", ci)
-        self.assertIn("cargo tree -p ktesio -e normal,build --all-features", ci)
+        # Stable jobs select +stable so the root rust-toolchain.toml pin (MSRV
+        # 1.96.1) does not silently redirect them off latest stable (AI-17).
+        self.assertIn("cargo +stable check -p ktesio", ci)
+        self.assertIn("cargo +stable tree -p ktesio -e normal,build --all-features", ci)
         # Boundary gate is an allowlist: only these internal edges may exist.
         self.assertIn("ktesio-(engine|adapter-api)", ci)
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/ktesio-engine/src/backends/", ci)
         # Semver gate: lazy install inside the armed branch, transient skip.
-        self.assertIn("cargo install cargo-semver-checks --locked", ci)
-        self.assertIn("cargo semver-checks check-release", ci)
+        self.assertIn("cargo +stable install cargo-semver-checks --locked", ci)
+        self.assertIn("cargo +stable semver-checks check-release", ci)
         self.assertIn("000|429|5[0-9][0-9]", ci)
         # Semver gate caches the source-installed binary so it is not rebuilt
         # (~10 min) on every fresh runner (AI-1).
@@ -168,6 +177,16 @@ class ReleaseDocsTests(unittest.TestCase):
 
         cargo_toml = (release_docs.ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('rust-version = "1.96.1"', cargo_toml)
+
+        # AI-17: a root rust-toolchain.toml pins bare cargo to the MSRV so
+        # local `cargo build/test/clippy/fmt` need no `+1.96.1`. It must stay in
+        # lockstep with rust-version; the `msrv` job above still proves the floor
+        # (bare cargo in CI would otherwise resolve to this pin, not stable —
+        # hence the explicit +stable on the stable jobs).
+        toolchain_toml = (release_docs.ROOT / "rust-toolchain.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('channel = "1.96.1"', toolchain_toml)
 
 
 class InstallerScriptTests(unittest.TestCase):
