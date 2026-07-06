@@ -15,16 +15,17 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, Capability, EffectiveCapabilities, Engine, EngineError, FleetEntry, FleetListing,
-    RegistryError, RemoveDisposition, SupportLevel, FLEET_SCHEMA_VERSION,
+    AdapterRef, Capability, ConfigError, ConfigLayer, EffectiveCapabilities, EffectiveConfig,
+    Engine, EngineError, FleetEntry, FleetListing, RegistryError, RemoveDisposition, SupportLevel,
+    FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentDuplicateName, AgentInvalidName, AgentInvalidTransition,
-    AgentIo, AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound,
-    AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound,
-    AgentRunningRequiresForce, AgentStore, AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInvalidName,
+    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+    AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource,
+    AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -569,6 +570,176 @@ fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &st
              the process may keep running.",
             os = caps.os,
         ));
+    }
+}
+
+/// The one-line stderr NOTE (AD-12: notices → stderr) that `config get` shows
+/// effective VALUES only — per-value SOURCE LAYERS (which layer supplied each
+/// value) arrive with effective-config provenance in Epic 2.3 (FR-13). Honest
+/// scoping, never fabricated (AC11).
+const CONFIG_PROVENANCE_EPIC3_NOTE: &str =
+    "showing effective values only; per-value source layers (engine/kind/instance/override) \
+     arrive with effective-config provenance in Epic 2.3.";
+
+/// `kt agent config set <name> <key> <value>` — write one key to the Agent
+/// Instance config layer (story 2-1, AC-B/AC10, AD-12).
+///
+/// Validated at WRITE time by the engine: a known unified key or an `agent.*`
+/// pass-through key is accepted and persisted to the instance `config.toml`
+/// through path authority; an unknown key OUTSIDE `agent.*` is REJECTED before
+/// anything is written (the on-disk config is byte-unchanged) and a miette
+/// diagnostic naming the offending key + the nearest valid key goes to STDERR
+/// with a non-zero exit. On success `ui::success` confirms to stdout. The value
+/// is stored verbatim (a `secret:` value is opaque text in 2-1 — masking is
+/// Epic 2.4; this command resolves no secret).
+pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    match engine.blocking().set_config(name, key, value) {
+        Ok(()) => {
+            ui::success(format!(
+                "Set {} = {} on Agent Instance {} (instance layer)",
+                key,
+                value,
+                ui::skill_name(name)
+            ));
+            Ok(())
+        }
+        Err(err) => Err(map_config_error(err)),
+    }
+}
+
+/// `kt agent config get <name> [<key>]` — read the EFFECTIVE (resolved) config
+/// (story 2-1, AC10/AC11, AD-12).
+///
+/// With `<key>`, prints that key's effective VALUE to stdout (a not-set key is a
+/// diagnostic on stderr + non-zero exit). Without a key, prints the whole
+/// effective config as a Key/Value table to stdout. Output discipline (AD-12):
+/// result → stdout; a one-line note that per-value source layers are Epic 2.3
+/// rides on stderr (AC11 — never fabricated). Deep-resolved via the engine
+/// (engine defaults < kind defaults < instance < invocation overrides); a key set
+/// at the instance layer overrides the same key at a lower layer, every time
+/// (FR-11). No invocation overrides are supplied here (a plain read).
+pub fn config_get(name: &str, key: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let effective = engine
+        .blocking()
+        .effective_config(name, ConfigLayer::empty())
+        .map_err(map_config_error)?;
+
+    match key {
+        Some(key) => match effective.value_display(key) {
+            Some(value) => {
+                // Command result to stdout: just the effective value.
+                println!("{value}");
+                Ok(())
+            }
+            None => {
+                // A syntactically fine key that has no effective value (unset at
+                // every layer). Honest diagnostic to stderr, non-zero exit.
+                Err(AgentUnknownConfigKey {
+                    message: format!(
+                        "Agent Instance '{name}' has no effective value for config key '{key}'. \
+                         List the effective config with: kt agent config get {name}"
+                    ),
+                }
+                .into())
+            }
+        },
+        None => {
+            render_effective_config(name, &effective);
+            // The provenance note rides on stderr (AD-12), keeping stdout clean.
+            ui::note(CONFIG_PROVENANCE_EPIC3_NOTE);
+            Ok(())
+        }
+    }
+}
+
+/// Render the whole effective config as a Key/Value table (result → stdout,
+/// AD-12). VALUES only — source layers are Epic 2.3 (the caller prints the
+/// provenance note to stderr). An empty effective config prints a plain info
+/// line rather than an empty table.
+fn render_effective_config(name: &str, effective: &EffectiveConfig) {
+    let title = format!("Effective config for {name}");
+    if effective.is_empty() {
+        ui::info(format!("{title}: no config keys set"));
+        return;
+    }
+    let columns = [
+        ui::TableColumn::new("Key", 12, 40),
+        ui::TableColumn::new("Value", 12, 60),
+    ];
+    let rows: Vec<Vec<ui::TableCell>> = effective
+        .iter()
+        .map(|(key, resolved)| {
+            vec![
+                ui::TableCell::skill(key.clone()),
+                // The engine renders the value (no `toml::Value` in `kt` — AD-2).
+                ui::TableCell::plain(resolved.display()),
+            ]
+        })
+        .collect();
+    ui::print_table(&title, &columns, &rows);
+}
+
+/// Translate a [`ConfigError`] (story 2-1) into a `miette` diagnostic with a
+/// remediation hint (NFR-1). The unknown-key class (AC-B) carries the offending
+/// key + the nearest-key suggestion the engine computed; the shared name/store
+/// classes reuse the existing agent diagnostics for a consistent surface;
+/// malformed-layer names the layer + path (AC8).
+fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
+    match err {
+        // AC-B: an unknown key outside `agent.*` — the engine already computed the
+        // nearest valid key (or "no close match"); surface the whole message
+        // (which names the key + the suggestion) with a pass-through remediation.
+        ConfigError::UnknownKey { .. } => AgentUnknownConfigKey {
+            message: format!(
+                "{err}. Set a known unified key, or use the agent.* pass-through namespace for \
+                 agent-native extras (e.g. kt agent config set <name> agent.<key> <value>)."
+            ),
+        }
+        .into(),
+        // Patch #3: a write that would nest a child under an existing scalar is
+        // rejected (nothing persisted) — the message names the conflicting
+        // ancestor; add the remediation.
+        ConfigError::WriteShapeConflict { .. } => AgentConfig {
+            message: format!(
+                "{err}. Nothing was changed. Unset or rename the conflicting key first, then \
+                 set the nested key."
+            ),
+        }
+        .into(),
+        ConfigError::InvalidName { name, reason } => AgentInvalidName {
+            message: format!(
+                "Invalid Agent Instance name '{name}': {reason}. Names must match \
+                 ^[a-z0-9][a-z0-9_-]*$ (lowercase letters, digits, '_' or '-', not starting \
+                 with '_' or '-')."
+            ),
+        }
+        .into(),
+        ConfigError::NotFound { name } => AgentNotFound {
+            message: format!(
+                "No Agent Instance named '{name}' is registered. List the Fleet with: kt agent list"
+            ),
+        }
+        .into(),
+        ConfigError::MalformedLayer {
+            layer,
+            path,
+            detail,
+        } => AgentConfig {
+            message: format!(
+                "The {layer} config layer at '{path}' could not be read/parsed: {detail}. \
+                 Fix the TOML (or restore the file) and try again."
+            ),
+        }
+        .into(),
+        ConfigError::Store { name, detail } => AgentStore {
+            message: format!(
+                "State store error for Agent Instance '{name}': {detail}. The state database may \
+                 be inaccessible."
+            ),
+        }
+        .into(),
     }
 }
 

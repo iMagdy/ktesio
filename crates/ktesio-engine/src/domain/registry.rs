@@ -24,11 +24,48 @@ use crate::ports::{SpawnRecord, StateStore, StoreError};
 use crate::store::SqliteStore;
 use crate::time::now_rfc3339;
 
+use super::config::{self, ConfigError, ConfigLayer, EffectiveConfig, SourceLayer};
 use super::error::RegistryError;
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
 use super::restart::RestartPolicy;
+
+/// The engine-owned DEFAULTS layer (spine AD-9 layer 1), story 2-1.
+///
+/// `[ASSUMPTION]` recorded (Decision 1): the engine defaults are an EMBEDDED
+/// `const` TOML string parsed once — there is no on-disk file to lose, corrupt,
+/// or guard as a path-authority surface, and the layer is identical + fully
+/// deterministic on every install.
+///
+/// HONESTY RULE (review decision #1, Islam): the engine-defaults layer ships
+/// EMPTY in 2-1. It previously seeded `restart.policy = "on-failure"`, but the
+/// reaper reads the Restart Policy from the SQLite spawn record (NOT config), so
+/// config must not advertise/seed a key it does not control — that would be a
+/// misleading no-op. The reaper's default keeps coming from
+/// [`RestartPolicy::default`](super::restart::RestartPolicy) in the engine,
+/// unchanged. Kept as a comment-only TOML (parses to an empty table) so the
+/// four-layer plumbing stays real and the engine-defaults slot is honestly
+/// present-but-empty; a later story that makes a unified key engine-controlled
+/// will add it here. A parse failure is an ENGINE BUG (compile-time constant),
+/// surfaced as a typed [`ConfigError::MalformedLayer`], never a panic.
+const ENGINE_DEFAULTS_TOML: &str = "\
+# Ktesio engine-owned config defaults (spine AD-9 layer 1: weakest).
+# Embedded in the engine; the same for every Agent Instance. Intentionally EMPTY
+# in Epic 2.1: config ships only keys it can honestly honor, and no engine-wide
+# unified key is engine-controlled yet. The unified schema grows additively in
+# later Epic-2 stories (this const gains keys as they become config-controlled).
+";
+
+/// A human label for the embedded engine-defaults layer in diagnostics (it has
+/// no filesystem path — it is a compiled-in constant).
+const ENGINE_DEFAULTS_LABEL: &str = "<engine-defaults>";
+
+/// The reserved IDENTITY key `materialize_home` seeds into an instance
+/// `config.toml` (`name = "<instance>"`), filtered out of the resolved effective
+/// config so it is not presented as a settable unified key (review patch #4). It
+/// is instance identity — the row + Agent Home directory name — not user config.
+const RESERVED_IDENTITY_KEY: &str = "name";
 
 /// Filename of the adapter snapshot inside an Agent Home (story 1.3).
 ///
@@ -535,6 +572,130 @@ impl Registry {
             .unwrap_or_default())
     }
 
+    // ---- Unified layered config (story 2-1, spine AD-9, FR-11) ----
+    //
+    // Path authority for config: the engine is the SOLE reader/writer of every
+    // config layer. These `pub(crate)` methods sit behind the `Engine` facade
+    // (mirroring `set_restart_policy` / `effective_restart_policy`) and speak
+    // domain types only (AD-1/AD-2). Config stays as TOML FILES under path
+    // authority (AD-9's "TOML at every layer"); it does NOT move into SQLite
+    // (AD-6 governs registry/lifecycle/ledger state, not config).
+
+    /// The effective (resolved) config for an instance (spine AD-9, AC-A).
+    ///
+    /// Loads the four layers THROUGH PATH AUTHORITY — embedded engine defaults +
+    /// the instance's kind defaults + its Agent Home `config.toml` +
+    /// `overrides` — and folds them with the pure [`config::resolve`]. This is the
+    /// read `kt agent config get` uses. `overrides` is the ephemeral invocation
+    /// layer (empty for a plain `get`); it is threaded here so a future
+    /// `start --set k=v` (a later story) can supply it WITHOUT an API change
+    /// (Decision 8, recorded). A malformed on-disk layer surfaces a typed
+    /// [`ConfigError`] naming the layer + path (never a panic — AC8).
+    pub(crate) fn effective_config(
+        &self,
+        name: &InstanceName,
+        overrides: ConfigLayer,
+    ) -> Result<EffectiveConfig, ConfigError> {
+        // Confirm the instance exists (so `get` on a ghost is NotFound, not an
+        // empty resolve) AND capture its kind in ONE lookup — the kind selects the
+        // kind-defaults layer, so there is no second store round-trip.
+        let instance = self.require_instance(name)?;
+
+        let engine = engine_defaults_layer()?;
+        let kind = kind_defaults_layer(&instance.kind);
+        let instance_layer = self.instance_config_layer(name)?;
+        let mut effective = config::resolve([engine, kind, instance_layer, overrides]);
+        // Drop the reserved IDENTITY key (review patch #4): `materialize_home`
+        // seeds `name = "<instance>"` into the instance config.toml, but that is
+        // instance identity (already the row + the Agent Home dir name), NOT user
+        // config. Presenting it via `config get` while `config set … name …` is
+        // rejected as unknown would be incoherent — so it is not surfaced as a
+        // settable key. (It stays in the on-disk file as a human-readable marker;
+        // we only filter the RESOLVED view.)
+        effective.remove(RESERVED_IDENTITY_KEY);
+        Ok(effective)
+    }
+
+    /// Set one config key on the INSTANCE layer (spine AD-9, AC-B/AC10).
+    ///
+    /// Validates at WRITE time FIRST ([`config::validate_write`]): an unknown key
+    /// outside the `agent.*` pass-through namespace is rejected BEFORE any
+    /// persistence, so the instance `config.toml` is left byte-unchanged (the
+    /// registry's "reject before side effect" atomicity). On acceptance the key is
+    /// set into the parsed instance table (a DEEP dotted-path set, so a nested key
+    /// like `restart.policy` writes the right nested table and existing siblings
+    /// survive) and the whole instance layer is re-serialized to disk through path
+    /// authority. Pass-through (`agent.*`) keys round-trip verbatim (AC7); the
+    /// value is stored as an ordinary TOML STRING (a `secret:` value is opaque
+    /// text in 2-1 — secrets are 2-4).
+    pub(crate) fn set_config(
+        &self,
+        name: &InstanceName,
+        key: &str,
+        value: &str,
+    ) -> Result<(), ConfigError> {
+        self.require_instance(name)?;
+
+        // (1) Validate BEFORE touching disk (AC-B). A rejection returns here with
+        // nothing written.
+        config::validate_write(key, value)?;
+
+        // (2) Load the current instance layer, set the dotted key (deep), and
+        // re-serialize. All through path authority — the engine owns the path.
+        // set_dotted FAILS CLOSED on a scalar-intermediate collision (patch #3),
+        // BEFORE the write below, so a conflicting write leaves config unchanged.
+        let path = self.paths.instance_config(name);
+        let mut table = self.instance_config_layer(name)?.as_table().clone();
+        set_dotted(&mut table, key, toml::Value::String(value.to_string()))?;
+
+        let serialized =
+            toml::to_string_pretty(&table).map_err(|e| ConfigError::MalformedLayer {
+                layer: SourceLayer::Instance,
+                path: path.to_string_lossy().into_owned(),
+                detail: format!("could not serialize the updated instance config: {e}"),
+            })?;
+        std::fs::write(&path, serialized).map_err(|source| ConfigError::MalformedLayer {
+            layer: SourceLayer::Instance,
+            path: path.to_string_lossy().into_owned(),
+            detail: format!("could not write the instance config: {source}"),
+        })?;
+        Ok(())
+    }
+
+    /// Confirm an instance is registered, returning it (for its kind) — mapping
+    /// absence/read failure into a [`ConfigError`] so the config surface never
+    /// leaks a `RegistryError` across the AD-1 boundary.
+    fn require_instance(&self, name: &InstanceName) -> Result<AgentInstance, ConfigError> {
+        match self.store.get_instance(name) {
+            Ok(Some(instance)) => Ok(instance),
+            Ok(None) => Err(ConfigError::NotFound {
+                name: name.as_str().to_string(),
+            }),
+            Err(e) => Err(ConfigError::Store {
+                name: name.as_str().to_string(),
+                detail: e.to_string(),
+            }),
+        }
+    }
+
+    /// Load + parse an instance's `config.toml` (the AD-9 INSTANCE layer) through
+    /// path authority. A missing file resolves to an EMPTY layer (an instance
+    /// whose config was removed still resolves to defaults, not an error); a
+    /// present-but-malformed file surfaces [`ConfigError::MalformedLayer`] naming
+    /// the path (never a panic — AC8).
+    fn instance_config_layer(&self, name: &InstanceName) -> Result<ConfigLayer, ConfigError> {
+        let path = self.paths.instance_config(name);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => ConfigLayer::parse(SourceLayer::Instance, &path.to_string_lossy(), &text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigLayer::empty()),
+            Err(e) => Err(ConfigError::MalformedLayer {
+                layer: SourceLayer::Instance,
+                path: path.to_string_lossy().into_owned(),
+                detail: format!("could not read the instance config: {e}"),
+            }),
+        }
+    }
+
     /// The per-instance log directory inside the Agent Home (AD-12 seed).
     pub(crate) fn instance_log_dir(&self, name: &InstanceName) -> std::path::PathBuf {
         self.paths.agent_home(name).join("logs")
@@ -582,6 +743,84 @@ fn ensure_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
         path: dir.to_string_lossy().into_owned(),
         source,
     })
+}
+
+/// Parse the embedded engine-defaults TOML into the AD-9 ENGINE-DEFAULTS layer
+/// (story 2-1, Decision 1). A parse failure is an ENGINE BUG (the source is a
+/// compile-time [`ENGINE_DEFAULTS_TOML`] constant), surfaced as a typed
+/// [`ConfigError::MalformedLayer`] rather than a panic.
+fn engine_defaults_layer() -> Result<ConfigLayer, ConfigError> {
+    ConfigLayer::parse(
+        SourceLayer::EngineDefault,
+        ENGINE_DEFAULTS_LABEL,
+        ENGINE_DEFAULTS_TOML,
+    )
+}
+
+/// The AD-9 KIND-DEFAULTS layer for a `kind` (story 2-1, Decision 2, recorded).
+///
+/// `[ASSUMPTION]`: in story 2-1 NO kind ships config defaults — the adapter
+/// contract does not yet carry a config-defaults document (that is 2-2+
+/// territory, FR-12). So EVERY kind (including `mock`) resolves to an EMPTY layer,
+/// a valid "no defaults" layer and NOT an error (AC8). The `kind` is passed in
+/// (already looked up by the caller) so the seam is real — a later story maps
+/// `kind` → real per-kind defaults here WITHOUT changing `effective_config`. Pure
+/// (no I/O), so it adds no error branch.
+fn kind_defaults_layer(_kind: &str) -> ConfigLayer {
+    ConfigLayer::empty()
+}
+
+/// Set a DOTTED key (`a.b.c`) into a TOML table, creating intermediate tables as
+/// needed and preserving existing siblings (the per-leaf write that mirrors the
+/// resolver's per-leaf merge — AC-B/AC4). The leaf segment is overwritten with
+/// `value`.
+///
+/// FAILS CLOSED (review patch #3): if an intermediate segment currently holds a
+/// NON-table SCALAR value (e.g. `set X agent.a.b` after `agent.a` is a scalar),
+/// this returns [`ConfigError::WriteShapeConflict`] naming the conflicting
+/// ancestor and mutates NOTHING — accepting it would silently destroy the
+/// existing scalar. The caller runs this on an in-memory clone BEFORE writing, so
+/// the error leaves the on-disk config byte-unchanged (AC-B atomicity). This is a
+/// WRITE-time rule; the READ-time resolver still masks such collisions across
+/// layers (a strong scalar prunes a weak subtree) — but a single instance-layer
+/// write must never clobber its own existing value.
+fn set_dotted(
+    table: &mut toml::value::Table,
+    dotted_key: &str,
+    value: toml::Value,
+) -> Result<(), ConfigError> {
+    let mut segments = dotted_key.split('.').peekable();
+    let mut current = table;
+    // Track the dotted path walked so far, to name the conflicting ancestor.
+    let mut walked = String::new();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            // Leaf: overwrite (or insert) the value at this exact key.
+            current.insert(segment.to_string(), value);
+            return Ok(());
+        }
+        if walked.is_empty() {
+            walked.push_str(segment);
+        } else {
+            walked.push('.');
+            walked.push_str(segment);
+        }
+        // Intermediate: descend, creating a table node if absent.
+        let entry = current
+            .entry(segment.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        // FAIL CLOSED on a scalar intermediate — do NOT clobber it.
+        if !entry.is_table() {
+            return Err(ConfigError::WriteShapeConflict {
+                key: dotted_key.to_string(),
+                conflicting_ancestor: walked,
+            });
+        }
+        current = entry.as_table_mut().expect("just ensured a table");
+    }
+    // Unreachable: an empty key is caught by validate_write's empty-segment guard
+    // before set_dotted is called, so the leaf branch above always returns.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1288,6 +1527,401 @@ source = "self-reported"
 
         let level = reg.effective_support(&name, Capability::Pause).unwrap();
         assert_eq!(level, SupportLevel::Unsupported);
+    }
+
+    // ---- Story 2-1: unified layered config through path authority ----
+
+    #[test]
+    fn engine_defaults_layer_parses_and_is_empty_in_2_1() {
+        // Review decision #1: the embedded engine defaults parse (compile-time
+        // constant) but ship EMPTY — config no longer seeds restart.policy (the
+        // reaper owns the policy default via RestartPolicy::default, not config).
+        let layer = engine_defaults_layer().unwrap();
+        assert!(layer.is_empty(), "engine defaults must be empty in 2-1");
+        let eff = config::resolve([
+            layer,
+            ConfigLayer::empty(),
+            ConfigLayer::empty(),
+            ConfigLayer::empty(),
+        ]);
+        assert!(eff.is_empty());
+        assert_eq!(eff.value("restart.policy"), None);
+    }
+
+    #[test]
+    fn set_config_then_effective_config_reflects_it_at_the_instance_layer() {
+        // AC-A/AC10 round trip: set a known key, then the effective config shows
+        // it tagged as the INSTANCE layer (beating the engine default).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        reg.set_config(&name, "model", "gpt-4").unwrap();
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        let r = eff.get("model").unwrap();
+        assert_eq!(r.value, toml::Value::String("gpt-4".into()));
+        assert_eq!(r.source, SourceLayer::Instance);
+    }
+
+    #[test]
+    fn set_config_instance_beats_invocation_and_records_provenance() {
+        // AC-A end-to-end through the engine: set `model` at the instance layer;
+        // with NO overrides it resolves from the instance layer (tagged Instance),
+        // and an invocation override for the same key beats it (tagged
+        // InvocationOverride). (Engine + kind defaults are empty in 2-1, so
+        // instance-vs-override is the precedence pair observable via the engine;
+        // the full 4-layer precedence is covered by the pure-resolver tests.)
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        reg.set_config(&name, "model", "instance-model").unwrap();
+        let plain = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        let r = plain.get("model").unwrap();
+        assert_eq!(r.value, toml::Value::String("instance-model".into()));
+        assert_eq!(r.source, SourceLayer::Instance);
+
+        let overrides =
+            ConfigLayer::parse(SourceLayer::InvocationOverride, "<ov>", "model = \"ov\"").unwrap();
+        let overridden = reg.effective_config(&name, overrides).unwrap();
+        let r = overridden.get("model").unwrap();
+        assert_eq!(r.value, toml::Value::String("ov".into()));
+        assert_eq!(r.source, SourceLayer::InvocationOverride);
+    }
+
+    #[test]
+    fn set_config_unknown_key_is_rejected_and_config_is_byte_unchanged() {
+        // AC-B atomicity: a rejected write persists NOTHING — the on-disk
+        // config.toml is byte-identical before and after.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let path = reg.paths().instance_config(&name);
+        let before = std::fs::read(&path).unwrap();
+
+        let err = reg.set_config(&name, "notakey", "x").unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownKey { key, .. } if key == "notakey"));
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected write must leave config byte-unchanged"
+        );
+    }
+
+    #[test]
+    fn set_config_agent_pass_through_key_round_trips_verbatim() {
+        // AC7: an agent.* key writes successfully and round-trips verbatim at the
+        // instance layer (no native mapping — that is 2-2).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        reg.set_config(&name, "agent.custom_flag", "verbatim-value")
+            .unwrap();
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        let r = eff.get("agent.custom_flag").unwrap();
+        assert_eq!(r.value, toml::Value::String("verbatim-value".into()));
+        assert_eq!(r.source, SourceLayer::Instance);
+    }
+
+    #[test]
+    fn set_config_preserves_sibling_keys_deep_set() {
+        // AC4/AC-B: setting a scalar (model), then a nested agent.* key, then a
+        // SIBLING under the same nested table preserves all three — the deep dotted
+        // set does not clobber siblings, and neither does re-serialization.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        reg.set_config(&name, "model", "gpt-4").unwrap();
+        reg.set_config(&name, "agent.tools.web", "on").unwrap();
+        reg.set_config(&name, "agent.tools.shell", "off").unwrap();
+
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        assert_eq!(
+            eff.value("model"),
+            Some(&toml::Value::String("gpt-4".into()))
+        );
+        // Both nested siblings survive (deep per-leaf set).
+        assert_eq!(
+            eff.value("agent.tools.web"),
+            Some(&toml::Value::String("on".into()))
+        );
+        assert_eq!(
+            eff.value("agent.tools.shell"),
+            Some(&toml::Value::String("off".into()))
+        );
+    }
+
+    #[test]
+    fn set_config_child_under_existing_scalar_fails_closed_byte_unchanged() {
+        // Review patch #3: `set agent.a v1` then `set agent.a.b v2` would destroy
+        // the scalar `agent.a` — instead it FAILS CLOSED with WriteShapeConflict
+        // (naming the conflicting ancestor) and the on-disk config is byte-unchanged.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        reg.set_config(&name, "agent.a", "v1").unwrap();
+        let path = reg.paths().instance_config(&name);
+        let before = std::fs::read(&path).unwrap();
+
+        let err = reg.set_config(&name, "agent.a.b", "v2").unwrap_err();
+        match err {
+            ConfigError::WriteShapeConflict {
+                key,
+                conflicting_ancestor,
+            } => {
+                assert_eq!(key, "agent.a.b");
+                assert_eq!(conflicting_ancestor, "agent.a");
+            }
+            other => panic!("expected WriteShapeConflict, got {other:?}"),
+        }
+        // AC-B atomicity: nothing persisted — the scalar agent.a survives intact.
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "failed write must leave config byte-unchanged"
+        );
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        assert_eq!(
+            eff.value("agent.a"),
+            Some(&toml::Value::String("v1".into()))
+        );
+        assert_eq!(eff.value("agent.a.b"), None);
+    }
+
+    #[test]
+    fn set_config_rejects_empty_dotted_segment_byte_unchanged() {
+        // Patch #5 at the write API: an empty-segment key is rejected and nothing
+        // is persisted.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let path = reg.paths().instance_config(&name);
+        let before = std::fs::read(&path).unwrap();
+
+        let err = reg.set_config(&name, "agent..b", "v").unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownKey { key, .. } if key == "agent..b"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn effective_config_filters_the_seeded_name_identity_key() {
+        // Review patch #4: materialize_home seeds `name = "<instance>"` into
+        // config.toml; the resolved effective config must NOT surface it as a
+        // settable key (it is identity, and `config set … name …` is rejected).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        // The on-disk file still has it (a human-readable marker)...
+        let body = std::fs::read_to_string(reg.paths().instance_config(&name)).unwrap();
+        assert!(
+            body.contains("name = \"demo\""),
+            "seed still on disk: {body}"
+        );
+        // ...but the resolved view filters it out.
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        assert_eq!(eff.value("name"), None, "identity key must not be surfaced");
+        // And `config set … name …` is rejected as unknown (coherent now).
+        assert!(matches!(
+            reg.set_config(&name, "name", "renamed").unwrap_err(),
+            ConfigError::UnknownKey { .. }
+        ));
+    }
+
+    #[test]
+    fn effective_config_threads_invocation_overrides_strongest() {
+        // Decision 8 + AC-A: an invocation-override layer beats the instance
+        // layer for the same key.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        reg.set_config(&name, "model", "instance-model").unwrap();
+
+        let overrides = ConfigLayer::parse(
+            SourceLayer::InvocationOverride,
+            "<ov>",
+            "model = \"override-model\"",
+        )
+        .unwrap();
+        let eff = reg.effective_config(&name, overrides).unwrap();
+        let r = eff.get("model").unwrap();
+        assert_eq!(r.value, toml::Value::String("override-model".into()));
+        assert_eq!(r.source, SourceLayer::InvocationOverride);
+    }
+
+    #[test]
+    fn config_ops_on_unknown_instance_are_not_found() {
+        let (_tmp, reg) = open_temp();
+        let ghost = InstanceName::new("ghost").unwrap();
+        assert!(matches!(
+            reg.effective_config(&ghost, ConfigLayer::empty()).unwrap_err(),
+            ConfigError::NotFound { name } if name == "ghost"
+        ));
+        assert!(matches!(
+            reg.set_config(&ghost, "model", "x").unwrap_err(),
+            ConfigError::NotFound { name } if name == "ghost"
+        ));
+    }
+
+    #[test]
+    fn config_ops_surface_a_store_error_without_leaking_registry_error() {
+        // The require_instance Store arm: if the store read fails (table dropped),
+        // both effective_config and set_config surface ConfigError::Store naming
+        // the instance — never a RegistryError across the AD-1 boundary.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        reg.store.break_instance_reads_for_test();
+
+        assert!(matches!(
+            reg.effective_config(&name, ConfigLayer::empty()).unwrap_err(),
+            ConfigError::Store { name: n, .. } if n == "demo"
+        ));
+        assert!(matches!(
+            reg.set_config(&name, "model", "x").unwrap_err(),
+            ConfigError::Store { name: n, .. } if n == "demo"
+        ));
+    }
+
+    #[test]
+    fn instance_config_layer_read_failure_is_a_typed_error_not_panic() {
+        // instance_config_layer's non-NotFound read-failure arm: a config.toml
+        // that is a DIRECTORY makes read_to_string fail with a non-NotFound error
+        // → MalformedLayer, never a panic. This is the read arm BOTH config reads
+        // funnel through, exercised via both entry points:
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let path = reg.paths().instance_config(&name);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        // effective_config surfaces it (read at resolve time).
+        let err = reg
+            .effective_config(&name, ConfigLayer::empty())
+            .unwrap_err();
+        match err {
+            ConfigError::MalformedLayer { layer, detail, .. } => {
+                assert_eq!(layer, SourceLayer::Instance);
+                assert!(detail.contains("could not read"), "detail={detail}");
+            }
+            other => panic!("expected MalformedLayer, got {other:?}"),
+        }
+        // set_config surfaces it too (it reads the current layer before writing) —
+        // so a rejected write never blindly clobbers an unreadable config.
+        let err = reg.set_config(&name, "model", "gpt-4").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MalformedLayer { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kind_defaults_layer_is_empty_for_every_kind_in_2_1() {
+        // Decision 2: no per-kind config defaults in 2-1 — every kind resolves to
+        // an EMPTY layer (a valid "no defaults", not an error).
+        assert!(kind_defaults_layer("mock").is_empty());
+        assert!(kind_defaults_layer("anything-else").is_empty());
+    }
+
+    #[test]
+    fn effective_config_reports_malformed_instance_layer_without_panic() {
+        // AC8: a present-but-malformed config.toml surfaces MalformedLayer naming
+        // the instance layer + path, never a panic.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let path = reg.paths().instance_config(&name);
+        std::fs::write(&path, "this is = = not valid toml").unwrap();
+
+        let err = reg
+            .effective_config(&name, ConfigLayer::empty())
+            .unwrap_err();
+        match err {
+            ConfigError::MalformedLayer { layer, path: p, .. } => {
+                assert_eq!(layer, SourceLayer::Instance);
+                assert!(p.ends_with("config.toml"), "path={p}");
+            }
+            other => panic!("expected MalformedLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_config_missing_instance_file_resolves_without_error() {
+        // A registered instance whose config.toml was removed still RESOLVES
+        // (the instance layer is treated as empty) rather than erroring. With the
+        // engine + kind defaults both empty in 2-1 and no instance file, the
+        // effective config is empty — but the read succeeds (no panic, no error).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        std::fs::remove_file(reg.paths().instance_config(&name)).unwrap();
+
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        assert!(eff.is_empty());
+        // A later-set key still resolves after the file is recreated by set_config.
+        reg.set_config(&name, "model", "gpt-4").unwrap();
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        assert_eq!(
+            eff.value("model"),
+            Some(&toml::Value::String("gpt-4".into()))
+        );
+    }
+
+    #[test]
+    fn set_dotted_creates_nested_tables_and_preserves_siblings() {
+        // Unit-test the deep dotted set helper directly: a.b then a.c coexist;
+        // setting a.b again overwrites only a.b. Each set returns Ok.
+        let mut t = toml::value::Table::new();
+        set_dotted(&mut t, "a.b", toml::Value::Integer(1)).unwrap();
+        set_dotted(&mut t, "a.c", toml::Value::Integer(2)).unwrap();
+        set_dotted(&mut t, "a.b", toml::Value::Integer(9)).unwrap();
+        let a = t.get("a").unwrap().as_table().unwrap();
+        assert_eq!(a.get("b"), Some(&toml::Value::Integer(9)));
+        assert_eq!(a.get("c"), Some(&toml::Value::Integer(2)));
+        // Overwriting a leaf with another leaf at the same key is fine.
+        set_dotted(&mut t, "a.b", toml::Value::String("s".into())).unwrap();
+        assert_eq!(
+            t.get("a").unwrap().as_table().unwrap().get("b"),
+            Some(&toml::Value::String("s".into()))
+        );
+    }
+
+    #[test]
+    fn set_dotted_fails_closed_on_scalar_intermediate_and_mutates_nothing() {
+        // Review patch #3: nesting a child under an existing scalar returns
+        // WriteShapeConflict (naming the conflicting ancestor) and mutates the
+        // table NOT AT ALL — the scalar survives.
+        let mut t = toml::value::Table::new();
+        set_dotted(&mut t, "x", toml::Value::Integer(5)).unwrap();
+        let err = set_dotted(&mut t, "x.y", toml::Value::Integer(6)).unwrap_err();
+        match err {
+            ConfigError::WriteShapeConflict {
+                key,
+                conflicting_ancestor,
+            } => {
+                assert_eq!(key, "x.y");
+                assert_eq!(conflicting_ancestor, "x");
+            }
+            other => panic!("expected WriteShapeConflict, got {other:?}"),
+        }
+        // The scalar `x` is untouched (fail-closed, no partial mutation).
+        assert_eq!(t.get("x"), Some(&toml::Value::Integer(5)));
+
+        // A DEEPER conflict names the deepest scalar ancestor walked: a.b is a
+        // scalar; setting a.b.c.d conflicts at a.b.
+        let mut t2 = toml::value::Table::new();
+        set_dotted(&mut t2, "a.b", toml::Value::Integer(1)).unwrap();
+        let err = set_dotted(&mut t2, "a.b.c.d", toml::Value::Integer(2)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::WriteShapeConflict { conflicting_ancestor, .. }
+                if conflicting_ancestor == "a.b"
+        ));
     }
 
     #[test]

@@ -33,8 +33,9 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    AgentInstance, EngineError, FleetEntry, InstanceName, LifecycleState, Registry, RegistryError,
-    RemoveDisposition, RestartPolicy, Supervisor, TransitionCause, TransitionEvent,
+    AgentInstance, ConfigError, ConfigLayer, EffectiveConfig, EngineError, FleetEntry,
+    InstanceName, LifecycleState, Registry, RegistryError, RemoveDisposition, RestartPolicy,
+    Supervisor, TransitionCause, TransitionEvent,
 };
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
@@ -623,6 +624,66 @@ impl Engine {
         .await
     }
 
+    /// The effective (resolved) unified config for an instance (story 2-1,
+    /// spine AD-9, AC-A / AC10). This is the read `kt agent config get` uses.
+    ///
+    /// Loads the four layers through path authority and folds them with the pure
+    /// resolver (engine defaults < kind defaults < instance `config.toml` <
+    /// invocation overrides), returning the [`EffectiveConfig`] (values + per-key
+    /// [`SourceLayer`](crate::domain::SourceLayer) provenance — the 2-3 seam; 2-1
+    /// renders values only). `overrides` is the ephemeral invocation layer,
+    /// EMPTY for a plain `get`; it is a parameter now so a future `start --set
+    /// k=v` threads it without an API change (Decision 8). Runs on the blocking
+    /// pool like the other reads. An invalid name / missing instance / malformed
+    /// layer surfaces a typed [`ConfigError`] (never a panic).
+    pub async fn effective_config(
+        &self,
+        name: &str,
+        overrides: ConfigLayer,
+    ) -> Result<EffectiveConfig, ConfigError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let iname = InstanceName::new(&name).map_err(|reason| ConfigError::InvalidName {
+                name: name.clone(),
+                reason: reason.to_string(),
+            })?;
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .effective_config(&iname, overrides)
+        })
+        .await
+    }
+
+    /// Set one unified-config key on an instance's INSTANCE layer (story 2-1,
+    /// spine AD-9, AC-B / AC10). This is the write `kt agent config set` uses.
+    ///
+    /// Validates at WRITE time first (an unknown key outside the `agent.*`
+    /// pass-through namespace is rejected with the nearest key suggested), THEN
+    /// persists to the Agent Home `config.toml` through path authority. A rejected
+    /// write persists NOTHING (the instance config is byte-unchanged — AC-B). Runs
+    /// on the blocking pool like the other mutations.
+    pub async fn set_config(&self, name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        let key = key.to_string();
+        let value = value.to_string();
+        self.run_blocking(move || {
+            let iname = InstanceName::new(&name).map_err(|reason| ConfigError::InvalidName {
+                name: name.clone(),
+                reason: reason.to_string(),
+            })?;
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .set_config(&iname, &key, &value)
+        })
+        .await
+    }
+
     /// Read the recorded transition events for an instance from its log (AC1
     /// "each transition emits an event"; AC3 escalation recorded). Test/embedding
     /// observation helper — this is the AD-14 seed, NOT the 7-2 subscription bus.
@@ -748,6 +809,26 @@ impl Blocking<'_> {
             .rt
             .block_on(self.engine.set_restart_policy(name, policy))
     }
+
+    /// Blocking [`Engine::effective_config`] (story 2-1, AC-A/AC10). The read
+    /// `kt agent config get` uses.
+    pub fn effective_config(
+        &self,
+        name: &str,
+        overrides: ConfigLayer,
+    ) -> Result<EffectiveConfig, ConfigError> {
+        self.engine
+            .rt
+            .block_on(self.engine.effective_config(name, overrides))
+    }
+
+    /// Blocking [`Engine::set_config`] (story 2-1, AC-B/AC10). The write
+    /// `kt agent config set` uses.
+    pub fn set_config(&self, name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_config(name, key, value))
+    }
 }
 
 #[cfg(test)]
@@ -755,6 +836,38 @@ mod tests {
     use super::*;
     use crate::domain::NameError;
     use crate::ports::StoreError;
+
+    #[test]
+    fn config_facade_round_trip_and_invalid_name_arms() {
+        // Story 2-1: cover the engine config facade end-to-end through the
+        // blocking wrapper — a set/get round trip plus the InvalidName arm on both
+        // methods (a malformed name is rejected as ConfigError::InvalidName before
+        // any layer is touched).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+
+        // Round trip through the facade: set then effective_config reflects it.
+        facade.set_config("demo", "model", "gpt-4").unwrap();
+        let eff = facade
+            .effective_config("demo", ConfigLayer::empty())
+            .unwrap();
+        assert_eq!(eff.value_display("model").as_deref(), Some("gpt-4"));
+
+        // InvalidName arm on effective_config (a space is an illegal name char).
+        assert!(matches!(
+            facade
+                .effective_config("Bad Name", ConfigLayer::empty())
+                .unwrap_err(),
+            ConfigError::InvalidName { name, .. } if name == "Bad Name"
+        ));
+        // InvalidName arm on set_config.
+        assert!(matches!(
+            facade.set_config("Bad Name", "model", "x").unwrap_err(),
+            ConfigError::InvalidName { name, .. } if name == "Bad Name"
+        ));
+    }
 
     #[test]
     fn stop_error_to_registry_maps_each_arm() {

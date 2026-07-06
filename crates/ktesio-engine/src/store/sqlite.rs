@@ -159,6 +159,19 @@ impl SqliteStore {
             )
             .expect("install delete-blocking trigger");
     }
+
+    /// Test-only fault injection: DROP the `agent_instances` table so every
+    /// subsequent read/write of it fails with a SQL error. Used to exercise the
+    /// config surface's store-error arms (`require_instance`'s
+    /// [`StoreError`]-mapping branch) deterministically, without a mock store —
+    /// mirrors [`SqliteStore::break_deletes_for_test`]. Irreversible for the
+    /// connection; call it last in a test.
+    #[cfg(test)]
+    pub(crate) fn break_instance_reads_for_test(&self) {
+        self.conn
+            .execute_batch("DROP TABLE agent_instances")
+            .expect("drop agent_instances for test");
+    }
 }
 
 /// Run any outstanding migrations to bring the DB to [`SCHEMA_VERSION`].

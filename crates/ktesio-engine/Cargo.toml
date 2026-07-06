@@ -26,9 +26,16 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 # Persist the effective per-OS Capability Declaration snapshot as a JSON file in
 # the Agent Home (AD-6: structured artifacts are files in the home, DB stays
-# lean). JSON (not TOML) so the engine does not depend on `toml` — that crate is
-# owned by ktesio-adapter-api alone (AD-3).
+# lean). JSON (not TOML) so the adapter SNAPSHOT does not depend on `toml`.
 serde_json = { workspace = true }
+# Parse + serialize the layered unified-config TOML (AD-9: "TOML at every
+# layer"), story 2-1. APPROVED additive runtime dep: the workspace already pins
+# `toml = "1"`; historically only `ktesio-adapter-api` consumed it (AD-3, which
+# governs the adapter-MANIFEST schema). Config keys are a DIFFERENT concern from
+# the manifest schema, so parsing config TOML here does not violate AD-3 — the
+# engine defines no manifest schema. It is a normal external edge (not an
+# internal ktesio-* crate), so the AD-2 boundary gate is unaffected.
+toml = { workspace = true }
 # Async supervision core (AD-13). The engine owns the tokio runtime; the
 # blocking() facade drives it for kt. Not a ktesio-* crate, so it is fine on the
 # AD-2 boundary gate (a normal edge, but not an internal one).

@@ -136,7 +136,13 @@ Details:
   one instance's effective capabilities and runtime status. Both list and show
   accept --json for a machine-readable document (budget/cap and Usage Ledger
   columns are honest Epic-3 seeds until metering lands: '—' in the table, null in
-  JSON). Removing a running instance requires --force.
+  JSON). config set writes a key to the Agent Instance layer (validated at write
+  time — an unknown key outside the agent.* pass-through namespace is rejected
+  with the nearest valid key suggested, and nothing is persisted); config get
+  prints the effective (resolved) config, where a key set at the instance layer
+  overrides the same key at the kind/engine-default layer, every time (FR-11).
+  Per-value source layers are Epic 2.3, not shown here. Removing a running
+  instance requires --force.
 
 Examples:
   kt agent register demo --kind mock
@@ -148,6 +154,9 @@ Examples:
   kt agent show demo
   kt agent list
   kt agent list --json
+  kt agent config set demo model gpt-4
+  kt agent config get demo
+  kt agent config get demo model
   kt agent remove demo --delete";
 
 #[derive(Parser)]
@@ -370,6 +379,31 @@ enum AgentCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Get or set an Agent Instance's unified config (layered, FR-11)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set a config key on the Agent Instance layer (validated at write time)
+    Set {
+        /// Name of the Agent Instance
+        name: String,
+        /// Config key (a known unified key, or an `agent.*` pass-through key)
+        key: String,
+        /// Value to set (stored verbatim; `secret:` values are opaque in Epic 2.1)
+        value: String,
+    },
+    /// Get an Agent Instance's effective (resolved) config value(s)
+    Get {
+        /// Name of the Agent Instance
+        name: String,
+        /// Optional config key; omitted prints the whole effective config
+        key: Option<String>,
+    },
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -461,6 +495,12 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Resume { name } => cli::agent::resume(&name),
             AgentCommands::List { json } => cli::agent::list(json),
             AgentCommands::Show { name, json } => cli::agent::show(&name, json),
+            AgentCommands::Config { command } => match command {
+                ConfigCommands::Set { name, key, value } => {
+                    cli::agent::config_set(&name, &key, &value)
+                }
+                ConfigCommands::Get { name, key } => cli::agent::config_get(&name, key.as_deref()),
+            },
         },
         None => {
             Cli::command().print_help()?;
@@ -514,6 +554,25 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "resume"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
+    }
+
+    #[test]
+    fn test_agent_config_parse() {
+        // Story 2-1: `config set <name> <key> <value>` and
+        // `config get <name> [key]` parse (a nested subcommand).
+        assert!(
+            Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model", "gpt-4"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model"]).is_ok());
+        // set requires all three positional args.
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model"]).is_err());
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo"]).is_err());
+        // get requires at least a name.
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get"]).is_err());
+        // config requires a subcommand.
+        assert!(Cli::try_parse_from(["kt", "agent", "config"]).is_err());
     }
 
     #[test]

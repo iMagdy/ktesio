@@ -1419,3 +1419,282 @@ fn human_show_surfaces_the_metering_seed_rows() {
         run.stderr
     );
 }
+
+// ---- Story 2-1: `kt agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
+
+#[test]
+fn config_set_then_get_shows_the_value_on_stdout() {
+    // AC10/AC-A end-to-end: set a known key, then `config get <name> <key>`
+    // prints the effective value to stdout (bare, no quotes) and exits 0.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let set = run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(set.success, "set should exit 0; stderr={}", set.stderr);
+    assert!(set.stdout.contains("Set"), "stdout={}", set.stdout);
+
+    // Single-key get: the bare value on stdout.
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "model"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "gpt-4"),
+        "stdout should print the bare value; stdout={}",
+        get.stdout
+    );
+
+    // Whole-config get: a Key/Value table on stdout, provenance note on stderr.
+    let get_all = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get_all.success,
+        "get-all should exit 0; stderr={}",
+        get_all.stderr
+    );
+    assert!(
+        get_all.stdout.contains("model"),
+        "stdout should list the key; stdout={}",
+        get_all.stdout
+    );
+    // AC11/AD-12: the source-layer note is on STDERR (Epic 2.3), never stdout.
+    assert!(
+        get_all.stderr.contains("Epic 2.3"),
+        "stderr should carry the provenance note; stderr={}",
+        get_all.stderr
+    );
+    assert!(
+        !get_all.stdout.contains("Epic 2.3"),
+        "stdout must stay clean of the note; stdout={}",
+        get_all.stdout
+    );
+}
+
+#[test]
+fn config_get_effective_is_empty_before_any_set() {
+    // AC-C / review decision #1: engine + kind defaults ship EMPTY in 2-1, so
+    // before any `set` the effective config has no keys — `config get` exits 0
+    // and prints the "no config keys set" info line (never a fabricated default).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    assert!(
+        get.stdout.contains("no config keys set"),
+        "empty effective config should say so; stdout={}",
+        get.stdout
+    );
+    // The seeded identity key `name` is NOT surfaced (patch #4).
+    assert!(
+        !get.stdout.contains("name"),
+        "identity key must not appear; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_set_instance_value_is_read_back() {
+    // AC-A/AC10: a key set at the INSTANCE layer is read back by `config get`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "claude-opus"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "model"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "claude-opus"),
+        "instance value should read back; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_set_child_under_scalar_fails_closed() {
+    // Review patch #3 end-to-end: nesting a child under an existing scalar is
+    // rejected (non-zero exit) naming the conflict; nothing persisted.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.a", "v1"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let config_path = state_dir.join("agents").join("demo").join("config.toml");
+    let before = std::fs::read(&config_path).unwrap();
+
+    let run = run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.a.b", "v2"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "shape conflict must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("agent.a"),
+        "stderr should name the conflicting ancestor; stderr={}",
+        run.stderr
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        before,
+        "failed write must leave config byte-unchanged"
+    );
+}
+
+#[test]
+fn config_set_unknown_key_is_rejected_with_suggestion_and_config_unchanged() {
+    // AC-B: an unknown key outside `agent.*` is rejected (non-zero exit), the
+    // suggestion is on stderr, and the on-disk config.toml is byte-unchanged.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let config_path = state_dir.join("agents").join("demo").join("config.toml");
+    let before = std::fs::read(&config_path).expect("read config before");
+
+    // `modle` is a near-miss for the known key `model`.
+    let run = run_kt_agent(
+        &["agent", "config", "set", "demo", "modle", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "unknown key must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("modle"),
+        "stderr should name the offending key; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("model"),
+        "stderr should suggest the nearest key; stderr={}",
+        run.stderr
+    );
+
+    // AC-B atomicity: nothing persisted — config byte-unchanged.
+    let after = std::fs::read(&config_path).expect("read config after");
+    assert_eq!(before, after, "rejected write must not touch config.toml");
+}
+
+#[test]
+fn config_set_agent_pass_through_key_round_trips_verbatim() {
+    // AC7: an `agent.*` key writes successfully and round-trips verbatim.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let set = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "agent.custom_flag",
+            "verbatim-value",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "agent.* set should exit 0; stderr={}",
+        set.stderr
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "agent.custom_flag"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "verbatim-value"),
+        "pass-through key must round-trip verbatim; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_get_unknown_instance_exits_nonzero() {
+    // A `get` on an unregistered instance is the uniform not-found diagnostic on
+    // stderr with a non-zero exit.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "config", "get", "ghost"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "get on a ghost must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("ghost"),
+        "stderr should name the missing instance; stderr={}",
+        run.stderr
+    );
+}

@@ -9,6 +9,7 @@
 //! seed), and the [`Supervisor`] that drives start/stop through the process
 //! backend. Budgets and config resolution arrive with their stories.
 
+mod config;
 mod error;
 mod event;
 mod fleet;
@@ -20,6 +21,10 @@ mod restart;
 mod supervisor;
 mod transition;
 
+pub use config::{
+    resolve, ConfigError, ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer,
+    PASS_THROUGH_PREFIX,
+};
 pub use error::{EngineError, RegistryError};
 pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION};
 pub use fleet::{FleetEntry, FleetListing, MeteringSeed};
