@@ -1217,3 +1217,178 @@ source = "self-reported"
     // Teardown: stop it so the process does not linger.
     run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
 }
+
+#[test]
+fn list_json_emits_a_parseable_document_with_null_metering_seeds() {
+    // Story 1-7 (Task 5, AC5/AC9): `kt agent list --json` writes ONE parseable
+    // JSON document to stdout (and NOTHING non-JSON there), carrying a top-level
+    // schema_version + per-instance objects whose budget/usage are the honest
+    // JSON `null` seed (never 0, never fabricated). The Epic-3 note is on stderr.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "alpha", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        run.success,
+        "list --json should exit 0; stderr={}",
+        run.stderr
+    );
+
+    // stdout is PURE JSON and re-parses (nothing else on stdout, AC9/AD-12).
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let instances = doc["instances"].as_array().expect("instances array");
+    assert_eq!(instances.len(), 1);
+    let entry = &instances[0];
+    assert_eq!(entry["name"], serde_json::json!("alpha"));
+    assert_eq!(entry["kind"], serde_json::json!("mock"));
+    assert_eq!(entry["state"], serde_json::json!("registered"));
+    assert_eq!(entry["restart_count"], serde_json::json!(0));
+    // The honest Epic-1 metering seed: JSON null, NOT 0, NOT a fabricated number.
+    assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
+    assert_eq!(entry["usage"], serde_json::Value::Null, "{entry}");
+    assert_ne!(entry["budget"], serde_json::json!(0));
+    assert!(entry.get("agent_home").is_some());
+
+    // The Epic-3 metering note rides on stderr (never stdout), so stdout stays
+    // valid JSON. stdout must NOT contain the note text.
+    assert!(
+        run.stderr.contains("metering in Epic 3"),
+        "the Epic-3 note must be on stderr; stderr={}",
+        run.stderr
+    );
+    assert!(
+        !run.stdout.contains("Epic 3"),
+        "stdout must be pure JSON (no note); stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn list_json_on_empty_fleet_is_a_valid_empty_document() {
+    // AC9: an empty Fleet with --json is still valid JSON — an empty `instances`
+    // array — and the "no instances" guidance goes to STDERR so stdout parses.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        run.success,
+        "empty list --json should exit 0; stderr={}",
+        run.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
+    assert_eq!(doc["instances"], serde_json::json!([]), "{doc}");
+    assert_eq!(doc["schema_version"], serde_json::json!(1));
+    // The "no instances" guidance is on stderr (so stdout is pure JSON).
+    assert!(
+        run.stderr.contains("No Agent Instances"),
+        "empty --json guidance must be on stderr; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn human_list_shows_the_honest_metering_seed_columns() {
+    // Story 1-7 (Task 5, AC4): the human `list` renders Budget/cap + Usage columns
+    // as the honest `—` seed (never a number), and the Epic-3 note is on stderr.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "alpha", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(run.success, "list should exit 0; stderr={}", run.stderr);
+    // The new columns are present (headers) and render the `—` seed (stdout).
+    assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
+    assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
+    assert!(
+        run.stdout.contains('—'),
+        "the metering seed cell must render the em dash; stdout={}",
+        run.stdout
+    );
+    // The Epic-3 note is on stderr (AD-12), never stdout.
+    assert!(
+        run.stderr.contains("metering in Epic 3"),
+        "stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn show_json_surfaces_the_same_entry_shape_with_null_seeds() {
+    // Story 1-7 (Task 5, AC5): `kt agent show <name> --json` writes ONE JSON
+    // document to stdout: { schema_version, instance: <the same FleetEntry
+    // shape> }, budget/usage the honest null seed. The Epic-3 note is on stderr.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "alpha", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(
+        &["agent", "show", "alpha", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        run.success,
+        "show --json should exit 0; stderr={}",
+        run.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let entry = &doc["instance"];
+    assert_eq!(entry["name"], serde_json::json!("alpha"));
+    assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
+    assert_eq!(entry["usage"], serde_json::Value::Null, "{entry}");
+    // stdout is pure JSON; the note is on stderr.
+    assert!(!run.stdout.contains("Epic 3"), "stdout={}", run.stdout);
+    assert!(
+        run.stderr.contains("metering in Epic 3"),
+        "stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn human_show_surfaces_the_metering_seed_rows() {
+    // Story 1-7 (Task 5, AC4): human `show` adds Budget/cap + Usage seed rows
+    // (rendered `—`) to the runtime-status block, with the Epic-3 note on stderr.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "alpha", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(&["agent", "show", "alpha"], &ctx.project_dir, state_dir);
+    assert!(run.success, "show should exit 0; stderr={}", run.stderr);
+    assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
+    assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
+    assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
+    assert!(
+        run.stderr.contains("metering in Epic 3"),
+        "stderr={}",
+        run.stderr
+    );
+}

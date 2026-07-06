@@ -11,6 +11,7 @@
 
 mod error;
 mod event;
+mod fleet;
 mod instance;
 mod lifecycle;
 mod name;
@@ -20,7 +21,8 @@ mod supervisor;
 mod transition;
 
 pub use error::{EngineError, RegistryError};
-pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION};
+pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION};
+pub use fleet::{FleetEntry, FleetListing, MeteringSeed};
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};

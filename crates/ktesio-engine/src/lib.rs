@@ -64,9 +64,10 @@ mod time;
 // collaborators + tests but is no longer what `kt` uses directly.
 pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
-    AgentInstance, EngineError, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
-    NameError, Registry, RegistryError, RemoveDisposition, RestartPolicy, TransitionCause,
-    TransitionEvent,
+    AgentInstance, EngineError, FleetEntry, FleetListing, InstanceName, LifecycleCommand,
+    LifecycleError, LifecycleState, MeteringSeed, NameError, Registry, RegistryError,
+    RemoveDisposition, RestartPolicy, TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION,
+    FLEET_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, InstanceStatus};
 

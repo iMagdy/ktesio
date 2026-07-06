@@ -133,8 +133,10 @@ Details:
   qualifier note, and an unsupported pause fails fast quoting the Capability
   Declaration. remove deletes the registry entry and, with --delete, the Agent
   Home too (--retain, the default, keeps it); list shows the Fleet; show renders
-  one instance's effective capabilities. Removing a running instance requires
-  --force.
+  one instance's effective capabilities and runtime status. Both list and show
+  accept --json for a machine-readable document (budget/cap and Usage Ledger
+  columns are honest Epic-3 seeds until metering lands: '—' in the table, null in
+  JSON). Removing a running instance requires --force.
 
 Examples:
   kt agent register demo --kind mock
@@ -145,6 +147,7 @@ Examples:
   kt agent stop my-agent --timeout 10
   kt agent show demo
   kt agent list
+  kt agent list --json
   kt agent remove demo --delete";
 
 #[derive(Parser)]
@@ -354,11 +357,18 @@ enum AgentCommands {
         name: String,
     },
     /// List every Agent Instance in the Fleet
-    List,
+    List {
+        /// Emit the Fleet as a machine-readable JSON document (FR-4 / AD-14)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show an Agent Instance's effective per-OS Capability Declaration
     Show {
         /// Name of the Agent Instance to inspect
         name: String,
+        /// Emit the instance's runtime status as a machine-readable JSON document
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -449,8 +459,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),
-            AgentCommands::List => cli::agent::list(),
-            AgentCommands::Show { name } => cli::agent::show(&name),
+            AgentCommands::List { json } => cli::agent::list(json),
+            AgentCommands::Show { name, json } => cli::agent::show(&name, json),
         },
         None => {
             Cli::command().print_help()?;
@@ -516,6 +526,18 @@ mod tests {
         assert!(Cli::try_parse_from(["kt", "agent", "start"]).is_err());
         // --timeout must be a number.
         assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc", "--timeout", "abc"]).is_err());
+    }
+
+    #[test]
+    fn test_agent_list_and_show_accept_json_flag() {
+        // Story 1-7: `--json` is ADDED to the Agent `list`/`show` subcommands
+        // (they took none before). Bare forms and the `--json` forms both parse.
+        assert!(Cli::try_parse_from(["kt", "agent", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "show", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "show", "svc", "--json"]).is_ok());
+        // `show --json` still requires a name.
+        assert!(Cli::try_parse_from(["kt", "agent", "show", "--json"]).is_err());
     }
 
     #[test]

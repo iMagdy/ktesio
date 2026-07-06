@@ -33,7 +33,7 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    AgentInstance, EngineError, InstanceName, LifecycleState, Registry, RegistryError,
+    AgentInstance, EngineError, FleetEntry, InstanceName, LifecycleState, Registry, RegistryError,
     RemoveDisposition, RestartPolicy, Supervisor, TransitionCause, TransitionEvent,
 };
 
@@ -297,6 +297,81 @@ impl Engine {
         .await
     }
 
+    /// The whole Fleet as serializable [`FleetEntry`] rows (story 1-7, FR-4 /
+    /// AD-14). This is the read `kt agent list [--json]` uses.
+    ///
+    /// Composes the existing reads in ONE blocking pass: [`Registry::list`]
+    /// (ordered by name) plus, per instance, the same runtime status
+    /// ([`Engine::instance_status`]) the CLI already surfaces — the restart
+    /// count/policy + (for a `failed` instance) the last-known cause — plus the
+    /// honest Epic-1 metering seed (`budget`/`usage` = `None`; metering is Epic
+    /// 3). Reading live persisted state on every call is what makes the listing
+    /// ≤2s fresh (AC6): there is no cache, so any committed transition is
+    /// reflected on the next `fleet()` (a single DB read, far under 2s).
+    ///
+    /// A per-instance status read-back failure DEGRADES that entry's runtime
+    /// fields (count `0`, policy default, no cause) rather than failing the whole
+    /// Fleet — mirroring the 1-6 `list` fallback — so one bad row never hides the
+    /// rest. The top-level `list` read is the only hard failure.
+    pub async fn fleet(&self) -> Result<Vec<FleetEntry>, RegistryError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let instances = registry.list()?;
+            let entries = instances
+                .into_iter()
+                .map(|instance| Self::fleet_entry_for(&registry, instance))
+                .collect();
+            Ok(entries)
+        })
+        .await
+    }
+
+    /// Build a [`FleetEntry`] from an already-listed instance by reading its
+    /// runtime status through the SAME registry lock (one read pass, no
+    /// re-entrancy). A status read-back failure degrades the runtime fields to
+    /// their defaults rather than failing the whole Fleet (the 1-6 `list`
+    /// fallback). `budget`/`usage` are the honest Epic-1 `None` seed (Epic 3).
+    fn fleet_entry_for(registry: &Registry, instance: AgentInstance) -> FleetEntry {
+        // Read the write-ahead spawn record for the restart count/policy + cause,
+        // exactly as `instance_status` does. A missing record → defaults (count 0,
+        // policy default) — this is the normal case for a never-started instance.
+        let record = registry.spawn_record(&instance.name).ok().flatten();
+        let restart_policy = record
+            .as_ref()
+            .map(|r| r.restart_policy)
+            .unwrap_or_default();
+        let restart_count = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
+        let failed_cause = record.and_then(|r| r.last_known_cause).or_else(|| {
+            // No record cause. For a `failed` instance, fall back to the last
+            // event-log cause (a launch-error / cleared-terminal crash) — the same
+            // fallback `instance_status` uses (AC9).
+            if instance.state != LifecycleState::Failed {
+                return None;
+            }
+            let events =
+                Supervisor::read_events(registry, instance.name.as_str()).unwrap_or_default();
+            events
+                .iter()
+                .rev()
+                .find(|e| e.new_state == LifecycleState::Failed)
+                .and_then(|e| failed_cause_detail(&e.cause))
+        });
+        FleetEntry {
+            name: instance.name,
+            kind: instance.kind,
+            state: instance.state,
+            restart_count,
+            restart_policy,
+            failed_cause,
+            // The honest Epic-1 metering seed: metering is Epic 3 (AD-7), so these
+            // are always `None` (JSON `null`), never `0` and never fabricated.
+            budget: None,
+            usage: None,
+            agent_home: instance.agent_home,
+        }
+    }
+
     /// The effective (current-OS) Capability Declaration for a registered
     /// instance (AC1 "visible for the instance"). `kt agent show` renders this.
     pub async fn effective_capabilities(
@@ -538,6 +613,12 @@ impl Blocking<'_> {
     /// Blocking [`Engine::list`].
     pub fn list(&self) -> Result<Vec<AgentInstance>, RegistryError> {
         self.engine.rt.block_on(self.engine.list())
+    }
+
+    /// Blocking [`Engine::fleet`] (story 1-7, FR-4). The Fleet as serializable
+    /// [`FleetEntry`] rows — what `kt agent list [--json]` renders.
+    pub fn fleet(&self) -> Result<Vec<FleetEntry>, RegistryError> {
+        self.engine.rt.block_on(self.engine.fleet())
     }
 
     /// Blocking [`Engine::effective_capabilities`].

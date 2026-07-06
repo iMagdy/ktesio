@@ -39,6 +39,23 @@ use super::lifecycle::LifecycleState;
 /// incompatible restructure) would bump the version.
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
+/// The schema version stamped on the `kt --json` Fleet document (story 1-7,
+/// AD-14).
+///
+/// AD-14 requires `kt --json` and the (future 7-2) Host event stream to be ONE
+/// contract, so the Fleet document is a versioned serde struct just like
+/// [`TransitionEvent`]. This starts at the SAME value as [`EVENT_SCHEMA_VERSION`]
+/// so the two versioning stories begin aligned; it is a SEPARATE constant so the
+/// Fleet document can evolve independently of the event schema (a change to one
+/// shape must not force a version bump on the other). It rides on the
+/// [`crate::FleetListing`] wrapper (for `list`) and each `show --json` object.
+///
+/// Bumped only on an INCOMPATIBLE change to the Fleet document shape. Adding a
+/// field (e.g. populating the Epic-3 `budget`/`usage` from `null` to a real
+/// type) is backward-ADDITIVE and does NOT bump the version — a new reader
+/// parses every old document and no field is renamed or removed.
+pub const FLEET_SCHEMA_VERSION: u32 = 1;
+
 /// Why a lifecycle transition happened (the transition event's `cause`).
 ///
 /// A small closed vocabulary so consumers (log readers, 7-2, `--json`) can match

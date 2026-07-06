@@ -680,6 +680,19 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1, "foreign_keys should be ON");
+        // AD-6 / story-1.7 AC-C durability substrate: WAL + synchronous=NORMAL is
+        // what bounds the crash loss window to ≤1s (one committed transaction per
+        // state mutation). synchronous=NORMAL reports as 1. Epic 1 persists
+        // lifecycle state per-event, so the loss window already holds; the same
+        // bound governs the Usage Ledger once Epic 3 adds `usage_events`.
+        let sync: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sync, 1,
+            "synchronous should be NORMAL (=1) for the ≤1s bound"
+        );
     }
 
     #[test]

@@ -15,9 +15,10 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, Capability, EffectiveCapabilities, Engine, EngineError, RegistryError,
-    RemoveDisposition, SupportLevel,
+    AdapterRef, Capability, EffectiveCapabilities, Engine, EngineError, FleetEntry, FleetListing,
+    RegistryError, RemoveDisposition, SupportLevel, FLEET_SCHEMA_VERSION,
 };
+use serde::Serialize;
 
 use crate::error::{
     AgentCapabilityUnsupported, AgentDuplicateName, AgentInvalidName, AgentInvalidTransition,
@@ -148,31 +149,116 @@ pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::err
     }
 }
 
-/// `kt agent show <name>` — render an instance's effective Capability
+/// The `kt agent show <name> --json` document (story 1-7, AD-14).
+///
+/// A versioned wrapper carrying the SAME [`FLEET_SCHEMA_VERSION`] as the
+/// `list --json` [`FleetListing`] (so `kt --json` speaks ONE schema, AD-14) plus
+/// the single instance's [`FleetEntry`]. Presentation-only — the engine owns the
+/// domain types; this wraps one entry with the shared schema version for the
+/// `show` surface.
+#[derive(Serialize)]
+struct ShowDocument {
+    /// The Fleet document schema version ([`FLEET_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// The single instance's Fleet entry (runtime fields + honest metering seed).
+    instance: FleetEntry,
+}
+
+impl ShowDocument {
+    /// Wrap one [`FleetEntry`], stamping the current [`FLEET_SCHEMA_VERSION`].
+    fn new(instance: FleetEntry) -> Self {
+        Self {
+            schema_version: FLEET_SCHEMA_VERSION,
+            instance,
+        }
+    }
+}
+
+/// Serialize the Fleet entries into the pretty `list --json` document (a
+/// versioned [`FleetListing`]). Pure (no engine, no I/O) so it is unit-testable
+/// in-process; the CLI just prints the returned string to stdout. A serialize
+/// failure (not reachable for these plain serde structs) becomes an [`AgentIo`]
+/// diagnostic rather than a panic.
+fn fleet_json(entries: Vec<FleetEntry>) -> Result<String, Box<dyn std::error::Error>> {
+    let listing = FleetListing::new(entries);
+    serde_json::to_string_pretty(&listing).map_err(|e| serialize_error("Fleet", e))
+}
+
+/// Serialize one entry into the pretty `show --json` document (a versioned
+/// [`ShowDocument`]). Pure, for the same reason as [`fleet_json`].
+fn show_json(entry: FleetEntry) -> Result<String, Box<dyn std::error::Error>> {
+    let document = ShowDocument::new(entry);
+    serde_json::to_string_pretty(&document).map_err(|e| serialize_error("instance", e))
+}
+
+/// Wrap a `serde_json` serialization failure into an [`AgentIo`] diagnostic. Not
+/// reachable for the plain serde structs `--json` emits (serialization of a
+/// derive-only struct cannot fail), so this is defense-in-depth, never a panic.
+fn serialize_error(what: &str, err: serde_json::Error) -> Box<dyn std::error::Error> {
+    AgentIo {
+        message: format!("Failed to serialize the {what}: {err}"),
+    }
+    .into()
+}
+
+/// `kt agent show <name> [--json]` — render an instance's effective Capability
 /// Declaration (AC1 "visible for the instance") plus its runtime status (story
 /// 1-6, AC9): the current Lifecycle State, the active Restart Policy, the restart
-/// count, and — for a `failed` instance — the failed cause.
+/// count, the honest Budget/cap + Usage metering seed (Epic 3 — `—`/`null`), and
+/// — for a `failed` instance — the failed cause.
 ///
-/// Human-readable only; `--json` is out of scope (FR-4 / story 1.7). Output
-/// discipline (AD-12): the status result → stdout.
-pub fn show(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// `--json` mode (story 1-7) writes a single versioned document to STDOUT and
+/// nothing else there: `{ schema_version, instance: <FleetEntry> }` — the SAME
+/// [`FleetEntry`] shape `list --json` emits (RUNTIME fields only; the effective
+/// Capability Declaration stays a human-`show` concern — decision recorded in the
+/// Dev Agent Record). Output discipline (AD-12): result → stdout; the Epic-3
+/// metering note + any read-back diagnostic → stderr.
+pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     let facade = engine.blocking();
+
+    if json {
+        // Reuse the SAME composition as `list --json` and pick the named entry, so
+        // the `show` object is byte-identical to that instance's `list` row. A
+        // missing name is the uniform not-found diagnostic (to stderr).
+        let entry = facade
+            .fleet()
+            .map_err(map_error)?
+            .into_iter()
+            .find(|e| e.name.as_str() == name)
+            .ok_or_else(|| {
+                map_error(RegistryError::NotFound {
+                    name: name.to_string(),
+                })
+            })?;
+        let json = show_json(entry)?;
+        println!("{json}");
+        // The metering-seed note rides on stderr (AD-12), keeping stdout pure JSON.
+        ui::note(METERING_EPIC3_NOTE);
+        return Ok(());
+    }
+
     let caps = facade.effective_capabilities(name).map_err(map_error)?;
     render_capabilities(name, &caps);
     // Runtime status (story 1-6, AC9): state + policy + restart count + failed
     // cause. A status read-back failure must not fail `show` (the capabilities
     // already printed); note it and continue.
     match facade.instance_status(name) {
-        Ok(status) => render_runtime_status(&status),
+        Ok(status) => {
+            render_runtime_status(&status);
+            // One stderr note (AD-12) that the budget/usage rows are Epic-3 seeds.
+            ui::note(METERING_EPIC3_NOTE);
+        }
         Err(err) => ui::warning(format!("Could not read runtime status for '{name}': {err}")),
     }
     Ok(())
 }
 
 /// Render the per-instance runtime status (story 1-6, AC9) as a small table:
-/// State, Restart Policy, and Restart count; for a `failed` instance the failed
-/// cause is printed below (result → stdout, AD-12).
+/// State, Restart Policy, Restart count, and the honest Budget/cap + Usage
+/// metering seed (story 1-7 — Epic 3, rendered `—`); for a `failed` instance the
+/// failed cause is printed below (result → stdout, AD-12). The caller prints the
+/// Epic-3 metering note to stderr.
 fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
     let title = format!("Runtime status for {}", status.instance.name.as_str());
     let columns = [
@@ -191,6 +277,16 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
         vec![
             ui::TableCell::plain("Restart count"),
             ui::TableCell::plain(status.restart_count.to_string()),
+        ],
+        // The honest Epic-1 metering seed rows (story 1-7): a single `—`, never a
+        // fabricated number. Populated by Epic 3 metering.
+        vec![
+            ui::TableCell::plain("Budget/cap"),
+            ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+        ],
+        vec![
+            ui::TableCell::plain("Usage"),
+            ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
         ],
     ];
     ui::print_table(&title, &columns, &rows);
@@ -253,19 +349,45 @@ pub fn remove(
     }
 }
 
-/// `kt agent list` — render the Fleet as a plain human table (AC9: surfaces the
-/// restart count).
+/// The one-line stderr NOTE (AD-12: notices → stderr) that the budget/cap +
+/// Usage Ledger columns are HONEST Epic-1 seeds — metering arrives in Epic 3.
+/// Shared by `list` and `show` so both surfaces state it identically.
+const METERING_EPIC3_NOTE: &str =
+    "budget/cap status and Usage Ledger totals arrive with metering in Epic 3; \
+     they show as '—' (JSON null) until then.";
+
+/// `kt agent list [--json]` — render the Fleet (FR-4).
 ///
-/// A `--json` variant is out of scope here (Fleet visibility with `--json` is
-/// FR-4 / story 1.7); a human table suffices. Deferral noted. The "Restarts"
-/// column surfaces the per-instance restart count (story 1-6, AC9); the failed
-/// cause + active policy for a `failed` instance are shown by `kt agent show`.
-pub fn list() -> Result<(), Box<dyn std::error::Error>> {
+/// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the honest
+/// Budget/cap + Usage metering-seed columns (Epic 3 — rendered `—`), and the
+/// Agent Home; one stderr note explains the metering seed (AD-12: result →
+/// stdout, note → stderr). `--json` mode writes a single versioned
+/// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `kt --json`
+/// serializes the same struct the Host event stream will publish). Freshness
+/// (≤2s, AC6) is structural: each invocation opens the engine and reads live
+/// persisted state via [`ktesio_engine::Engine::fleet`] — there is no cache, so
+/// any committed transition is reflected on the next listing (a single DB read).
+pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     let facade = engine.blocking();
-    let instances = facade.list().map_err(map_error)?;
+    let entries = facade.fleet().map_err(map_error)?;
 
-    if instances.is_empty() {
+    if json {
+        // AC5/AC9: the whole result is ONE JSON document to stdout (an empty Fleet
+        // is a valid empty `instances` array). Any guidance/notes go to stderr so
+        // stdout is always parseable JSON.
+        let empty = entries.is_empty();
+        let document = fleet_json(entries)?;
+        println!("{document}");
+        if empty {
+            ui::note("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
+        }
+        // The metering-seed note still rides on stderr (AD-12).
+        ui::note(METERING_EPIC3_NOTE);
+        return Ok(());
+    }
+
+    if entries.is_empty() {
         ui::info("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
         return Ok(());
     }
@@ -275,28 +397,28 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
         ui::TableColumn::new("Restarts", 8, 10),
+        ui::TableColumn::new("Budget/cap", 10, 12),
+        ui::TableColumn::new("Usage", 8, 12),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
-    let rows: Vec<Vec<ui::TableCell>> = instances
+    let rows: Vec<Vec<ui::TableCell>> = entries
         .iter()
-        .map(|instance| {
-            // The restart count rides in the per-instance status (story 1-6,
-            // AC9). A status read-back failure must not fail the whole list;
-            // fall back to "-" for that instance.
-            let restarts = facade
-                .instance_status(instance.name.as_str())
-                .map(|s| s.restart_count.to_string())
-                .unwrap_or_else(|_| "-".to_string());
+        .map(|entry| {
             vec![
-                ui::TableCell::skill(instance.name.as_str()),
-                ui::TableCell::plain(instance.kind.clone()),
-                ui::TableCell::status(instance.state.as_str()),
-                ui::TableCell::plain(restarts),
-                ui::TableCell::muted(instance.agent_home.clone()),
+                ui::TableCell::skill(entry.name.as_str()),
+                ui::TableCell::plain(entry.kind.clone()),
+                ui::TableCell::status(entry.state.as_str()),
+                ui::TableCell::plain(entry.restart_count.to_string()),
+                // The honest Epic-1 metering seed: a single `—`, never a number.
+                ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+                ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+                ui::TableCell::muted(entry.agent_home.clone()),
             ]
         })
         .collect();
     ui::print_table("Fleet", &columns, &rows);
+    // One stderr note (AD-12) that budget/usage are Epic-3 seeds, not fabricated.
+    ui::note(METERING_EPIC3_NOTE);
     Ok(())
 }
 
@@ -811,6 +933,102 @@ mod tests {
             AdapterArg::Manifest("/x/dir".into()).to_ref(),
             AdapterRef::Manifest(std::path::PathBuf::from("/x/dir"))
         );
+    }
+
+    fn sample_fleet_entry(name: &str) -> FleetEntry {
+        FleetEntry {
+            name: ktesio_engine::InstanceName::new(name).unwrap(),
+            kind: "mock".to_string(),
+            state: ktesio_engine::LifecycleState::Registered,
+            restart_count: 0,
+            restart_policy: ktesio_engine::RestartPolicy::OnFailure,
+            failed_cause: None,
+            budget: None,
+            usage: None,
+            agent_home: format!("/x/agents/{name}"),
+        }
+    }
+
+    #[test]
+    fn fleet_json_emits_versioned_document_with_null_seeds() {
+        // The `list --json` document is a versioned FleetListing whose per-entry
+        // budget/usage are the honest JSON null seed (never 0). Pure — no engine.
+        let doc = fleet_json(vec![sample_fleet_entry("alpha")]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(
+            value["schema_version"],
+            serde_json::json!(FLEET_SCHEMA_VERSION)
+        );
+        let entry = &value["instances"][0];
+        assert_eq!(entry["name"], serde_json::json!("alpha"));
+        assert_eq!(entry["budget"], serde_json::Value::Null);
+        assert_eq!(entry["usage"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn fleet_json_on_empty_is_a_valid_empty_array() {
+        // AC9: an empty Fleet serializes as a valid empty `instances` array.
+        let doc = fleet_json(vec![]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(value["instances"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn show_json_wraps_one_entry_with_the_shared_schema_version() {
+        // `show --json` is { schema_version, instance: <FleetEntry> } — the SAME
+        // schema version as list --json (AD-14: one schema), null metering seed.
+        let doc = show_json(sample_fleet_entry("web-1")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(
+            value["schema_version"],
+            serde_json::json!(FLEET_SCHEMA_VERSION)
+        );
+        assert_eq!(value["instance"]["name"], serde_json::json!("web-1"));
+        assert_eq!(value["instance"]["budget"], serde_json::Value::Null);
+        assert_eq!(value["instance"]["usage"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn serialize_error_wraps_into_an_agent_io_diagnostic() {
+        // The defense-in-depth serialization-failure wrapper names what failed.
+        let err = serde_json::from_str::<i32>("not-json").unwrap_err();
+        let wrapped = serialize_error("Fleet", err);
+        assert!(wrapped
+            .to_string()
+            .contains("Failed to serialize the Fleet"));
+    }
+
+    #[test]
+    fn list_and_show_drive_the_engine_in_process_json_and_human() {
+        // Cover the list()/show() success paths in-process (both --json and
+        // human) against a real temp state dir. `open_engine()` reads
+        // KTESIO_STATE_DIR; set it, seed one instance via the engine, then drive
+        // each surface. They print to stdout (test noise, harmless) and must all
+        // return Ok — proving the full CLI read path, not just the pure helpers.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: single-threaded test; set the state dir the CLI resolves.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+        }
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            engine.blocking().register("demo", "mock").unwrap();
+        }
+        // Human + JSON list, human + JSON show — every success path.
+        list(false).unwrap();
+        list(true).unwrap();
+        show("demo", false).unwrap();
+        show("demo", true).unwrap();
+        // Empty-Fleet JSON + human paths (a different state dir, no instances).
+        let empty = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", empty.path());
+        }
+        list(true).unwrap();
+        list(false).unwrap();
+        unsafe {
+            std::env::remove_var("KTESIO_STATE_DIR");
+        }
     }
 
     #[test]

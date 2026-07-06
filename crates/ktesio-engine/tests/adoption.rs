@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ktesio_engine::{AdapterRef, Engine, LifecycleState, RestartPolicy};
+use ktesio_engine::{AdapterRef, Engine, FleetEntry, LifecycleState, RestartPolicy};
 use tempfile::TempDir;
 
 /// Write a manifest whose `[lifecycle.start]` exec is `fake_agent` + `args`.
@@ -235,6 +235,45 @@ fn adoption_helper_subprocess() {
             facade.stop("clean", Some(Duration::from_secs(5))).unwrap();
             std::process::exit(0);
         }
+        // WHOLE-FLEET REBOOT setup (story 1-7, AC-B). Register several instances
+        // in DIFFERENT states, then crash (exit without drop):
+        //   * `keeper`  — registered, never started (no process, no record).
+        //   * `napper`  — registered, policy set to `never` (proves policy +
+        //                 count survive the reopen unchanged).
+        //   * `worker`  — started + LEFT RUNNING (survives the crash; the PARENT
+        //                 test then kills it to fabricate "every process gone").
+        //   * `finished`— started then cleanly STOPPED (record cleared; must stay
+        //                 `stopped`, not be resurrected as an orphan).
+        "whole_fleet_reboot" => {
+            facade.register("keeper", "mock").unwrap();
+            facade.register("napper", "mock").unwrap();
+            facade
+                .set_restart_policy("napper", RestartPolicy::Never)
+                .unwrap();
+
+            let worker_manifest = manifest.join("worker");
+            std::fs::create_dir_all(&worker_manifest).unwrap();
+            write_fake_manifest(&worker_manifest, "workerkind", &["--linger-ms", "600000"]);
+            facade
+                .register_with_adapter("worker", &AdapterRef::Manifest(worker_manifest))
+                .unwrap();
+            facade.start("worker").unwrap();
+
+            let finished_manifest = manifest.join("finished");
+            std::fs::create_dir_all(&finished_manifest).unwrap();
+            write_fake_manifest(&finished_manifest, "finkind", &["--linger-ms", "600000"]);
+            facade
+                .register_with_adapter("finished", &AdapterRef::Manifest(finished_manifest))
+                .unwrap();
+            facade.start("finished").unwrap();
+            facade
+                .stop("finished", Some(Duration::from_secs(5)))
+                .unwrap();
+
+            // Crash: exit WITHOUT dropping the engine. `worker` survives (the
+            // parent kills it to model the reboot); `finished` already stopped.
+            std::process::exit(0);
+        }
         other => panic!("unknown adoption helper mode: {other}"),
     }
 }
@@ -296,6 +335,101 @@ fn engine_kill_adopts_live_child_and_fails_gone_record() {
     wait_until_gone(
         survivor_pid,
         "stop on the adopted instance must terminate its process (no orphan left)",
+    );
+}
+
+#[test]
+fn whole_fleet_survives_a_reboot_and_reconciles_running_to_failed() {
+    // THE reboot-durability proof (story 1-7, AC-B / AC7 / AC8). A machine reboot
+    // is the degenerate "all processes gone" case of engine-crash recovery: every
+    // agent PID AND the engine are gone, but the on-disk SQLite state + Agent
+    // Homes survive. We SIMULATE it (a true reboot is CI-infeasible) with the 1-6
+    // harness: an engine-1 subprocess registers several instances in different
+    // states + starts `worker` (survives the crash), then the parent KILLS every
+    // live agent process (fabricating "all processes gone" — their PIDs would not
+    // survive a reboot) and opens a NEW engine over the SAME state dir. The test
+    // asserts the reboot INVARIANTS, not a literal reboot.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1 (crash semantics): register keeper/napper/worker/finished, start
+    // worker (left running) + finished (cleanly stopped), then exit without drop.
+    run_engine1("whole_fleet_reboot", state.path(), manifest.path());
+
+    // `worker` survived the crash (re-parented to init); note its pid, then KILL
+    // it to fabricate the reboot condition (every process gone). init reaps it.
+    let worker_pid = wait_for_agent_pid(&agent_log_path(state.path(), "worker"));
+    assert!(
+        pid_alive(worker_pid),
+        "worker must survive the engine crash"
+    );
+    kill_pid(worker_pid);
+    wait_until_gone(worker_pid, "worker should be gone for the reboot condition");
+
+    // "Reboot": open a NEW engine over the SAME state dir → adopt_orphans runs
+    // with ZERO live matches (every process is gone).
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+
+    // (a) EVERY registration is still present with name/kind/home intact — nothing
+    // is lost across the reboot (durable state lives in SQLite, AD-6).
+    let fleet = facade.fleet().unwrap();
+    let mut names: Vec<&str> = fleet.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["finished", "keeper", "napper", "worker"],
+        "every registration must survive the reboot"
+    );
+    for entry in &fleet {
+        assert!(
+            entry.agent_home.contains(entry.name.as_str()),
+            "agent home must be intact for {}",
+            entry.name.as_str()
+        );
+        assert!(!entry.kind.is_empty(), "kind must be intact");
+    }
+
+    // (b) the previously-RUNNING instance reconciles to `failed` (reboot =
+    // orphan-not-found), NEVER left `running` and NEVER dropped (AI-8 honesty).
+    let worker = facade.instance_status("worker").unwrap();
+    assert_eq!(
+        worker.instance.state,
+        LifecycleState::Failed,
+        "a previously-running instance must reconcile to failed after a reboot"
+    );
+
+    // (c) the cleanly-STOPPED instance stays `stopped` (its record was cleared on
+    // clean stop; a reboot must not resurrect it as an orphan).
+    let finished = facade.instance_status("finished").unwrap();
+    assert_eq!(
+        finished.instance.state,
+        LifecycleState::Stopped,
+        "a cleanly-stopped instance must stay stopped after a reboot"
+    );
+
+    // the never-started instance stays `registered` (no process, nothing to
+    // reconcile).
+    let keeper = facade.instance_status("keeper").unwrap();
+    assert_eq!(keeper.instance.state, LifecycleState::Registered);
+
+    // (d) the persisted Restart Policy + count are UNCHANGED across the reopen —
+    // `napper`'s explicitly-set `never` survived byte-intact (AD-6).
+    let napper = facade.instance_status("napper").unwrap();
+    assert_eq!(
+        napper.restart_policy,
+        RestartPolicy::Never,
+        "the per-instance restart policy must survive the reboot"
+    );
+    assert_eq!(napper.restart_count, 0, "restart count must survive intact");
+    // And the default-policy instances still read the default (survived intact).
+    assert_eq!(keeper.restart_policy, RestartPolicy::OnFailure);
+
+    // (e) no orphan process remains (the killed worker stays gone).
+    assert!(
+        !pid_alive(worker_pid),
+        "no orphan process may remain after the reboot"
     );
 }
 
@@ -452,6 +586,131 @@ fn instance_status_and_set_policy_reject_an_invalid_name() {
     assert!(policy_err.to_string().contains("invalid"), "{policy_err}");
     let missing = facade.instance_status("ghost").unwrap_err();
     assert!(missing.to_string().contains("ghost"), "{missing}");
+}
+
+#[test]
+fn fleet_composes_status_and_carries_the_honest_metering_seed() {
+    // Story 1-7 (Task 1, AC4/AC5): Engine::fleet() composes list() + the
+    // per-instance runtime status into FleetEntry rows, ordered by name, and the
+    // Epic-1 metering seed (budget/usage) is None — never fabricated.
+    let state = TempDir::new().unwrap();
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    facade.register("beta", "mock").unwrap();
+    facade.register("alpha", "mock").unwrap();
+
+    let fleet = facade.fleet().unwrap();
+    // Ordered by name (alpha before beta), one entry per registration.
+    let names: Vec<&str> = fleet.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "beta"]);
+    for entry in &fleet {
+        // The honest Epic-1 seed: metering is Epic 3, so both are None (JSON
+        // null), never 0 and never fabricated.
+        assert!(entry.budget.is_none(), "budget must be the null seed");
+        assert!(entry.usage.is_none(), "usage must be the null seed");
+        // Runtime fields match the per-instance status the CLI already surfaces.
+        let status = facade.instance_status(entry.name.as_str()).unwrap();
+        assert_eq!(entry.state, status.instance.state);
+        assert_eq!(entry.restart_count, status.restart_count);
+        assert_eq!(entry.restart_policy, status.restart_policy);
+        assert_eq!(entry.kind, status.instance.kind);
+        assert_eq!(entry.agent_home, status.instance.agent_home);
+    }
+    // The human metering-seed token is the em dash (consistent list + show).
+    assert_eq!(FleetEntry::METERING_SEED_CELL, "—");
+}
+
+#[test]
+fn fleet_entry_surfaces_the_failed_cause_for_a_failed_instance() {
+    // Story 1-7 (Task 1): a `failed` instance's FleetEntry carries the last-known
+    // failed cause (the same value `show` uses), while a healthy instance carries
+    // none. This exercises fleet_entry_for's cause-resolution path.
+    let state = TempDir::new().unwrap();
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    facade.register("boom", "mock").unwrap();
+    facade.register("ok", "mock").unwrap();
+
+    // Seed `boom` to `failed` with a write-ahead record carrying a cause (the
+    // record-based cause path), directly in the store — no real crash needed.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    conn.execute(
+        "UPDATE agent_instances SET state = 'failed' WHERE name = 'boom'",
+        [],
+    )
+    .unwrap();
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM agent_instances WHERE name = 'boom'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO agent_runtime \
+         (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+         VALUES (?1, 0, 0, 'on-failure', 2, 'crashed with code 1')",
+        rusqlite::params![id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let fleet = facade.fleet().unwrap();
+    let boom = fleet.iter().find(|e| e.name.as_str() == "boom").unwrap();
+    assert_eq!(boom.state, LifecycleState::Failed);
+    assert_eq!(
+        boom.restart_count, 2,
+        "the seeded restart count is surfaced"
+    );
+    assert_eq!(
+        boom.failed_cause.as_deref(),
+        Some("crashed with code 1"),
+        "a failed entry must surface its cause"
+    );
+    // A healthy instance carries no failed cause.
+    let ok = fleet.iter().find(|e| e.name.as_str() == "ok").unwrap();
+    assert!(ok.failed_cause.is_none(), "a healthy entry has no cause");
+}
+
+#[test]
+fn fleet_reflects_a_state_transition_on_the_next_read_freshness() {
+    // Story 1-7 (Task 3, AC6 ≤2s freshness): the listing reads live persisted
+    // state on every call — there is no cache — so a transition committed before
+    // the read is ALWAYS reflected on the next fleet() (a single DB read, far
+    // under 2s). We seed the transition directly (write the persisted state) and
+    // assert the very next fleet() read reflects it — the reaper's 250ms poll only
+    // makes long-lived embeddings fresh too; the read path itself is what carries
+    // the guarantee. Seeding directly (rather than driving a real crash) keeps the
+    // freshness assertion deterministic under coverage instrumentation.
+    let state = TempDir::new().unwrap();
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    facade.register("svc", "mock").unwrap();
+
+    // First read: freshly registered.
+    let before = facade.fleet().unwrap();
+    let entry = before.iter().find(|e| e.name.as_str() == "svc").unwrap();
+    assert_eq!(entry.state, LifecycleState::Registered);
+
+    // Commit a state transition out-of-band (a direct persisted write, standing in
+    // for any committed transition), then read again WITHOUT reopening the engine.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    let affected = conn
+        .execute(
+            "UPDATE agent_instances SET state = 'stopped' WHERE name = ?1",
+            ["svc"],
+        )
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    // The next listing reflects the new state immediately (no stale cache).
+    let after = facade.fleet().unwrap();
+    let entry = after.iter().find(|e| e.name.as_str() == "svc").unwrap();
+    assert_eq!(
+        entry.state,
+        LifecycleState::Stopped,
+        "a committed transition must be reflected on the next listing (freshness)"
+    );
 }
 
 #[test]
