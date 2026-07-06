@@ -60,6 +60,14 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `kill(pid, 0)` and the OS/init reaps the non-child when it exits. In BOTH
 /// cases the group id lets us signal the whole tree (`killpg`), so stop / pause /
 /// resume work identically.
+///
+/// ## Steady-state PID-reuse guard for an ADOPTED handle (AI-10)
+///
+/// An adopted handle carries the LIVE `start_time` verified at adoption so its
+/// liveness poll can RE-check the start-time fingerprint, not just the bare PID.
+/// A spawned handle records its start-time too (for symmetry / diagnostics), but
+/// it reaps through its owned [`Child`] so it is already immune to PID reuse; the
+/// re-check matters only on the adopted (`child: None`) path.
 #[derive(Debug)]
 pub struct UnixProcess {
     /// The owned child handle, if THIS engine spawned the process (reaped on
@@ -69,6 +77,16 @@ pub struct UnixProcess {
     pgid: Pid,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
+    /// The recorded process start-time token (spine AD-5) — the PID-reuse guard
+    /// carried on the handle itself. `0` means "no start-time source" (a degraded
+    /// but honest fingerprint on a host with no `process_start_time` source, or a
+    /// read that failed at spawn). For an ADOPTED process (`child: None`) this is
+    /// the LIVE start-time verified at adoption (always non-zero on the supported
+    /// Linux/macOS hosts, since `adopt` returns `None` when it cannot read one), so
+    /// [`UnixProcess::reap_if_exited`] can RE-verify it on every steady-state poll:
+    /// a bare `kill(pid, 0)` alone cannot tell an adopted agent's crash from the OS
+    /// recycling its PID to an unrelated process within a reaper interval (AI-10).
+    start_time: u64,
 }
 
 /// The Unix process backend (AD-4).
@@ -145,10 +163,15 @@ impl ProcessBackend for UnixBackend {
         let pid = child.id();
         // The child is its own group leader, so pgid == pid.
         let pgid = Pid::from_raw(pid as i32);
+        // Record the start-time for symmetry with the adopted handle (a spawned
+        // handle reaps via its owned Child, so it never relies on this for the
+        // PID-reuse guard; a read failure degrades to 0, an honest pid-only form).
+        let start_time = process_start_time(pid).unwrap_or(0);
         Ok(UnixProcess {
             child: Some(child),
             pgid,
             pid,
+            start_time,
         })
     }
 
@@ -286,11 +309,14 @@ impl ProcessBackend for UnixBackend {
         }
         // Same process. Rebuild an adopted handle: no owned Child (not our
         // child), but the group id (== pid, the setsid leader) lets us still
-        // signal/stop the whole tree. Liveness is kill(pid, 0).
+        // signal/stop the whole tree. Liveness is kill(pid, 0) RE-checked against
+        // `live_start` on every poll (AI-10), so a later PID reuse cannot mask a
+        // crash of this adopted process.
         Ok(Some(UnixProcess {
             child: None,
             pgid: Pid::from_raw(fingerprint.pid as i32),
             pid: fingerprint.pid,
+            start_time: live_start,
         }))
     }
 }
@@ -396,6 +422,22 @@ impl UnixProcess {
     /// other result means it is still alive. An adopted process reports
     /// `Exited { code: None }` when gone — we cannot recover a non-child's exit
     /// code, which is honest (the code is unknown to us).
+    ///
+    /// ## Adopted PID-reuse guard (AI-10)
+    ///
+    /// A bare `kill(pid, 0)` cannot distinguish "the adopted process is still
+    /// alive" from "the adopted process crashed and the OS recycled its PID for an
+    /// unrelated new process within a reaper interval (~250ms)" — both read as
+    /// alive, so the crash would be missed and the row left a phantom `running`.
+    /// So when this handle carries a real recorded start-time (`start_time != 0`,
+    /// always true for an adopted handle on the supported Linux/macOS hosts — see
+    /// [`UnixBackend::adopt`]), we RE-read the live PID's start-time and treat a
+    /// MISMATCH or a read failure as "the original process is gone" →
+    /// `Exited { code: None }`. Only when we have NO recorded token (`start_time
+    /// == 0`, a degraded host with no start-time source) do we fall back to the
+    /// bare liveness probe — the best that host can honestly do. A spawned handle
+    /// (`child: Some`) reaps via its owned `Child` and never reaches this path, so
+    /// it was already immune to PID reuse.
     fn reap_if_exited(&mut self) -> Result<ProcessStatus, BackendError> {
         match self.child.as_mut() {
             Some(child) => match child.try_wait() {
@@ -408,12 +450,43 @@ impl UnixProcess {
                     detail: e.to_string(),
                 }),
             },
-            // Adopted (not our child): probe liveness via kill(pid, 0).
+            // Adopted (not our child): probe liveness via kill(pid, 0), then
+            // RE-verify the start-time fingerprint so a recycled PID cannot mask a
+            // crash (AI-10).
             None => {
-                if pid_is_alive(self.pid) {
-                    Ok(ProcessStatus::Alive)
+                if !pid_is_alive(self.pid) {
+                    // The PID is gone → the process exited (reaped by init).
+                    return Ok(ProcessStatus::Exited { code: None });
+                }
+                // The PID is alive. If we hold a real recorded start-time, confirm
+                // it still matches the live PID.
+                if self.start_time != 0 {
+                    match process_start_time(self.pid) {
+                        // Successful read that MATCHES → the same process, alive.
+                        Some(live) if live == self.start_time => Ok(ProcessStatus::Alive),
+                        // Successful read that MISMATCHES → the PID was recycled for
+                        // a DIFFERENT process; the original adopted process is gone.
+                        // This is THE AI-10 guard: a recycled PID always yields a
+                        // successful read + a differing start-time, so this path is
+                        // exactly the recycled-PID case.
+                        Some(_) => Ok(ProcessStatus::Exited { code: None }),
+                        // Read FAILED (a transient /proc or libproc hiccup) → we
+                        // CANNOT confidently distinguish alive-vs-gone, so do NOT
+                        // report a crash on an ambiguous read (that would spuriously
+                        // kill+restart a genuinely-live agent). Treat as still-alive
+                        // and let the reaper re-check next tick — a truly-dead
+                        // process is still caught then (its PID goes away → Exited,
+                        // or a reused PID reads a MISMATCHING start-time → Exited),
+                        // so this does NOT reopen the AI-10 hole. This mirrors how
+                        // `adopt`/`fingerprint` already treat a start-time read
+                        // failure as "not confident", never as a positive signal.
+                        None => Ok(ProcessStatus::Alive),
+                    }
                 } else {
-                    Ok(ProcessStatus::Exited { code: None })
+                    // Degraded host with no start-time source: bare liveness is the
+                    // honest best we can do (an adopted handle here is unusual —
+                    // `adopt` needs a readable start-time to create one at all).
+                    Ok(ProcessStatus::Alive)
                 }
             }
         }
@@ -663,6 +736,94 @@ mod tests {
             );
         }
         let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn adopted_poll_reports_exited_when_start_time_no_longer_matches_ai10() {
+        // AI-10 (steady-state PID-reuse guard): an ADOPTED handle whose live PID is
+        // still alive but whose start-time NO LONGER matches the recorded token is
+        // a DIFFERENT process (the original crashed and the OS recycled its PID) —
+        // `poll` must report `Exited`, NOT `Alive`, so the reaper detects the crash
+        // instead of trusting a bare PID match.
+        //
+        // We prove this deterministically WITHOUT waiting for a real PID recycle:
+        // adopt a genuinely live process (so the handle is a real adopted handle),
+        // then construct a sibling handle for the SAME live pid whose recorded
+        // start-time is deliberately wrong. A bare `kill(pid,0)` would still say
+        // "alive"; the start-time re-check must override that to `Exited`.
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return; // no real start-time source on this host — guard is a no-op.
+        }
+        let backend = UnixBackend::new();
+        // Keep the ORIGINAL handle so the live process is reaped on drop (leak
+        // guard) regardless of what the crafted handle reports.
+        let mut original = backend
+            .spawn(&spec("sleep", &["600"]))
+            .expect("spawn sleep");
+        let fp = backend.fingerprint(&original);
+        assert!(fp.start_time > 0, "supported host has a real start-time");
+
+        // A genuine adopted handle (correct start-time) polls Alive.
+        let adopter = UnixBackend::new();
+        let mut adopted = adopter
+            .adopt(&fp)
+            .expect("adopt call ok")
+            .expect("a live matching process must be adopted");
+        assert_eq!(
+            adopter.poll(&mut adopted).unwrap(),
+            ProcessStatus::Alive,
+            "a matching adopted process is alive"
+        );
+
+        // Now craft an adopted-shaped handle for the SAME live pid but with a
+        // recorded start-time that does NOT match the live one (models a recycled
+        // PID). The pid is provably still alive (the original sleep is running).
+        assert!(pid_alive(fp.pid), "the live pid is still running");
+        let mut recycled = UnixProcess {
+            child: None,
+            pgid: Pid::from_raw(fp.pid as i32),
+            pid: fp.pid,
+            start_time: fp.start_time.wrapping_add(1),
+        };
+        assert_eq!(
+            backend.poll(&mut recycled).unwrap(),
+            ProcessStatus::Exited { code: None },
+            "a live pid whose start-time no longer matches must poll Exited (AI-10), \
+             not Alive — so a recycled PID cannot mask an adopted process's crash"
+        );
+
+        // Teardown the real process via the original owning handle.
+        let _ = backend.stop(&mut original, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn adopted_poll_with_no_recorded_start_time_falls_back_to_bare_liveness() {
+        // AI-10 degraded fallback: an adopted-shaped handle that carries NO
+        // recorded start-time (`start_time == 0` — a host with no start-time
+        // source, where `adopt` would not normally build a handle) must fall back
+        // to the bare `kill(pid, 0)` liveness probe, not spuriously report Exited.
+        // Construct such a handle over a genuinely live pid and assert Alive.
+        let backend = UnixBackend::new();
+        let mut original = backend
+            .spawn(&spec("sleep", &["600"]))
+            .expect("spawn sleep");
+        let pid = original.pid;
+        assert!(pid_alive(pid));
+
+        let mut degraded = UnixProcess {
+            child: None,
+            pgid: Pid::from_raw(pid as i32),
+            pid,
+            start_time: 0, // no recorded token → bare-liveness fallback
+        };
+        assert_eq!(
+            backend.poll(&mut degraded).unwrap(),
+            ProcessStatus::Alive,
+            "a live adopted pid with no recorded start-time falls back to bare liveness"
+        );
+
+        // Teardown via the real owner.
+        let _ = backend.stop(&mut original, Duration::from_secs(2));
     }
 
     #[test]

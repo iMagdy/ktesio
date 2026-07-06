@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ktesio_engine::{AdapterRef, Engine, FleetEntry, LifecycleState, RestartPolicy};
+use ktesio_engine::{
+    AdapterRef, Engine, FleetEntry, LifecycleState, RemoveDisposition, RestartPolicy,
+};
 use tempfile::TempDir;
 
 /// Write a manifest whose `[lifecycle.start]` exec is `fake_agent` + `args`.
@@ -743,4 +745,92 @@ fn per_instance_restart_policy_defaults_to_on_failure_and_is_configurable() {
         "seed survives reopen"
     );
     assert_eq!(status.instance.state, LifecycleState::Registered);
+}
+
+/// Count write-ahead spawn records (`agent_runtime` rows) for `name` by reading
+/// the engine's SQLite DB directly — used to prove `remove` clears the record so
+/// no orphan can be adopted later (AI-11). Returns 0 if the row/instance is gone.
+fn spawn_record_count(state: &Path, name: &str) -> i64 {
+    let conn = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM agent_runtime r \
+         JOIN agent_instances i ON i.id = r.instance_id WHERE i.name = ?1",
+        [name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn ai11_remove_of_a_live_instance_terminates_it_and_leaves_no_orphan() {
+    // AI-11: `remove` of a LIVE (running) instance must terminate its process
+    // (leaving no unsupervised orphan) AND clear its write-ahead spawn record (so
+    // a later engine crash cannot leave a TRUE orphan no future engine can adopt).
+    // Drive the PUBLIC engine: start a long-lingering agent, capture its pid,
+    // `remove --force`, then assert the process is gone and no spawn record / no
+    // instance row remains.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "victim",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let started = facade.start("victim").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // The process is alive and its write-ahead spawn record was committed.
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "victim"));
+    assert!(pid_alive(pid), "the agent must be running before remove");
+    assert_eq!(
+        spawn_record_count(state.path(), "victim"),
+        1,
+        "a running instance has a committed spawn record"
+    );
+
+    // remove --force: the running-guard is satisfied, and the live process is
+    // torn down BEFORE the row is deleted (AI-11).
+    facade
+        .remove("victim", RemoveDisposition::Delete, true)
+        .unwrap();
+
+    // (a) the process is gone — no unsupervised orphan left behind.
+    wait_until_gone(
+        pid,
+        "remove of a live instance must terminate its process (no orphan)",
+    );
+    // (b) the instance row is gone (removed from the Fleet).
+    let fleet = facade.fleet().unwrap();
+    assert!(
+        !fleet.iter().any(|e| e.name.as_str() == "victim"),
+        "the removed instance must be gone from the Fleet"
+    );
+    // (c) no write-ahead spawn record remains — a later engine crash cannot leave
+    // a TRUE orphan (the record the stop path cleared is what a future engine
+    // would have adopted from).
+    assert_eq!(
+        spawn_record_count(state.path(), "victim"),
+        0,
+        "remove must clear the write-ahead spawn record (no adoptable orphan)"
+    );
+
+    // A fresh engine over the same state dir finds nothing to adopt and no orphan
+    // process — the NFR-1 invariant holds across a restart after remove.
+    drop(engine);
+    let engine2 = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    assert!(
+        !engine2
+            .blocking()
+            .fleet()
+            .unwrap()
+            .iter()
+            .any(|e| e.name.as_str() == "victim"),
+        "a reopened engine must not resurrect a removed instance"
+    );
+    assert!(!pid_alive(pid), "no orphan process may remain after remove");
 }

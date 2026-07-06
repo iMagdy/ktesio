@@ -325,15 +325,19 @@ impl Registry {
     /// Remove an Agent Instance, honoring the retain/delete disposition (AC4)
     /// and the running-guard (AC5).
     ///
-    /// ## Running-guard SCOPE BOUNDARY (AC5)
+    /// ## Running-guard (AC5) + process teardown (AI-11)
     ///
-    /// Nothing can actually `start`/run until story 1.4 (tokio supervision
-    /// core), so this guard is **state-machine validation only**: if the stored
-    /// Lifecycle State is `running` and `force` is false, it returns
-    /// [`RegistryError::RunningRequiresForce`]. Because a real `running`
-    /// instance cannot be produced yet, tests prove this path by directly
-    /// seeding a `running` row via the store. Real running-instance teardown
-    /// (stopping the process before removal) lands in story 1.4/1.6.
+    /// This method is the RECORD + Agent-Home half of remove: it validates the
+    /// state-machine guard — if the stored Lifecycle State is `running` and
+    /// `force` is false, it returns [`RegistryError::RunningRequiresForce`] — then
+    /// deletes the row (FK-cascading the write-ahead spawn record) and, for
+    /// `Delete`, the Agent Home. It does NOT touch live processes: stopping a
+    /// live/adopted instance's process BEFORE the row is deleted (so `remove` never
+    /// leaves an unsupervised orphan — the AI-11 invariant, for both plain and
+    /// `--force` remove) is the caller's job and lives in [`Engine::remove`], which
+    /// holds the supervisor's in-memory handle map. Tests that exercise the guard
+    /// here still seed a `running`/`paused` row directly via the store (no live
+    /// process needed) — the guard is pure state-machine validation.
     ///
     /// ## Removal ordering
     ///

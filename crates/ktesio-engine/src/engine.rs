@@ -73,6 +73,29 @@ fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
     }
 }
 
+/// Map a [`Supervisor::stop`] failure encountered during [`Engine::remove`]'s
+/// live-instance teardown (AI-11) into a [`RegistryError`], since `remove` speaks
+/// the registry error type. A store failure passes through as
+/// [`RegistryError::Store`]; any other stop failure (a backend terminate/signal
+/// error, a log-write error, …) surfaces as a filesystem-shaped
+/// [`RegistryError::Io`] naming the instance — so a teardown failure ABORTS the
+/// remove (the row is NOT deleted and the process is NOT orphaned) with a
+/// diagnostic the CLI already renders, rather than inventing a new public variant.
+fn stop_error_to_registry(err: EngineError) -> RegistryError {
+    match err {
+        EngineError::Store(inner) => RegistryError::Store(inner),
+        EngineError::InvalidName { name, reason } => RegistryError::InvalidName { name, reason },
+        EngineError::NotFound { name } => RegistryError::NotFound { name },
+        other => RegistryError::Io {
+            name: "<remove-teardown>".to_string(),
+            path: "<process teardown>".to_string(),
+            source: std::io::Error::other(format!(
+                "could not stop the live instance before removal: {other}"
+            )),
+        },
+    }
+}
+
 /// The async engine handle (the Embedding Interface, AD-2/AD-13).
 ///
 /// Constructed once per embedding via [`Engine::open`]. Owns the runtime, the
@@ -266,6 +289,38 @@ impl Engine {
 
     /// Remove an Agent Instance, honoring the retain/delete disposition (AC4)
     /// and the running-guard (AC5).
+    ///
+    /// ## Live/adopted-instance teardown — remove never leaves an orphan (AI-11)
+    ///
+    /// SEMANTICS DECISION (Away-Mode, conservative): `remove` must NEVER leave a
+    /// live, unsupervised agent process behind — for BOTH plain and `--force`
+    /// remove. If the supervisor still holds a handle for this instance
+    /// (running/paused, including a process ADOPTED from a prior engine),
+    /// [`Engine::remove`] STOPS it first — reusing the ordinary
+    /// [`Supervisor::stop`] path, which terminates the whole process group/job,
+    /// drops the handle, and CLEARS the write-ahead spawn record — and only THEN
+    /// deletes the row. This closes the NFR-1 counterexample the story-1-2 `remove`
+    /// docstring deferred to 1.4/1.6: without it, `kt agent remove <live> --force`
+    /// deleted the record while the process kept running, and because the
+    /// write-ahead record was gone a later engine crash left a TRUE unsupervised
+    /// orphan no future engine could adopt.
+    ///
+    /// `--force` keeps its EXISTING meaning — it governs whether a `running` row
+    /// may be removed at all (the [`RegistryError::RunningRequiresForce`] guard),
+    /// NOT whether the process is torn down. So the teardown runs whenever we are
+    /// actually going to delete the row: `force`, or a non-`running` live state
+    /// (a `paused` instance is removable without `--force`, yet may still hold a
+    /// live — SIGSTOP'd — process, so it is stopped too). A `running` instance
+    /// without `--force` is rejected by the registry guard BEFORE any teardown, so
+    /// a refused remove never touches the process.
+    ///
+    /// PARTIAL FAILURE: the teardown and the row deletion are two steps. If the
+    /// [`Supervisor::stop`] succeeds (process killed, write-ahead record cleared)
+    /// but the subsequent `registry.remove` then fails, the instance is left
+    /// `stopped` with NO live process and NO spawn record — a coherent, safe state
+    /// (never an orphan): the operator can simply re-run `remove` to delete the now
+    /// already-stopped row. (A teardown-step failure aborts BEFORE any deletion —
+    /// see the teardown call — so that case leaves the instance exactly as it was.)
     pub async fn remove(
         &self,
         name: &str,
@@ -275,11 +330,37 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .remove(&name, disposition, force)
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            // (1) Stop a live/adopted instance FIRST so no unsupervised process is
+            // ever orphaned (AI-11). Only when we will actually delete the row —
+            // i.e. `force`, or a live state other than `running` (a `running`
+            // instance without `--force` is refused by the registry guard below, so
+            // we must NOT tear its process down for a remove that gets rejected).
+            if let Ok(iname) = InstanceName::new(&name) {
+                if let Ok(instance) = registry.lookup(&iname) {
+                    let live = matches!(
+                        instance.state,
+                        LifecycleState::Running | LifecycleState::Paused
+                    );
+                    let will_delete = force || instance.state.is_removable_without_force();
+                    if live && will_delete {
+                        // Reuse the ordinary stop path: terminates the whole
+                        // group/job, drops the handle, and clears the write-ahead
+                        // record. A teardown failure aborts the remove (surfaced as
+                        // a RegistryError) rather than deleting the row and leaking
+                        // the process.
+                        supervisor
+                            .stop(&registry, &name, None)
+                            .map_err(stop_error_to_registry)?;
+                    }
+                }
+            }
+            // (2) Delete the row (+ handle the Agent Home per disposition). The
+            // authoritative name validation and the `running` running-guard live
+            // here, so a malformed name / not-found / running-without-force is
+            // reported exactly as before.
+            registry.remove(&name, disposition, force)
         })
         .await
     }
@@ -666,5 +747,68 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.set_restart_policy(name, policy))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::NameError;
+    use crate::ports::StoreError;
+
+    #[test]
+    fn stop_error_to_registry_maps_each_arm() {
+        // AI-11: a live-instance teardown failure during `remove` is mapped into a
+        // RegistryError so `remove` (which speaks RegistryError) aborts WITHOUT
+        // deleting the row or orphaning the process. Exercise every arm.
+
+        // Store passes through as Store.
+        assert!(matches!(
+            stop_error_to_registry(EngineError::Store(StoreError::Backend("db gone".into()))),
+            RegistryError::Store(_)
+        ));
+
+        // InvalidName / NotFound keep their shape (defensive — a well-formed remove
+        // has already resolved the name, but the mapping must stay total).
+        assert!(matches!(
+            stop_error_to_registry(EngineError::InvalidName {
+                name: "Bad Name".into(),
+                reason: NameError::BadChar,
+            }),
+            RegistryError::InvalidName { .. }
+        ));
+        assert!(matches!(
+            stop_error_to_registry(EngineError::NotFound { name: "ghost".into() }),
+            RegistryError::NotFound { name } if name == "ghost"
+        ));
+
+        // Any other stop failure (a backend terminate/signal error, a log error)
+        // surfaces as a filesystem-shaped Io naming the teardown, preserving the
+        // underlying detail so the operator sees WHY the remove aborted.
+        let mapped = stop_error_to_registry(EngineError::Backend {
+            name: "live".into(),
+            source: crate::ports::BackendError::Control {
+                op: "terminate",
+                detail: "boom".into(),
+            },
+        });
+        match mapped {
+            RegistryError::Io { source, .. } => {
+                let msg = source.to_string();
+                assert!(msg.contains("could not stop the live instance"), "{msg}");
+                assert!(msg.contains("boom"), "underlying detail preserved: {msg}");
+            }
+            other => panic!("expected Io for a backend teardown failure, got {other:?}"),
+        }
+
+        // A log-write teardown failure also folds into the Io arm.
+        assert!(matches!(
+            stop_error_to_registry(EngineError::Log {
+                name: "live".into(),
+                path: "/x/logs/instance.log".into(),
+                detail: "disk full".into(),
+            }),
+            RegistryError::Io { .. }
+        ));
     }
 }
