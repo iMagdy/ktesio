@@ -149,17 +149,58 @@ pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::err
 }
 
 /// `kt agent show <name>` — render an instance's effective Capability
-/// Declaration (AC1 "visible for the instance").
+/// Declaration (AC1 "visible for the instance") plus its runtime status (story
+/// 1-6, AC9): the current Lifecycle State, the active Restart Policy, the restart
+/// count, and — for a `failed` instance — the failed cause.
 ///
-/// Human-readable only; `--json` is out of scope (FR-4 / story 1.7).
+/// Human-readable only; `--json` is out of scope (FR-4 / story 1.7). Output
+/// discipline (AD-12): the status result → stdout.
 pub fn show(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
-    let caps = engine
-        .blocking()
-        .effective_capabilities(name)
-        .map_err(map_error)?;
+    let facade = engine.blocking();
+    let caps = facade.effective_capabilities(name).map_err(map_error)?;
     render_capabilities(name, &caps);
+    // Runtime status (story 1-6, AC9): state + policy + restart count + failed
+    // cause. A status read-back failure must not fail `show` (the capabilities
+    // already printed); note it and continue.
+    match facade.instance_status(name) {
+        Ok(status) => render_runtime_status(&status),
+        Err(err) => ui::warning(format!("Could not read runtime status for '{name}': {err}")),
+    }
     Ok(())
+}
+
+/// Render the per-instance runtime status (story 1-6, AC9) as a small table:
+/// State, Restart Policy, and Restart count; for a `failed` instance the failed
+/// cause is printed below (result → stdout, AD-12).
+fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
+    let title = format!("Runtime status for {}", status.instance.name.as_str());
+    let columns = [
+        ui::TableColumn::new("Field", 14, 20),
+        ui::TableColumn::new("Value", 14, 48),
+    ];
+    let rows = vec![
+        vec![
+            ui::TableCell::plain("State"),
+            ui::TableCell::status(status.instance.state.as_str()),
+        ],
+        vec![
+            ui::TableCell::plain("Restart policy"),
+            ui::TableCell::plain(status.restart_policy.as_str()),
+        ],
+        vec![
+            ui::TableCell::plain("Restart count"),
+            ui::TableCell::plain(status.restart_count.to_string()),
+        ],
+    ];
+    ui::print_table(&title, &columns, &rows);
+    // For a failed instance, surface the last-known cause (the crash / crash-loop
+    // detail) so the operator sees WHY it failed and the active policy (AC9).
+    if status.instance.state == ktesio_engine::LifecycleState::Failed {
+        if let Some(cause) = &status.failed_cause {
+            ui::info(format!("Failed cause: {cause}"));
+        }
+    }
 }
 
 /// Render the effective (current-OS) Capability Declaration as a small table.
@@ -212,13 +253,17 @@ pub fn remove(
     }
 }
 
-/// `kt agent list` — render the Fleet as a plain human table.
+/// `kt agent list` — render the Fleet as a plain human table (AC9: surfaces the
+/// restart count).
 ///
 /// A `--json` variant is out of scope here (Fleet visibility with `--json` is
-/// FR-4 / story 1.7); a human table suffices. Deferral noted.
+/// FR-4 / story 1.7); a human table suffices. Deferral noted. The "Restarts"
+/// column surfaces the per-instance restart count (story 1-6, AC9); the failed
+/// cause + active policy for a `failed` instance are shown by `kt agent show`.
 pub fn list() -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
-    let instances = engine.blocking().list().map_err(map_error)?;
+    let facade = engine.blocking();
+    let instances = facade.list().map_err(map_error)?;
 
     if instances.is_empty() {
         ui::info("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
@@ -229,15 +274,24 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
         ui::TableColumn::new("Name", 12, 32),
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
+        ui::TableColumn::new("Restarts", 8, 10),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
     let rows: Vec<Vec<ui::TableCell>> = instances
         .iter()
         .map(|instance| {
+            // The restart count rides in the per-instance status (story 1-6,
+            // AC9). A status read-back failure must not fail the whole list;
+            // fall back to "-" for that instance.
+            let restarts = facade
+                .instance_status(instance.name.as_str())
+                .map(|s| s.restart_count.to_string())
+                .unwrap_or_else(|_| "-".to_string());
             vec![
                 ui::TableCell::skill(instance.name.as_str()),
                 ui::TableCell::plain(instance.kind.clone()),
                 ui::TableCell::status(instance.state.as_str()),
+                ui::TableCell::plain(restarts),
                 ui::TableCell::muted(instance.agent_home.clone()),
             ]
         })
@@ -254,16 +308,19 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
 /// diagnostic goes to stderr (AC2). Output discipline (AD-12): result → stdout,
 /// diagnostics/notices → stderr.
 ///
-/// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5 / durable
-/// supervision is story 1-6): the engine supervises the started process only for
-/// the lifetime of THIS engine session. Because the backend kills the process
-/// group / job on handle drop, a standalone `kt agent start <name>` stops the
-/// agent when this CLI process exits — the persisted `running` row then outlives
-/// the live process. Re-attaching across CLI invocations (orphan adoption by
-/// pid + start-time fingerprint) and crash detection arrive with story 1-6. To
-/// keep the operator honest about this at the point of pain, the success path
-/// prints a one-line notice to STDERR (never stdout — existing tests assert the
-/// stdout result line).
+/// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5): the engine
+/// supervises the started process only for the lifetime of THIS engine session.
+/// Because the backend kills the process group / job on handle drop, a
+/// standalone `kt agent start <name>` stops the agent when this CLI process
+/// exits cleanly — the persisted `running` row then outlives the live process.
+/// Story 1-6 delivers CRASH recovery: if the engine CRASHES (no clean drop), a
+/// surviving process is re-adopted on the next `Engine::open` (by pid +
+/// start-time fingerprint) and crashes are detected + handled by the Restart
+/// Policy. It does NOT make a cleanly-exited standalone `kt agent start` leave a
+/// durably-supervised process across separate CLI invocations — that remains
+/// future work. To keep the operator honest at the point of pain, the success
+/// path prints a one-line notice to STDERR (never stdout — existing tests assert
+/// the stdout result line).
 pub fn start(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     match engine.blocking().start(name) {
@@ -275,11 +332,12 @@ pub fn start(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             // Command result to stdout: the new Lifecycle State.
             println!("{}", instance.state);
             // Honest single-lifetime notice to STDERR (AD-12: notices → stderr,
-            // never stdout). Durable cross-invocation supervision is story 1-6.
+            // never stdout). A clean CLI exit stops the agent; durable supervision
+            // across separate CLI invocations is future work.
             ui::note(
-                "the started process is supervised only for this engine session; \
-                 durable supervision across CLI invocations arrives with orphan \
-                 adoption (story 1-6).",
+                "the started process is supervised only for this engine session \
+                 and stops when this command exits; durable supervision across \
+                 separate CLI invocations is future work.",
             );
             Ok(())
         }

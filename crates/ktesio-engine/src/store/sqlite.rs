@@ -8,20 +8,25 @@
 //! ## Schema & migration
 //!
 //! Schema version is tracked with `PRAGMA user_version` (chosen over a `_meta`
-//! table for simplicity — no extra table, atomic with the connection). On open:
-//! `user_version == 0` → apply schema v1 → set `user_version = 1`. Reopening an
-//! existing DB is idempotent (version already 1 → no DDL runs). A future story
-//! adds v2 by checking the version and stepping.
+//! table for simplicity — no extra table, atomic with the connection). On open,
+//! the migrator STEPS from the DB's current `user_version` up to
+//! [`SCHEMA_VERSION`], applying each version's DDL in order and stamping the new
+//! version. Reopening an existing DB is idempotent (already at the target → no
+//! DDL runs). Story 1-6 adds v2: the `agent_runtime` write-ahead spawn-record
+//! table (AD-5/AD-6). A DB ahead of this build is refused (forward-compat guard).
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::domain::{AgentInstance, InstanceName, LifecycleState};
-use crate::ports::{StateStore, StoreError};
+use crate::domain::{AgentInstance, InstanceName, LifecycleState, RestartPolicy};
+use crate::ports::{ProcessFingerprint, SpawnRecord, StateStore, StoreError};
 
 /// Current schema version applied by this build.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v1: registry + lifecycle + Usage Ledger. v2 (story 1-6): the `agent_runtime`
+/// write-ahead spawn-record table (AD-5).
+const SCHEMA_VERSION: i64 = 2;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -49,6 +54,27 @@ CREATE TABLE usage_events (
     occurred_at     TEXT NOT NULL
 );
 CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);
+";
+
+/// Schema v2 DDL (story 1-6): the write-ahead spawn-record table (spine AD-5).
+///
+/// One row per SUPERVISED instance, keyed by `instance_id` (UNIQUE, FK with
+/// `ON DELETE CASCADE` so removing an instance drops its record). Holds the
+/// process fingerprint (`pid` + opaque `start_time`), the per-instance Restart
+/// Policy (AD-15), the consecutive-failure `restart_count` (survives an engine
+/// restart), and the `last_known_cause`. The row EXISTS only while the instance
+/// is supervised (`running`/`paused`); a clean stop deletes it, so a
+/// normally-stopped instance is never later adopted/failed as an orphan.
+const SCHEMA_V2: &str = "\
+CREATE TABLE agent_runtime (
+    id               INTEGER PRIMARY KEY,
+    instance_id      INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,
+    pid              INTEGER NOT NULL,
+    start_time       INTEGER NOT NULL,
+    restart_policy   TEXT NOT NULL,
+    restart_count    INTEGER NOT NULL DEFAULT 0,
+    last_known_cause TEXT
+);
 ";
 
 /// A SQLite-backed state store over a single connection.
@@ -153,10 +179,18 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         });
     }
 
-    // Up-migration path only (version < SCHEMA_VERSION). A DB already at
-    // SCHEMA_VERSION needs neither DDL nor a version bump (idempotent reopen).
-    if version < SCHEMA_VERSION {
+    // Step up one version at a time, applying each version's DDL in order. A DB
+    // already at SCHEMA_VERSION runs no DDL (idempotent reopen). Each step is
+    // additive; a partially-migrated DB from a crashed migration re-runs only
+    // the steps it still needs.
+    if version < 1 {
         conn.execute_batch(SCHEMA_V1).map_err(backend)?;
+    }
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2).map_err(backend)?;
+    }
+
+    if version < SCHEMA_VERSION {
         // pragma_update cannot bind user_version; format the constant in. It is
         // a compile-time integer, so this is injection-safe.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -314,6 +348,171 @@ impl StateStore for SqliteStore {
             .map_err(backend)?;
         Ok(count.max(0) as u64)
     }
+
+    fn upsert_spawn_record(&self, record: &SpawnRecord) -> Result<(), StoreError> {
+        // Resolve the instance row id (the FK). An absent instance is NotFound.
+        let id = self
+            .instance_id(&record.name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: record.name.as_str().to_string(),
+            })?;
+        // Insert-or-replace on the UNIQUE instance_id, in one statement (AD-6:
+        // one transaction per event — a single INSERT ... ON CONFLICT is atomic).
+        self.conn
+            .execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(instance_id) DO UPDATE SET \
+                 pid = excluded.pid, start_time = excluded.start_time, \
+                 restart_policy = excluded.restart_policy, \
+                 restart_count = excluded.restart_count, \
+                 last_known_cause = excluded.last_known_cause",
+                rusqlite::params![
+                    id,
+                    record.fingerprint.pid as i64,
+                    record.fingerprint.start_time as i64,
+                    record.restart_policy.as_str(),
+                    record.restart_count as i64,
+                    record.last_known_cause,
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn clear_spawn_record(&self, name: &InstanceName) -> Result<(), StoreError> {
+        // Idempotent: clearing an absent record (or an absent instance) is
+        // success — the desired end state (no record) already holds.
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(());
+        };
+        self.conn
+            .execute("DELETE FROM agent_runtime WHERE instance_id = ?1", [id])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn get_spawn_record(&self, name: &InstanceName) -> Result<Option<SpawnRecord>, StoreError> {
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(None);
+        };
+        self.conn
+            .query_row(
+                "SELECT pid, start_time, restart_policy, restart_count, last_known_cause \
+                 FROM agent_runtime WHERE instance_id = ?1",
+                [id],
+                |row| Ok(row_to_spawn_record(name.clone(), row)),
+            )
+            .optional()
+            .map_err(backend)?
+            .transpose()
+    }
+
+    fn list_spawn_records(&self) -> Result<Vec<SpawnRecord>, StoreError> {
+        // Join to the instance name (the domain key), ordered by name.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
+                 r.last_known_cause \
+                 FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
+                 ORDER BY i.name",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let name_raw: String = row.get("name")?;
+                let name =
+                    InstanceName::new(name_raw.clone()).map_err(|e| StoreError::CorruptRow {
+                        name: name_raw,
+                        detail: format!("invalid stored name: {e}"),
+                    });
+                Ok(name.and_then(|n| row_to_spawn_record(n, row)))
+            })
+            .map_err(backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(backend)??);
+        }
+        Ok(out)
+    }
+
+    fn set_restart_count(
+        &self,
+        name: &InstanceName,
+        restart_count: u32,
+        last_known_cause: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // No-op if the instance has no spawn record (e.g. it was cleanly stopped
+        // between the crash and this update). One UPDATE = one transaction.
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(());
+        };
+        self.conn
+            .execute(
+                "UPDATE agent_runtime SET restart_count = ?1, last_known_cause = ?2 \
+                 WHERE instance_id = ?3",
+                rusqlite::params![restart_count as i64, last_known_cause, id],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn set_restart_policy(
+        &self,
+        name: &InstanceName,
+        policy: RestartPolicy,
+    ) -> Result<(), StoreError> {
+        // The instance must exist (the FK). An absent instance is NotFound.
+        let id = self
+            .instance_id(name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })?;
+        // Upsert on UNIQUE(instance_id): if a record exists, update ONLY the
+        // policy (preserving pid/start_time/count/cause); if none exists, create a
+        // minimal record carrying just the policy (zero fingerprint, count 0) so
+        // the per-instance config persists before the first start. On the insert
+        // path we set pid/start_time to 0 (a not-yet-supervised placeholder;
+        // `start` overwrites them with the real fingerprint).
+        self.conn
+            .execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+                 VALUES (?1, 0, 0, ?2, 0, NULL) \
+                 ON CONFLICT(instance_id) DO UPDATE SET restart_policy = excluded.restart_policy",
+                rusqlite::params![id, policy.as_str()],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+}
+
+/// Build a [`SpawnRecord`] from a result row (the `pid, start_time,
+/// restart_policy, restart_count, last_known_cause` columns), decoding the
+/// policy wire form and clamping the integer columns into domain types.
+fn row_to_spawn_record(
+    name: InstanceName,
+    row: &rusqlite::Row<'_>,
+) -> Result<SpawnRecord, StoreError> {
+    let pid: i64 = row.get("pid").map_err(backend)?;
+    let start_time: i64 = row.get("start_time").map_err(backend)?;
+    let policy_raw: String = row.get("restart_policy").map_err(backend)?;
+    let restart_count: i64 = row.get("restart_count").map_err(backend)?;
+    let last_known_cause: Option<String> = row.get("last_known_cause").map_err(backend)?;
+    let restart_policy =
+        RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
+            name: name.as_str().to_string(),
+            detail: format!("unknown restart policy '{policy_raw}'"),
+        })?;
+    Ok(SpawnRecord {
+        name,
+        fingerprint: ProcessFingerprint::new(pid.max(0) as u32, start_time.max(0) as u64),
+        restart_policy,
+        restart_count: restart_count.max(0) as u32,
+        last_known_cause,
+    })
 }
 
 #[cfg(test)]
@@ -512,10 +711,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("state.db");
         {
-            // Materialize a valid v1 DB first, then bump user_version to 2 to
-            // simulate a newer schema on disk.
+            // Materialize a valid current-schema DB, then bump user_version
+            // ABOVE the current version to simulate a newer schema on disk.
             let store = SqliteStore::open(&db).unwrap();
-            store.conn.execute_batch("PRAGMA user_version = 2").unwrap();
+            store
+                .conn
+                .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+                .unwrap();
         }
         // Reopening must refuse rather than downgrade. (SqliteStore has no
         // Debug impl, so destructure the Result rather than unwrap_err.)
@@ -525,15 +727,19 @@ mod tests {
         };
         assert!(
             matches!(err, StoreError::SchemaTooNew { found, supported }
-                if found == 2 && supported == SCHEMA_VERSION),
+                if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION),
             "got {err:?}"
         );
-        // And the version on disk is untouched (not downgraded to 1).
+        // And the version on disk is untouched (not downgraded).
         let probe = Connection::open(&db).unwrap();
         let version: i64 = probe
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "user_version must not be downgraded");
+        assert_eq!(
+            version,
+            SCHEMA_VERSION + 1,
+            "user_version must not be downgraded"
+        );
     }
 
     #[test]
@@ -611,5 +817,287 @@ mod tests {
         let err = store.get_instance(&name("demo")).unwrap_err();
         assert!(matches!(err, StoreError::CorruptRow { name, detail }
                 if name == "demo" && detail.contains("teleporting")),);
+    }
+
+    // ---- Story 1-6: write-ahead spawn records (AD-5/AD-6) ----
+
+    fn record(n: &str, pid: u32, start: u64, count: u32) -> SpawnRecord {
+        SpawnRecord {
+            name: name(n),
+            fingerprint: ProcessFingerprint::new(pid, start),
+            restart_policy: RestartPolicy::OnFailure,
+            restart_count: count,
+            last_known_cause: None,
+        }
+    }
+
+    #[test]
+    fn spawn_record_round_trips_and_clears() {
+        // AD-5: write a record, read it back identically, then clear it.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        assert!(store.get_spawn_record(&name("demo")).unwrap().is_none());
+
+        let rec = record("demo", 4321, 987_654, 0);
+        store.upsert_spawn_record(&rec).unwrap();
+        let back = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(back, rec);
+
+        // Clear (a clean stop) → gone, and clearing again is idempotent.
+        store.clear_spawn_record(&name("demo")).unwrap();
+        assert!(store.get_spawn_record(&name("demo")).unwrap().is_none());
+        store.clear_spawn_record(&name("demo")).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn upsert_replaces_an_existing_record() {
+        // The UNIQUE(instance_id) upsert replaces on conflict (a re-spawn or a
+        // restart re-arming the record).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("demo", 1, 100, 0))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("demo", 2, 200, 3))
+            .unwrap();
+        let back = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(back.fingerprint, ProcessFingerprint::new(2, 200));
+        assert_eq!(back.restart_count, 3);
+        // Exactly one row (replaced, not duplicated).
+        let all = store.list_spawn_records().unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn list_spawn_records_is_ordered_by_name() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for n in ["beta", "alpha", "gamma"] {
+            store
+                .create_instance(&sample(n, "mock", &format!("/x/agents/{n}")))
+                .unwrap();
+            store.upsert_spawn_record(&record(n, 10, 20, 0)).unwrap();
+        }
+        let names: Vec<String> = store
+            .list_spawn_records()
+            .unwrap()
+            .iter()
+            .map(|r| r.name.as_str().to_string())
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn upsert_spawn_record_for_missing_instance_is_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .upsert_spawn_record(&record("ghost", 1, 1, 0))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn set_restart_count_updates_count_and_cause() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("demo", 5, 50, 0))
+            .unwrap();
+        store
+            .set_restart_count(&name("demo"), 2, Some("crashed with code 1"))
+            .unwrap();
+        let back = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(back.restart_count, 2);
+        assert_eq!(
+            back.last_known_cause.as_deref(),
+            Some("crashed with code 1")
+        );
+        // set_restart_count on an instance with no record is a harmless no-op.
+        store
+            .create_instance(&sample("norecord", "mock", "/x/agents/norecord"))
+            .unwrap();
+        store.set_restart_count(&name("norecord"), 9, None).unwrap();
+        assert!(store.get_spawn_record(&name("norecord")).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_restart_policy_creates_then_updates_the_seed() {
+        // AC4 per-instance config: setting the policy before a start creates a
+        // policy-only record (pid 0); a later start-written record + a re-set
+        // update only the policy, preserving the fingerprint + count.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        // No record yet → effective policy defaults (read via get_spawn_record).
+        assert!(store.get_spawn_record(&name("demo")).unwrap().is_none());
+
+        // Seed `never` before any start: creates a minimal policy-only record.
+        store
+            .set_restart_policy(&name("demo"), RestartPolicy::Never)
+            .unwrap();
+        let seed = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(seed.restart_policy, RestartPolicy::Never);
+        assert_eq!(seed.fingerprint, ProcessFingerprint::new(0, 0));
+        assert_eq!(seed.restart_count, 0);
+
+        // A start writes the real fingerprint + count; then re-setting the policy
+        // updates ONLY the policy.
+        store
+            .upsert_spawn_record(&record("demo", 99, 999, 4))
+            .unwrap();
+        store
+            .set_restart_policy(&name("demo"), RestartPolicy::OnFailure)
+            .unwrap();
+        let back = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(back.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(back.fingerprint, ProcessFingerprint::new(99, 999));
+        assert_eq!(back.restart_count, 4, "count preserved across a policy set");
+    }
+
+    #[test]
+    fn set_restart_policy_for_missing_instance_is_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .set_restart_policy(&name("ghost"), RestartPolicy::Never)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn set_restart_count_on_an_instance_without_a_record_is_a_noop() {
+        // The no-record branch: setting a count for an instance that has no spawn
+        // record (e.g. cleanly stopped between crash and update) is a harmless
+        // no-op — no row is created, no error.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .set_restart_count(&name("demo"), 3, Some("ignored"))
+            .unwrap();
+        assert!(store.get_spawn_record(&name("demo")).unwrap().is_none());
+        // Also a no-op for a wholly-absent instance.
+        store.set_restart_count(&name("absent"), 1, None).unwrap();
+    }
+
+    #[test]
+    fn list_spawn_records_flags_a_corrupt_name_row() {
+        // The corrupt-name branch in list_spawn_records: a stored name that
+        // violates the newtype rule is flagged CorruptRow on read.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('Bad Name', 'mock', 'running', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let id: i64 = store
+            .conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'Bad Name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, restart_count) \
+                 VALUES (?1, 1, 1, 'on-failure', 0)",
+                [id],
+            )
+            .unwrap();
+        let err = store.list_spawn_records().unwrap_err();
+        assert!(
+            matches!(&err, StoreError::CorruptRow { name, .. } if name == "Bad Name"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_record_cascades_on_instance_delete() {
+        // Removing the instance drops its runtime row (FK ON DELETE CASCADE).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("demo", 7, 70, 1))
+            .unwrap();
+        store.delete_instance(&name("demo")).unwrap();
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_runtime", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "runtime row must cascade-delete");
+    }
+
+    #[test]
+    fn corrupt_restart_policy_row_is_reported() {
+        // A stored policy the domain cannot decode is flagged CorruptRow on read.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let id = store.instance_id(&name("demo")).unwrap().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, restart_count) \
+                 VALUES (?1, 1, 1, 'teleport-on-failure', 0)",
+                [id],
+            )
+            .unwrap();
+        let err = store.get_spawn_record(&name("demo")).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::CorruptRow { name, detail }
+                if name == "demo" && detail.contains("teleport-on-failure")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn migration_v1_db_upgrades_to_v2_preserving_rows() {
+        // A DB written at schema v1 (no agent_runtime table) must upgrade to v2
+        // on open — the step migration adds the table WITHOUT dropping the v1
+        // rows. Simulate a v1 DB by creating the v1 schema + a row, then reopen.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        // Reopen: migrator steps 1 → 2, adds agent_runtime, keeps the row.
+        let store = SqliteStore::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(store.get_instance(&name("legacy")).unwrap().is_some());
+        // The new table exists and is usable.
+        store
+            .upsert_spawn_record(&record("legacy", 3, 30, 0))
+            .unwrap();
+        assert!(store.get_spawn_record(&name("legacy")).unwrap().is_some());
     }
 }

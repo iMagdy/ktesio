@@ -15,6 +15,7 @@ mod instance;
 mod lifecycle;
 mod name;
 mod registry;
+mod restart;
 mod supervisor;
 mod transition;
 
@@ -24,5 +25,7 @@ pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};
 pub use registry::{Registry, RemoveDisposition};
-pub use supervisor::{Supervisor, DEFAULT_STOP_WINDOW};
+pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
+pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
+pub use supervisor::{RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
 pub use transition::{next_state, LifecycleCommand, LifecycleError};

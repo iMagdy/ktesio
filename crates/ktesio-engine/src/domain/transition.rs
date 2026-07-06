@@ -19,6 +19,9 @@
 //! * `starting → running`  — adapter ready (process spawned and not immediately dead)
 //! * `starting → failed`   — launch error
 //! * `stopping → stopped`  — process exited (gracefully or after a forced kill)
+//! * `running → failed`    — crash detected (story 1-6, event-driven; the
+//!   supervisor's reaper applies it when `backend.poll` reports an unrequested
+//!   `Exited` for an instance the store still shows `running`/`paused`)
 //!
 //! Modeling only the command edges here keeps the AC4 uniform-error contract
 //! precise: `InvalidTransition` is returned for a rejected COMMAND (e.g. `Stop`
@@ -26,7 +29,7 @@
 //! `running`), and the event-driven edges never reject (the supervisor only
 //! applies them when the corresponding process event has actually happened).
 //!
-//! ## Reachable this story (1-5 wires `paused`)
+//! ## Reachable this story (1-6 wires the crash + restart edges)
 //!
 //! `registered → starting → running → stopping → stopped`, plus
 //! `starting → failed` (launch error) and the `stopped → starting` restart of a
@@ -34,8 +37,12 @@
 //! Story 1-5 wires `paused`: `running --Pause--> paused`,
 //! `paused --Resume--> running`, and `paused --Stop--> stopping` (the spine
 //! state diagram's `paused --> stopping`, so a paused instance is stoppable).
-//! The `running → failed` crash edge + Restart Policy (story 1-6) are
-//! intentionally NOT wired; the table's doc lists them so the shape is complete.
+//! Story 1-6 wires the SURVIVAL edges: the `running → failed` crash edge
+//! (EVENT-driven, applied by the supervisor's reaper — see the event-driven set
+//! above, NOT a command row) and `failed --Start--> starting` (a COMMAND row, so
+//! a `failed` instance is restartable by both the Restart Policy executor and an
+//! explicit `kt agent start`). The Restart Policy math lives in
+//! [`super::restart`], a pure value module. The whole table stays PURE + total.
 
 use thiserror::Error;
 
@@ -115,6 +122,12 @@ pub fn next_state(
         // (FR-5: start applies to registered OR stopped instances).
         (Registered, Start) => Ok(Starting),
         (Stopped, Start) => Ok(Starting),
+        // Restart a FAILED instance (story 1-6, AC3): the `failed → starting`
+        // command edge. Applied by both the Restart Policy executor (on a
+        // detected crash of an `on-failure` instance) and an explicit
+        // `kt agent start` on a `failed` instance. This EXTENDS FR-5's
+        // "registered OR stopped" to also cover `failed`.
+        (Failed, Start) => Ok(Starting),
         // Stop a running OR paused instance (spine diagram: paused --> stopping).
         (Running, Stop) => Ok(Stopping),
         (Paused, Stop) => Ok(Stopping),
@@ -123,8 +136,9 @@ pub fn next_state(
         (Paused, Resume) => Ok(Running),
         // Every other (state, command) pair is an invalid COMMAND transition.
         // The event-driven edges (starting→running, starting→failed,
-        // stopping→stopped) are applied by the supervisor on process events, not
-        // through this command table, so they are not rows here.
+        // stopping→stopped, and the story-1-6 running→failed crash edge) are
+        // applied by the supervisor on process events, not through this command
+        // table, so they are not rows here.
         (from, command) => Err(LifecycleError::InvalidTransition { from, command }),
     }
 }
@@ -205,6 +219,7 @@ mod tests {
                 let expected = match (from, command) {
                     (Registered, Start) => Ok(Starting),
                     (Stopped, Start) => Ok(Starting),
+                    (Failed, Start) => Ok(Starting),
                     (Running, Stop) => Ok(Stopping),
                     (Paused, Stop) => Ok(Stopping),
                     (Running, Pause) => Ok(Paused),
@@ -223,6 +238,26 @@ mod tests {
         assert_eq!(next_state(Paused, Resume), Ok(Running));
         // A paused instance must be stoppable (spine diagram: paused --> stopping).
         assert_eq!(next_state(Paused, Stop), Ok(Stopping));
+    }
+
+    #[test]
+    fn restart_from_failed_enters_starting() {
+        // AC3 (1-6): the ONE new command row story 1-6 adds — a `failed`
+        // instance is restartable (by the Restart Policy executor or an explicit
+        // `kt agent start`). Every other command from `failed` still rejects.
+        assert_eq!(next_state(Failed, Start), Ok(Starting));
+        assert!(matches!(
+            next_state(Failed, Stop),
+            Err(LifecycleError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            next_state(Failed, Pause),
+            Err(LifecycleError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            next_state(Failed, Resume),
+            Err(LifecycleError::InvalidTransition { .. })
+        ));
     }
 
     #[test]

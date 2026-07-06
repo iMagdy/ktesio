@@ -53,6 +53,19 @@
 //! qualifier, not a silent fake in the backend, is what makes it "surfaced not
 //! silent". These methods are BEHAVIOR-verified only on the `windows-latest` CI
 //! matrix; on Unix hosts they are compile-checked only.
+//!
+//! ## Start-time fingerprint + orphan adoption (story 1-6, spine AD-5)
+//!
+//! [`WindowsBackend::fingerprint`] reads the process CREATION TIME via the
+//! documented `GetProcessTimes` (a `FILETIME`, folded to a u64 of 100ns ticks) —
+//! stable per process, different across a PID reuse. [`WindowsBackend::adopt`]
+//! re-opens a live pid with `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+//! PROCESS_TERMINATE)` and compares its creation time to the recorded
+//! fingerprint (the PID-reuse guard); a match yields an ADOPTED handle that holds
+//! the process HANDLE (no Job — the process is already running and may already be
+//! in one), so a subsequent `stop` uses `TerminateProcess` on that handle. No
+//! undocumented API. Behavior-verified on the `windows-latest` CI leg;
+//! compile-checked on Unix.
 
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -60,17 +73,20 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
+    CREATE_NEW_PROCESS_GROUP, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
-use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnSpec, StopOutcome};
+use crate::ports::{
+    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
+};
 
 /// `STILL_ACTIVE` (259): the exit code a process reports while still running.
 const STILL_ACTIVE: u32 = 259;
@@ -78,33 +94,52 @@ const STILL_ACTIVE: u32 = 259;
 /// How often the graceful-stop wait polls for the process to exit.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// A running process on Windows: the owned child + its Job Object handle.
+/// A running process on Windows.
 ///
-/// The Job holds the process (and its descendants). Dropping the handle closes
-/// the job, which — with kill-on-close set — terminates every process in it, so
-/// a leaked handle never leaves survivors.
+/// For a FRESHLY SPAWNED process, `child` is `Some` and `job` owns the process
+/// tree (kill-on-close). For an ADOPTED process (story 1-6, re-acquired on engine
+/// start), `child` is `None`, `job` is null, and `adopted` holds a process HANDLE
+/// opened via `OpenProcess` (for liveness + `TerminateProcess`) — this engine is
+/// not the parent, so it holds no reap-able [`Child`] and did not create a job.
+/// Dropping either form releases its OS handles; a spawned handle also kills the
+/// tree via the job's kill-on-close.
 pub struct WindowsProcess {
-    /// The owned child handle (its process handle drives waits/exit-code).
-    child: Child,
-    /// The Job Object handle (owns the process tree; kill-on-close configured).
+    /// The owned child handle if THIS engine spawned the process (drives
+    /// waits/exit-code). `None` for an adopted process (not our child).
+    child: Option<Child>,
+    /// The Job Object handle (owns the process tree; kill-on-close configured)
+    /// for a spawned process; null for an adopted one.
     job: HANDLE,
+    /// The opened process HANDLE for an ADOPTED process (liveness +
+    /// TerminateProcess); null for a spawned one (which uses its Child/job).
+    adopted: HANDLE,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
 }
 
-// The raw Job HANDLE is an owned OS resource this struct is solely responsible
-// for; it is safe to move across threads (tokio's blocking pool).
+// The raw Job / process HANDLEs are owned OS resources this struct is solely
+// responsible for; it is safe to move across threads (tokio's blocking pool).
 unsafe impl Send for WindowsProcess {}
 
 impl Drop for WindowsProcess {
     fn drop(&mut self) {
-        // Closing the job handle kills the tree (kill-on-close), then we release
-        // the handle. Best-effort — nothing to do if it fails during teardown.
+        // Spawned: closing the job handle kills the tree (kill-on-close), then
+        // release it. Adopted: SIGKILL-equivalent is not applied on drop for a
+        // process we merely re-opened (parity with Unix would kill it; but on
+        // Windows an adopted process has no job, and the cross-lifetime handle is
+        // dropped at engine shutdown — we terminate it in `stop`, and on drop we
+        // only release the opened handle so we do not leak it). Best-effort.
         if !self.job.is_null() {
             unsafe {
                 CloseHandle(self.job);
             }
             self.job = std::ptr::null_mut();
+        }
+        if !self.adopted.is_null() {
+            unsafe {
+                CloseHandle(self.adopted);
+            }
+            self.adopted = std::ptr::null_mut();
         }
     }
 }
@@ -220,7 +255,12 @@ impl ProcessBackend for WindowsBackend {
 
         // Assignment succeeded — hand the job handle to the process struct.
         let job = job_guard.into_inner();
-        Ok(WindowsProcess { child, job, pid })
+        Ok(WindowsProcess {
+            child: Some(child),
+            job,
+            adopted: std::ptr::null_mut(),
+            pid,
+        })
     }
 
     fn stop(
@@ -246,16 +286,33 @@ impl ProcessBackend for WindowsBackend {
             sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
 
-        // Escalate: terminate the whole job (kills the parent + all descendants).
-        let ok = unsafe { TerminateJobObject(handle.job, 1) };
-        if ok == 0 {
-            return Err(BackendError::Control {
-                op: "terminate",
-                detail: format!("TerminateJobObject failed (os error {})", last_error()),
-            });
+        // Escalate. Spawned: terminate the whole job (kills parent + descendants)
+        // and reap the child. Adopted (no job, no child): terminate the opened
+        // process HANDLE with TerminateProcess.
+        if !handle.job.is_null() {
+            let ok = unsafe { TerminateJobObject(handle.job, 1) };
+            if ok == 0 {
+                return Err(BackendError::Control {
+                    op: "terminate",
+                    detail: format!("TerminateJobObject failed (os error {})", last_error()),
+                });
+            }
+        } else if !handle.adopted.is_null() {
+            let ok = unsafe { TerminateProcess(handle.adopted, 1) };
+            if ok == 0 {
+                return Err(BackendError::Control {
+                    op: "terminate",
+                    detail: format!("TerminateProcess failed (os error {})", last_error()),
+                });
+            }
+            // Wait briefly for the adopted process to actually exit.
+            let h = handle.adopted;
+            let _ = unsafe { WaitForSingleObject(h, 5000) };
         }
-        // Reap the child so its handle is released.
-        let _ = handle.child.wait();
+        // Reap the direct child if it is ours (adopted: OS handles it).
+        if let Some(child) = handle.child.as_mut() {
+            let _ = child.wait();
+        }
         Ok(StopOutcome { forced: true })
     }
 
@@ -283,41 +340,147 @@ impl ProcessBackend for WindowsBackend {
     fn pid(&self, handle: &Self::Handle) -> u32 {
         handle.pid
     }
+
+    fn fingerprint(&self, handle: &Self::Handle) -> ProcessFingerprint {
+        // Creation time via GetProcessTimes; a read failure falls back to 0 (a
+        // degraded but honest fingerprint — the pid is still recorded).
+        let start_time = process_start_time(handle.pid).unwrap_or(0);
+        ProcessFingerprint::new(handle.pid, start_time)
+    }
+
+    fn adopt(
+        &self,
+        fingerprint: &ProcessFingerprint,
+    ) -> Result<Option<Self::Handle>, BackendError> {
+        // Open the pid for query + terminate. A gone pid → OpenProcess fails →
+        // Ok(None). Then compare the CURRENT creation time to the recorded one
+        // (the PID-reuse guard, AD-5): a mismatch → a different process → Ok(None).
+        let h = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                fingerprint.pid,
+            )
+        };
+        if h.is_null() {
+            return Ok(None);
+        }
+        let live_start = match process_start_time(fingerprint.pid) {
+            Some(t) => t,
+            None => {
+                unsafe {
+                    CloseHandle(h);
+                }
+                return Ok(None);
+            }
+        };
+        if live_start != fingerprint.start_time {
+            // PID reused by a different process — do NOT adopt.
+            unsafe {
+                CloseHandle(h);
+            }
+            return Ok(None);
+        }
+        // Same process. Hold the opened handle for liveness + TerminateProcess
+        // (no Job — the process is already running and may be in one already).
+        Ok(Some(WindowsProcess {
+            child: None,
+            job: std::ptr::null_mut(),
+            adopted: h,
+            pid: fingerprint.pid,
+        }))
+    }
 }
 
 impl WindowsProcess {
     /// Non-blocking: reap the child if it has exited, returning its status.
     ///
-    /// Uses `WaitForSingleObject(handle, 0)` for a zero-timeout liveness check,
-    /// then `GetExitCodeProcess` for the code. Falls back to `Child::try_wait`
-    /// to release the std child bookkeeping.
+    /// SPAWNED (`child: Some`): `Child::try_wait` (authoritative), double-checked
+    /// via the raw handle. ADOPTED (`child: None`, story 1-6): this engine is not
+    /// the parent, so liveness is `WaitForSingleObject(adopted, 0)` +
+    /// `GetExitCodeProcess` on the opened handle; a gone process reports its exit
+    /// code if still readable, else `Exited { code: None }`.
     fn reap_if_exited(&mut self) -> Result<ProcessStatus, BackendError> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Ok(ProcessStatus::Exited {
-                code: status.code(),
-            }),
-            Ok(None) => {
-                // Double-check via the raw handle (defensive; try_wait is
-                // authoritative but this keeps parity with the Unix poll).
-                let h = self.child.as_raw_handle() as HANDLE;
-                let waited = unsafe { WaitForSingleObject(h, 0) };
+        match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => Ok(ProcessStatus::Exited {
+                    code: status.code(),
+                }),
+                Ok(None) => {
+                    // Double-check via the raw handle (defensive; try_wait is
+                    // authoritative but this keeps parity with the Unix poll).
+                    let h = child.as_raw_handle() as HANDLE;
+                    let waited = unsafe { WaitForSingleObject(h, 0) };
+                    if waited == WAIT_OBJECT_0 {
+                        let mut code: u32 = 0;
+                        let ok = unsafe { GetExitCodeProcess(h, &mut code) };
+                        if ok != 0 && code != STILL_ACTIVE {
+                            return Ok(ProcessStatus::Exited {
+                                code: Some(code as i32),
+                            });
+                        }
+                    }
+                    Ok(ProcessStatus::Alive)
+                }
+                Err(e) => Err(BackendError::Control {
+                    op: "wait",
+                    detail: e.to_string(),
+                }),
+            },
+            // Adopted: liveness via the opened process handle.
+            None => {
+                if self.adopted.is_null() {
+                    // No handle at all — treat as gone (defensive; not normally
+                    // reachable, an adopted handle always opens a process handle).
+                    return Ok(ProcessStatus::Exited { code: None });
+                }
+                let waited = unsafe { WaitForSingleObject(self.adopted, 0) };
                 if waited == WAIT_OBJECT_0 {
                     let mut code: u32 = 0;
-                    let ok = unsafe { GetExitCodeProcess(h, &mut code) };
+                    let ok = unsafe { GetExitCodeProcess(self.adopted, &mut code) };
                     if ok != 0 && code != STILL_ACTIVE {
                         return Ok(ProcessStatus::Exited {
                             code: Some(code as i32),
                         });
                     }
+                    return Ok(ProcessStatus::Exited { code: None });
                 }
                 Ok(ProcessStatus::Alive)
             }
-            Err(e) => Err(BackendError::Control {
-                op: "wait",
-                detail: e.to_string(),
-            }),
         }
     }
+}
+
+/// Read a process's creation time via `GetProcessTimes`, folded to a u64 of
+/// 100ns ticks — stable per process, different across a PID reuse (spine AD-5).
+/// Opens a short-lived query handle by pid. Returns `None` if the process cannot
+/// be opened/queried (gone, or insufficient rights). No undocumented API.
+fn process_start_time(pid: u32) -> Option<u64> {
+    // PROCESS_QUERY_LIMITED_INFORMATION suffices for GetProcessTimes and is the
+    // least-privileged right that works across integrity levels.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let ok = unsafe { GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) };
+    unsafe {
+        CloseHandle(h);
+    }
+    if ok == 0 {
+        return None;
+    }
+    let ticks = ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+    if ticks == 0 {
+        return None;
+    }
+    Some(ticks)
 }
 
 /// A guard that closes a Job handle unless [`JobGuard::into_inner`] is called.

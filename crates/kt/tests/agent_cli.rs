@@ -30,6 +30,51 @@ fn force_state_running(state_dir: &Path, name: &str) {
     assert_eq!(affected, 1, "expected to update exactly one row");
 }
 
+/// Start an instance via a SEPARATE, leaked engine subprocess (crash semantics)
+/// so the spawned `fake_agent` SURVIVES the command's exit and can be adopted by
+/// the next `kt` invocation (story 1-6). A normal `kt agent start` cleanly drops
+/// its engine, which kills the process (the single-lifetime `Drop`), so pause on
+/// a later invocation would honestly reconcile the dead-process row to `failed`.
+/// To exercise real pause-on-a-LIVE-adopted-instance the process must genuinely
+/// outlive its starter — which is exactly the engine-crash case: this re-execs
+/// the test binary into `agent_cli_start_helper_subprocess`, which opens an
+/// engine, starts the instance, and `std::process::exit`s WITHOUT dropping the
+/// engine (no handle Drop → the agent survives and re-parents to init).
+fn start_via_surviving_engine(state_dir: &Path, name: &str) {
+    let exe = std::env::current_exe().expect("test exe");
+    let status = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "agent_cli_start_helper_subprocess",
+            "--nocapture",
+        ])
+        .env("KTESIO_CLI_START_HELPER", name)
+        .env("KTESIO_STATE_DIR", state_dir)
+        .status()
+        .expect("run cli start helper subprocess");
+    assert!(
+        status.success(),
+        "cli start helper subprocess failed: {status}"
+    );
+}
+
+/// The re-exec entry for [`start_via_surviving_engine`]. When
+/// `KTESIO_CLI_START_HELPER` is unset this is a trivial pass. When set, it opens
+/// an engine over `KTESIO_STATE_DIR`, starts the named instance, and exits
+/// WITHOUT dropping the engine — leaving a surviving, adoptable process.
+#[test]
+fn agent_cli_start_helper_subprocess() {
+    let Ok(name) = std::env::var("KTESIO_CLI_START_HELPER") else {
+        return;
+    };
+    let state = std::path::PathBuf::from(std::env::var("KTESIO_STATE_DIR").unwrap());
+    let engine = ktesio_engine::Engine::open(Some(state)).expect("helper engine open");
+    engine.blocking().start(&name).expect("helper start");
+    // Exit WITHOUT dropping `engine` (crash semantics): the started process
+    // survives and re-parents to init, ready for the next command to adopt.
+    std::process::exit(0);
+}
+
 #[test]
 fn register_prints_home_path_and_exits_zero() {
     let ctx = TestContext::new();
@@ -511,11 +556,13 @@ fn start_prints_running_state_and_exits_zero() {
 #[test]
 fn start_prints_single_lifetime_notice_to_stderr_only() {
     // LOW-1: the success path is honest about single-lifetime supervision — a
-    // standalone `kt agent start` kills the agent when the CLI exits (durable
-    // supervision is story 1-6). That caveat is printed as a one-line NOTICE to
-    // STDERR (AD-12: results → stdout, notices → stderr), and the stdout result
-    // line (`running`) is UNCHANGED. This asserts both halves so a future change
-    // that either drops the notice or leaks it onto stdout is caught.
+    // standalone `kt agent start` kills the agent when the CLI exits cleanly, and
+    // durable supervision across SEPARATE CLI invocations is future work (story
+    // 1-6 delivered crash recovery, NOT clean-exit cross-command survival). That
+    // caveat is printed as a one-line NOTICE to STDERR (AD-12: results → stdout,
+    // notices → stderr), and the stdout result line (`running`) is UNCHANGED.
+    // This asserts both halves so a future change that either drops the notice or
+    // leaks it onto stdout is caught.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -536,15 +583,27 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
     assert!(run.success, "start should exit 0; stderr={}", run.stderr);
     // stdout result line is unchanged (still shows `running`).
     assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
-    // The notice is on stderr, and names story 1-6 as the durable-supervision
-    // follow-up.
+    // The notice is on stderr and states the honest boundary (supervised only for
+    // this engine session; cross-invocation durability is future work). It must
+    // NOT promise cross-CLI durable supervision as delivered.
     assert!(
         run.stderr
             .contains("supervised only for this engine session"),
         "single-lifetime notice must go to stderr; stderr={}",
         run.stderr
     );
-    assert!(run.stderr.contains("1-6"), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("future work"),
+        "notice must state durable cross-invocation supervision is future work; stderr={}",
+        run.stderr
+    );
+    // It must NOT claim durable cross-CLI supervision arrives with 1-6 (that was
+    // the false promise this fix removes).
+    assert!(
+        !run.stderr.contains("across CLI invocations arrives"),
+        "notice must not promise cross-CLI durable supervision as delivered; stderr={}",
+        run.stderr
+    );
     // The notice must NOT leak onto stdout (AD-12: stdout is the result only).
     assert!(
         !run.stdout
@@ -722,9 +781,21 @@ source = "self-reported"
 
 #[test]
 fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
-    // AC6 + AC1 at the CLI (Unix guaranteed): pause prints the new state
-    // `paused` to stdout with exit 0. Runtime-skip on Windows (guaranteed pause
-    // is Unix-only); NO cfg — data-driven skip.
+    // AC6 + AC1 at the CLI (Unix guaranteed): `kt agent pause` on a genuinely
+    // LIVE instance prints the new state `paused` to stdout with exit 0 and NO
+    // best-effort qualifier. Runtime-skip on Windows (guaranteed pause is
+    // Unix-only); NO cfg — data-driven skip.
+    //
+    // NOTE (single-lifetime CLI boundary, story 1-6): each `kt` command is a
+    // short-lived engine whose handle Drop kills the process on the command's
+    // clean exit (the story-1-4 single-lifetime safety net; durable
+    // cross-invocation supervision remains future work — orphan ADOPTION here
+    // covers the engine-CRASH case, proven in `tests/adoption.rs`). So this test
+    // proves the pause command's CLI WIRING against a live adopted instance; it
+    // does NOT chain a follow-up `kt agent resume` (the paused process does not
+    // survive the pause command's clean drop). The pause/resume SEMANTICS —
+    // including resume after a real SIGSTOP within one engine lifetime — are
+    // covered by the engine integration tests in `tests/pause.rs`.
     if std::env::consts::OS == "windows" {
         return;
     }
@@ -747,7 +818,10 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    // Start via a surviving (crashed-engine) subprocess so the process is
+    // genuinely LIVE when the pause command adopts it (story 1-6). A plain
+    // `kt agent start` would kill it on the command's clean engine drop.
+    start_via_surviving_engine(state_dir, "svc");
 
     let paused = run_kt_agent(&["agent", "pause", "svc"], &ctx.project_dir, state_dir);
     assert!(
@@ -764,20 +838,8 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
         paused.stderr
     );
 
-    // Resume prints `running`.
-    let resumed = run_kt_agent(&["agent", "resume", "svc"], &ctx.project_dir, state_dir);
-    assert!(
-        resumed.success,
-        "resume should exit 0; stderr={}",
-        resumed.stderr
-    );
-    assert!(
-        resumed.stdout.contains("running"),
-        "stdout={}",
-        resumed.stdout
-    );
-
-    // Teardown.
+    // Teardown: the pause command's clean drop already killed the SIGSTOP'd
+    // process; a `stop` here settles the row (idempotent, no survivor).
     run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
 }
 
@@ -796,7 +858,9 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only() {
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(&["agent", "start", "be"], &ctx.project_dir, state_dir);
+    // Start via a surviving (crashed-engine) subprocess so the process is live
+    // when pause adopts it (story 1-6); a plain `kt agent start` kills it on exit.
+    start_via_surviving_engine(state_dir, "be");
 
     let paused = run_kt_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
     assert!(
@@ -868,7 +932,10 @@ source = "self-reported"
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(&["agent", "start", "un"], &ctx.project_dir, state_dir);
+    // Start via a surviving (crashed-engine) subprocess so the instance is
+    // genuinely `running` (adopted) when pause runs — so pause fails fast with
+    // the UNSUPPORTED diagnostic, not a reconciled-to-failed transition error.
+    start_via_surviving_engine(state_dir, "un");
 
     let paused = run_kt_agent(&["agent", "pause", "un"], &ctx.project_dir, state_dir);
     assert!(
@@ -891,9 +958,13 @@ source = "self-reported"
         "stderr must point at kt agent show; stderr={}",
         paused.stderr
     );
-    // The instance is UNCHANGED (still running).
-    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
-    assert!(list.stdout.contains("running"), "stdout={}", list.stdout);
+    // Fail-fast made NO transition to `paused`: the pause command exited
+    // non-zero WITHOUT persisting a pause. (We do not re-check the state via a
+    // follow-up `kt` command here: each command's clean engine drop kills the
+    // adopted process, and the next command's honest adoption would then
+    // reconcile the gone process to `failed` — a single-lifetime CLI artifact,
+    // NOT a pause side effect. The no-persist guarantee of the unsupported
+    // fail-fast is proven at the engine level in `tests/pause.rs`.)
 
     // Teardown.
     run_kt_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
@@ -918,4 +989,231 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
         "uniform invalid-transition; stderr={}",
         run.stderr
     );
+}
+
+// ---- Story 1-6: restart count / failed cause / policy surface (AC9) + restart ----
+
+/// Seed a `failed` instance with an `agent_runtime` record carrying a Restart
+/// Policy, a restart count, and a last-known (failed) cause — directly in the
+/// engine's SQLite DB. The record's pid is 0 (a policy/status seed, NOT a live
+/// process), so the engine's orphan adoption on open skips it and the row stays
+/// `failed`. This is how AC9's CLI surface is exercised without a real crash.
+fn seed_failed_with_record(state_dir: &Path, name: &str, policy: &str, count: u32, cause: &str) {
+    let conn = rusqlite::Connection::open(state_db(state_dir)).expect("open state db");
+    let affected = conn
+        .execute(
+            "UPDATE agent_instances SET state = 'failed' WHERE name = ?1",
+            [name],
+        )
+        .expect("update state to failed");
+    assert_eq!(affected, 1, "expected to update exactly one row");
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM agent_instances WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .expect("instance id");
+    conn.execute(
+        "INSERT INTO agent_runtime \
+         (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+         VALUES (?1, 0, 0, ?2, ?3, ?4)",
+        rusqlite::params![id, policy, count as i64, cause],
+    )
+    .expect("insert agent_runtime record");
+}
+
+#[test]
+fn list_surfaces_the_restart_count_column() {
+    // AC9: `kt agent list` surfaces the per-instance restart count.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "svc", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    seed_failed_with_record(state_dir, "svc", "on-failure", 3, "crashed with code 1");
+
+    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(list.success, "list should exit 0; stderr={}", list.stderr);
+    // The Restarts column header + the seeded count 3 are rendered (stdout).
+    assert!(
+        list.stdout.contains("Restarts"),
+        "list must have a Restarts column; stdout={}",
+        list.stdout
+    );
+    assert!(
+        list.stdout.contains('3'),
+        "list must show the restart count; stdout={}",
+        list.stdout
+    );
+    // The failed state is shown too.
+    assert!(list.stdout.contains("failed"), "stdout={}", list.stdout);
+}
+
+#[test]
+fn show_surfaces_restart_count_policy_and_failed_cause() {
+    // AC9: `kt agent show` on a failed instance surfaces the restart count, the
+    // active Restart Policy, and the failed cause (result → stdout).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "svc", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    seed_failed_with_record(
+        state_dir,
+        "svc",
+        "on-failure",
+        5,
+        "crash-loop: 5 consecutive failures reached",
+    );
+
+    let show = run_kt_agent(&["agent", "show", "svc"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    // Runtime status block: state + policy + count.
+    assert!(
+        show.stdout.contains("Runtime status"),
+        "show must render runtime status; stdout={}",
+        show.stdout
+    );
+    assert!(
+        show.stdout.contains("on-failure"),
+        "policy; stdout={}",
+        show.stdout
+    );
+    assert!(
+        show.stdout.contains('5'),
+        "restart count; stdout={}",
+        show.stdout
+    );
+    // The failed cause (crash-loop reason) is surfaced.
+    assert!(
+        show.stdout.contains("crash-loop"),
+        "show must surface the failed cause; stdout={}",
+        show.stdout
+    );
+}
+
+#[test]
+fn show_surfaces_a_launch_error_failed_cause() {
+    // F-Med-3 (AC9): a LAUNCH-ERROR `failed` instance has no write-ahead spawn
+    // record (the `starting→failed` launch error returns before the record is
+    // written), yet `kt agent show` must still surface the failed cause — via the
+    // engine's event-log fallback. Register a manifest whose exec does not exist,
+    // start it (fails to launch), then `show` must print the launch diagnostic.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = ctx.project_dir.join("bad-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let body = r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "bad"
+
+[lifecycle.start]
+exec = "ktesio-no-such-binary-cli-med3"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#;
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "bad",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Start fails to launch (exit non-zero) and lands the instance `failed`.
+    let start = run_kt_agent(&["agent", "start", "bad"], &ctx.project_dir, state_dir);
+    assert!(!start.success, "start of a bad exec should exit non-zero");
+
+    let show = run_kt_agent(&["agent", "show", "bad"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    // The runtime status shows `failed`, and the failed cause (the preserved
+    // launch diagnostic naming the missing exec) is surfaced on stdout.
+    assert!(show.stdout.contains("failed"), "stdout={}", show.stdout);
+    assert!(
+        show.stdout.contains("ktesio-no-such-binary-cli-med3"),
+        "show must surface the launch-error failed cause (AC9); stdout={}",
+        show.stdout
+    );
+}
+
+#[test]
+fn start_restarts_a_failed_instance() {
+    // AC3 at the CLI: `kt agent start` restarts a `failed` instance (the 1-6
+    // transition row `failed → starting` permits it). Seed a `failed` instance
+    // backed by a real `fake_agent` manifest, then start it → running.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    // Register a manifest instance whose exec is the real fake_agent (lingers).
+    let manifest_dir = TestContext::new();
+    let bin = ktesio_conformance::fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "svc"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000"]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+    );
+    std::fs::write(manifest_dir.project_dir.join("adapter.toml"), body).unwrap();
+    let manifest_path = manifest_dir.project_dir.to_string_lossy().to_string();
+    run_kt_agent(
+        &["agent", "register", "svc", "--manifest", &manifest_path],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Force it to `failed` (no record needed for the transition; policy defaults).
+    let conn = rusqlite::Connection::open(state_db(state_dir)).unwrap();
+    conn.execute(
+        "UPDATE agent_instances SET state = 'failed' WHERE name = 'svc'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // `kt agent start` on a failed instance restarts it → running (exit 0).
+    let start = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        start.success,
+        "start on a failed instance should restart it (exit 0); stderr={}",
+        start.stderr
+    );
+    assert!(start.stdout.contains("running"), "stdout={}", start.stdout);
+
+    // Teardown: stop it so the process does not linger.
+    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
 }

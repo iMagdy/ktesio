@@ -33,9 +33,45 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    AgentInstance, EngineError, InstanceName, Registry, RegistryError, RemoveDisposition,
-    Supervisor, TransitionEvent,
+    AgentInstance, EngineError, InstanceName, LifecycleState, Registry, RegistryError,
+    RemoveDisposition, RestartPolicy, Supervisor, TransitionCause, TransitionEvent,
 };
+
+/// How often the crash-detection reaper polls supervised processes (story 1-6,
+/// `[ASSUMPTION]`). Small enough that a crash is detected promptly, large enough
+/// to avoid busy-work; not spine-mandated. The engine owns this cadence and
+/// calls the sync [`Supervisor::poll_once`] via `spawn_blocking`, keeping the
+/// supervisor cfg-free + sync.
+const CRASH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The per-instance runtime status the CLI surfaces (story 1-6, AC9): the
+/// current Lifecycle State, the effective Restart Policy, the restart count, and
+/// (for a `failed` instance) the last-known failed cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceStatus {
+    /// The instance the status is for.
+    pub instance: AgentInstance,
+    /// The effective per-instance Restart Policy (AD-15).
+    pub restart_policy: RestartPolicy,
+    /// The consecutive-failure restart count (0 when never restarted / reset on a
+    /// clean run).
+    pub restart_count: u32,
+    /// The last-known cause (e.g. the crash / crash-loop detail), if any. Present
+    /// for a `failed` instance whose spawn record recorded a cause.
+    pub failed_cause: Option<String>,
+}
+
+/// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
+/// for the `instance_status` event-log fallback (AC9). Returns the carried detail
+/// for the failure-bearing causes (a launch error, or a crash), or `None` for a
+/// cause that does not describe a failure.
+fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
+    match cause {
+        TransitionCause::LaunchError { detail } => Some(detail.clone()),
+        TransitionCause::Crashed { detail } => Some(detail.clone()),
+        _ => None,
+    }
+}
 
 /// The async engine handle (the Embedding Interface, AD-2/AD-13).
 ///
@@ -47,6 +83,17 @@ pub struct Engine {
     rt: Arc<Runtime>,
     /// Shared engine state (registry + supervisor), guarded for `spawn_blocking`.
     inner: Arc<EngineInner>,
+    /// The crash-detection reaper task's abort handle (story 1-6). Aborted on
+    /// [`Engine::drop`] so the background poll stops with the engine.
+    reaper: tokio::task::AbortHandle,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Stop the background reaper when the engine goes away (its supervised
+        // handles drop with the supervisor, killing spawned processes).
+        self.reaper.abort();
+    }
 }
 
 /// Shared, `Send + Sync` engine state moved onto the blocking pool.
@@ -66,7 +113,14 @@ impl Engine {
     ///
     /// `base` is threaded straight into [`Registry::open`] (see its docs for the
     /// resolution order). Builds the multi-thread tokio runtime the blocking
-    /// facade owns and an empty in-memory supervisor.
+    /// facade owns and an empty in-memory supervisor, then:
+    /// 1. ADOPTS ORPHANS (story 1-6, AC-B): reconciles every write-ahead spawn
+    ///    record against live processes — a live fingerprint match is re-held
+    ///    under supervision, a non-match is reconciled to `failed`, so no agent
+    ///    process is left unsupervised and no phantom `running` row survives.
+    /// 2. Spawns the crash-detection reaper (story 1-6, AC-A): a tokio interval
+    ///    task that periodically runs [`Supervisor::poll_once`] via
+    ///    `spawn_blocking` and times the Restart Policy backoffs.
     pub fn open(base: Option<PathBuf>) -> Result<Self, RegistryError> {
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
@@ -74,14 +128,84 @@ impl Engine {
             path: "<tokio-runtime>".to_string(),
             source: e,
         })?;
-        let inner = EngineInner {
+        let inner = Arc::new(EngineInner {
             registry: Mutex::new(registry),
             supervisor: Mutex::new(Supervisor::new()),
-        };
+        });
+
+        // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
+        // reaper starts so an adopted process is already held when the first poll
+        // runs (and a phantom row is already `failed`).
+        {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.adopt_orphans(&registry);
+        }
+
+        // (2) Spawn the crash-detection reaper on the engine's runtime. It is
+        // aborted on Engine::drop. Cloning the Arc<EngineInner> keeps the shared
+        // state alive for the task without keeping the Engine itself alive.
+        let reaper = Self::spawn_reaper(&rt, Arc::clone(&inner));
+
         Ok(Self {
             rt: Arc::new(rt),
-            inner: Arc::new(inner),
+            inner,
+            reaper,
         })
+    }
+
+    /// Spawn the crash-detection reaper task on `rt` and return its abort handle.
+    ///
+    /// The task ticks every [`CRASH_POLL_INTERVAL`], running the sync
+    /// [`Supervisor::poll_once`] via `spawn_blocking` (rusqlite + syscalls off the
+    /// async workers, AD-13). For each returned [`RestartPlan`] it spawns a
+    /// DELAYED restart: sleep the backoff, then run [`Supervisor::restart`] via
+    /// `spawn_blocking`. A restart whose instance was meanwhile stopped is a
+    /// harmless no-op (the transition gate rejects a non-`failed` start — AC7).
+    fn spawn_reaper(rt: &Runtime, inner: Arc<EngineInner>) -> tokio::task::AbortHandle {
+        let handle = rt.spawn(async move {
+            let mut ticker = tokio::time::interval(CRASH_POLL_INTERVAL);
+            // Skip missed ticks rather than bursting after a slow poll.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let poll_inner = Arc::clone(&inner);
+                let plans = tokio::task::spawn_blocking(move || {
+                    let registry = poll_inner.registry.lock().expect("registry mutex poisoned");
+                    let mut supervisor = poll_inner
+                        .supervisor
+                        .lock()
+                        .expect("supervisor mutex poisoned");
+                    supervisor.poll_once(&registry)
+                })
+                .await
+                .unwrap_or_default();
+
+                // Time each restart's backoff, then perform it. Spawned as
+                // independent tasks so one instance's backoff does not delay
+                // another's; each holds its own Arc<EngineInner> clone.
+                for plan in plans {
+                    let restart_inner = Arc::clone(&inner);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(plan.delay).await;
+                        let name = plan.name.as_str().to_string();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let registry = restart_inner
+                                .registry
+                                .lock()
+                                .expect("registry mutex poisoned");
+                            let mut supervisor = restart_inner
+                                .supervisor
+                                .lock()
+                                .expect("supervisor mutex poisoned");
+                            supervisor.restart(&registry, &name, plan.attempt, plan.delay)
+                        })
+                        .await;
+                    });
+                }
+            }
+        });
+        handle.abort_handle()
     }
 
     /// A synchronous facade over the async API for non-async callers (`kt`).
@@ -263,6 +387,86 @@ impl Engine {
         .await
     }
 
+    /// The per-instance runtime status (story 1-6, AC9): Lifecycle State +
+    /// effective Restart Policy + restart count + (for `failed`) the last-known
+    /// cause. This is the read `kt agent list`/`show` uses to surface the restart
+    /// count and, for a failed instance, the failed cause + active policy.
+    ///
+    /// Failed-cause precedence (AC9 requires the cause for ANY `failed` instance):
+    /// the write-ahead record's `last_known_cause` if present; otherwise, for a
+    /// `failed` instance, a fallback to the LAST transition-event-log cause. The
+    /// fallback covers two cases the record cannot: a LAUNCH-ERROR failure
+    /// (`starting → failed` returns before any spawn record is written), and a
+    /// TERMINAL crash (`never` / crash-loop) whose record was cleared — both keep
+    /// their cause in the JSON-Lines event log.
+    pub async fn instance_status(&self, name: &str) -> Result<InstanceStatus, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            let instance = registry
+                .lookup(&iname)
+                .map_err(crate::domain::registry_error_to_engine)?;
+            let record = registry
+                .spawn_record(&iname)
+                .map_err(crate::domain::registry_error_to_engine)?;
+            let restart_policy = record
+                .as_ref()
+                .map(|r| r.restart_policy)
+                .unwrap_or_default();
+            let restart_count = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
+            let failed_cause = record.and_then(|r| r.last_known_cause).or_else(|| {
+                // No record cause. For a `failed` instance, fall back to the last
+                // event-log cause so a launch-error or a cleared-terminal crash
+                // still surfaces a reason (AC9).
+                if instance.state != LifecycleState::Failed {
+                    return None;
+                }
+                let events = Supervisor::read_events(&registry, &name).unwrap_or_default();
+                events
+                    .iter()
+                    .rev()
+                    .find(|e| e.new_state == LifecycleState::Failed)
+                    .and_then(|e| failed_cause_detail(&e.cause))
+            });
+            Ok(InstanceStatus {
+                instance,
+                restart_policy,
+                restart_count,
+                failed_cause,
+            })
+        })
+        .await
+    }
+
+    /// Set the per-instance Restart Policy (story 1-6, AC4 "per-instance
+    /// configurable") — the config SEED (Epic-2 layered TOML config is later).
+    /// Persists the policy so a subsequent `start` reads it and the reaper honors
+    /// it on a crash. Runs behind the blocking pool like the other mutations.
+    pub async fn set_restart_policy(
+        &self,
+        name: &str,
+        policy: RestartPolicy,
+    ) -> Result<(), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            registry
+                .set_restart_policy(&iname, policy)
+                .map_err(crate::domain::registry_error_to_engine)
+        })
+        .await
+    }
+
     /// Read the recorded transition events for an instance from its log (AC1
     /// "each transition emits an event"; AC3 escalation recorded). Test/embedding
     /// observation helper — this is the AD-14 seed, NOT the 7-2 subscription bus.
@@ -369,5 +573,17 @@ impl Blocking<'_> {
     /// Blocking [`Engine::transition_events`].
     pub fn transition_events(&self, name: &str) -> Result<Vec<TransitionEvent>, EngineError> {
         self.engine.rt.block_on(self.engine.transition_events(name))
+    }
+
+    /// Blocking [`Engine::instance_status`] (story 1-6, AC9).
+    pub fn instance_status(&self, name: &str) -> Result<InstanceStatus, EngineError> {
+        self.engine.rt.block_on(self.engine.instance_status(name))
+    }
+
+    /// Blocking [`Engine::set_restart_policy`] (story 1-6, AC4).
+    pub fn set_restart_policy(&self, name: &str, policy: RestartPolicy) -> Result<(), EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_restart_policy(name, policy))
     }
 }

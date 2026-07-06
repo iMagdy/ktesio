@@ -65,9 +65,10 @@ mod time;
 pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     AgentInstance, EngineError, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
-    NameError, Registry, RegistryError, RemoveDisposition, TransitionCause, TransitionEvent,
+    NameError, Registry, RegistryError, RemoveDisposition, RestartPolicy, TransitionCause,
+    TransitionEvent,
 };
-pub use engine::{Blocking, Engine};
+pub use engine::{Blocking, Engine, InstanceStatus};
 
 // Re-export the adapter-contract types `kt` needs to render the effective
 // per-OS Capability Declaration (AD-2: `kt` names these types, not the schema).

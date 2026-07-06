@@ -701,6 +701,7 @@ dependencies = [
  "dialoguer",
  "flate2",
  "indicatif",
+ "ktesio-conformance",
  "ktesio-engine",
  "miette",
  "regex",

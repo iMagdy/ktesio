@@ -10,8 +10,10 @@
 mod process_backend;
 mod state_store;
 
-pub use process_backend::{BackendError, ProcessBackend, ProcessStatus, SpawnSpec, StopOutcome};
-pub use state_store::StateStore;
+pub use process_backend::{
+    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
+};
+pub use state_store::{SpawnRecord, StateStore};
 
 use thiserror::Error;
 

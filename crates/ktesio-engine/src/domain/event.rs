@@ -25,9 +25,10 @@ use super::lifecycle::LifecycleState;
 /// unversioned event.
 ///
 /// NOTE (additive vs breaking): story 1-5 ADDS `TransitionCause` variants
-/// (`pause-best-effort` / `resume-best-effort`). Adding a new closed-vocabulary
-/// variant is a backward-ADDITIVE change: a NEW reader parses every OLD event,
-/// and no field is renamed or removed, so the version is NOT bumped. (The
+/// (`pause-best-effort` / `resume-best-effort`) and story 1-6 ADDS `crashed` /
+/// `restarted`. Adding a new closed-vocabulary variant is a backward-ADDITIVE
+/// change: a NEW reader parses every OLD event, and no field is renamed or
+/// removed, so the version is NOT bumped. (The
 /// converse — an OLD reader meeting a NEW cause — is a separate forward-compat
 /// question: because `TransitionCause` is `#[serde(tag = "kind")]` with no
 /// `#[serde(other)]` fallback, an old reader that hits an unknown tag ERRORS
@@ -88,6 +89,27 @@ pub enum TransitionCause {
         /// instance log (AC2).
         detail: String,
     },
+    /// The supervised process CRASHED — exited without a requested stop (story
+    /// 1-6, AC5): the EVENT-driven `running → failed` edge the reaper applies.
+    /// Wire tag `crashed`. Carries the exit code / signal detail so the
+    /// log/`--json`/7-2 consumers can match on it. DISTINCT from
+    /// [`TransitionCause::LaunchError`] (a startup failure) — a crash is a
+    /// running process dying unrequested.
+    Crashed {
+        /// The exit detail (e.g. `"exited with code 1"` / `"exited via signal"`),
+        /// preserved for the record (AC5).
+        detail: String,
+    },
+    /// A Restart Policy RESTART of a crashed instance (story 1-6, AC4): the
+    /// `failed → starting` edge the restart executor drives. Wire tag `restarted`.
+    /// Records the consecutive restart `count` and the backoff `waited_ms` so the
+    /// CLI + 7-2/`--json` consumers can surface both (AC9).
+    Restarted {
+        /// The consecutive restart count this restart represents (1-based).
+        count: u32,
+        /// The backoff waited before this restart, in milliseconds.
+        waited_ms: u64,
+    },
 }
 
 impl TransitionCause {
@@ -124,6 +146,19 @@ impl TransitionCause {
         TransitionCause::ResumeBestEffort {
             detail: detail.into(),
         }
+    }
+
+    /// A CRASH cause recording the exit `detail` (story 1-6, AC5).
+    pub fn crashed(detail: impl Into<String>) -> Self {
+        TransitionCause::Crashed {
+            detail: detail.into(),
+        }
+    }
+
+    /// A RESTART cause recording the consecutive `count` + backoff `waited_ms`
+    /// (story 1-6, AC4/AC9).
+    pub fn restarted(count: u32, waited_ms: u64) -> Self {
+        TransitionCause::Restarted { count, waited_ms }
     }
 }
 
@@ -232,10 +267,38 @@ mod tests {
                 TransitionCause::resume_best_effort("x"),
                 "resume-best-effort",
             ),
+            (TransitionCause::crashed("x"), "crashed"),
+            (TransitionCause::restarted(1, 1000), "restarted"),
         ];
         for (cause, tag) in cases {
             let json = serde_json::to_string(&cause).unwrap();
             assert!(json.contains(&format!("\"kind\":\"{tag}\"")), "{json}");
+        }
+    }
+
+    #[test]
+    fn crashed_and_restarted_causes_round_trip_with_their_fields() {
+        // AC5: the crash detail rides IN the event payload (matchable `crashed`
+        // tag). AC4/AC9: the restart cause carries the count + waited backoff.
+        let crashed = TransitionCause::crashed("exited with code 137");
+        let json = serde_json::to_string(&crashed).unwrap();
+        assert!(json.contains("\"kind\":\"crashed\""), "{json}");
+        let back: TransitionCause = serde_json::from_str(&json).unwrap();
+        match back {
+            TransitionCause::Crashed { detail } => assert!(detail.contains("137"), "{detail}"),
+            other => panic!("expected Crashed, got {other:?}"),
+        }
+
+        let restarted = TransitionCause::restarted(3, 4000);
+        let json = serde_json::to_string(&restarted).unwrap();
+        assert!(json.contains("\"kind\":\"restarted\""), "{json}");
+        let back: TransitionCause = serde_json::from_str(&json).unwrap();
+        match back {
+            TransitionCause::Restarted { count, waited_ms } => {
+                assert_eq!(count, 3);
+                assert_eq!(waited_ms, 4000);
+            }
+            other => panic!("expected Restarted, got {other:?}"),
         }
     }
 

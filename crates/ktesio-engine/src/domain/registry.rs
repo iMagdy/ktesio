@@ -20,7 +20,7 @@ use ktesio_adapter_api::{
 
 use crate::adapter::{self, AdapterRef, ResolvedAdapter};
 use crate::paths::EnginePaths;
-use crate::ports::{StateStore, StoreError};
+use crate::ports::{SpawnRecord, StateStore, StoreError};
 use crate::store::SqliteStore;
 use crate::time::now_rfc3339;
 
@@ -28,6 +28,7 @@ use super::error::RegistryError;
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
+use super::restart::RestartPolicy;
 
 /// Filename of the adapter snapshot inside an Agent Home (story 1.3).
 ///
@@ -448,6 +449,86 @@ impl Registry {
     ) -> Result<SupportLevel, RegistryError> {
         let snapshot = self.read_adapter_snapshot(name)?;
         Ok(snapshot.declaration.support(capability, OsId::current()))
+    }
+
+    // ---- Write-ahead spawn records + restart policy (story 1-6, AD-5/AD-6) ----
+    //
+    // Thin `pub(crate)` pass-throughs to the store's spawn-record methods (same
+    // pattern as `set_state` → `store.set_state`). Each store call is one
+    // transaction (AD-6). The supervisor commits the record BEFORE declaring an
+    // instance supervised, clears it on a clean stop, and reads every record on
+    // engine start to reconcile orphans.
+
+    /// Commit a write-ahead spawn record (AD-5) — one transaction. Called by the
+    /// supervisor between `spawn` and declaring the instance `running`.
+    pub(crate) fn write_spawn_record(&self, record: &SpawnRecord) -> Result<(), RegistryError> {
+        self.store.upsert_spawn_record(record)?;
+        Ok(())
+    }
+
+    /// Clear an instance's write-ahead spawn record (a clean stop, so it is not
+    /// later adopted/failed as an orphan). Idempotent.
+    pub(crate) fn clear_spawn_record(&self, name: &InstanceName) -> Result<(), RegistryError> {
+        self.store.clear_spawn_record(name)?;
+        Ok(())
+    }
+
+    /// Read an instance's write-ahead spawn record, or `None` if absent.
+    pub(crate) fn spawn_record(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Option<SpawnRecord>, RegistryError> {
+        Ok(self.store.get_spawn_record(name)?)
+    }
+
+    /// List every write-ahead spawn record (the orphan-reconcile input on engine
+    /// start).
+    pub(crate) fn list_spawn_records(&self) -> Result<Vec<SpawnRecord>, RegistryError> {
+        Ok(self.store.list_spawn_records()?)
+    }
+
+    /// Persist a new restart count + last-known cause for an instance (a restart
+    /// bump or a reset) — one transaction. No-op if the instance has no record.
+    pub(crate) fn set_restart_count(
+        &self,
+        name: &InstanceName,
+        restart_count: u32,
+        last_known_cause: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        self.store
+            .set_restart_count(name, restart_count, last_known_cause)?;
+        Ok(())
+    }
+
+    /// Set the per-instance [`RestartPolicy`] (story 1-6, AC4 "per-instance
+    /// configurable") — the config SEED. Persists via the store (creating a
+    /// minimal policy-only record if the instance was never started). One
+    /// transaction (AD-6).
+    pub(crate) fn set_restart_policy(
+        &self,
+        name: &InstanceName,
+        policy: RestartPolicy,
+    ) -> Result<(), RegistryError> {
+        self.store.set_restart_policy(name, policy)?;
+        Ok(())
+    }
+
+    /// The effective per-instance [`RestartPolicy`] (story 1-6, AC4/AC9).
+    ///
+    /// RECOMMENDED seed (AD-9 layered TOML config is Epic 2): read the policy from
+    /// the persisted spawn record; when there is no record yet (or its policy is
+    /// absent), fall back to the AD-15 default ([`RestartPolicy::default`] =
+    /// `on-failure`). This is a per-instance SOURCE (the DB), not a value
+    /// hard-wired at the call site.
+    pub(crate) fn effective_restart_policy(
+        &self,
+        name: &InstanceName,
+    ) -> Result<RestartPolicy, RegistryError> {
+        Ok(self
+            .store
+            .get_spawn_record(name)?
+            .map(|r| r.restart_policy)
+            .unwrap_or_default())
     }
 
     /// The per-instance log directory inside the Agent Home (AD-12 seed).

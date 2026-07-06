@@ -30,6 +30,14 @@
 //!   OBSERVABLE suspension proof for the guaranteed pause path. With no
 //!   `--heartbeat-ms` the loop is a quiet sleep (existing 1-4 tests that only
 //!   assert `ready`/lifecycle are unaffected). Pure `std`, NO OS-cfg.
+//! * `--crash-after-ms <ms>` (+ optional `--crash-with <code>`)  run normally
+//!   (announcing readiness, heartbeating if asked) for `<ms>`, THEN exit with
+//!   `<code>` (default 1) — simulating an UNREQUESTED crash AFTER the readiness
+//!   window (story 1-6). Distinct from `--exit-fast`, which exits DURING startup
+//!   (a launch failure); `--crash-after-ms` stays alive long enough to reach
+//!   `running`, so the supervisor's reaper detects the later `Exited` as a crash
+//!   and the Restart Policy fires. The `--heartbeat-ms` line count proves a
+//!   RESTARTED instance is alive again. Pure `std`, NO OS-cfg.
 //!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
@@ -55,6 +63,11 @@ struct Opts {
     marker: Option<PathBuf>,
     /// Heartbeat interval (story 1-5). `None` = no heartbeat (quiet sleep loop).
     heartbeat: Option<Duration>,
+    /// Crash AFTER this interval (story 1-6): run normally, then exit non-zero.
+    /// `None` = no self-crash (the linger loop governs exit).
+    crash_after: Option<Duration>,
+    /// The exit code the `--crash-after-ms` self-crash uses (default 1).
+    crash_with: i32,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -67,6 +80,8 @@ fn parse() -> Opts {
     let mut linger = Duration::from_secs(3600);
     let mut marker = None;
     let mut heartbeat = None;
+    let mut crash_after = None;
+    let mut crash_with = 1;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -86,6 +101,16 @@ fn parse() -> Opts {
                     heartbeat = Some(Duration::from_millis(ms));
                 }
             }
+            "--crash-after-ms" => {
+                if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    crash_after = Some(Duration::from_millis(ms));
+                }
+            }
+            "--crash-with" => {
+                if let Some(code) = args.next().and_then(|s| s.parse::<i32>().ok()) {
+                    crash_with = code;
+                }
+            }
             "--marker" => {
                 if let Some(path) = args.next() {
                     marker = Some(PathBuf::from(path));
@@ -102,6 +127,8 @@ fn parse() -> Opts {
         linger,
         marker,
         heartbeat,
+        crash_after,
+        crash_with,
     }
 }
 
@@ -146,17 +173,30 @@ fn main() {
     let _ = stdout.flush();
     write_marker(&opts.marker, "ready");
 
-    // Loop until we are killed, or until the linger window elapses (the self-exit
-    // fallback). When a heartbeat interval is set, print an incrementing
-    // `heartbeat <n>` line every interval and flush — while SIGSTOP'd the whole
-    // process freezes, so the captured log stops growing (the story-1-5
-    // observable-suspension proof); SIGCONT resumes it. With no heartbeat this is
-    // a quiet short-poll sleep (unchanged 1-4 behavior). A short poll keeps the
-    // process responsive to signals in both modes.
-    let deadline = Instant::now() + opts.linger;
+    // Loop until we are killed, until the crash-after window elapses (story 1-6:
+    // a simulated UNREQUESTED crash → non-zero exit), or until the linger window
+    // elapses (the clean self-exit fallback). When a heartbeat interval is set,
+    // print an incrementing `heartbeat <n>` line every interval and flush — while
+    // SIGSTOP'd the whole process freezes, so the captured log stops growing (the
+    // story-1-5 observable-suspension proof); SIGCONT resumes it. With no
+    // heartbeat this is a quiet short-poll sleep (unchanged 1-4 behavior). A
+    // short poll keeps the process responsive to signals in all modes.
+    let start = Instant::now();
+    let deadline = start + opts.linger;
+    let crash_deadline = opts.crash_after.map(|d| start + d);
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     while Instant::now() < deadline {
+        // Story 1-6: after the crash-after window, exit non-zero (a crash the
+        // supervisor's reaper detects, firing the Restart Policy). Checked after
+        // readiness was announced above, so the instance reaches `running` first.
+        if let Some(due) = crash_deadline {
+            if Instant::now() >= due {
+                let _ = writeln!(stdout, "crashing with code {}", opts.crash_with);
+                let _ = stdout.flush();
+                std::process::exit(opts.crash_with);
+            }
+        }
         if let (Some(interval), Some(due)) = (opts.heartbeat, next_beat) {
             if Instant::now() >= due {
                 let _ = writeln!(stdout, "heartbeat {beats}");

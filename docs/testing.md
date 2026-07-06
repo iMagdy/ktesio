@@ -26,7 +26,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 cargo test --workspace --all-targets
 ```
 
-Integration tests create local temporary git repositories. They do not require network access. The agent-lifecycle tests spawn a small cross-platform helper binary (`fake_agent`, in `ktesio-conformance`) as a real child process to prove start, stop, launch-failure, no-survivor, and pause/resume behavior end to end; it is a dev/test artifact and never ships. For pause, `fake_agent --heartbeat-ms <ms>` prints a periodic incrementing line, so a guaranteed (Unix) pause is provable — the heartbeat stops growing under `SIGSTOP` and resumes under `SIGCONT`.
+Integration tests create local temporary git repositories. They do not require network access. The agent-lifecycle tests spawn a small cross-platform helper binary (`fake_agent`, in `ktesio-conformance`) as a real child process to prove start, stop, launch-failure, no-survivor, pause/resume, crash-detection, restart, and orphan-adoption behavior end to end; it is a dev/test artifact and never ships. For pause, `fake_agent --heartbeat-ms <ms>` prints a periodic incrementing line, so a guaranteed (Unix) pause is provable — the heartbeat stops growing under `SIGSTOP` and resumes under `SIGCONT`. For survival, `fake_agent --crash-after-ms <ms>` runs normally past the readiness window and then exits non-zero, simulating an unrequested crash so the reaper detects it and the Restart Policy fires. The crash/restart legs (`tests/crash.rs`) prove a `never`-policy crash lands `failed` with a `crashed` cause and no restart, and an `on-failure` crash is automatically restarted by the reaper (the crash-loop-stops-at-5 and count-reset legs run in the supervisor unit tests with an injected fast backoff, so they never sleep for real seconds while production keeps the 1s×2/60s constants). The engine-kill adoption test (`tests/adoption.rs`) is the NFR-1 proof: it runs a first engine in a subprocess that starts an agent and exits WITHOUT a graceful stop (a `kill -9` model — no destructors run, so the agent survives and re-parents to init), then opens a new engine over the same state dir and asserts the live child is adopted (row `running`, a subsequent `stop` truly kills it, no orphan remains) while a record whose process is gone reconciles to `failed`; the AI-7 (paused-live process adopted and resumable) and AI-8 (phantom `running` row → `failed`) cases ride the same file.
 
 ## Cross-platform testing (3-OS matrix)
 
@@ -44,6 +44,12 @@ CI runs `cargo tarpaulin --workspace --fail-under 95` as the coverage gate, on L
 ```bash
 cargo install cargo-tarpaulin
 cargo tarpaulin --workspace --fail-under 95
+```
+
+On macOS the default ptrace engine is unavailable — tarpaulin errors with `missing section: CoverageFunctions` — so run the LLVM source-based engine instead (this is how the gate is reproduced on a macOS dev host):
+
+```bash
+cargo tarpaulin --engine llvm --workspace --fail-under 95
 ```
 
 Generate an HTML report:

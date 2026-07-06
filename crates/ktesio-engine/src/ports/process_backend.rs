@@ -83,6 +83,47 @@ impl ProcessStatus {
     }
 }
 
+/// A durable fingerprint of a supervised process (spine AD-5) — the PID-reuse
+/// guard behind orphan adoption.
+///
+/// AD-5 requires the write-ahead spawn record to carry the process
+/// `{ pid, start-time fingerprint }` so that, after an engine crash + restart,
+/// a persisted record can be reconciled against live processes WITHOUT a false
+/// adoption when the OS has recycled the PID for an unrelated new process. Two
+/// different processes that happen to reuse a PID have DIFFERENT start-times, so
+/// comparing the recorded `start_time` to a live PID's start-time is the guard:
+/// a match adopts, a mismatch (or a gone PID) reconciles to `failed`.
+///
+/// `start_time` is an OPAQUE, monotonic-per-boot token whose UNIT is per-OS
+/// (Linux: clock ticks since boot from `/proc/<pid>/stat` field 22; macOS: the
+/// process start-time from `libproc` `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// (`pbi_start_tvsec`/`pbi_start_tvusec`) folded to microseconds; Windows: the
+/// `GetProcessTimes` creation time in 100ns ticks). Its only contract is: STABLE for a given
+/// process across reads, and DIFFERENT across a PID reuse. It is a domain value
+/// (no OS type crosses the port); the per-OS sources live only in `backends/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessFingerprint {
+    /// The OS process id.
+    pub pid: u32,
+    /// The opaque, per-OS process start-time token (see the type docs). Stable
+    /// per process; differs across a PID reuse.
+    pub start_time: u64,
+}
+
+impl ProcessFingerprint {
+    /// Construct a fingerprint from a pid + start-time token.
+    pub fn new(pid: u32, start_time: u64) -> Self {
+        Self { pid, start_time }
+    }
+
+    /// Whether this fingerprint identifies the SAME process as `other`: both the
+    /// pid AND the start-time token must match. A pid match with a different
+    /// start-time is a PID reuse (a DIFFERENT process), not the same one.
+    pub fn matches(&self, other: &ProcessFingerprint) -> bool {
+        self.pid == other.pid && self.start_time == other.start_time
+    }
+}
+
 /// Why a process operation failed, in domain terms (never an OS error code).
 ///
 /// The backends map their OS failures into these variants; the supervisor maps
@@ -118,7 +159,7 @@ pub enum BackendError {
     #[error("process control operation '{op}' failed: {detail}")]
     Control {
         /// The operation that failed (`"signal"`, `"wait"`, `"terminate"`,
-        /// `"pause"`, `"resume"`, …).
+        /// `"pause"`, `"resume"`, `"fingerprint"`, `"adopt"`, …).
         op: &'static str,
         /// The underlying detail.
         detail: String,
@@ -189,10 +230,45 @@ pub trait ProcessBackend {
     /// syscall failure.
     fn resume(&self, handle: &mut Self::Handle) -> Result<(), BackendError>;
 
-    /// The OS process id of the spawned child (for the [`ProcessHandle`]
-    /// fingerprint / diagnostics). A stable accessor so the supervisor can log
-    /// the pid without naming an OS type.
+    /// The OS process id of the spawned child (for the [`ProcessFingerprint`] /
+    /// diagnostics). A stable accessor so the supervisor can log the pid without
+    /// naming an OS type.
     fn pid(&self, handle: &Self::Handle) -> u32;
+
+    /// The durable [`ProcessFingerprint`] of a supervised process (spine AD-5) —
+    /// its `{ pid, start-time }`. Written into the write-ahead spawn record
+    /// BEFORE the instance is treated as supervised, so a later engine restart
+    /// can adopt it back without a PID-reuse false match.
+    ///
+    /// The start-time source is per-OS and lives only in `backends/`: Linux reads
+    /// `/proc/<pid>/stat` field 22; macOS reads the process start-time via
+    /// `libproc` `proc_pidinfo(PROC_PIDTBSDINFO)`; Windows reads the
+    /// `GetProcessTimes` creation time. Reading the start-time of a process THIS backend spawned and holds
+    /// alive cannot fail in normal operation; a read failure falls back to a
+    /// start-time of `0` (the record still carries the pid — a degraded but
+    /// honest fingerprint) rather than erroring the spawn. Sync (called via
+    /// `spawn_blocking`). Domain terms only.
+    fn fingerprint(&self, handle: &Self::Handle) -> ProcessFingerprint;
+
+    /// Try to RE-ACQUIRE a live process matching `fingerprint`, for orphan
+    /// adoption on engine start (spine AD-5, AC-B). Returns:
+    /// * `Ok(Some(handle))` — a live process with pid `fingerprint.pid` exists
+    ///   AND its current start-time equals `fingerprint.start_time` (the SAME
+    ///   process, re-held so `stop`/`pause`/`poll` work on it again); the state
+    ///   stays as persisted (`running`/`paused`).
+    /// * `Ok(None)` — no live process matches (the pid is gone, OR it was reused
+    ///   by a DIFFERENT process whose start-time differs — the PID-reuse guard);
+    ///   the caller reconciles the record to `failed`.
+    ///
+    /// Re-acquisition keeps the OS specifics (how to re-open a live PID, verify
+    /// its start-time, and re-establish group/job control) inside `backends/`.
+    /// An adopted handle must remain signal-able / stoppable as its original
+    /// group/job (Unix: the pgid == pid is re-derived; Windows: re-open by pid).
+    /// Sync (called via `spawn_blocking`). Reports [`BackendError::Control`]
+    /// (op `"adopt"`) only on an unexpected syscall failure — a plain "no live
+    /// match" is `Ok(None)`, not an error.
+    fn adopt(&self, fingerprint: &ProcessFingerprint)
+        -> Result<Option<Self::Handle>, BackendError>;
 }
 
 #[cfg(test)]
@@ -210,6 +286,25 @@ mod tests {
     fn stop_outcome_records_forced_flag() {
         assert!(StopOutcome { forced: true }.forced);
         assert!(!StopOutcome { forced: false }.forced);
+    }
+
+    #[test]
+    fn fingerprint_matches_requires_both_pid_and_start_time() {
+        // AD-5 PID-reuse guard: the SAME process matches on both fields; a pid
+        // match with a different start-time is a REUSE (different process).
+        let a = ProcessFingerprint::new(1234, 999);
+        assert!(
+            a.matches(&ProcessFingerprint::new(1234, 999)),
+            "same → match"
+        );
+        assert!(
+            !a.matches(&ProcessFingerprint::new(1234, 1000)),
+            "pid reuse (start-time differs) → no match"
+        );
+        assert!(
+            !a.matches(&ProcessFingerprint::new(5678, 999)),
+            "different pid → no match"
+        );
     }
 
     #[test]

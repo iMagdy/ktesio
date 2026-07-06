@@ -11,6 +11,22 @@
 //! `#[cfg(unix)]`-gated at its `mod` declaration in `backends/mod.rs`). It uses
 //! `nix` for `setsid`/`kill`/`killpg` and `std::os::unix` for the `pre_exec`
 //! child hook.
+//!
+//! ## Start-time fingerprint + orphan adoption (story 1-6, spine AD-5)
+//!
+//! [`UnixBackend::fingerprint`] reads a process's start-time — a per-boot,
+//! per-process token that differs across a PID reuse — so the write-ahead spawn
+//! record can carry `{ pid, start-time }` (AD-5). The SOURCE is per-OS and lives
+//! ONLY here (the OS-cfg allowlist): Linux reads `/proc/<pid>/stat` field 22
+//! (`starttime`, clock ticks since boot); macOS/BSD reads the process
+//! `p_starttime` (a `timeval`, folded to microseconds) via `sysctl`
+//! `KERN_PROC_PID`. Both are documented, stable APIs — no undocumented calls.
+//! [`UnixBackend::adopt`] re-acquires a live PID whose current start-time equals
+//! the recorded fingerprint (the PID-reuse guard), rebuilding a HANDLE that can
+//! still signal/stop the group via `killpg` even though this process is not the
+//! child's parent (so it holds no reap-able [`Child`]; liveness is `kill(pid, 0)`
+//! and the OS/init reaps the non-child on exit). An adopted process is supervised
+//! for the new engine's lifetime exactly like a freshly spawned one.
 
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -18,10 +34,12 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{killpg, Signal};
+use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::{setsid, Pid};
 
-use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnSpec, StopOutcome};
+use crate::ports::{
+    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
+};
 
 /// How often the graceful-stop wait polls for the process to exit.
 ///
@@ -31,15 +49,22 @@ use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnSpec, StopO
 /// does not stall an async worker.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// A running process on Unix: the owned child + its process-group id.
+/// A running process on Unix: the (optionally owned) child + its process-group
+/// id.
 ///
 /// The group id equals the child pid (the child is its own group leader via
-/// `setsid`). Holding the [`Child`] lets us reap it (no zombie); the group id
-/// lets us signal the whole tree.
+/// `setsid`). For a FRESHLY SPAWNED process, `child` is `Some` — holding the
+/// [`Child`] lets us reap it (no zombie). For an ADOPTED process (story 1-6:
+/// re-acquired on engine start), `child` is `None` — this engine is not the
+/// process's parent, so it cannot `wait()`/reap it; liveness is probed with
+/// `kill(pid, 0)` and the OS/init reaps the non-child when it exits. In BOTH
+/// cases the group id lets us signal the whole tree (`killpg`), so stop / pause /
+/// resume work identically.
 #[derive(Debug)]
 pub struct UnixProcess {
-    /// The owned child handle (reaped on stop / drop).
-    child: Child,
+    /// The owned child handle, if THIS engine spawned the process (reaped on
+    /// stop / drop). `None` for an adopted process (not our child).
+    child: Option<Child>,
     /// The process-group id to signal (== child pid).
     pgid: Pid,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
@@ -120,7 +145,11 @@ impl ProcessBackend for UnixBackend {
         let pid = child.id();
         // The child is its own group leader, so pgid == pid.
         let pgid = Pid::from_raw(pid as i32);
-        Ok(UnixProcess { child, pgid, pid })
+        Ok(UnixProcess {
+            child: Some(child),
+            pgid,
+            pid,
+        })
     }
 
     fn stop(
@@ -166,13 +195,30 @@ impl ProcessBackend for UnixBackend {
         // (3) Escalate: SIGKILL to the whole group, then reap the child so no
         // zombie remains. SIGKILL cannot be caught/ignored, so the group dies.
         signal_group(handle.pgid, Signal::SIGKILL)?;
-        // Block until the child is reaped (it was just SIGKILLed, so this is
-        // bounded). `wait` reaps the direct child; group members are killed by
-        // the SIGKILL above and reaped by init.
-        handle.child.wait().map_err(|e| BackendError::Control {
-            op: "wait",
-            detail: e.to_string(),
-        })?;
+        match handle.child.as_mut() {
+            // Spawned: block until the direct child is reaped (it was just
+            // SIGKILLed, so this is bounded). Group members are killed by the
+            // SIGKILL above and reaped by init.
+            Some(child) => {
+                child.wait().map_err(|e| BackendError::Control {
+                    op: "wait",
+                    detail: e.to_string(),
+                })?;
+            }
+            // Adopted (not our child): we cannot `wait` it, but the SIGKILL to
+            // the group is delivered and its real parent / init reaps it. Poll
+            // liveness briefly so the desired end state ("no process survives")
+            // is confirmed before returning.
+            None => {
+                let kill_deadline = Instant::now() + Duration::from_secs(5);
+                while pid_is_alive(handle.pid) {
+                    if Instant::now() >= kill_deadline {
+                        break;
+                    }
+                    sleep(STOP_POLL_INTERVAL);
+                }
+            }
+        }
         Ok(StopOutcome { forced: true })
     }
 
@@ -206,6 +252,114 @@ impl ProcessBackend for UnixBackend {
     fn pid(&self, handle: &Self::Handle) -> u32 {
         handle.pid
     }
+
+    fn fingerprint(&self, handle: &Self::Handle) -> ProcessFingerprint {
+        // A read failure falls back to start_time 0 (a degraded but honest
+        // fingerprint — the pid is still recorded) rather than erroring the
+        // spawn; in normal operation reading the start-time of a process we hold
+        // alive succeeds.
+        let start_time = process_start_time(handle.pid).unwrap_or(0);
+        ProcessFingerprint::new(handle.pid, start_time)
+    }
+
+    fn adopt(
+        &self,
+        fingerprint: &ProcessFingerprint,
+    ) -> Result<Option<Self::Handle>, BackendError> {
+        // The PID-reuse guard (AD-5): a live pid whose CURRENT start-time equals
+        // the recorded one is the SAME process → adopt it. A gone pid, or one
+        // whose start-time differs (reused for a new process), is NOT a match →
+        // Ok(None), so the caller reconciles the record to `failed`.
+        if !pid_is_alive(fingerprint.pid) {
+            return Ok(None);
+        }
+        let live_start = match process_start_time(fingerprint.pid) {
+            Some(t) => t,
+            // The pid is alive but we cannot read its start-time (it may have
+            // exited between the liveness probe and the read, or it is not
+            // introspectable). Treat as no confident match — reconcile to failed.
+            None => return Ok(None),
+        };
+        if live_start != fingerprint.start_time {
+            // PID reused by a different process — do NOT adopt.
+            return Ok(None);
+        }
+        // Same process. Rebuild an adopted handle: no owned Child (not our
+        // child), but the group id (== pid, the setsid leader) lets us still
+        // signal/stop the whole tree. Liveness is kill(pid, 0).
+        Ok(Some(UnixProcess {
+            child: None,
+            pgid: Pid::from_raw(fingerprint.pid as i32),
+            pid: fingerprint.pid,
+        }))
+    }
+}
+
+/// Read a process's start-time — the per-boot, per-process token that differs
+/// across a PID reuse (spine AD-5). The SOURCE is per-OS; both are documented,
+/// stable APIs (no undocumented calls). Returns `None` if the process is gone or
+/// its start-time cannot be read.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // Linux: /proc/<pid>/stat field 22 (`starttime`) — the time the process
+    // started after boot, in clock ticks. The field is AFTER the `comm` field,
+    // which is parenthesized and may itself contain spaces/parentheses, so we
+    // split on the LAST ')' first, then take field 22 counting from there.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest)?;
+    // After ')' the fields are: state(3) ppid(4) ... starttime(22). `rest`
+    // begins with a leading space then field 3, so index 22-3 = 19 in the
+    // whitespace-split remainder.
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // field 3 is fields[0]; field 22 is fields[19].
+    fields.get(19).and_then(|s| s.parse::<u64>().ok())
+}
+
+/// macOS: the process start-time (`pbi_start_tvsec`/`pbi_start_tvusec`) via the
+/// documented `libproc` `proc_pidinfo(PROC_PIDTBSDINFO)` call, folded to
+/// microseconds since the epoch — stable per process, different across a PID
+/// reuse. Uses `nix::libc` (nix re-exports libc; no new dependency). No
+/// undocumented API. Behavior-verified on the macOS CI leg.
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    use nix::libc;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed proc_bsdinfo of exactly `size` bytes;
+    // proc_pidinfo writes at most `size` bytes into it. The pointer is valid for
+    // the call's duration. proc_pidinfo returns the number of bytes written.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if written != size {
+        // Process gone, insufficient permission, or a short read — no confident
+        // start-time.
+        return None;
+    }
+    // Fold seconds + microseconds into a single microsecond token — stable per
+    // process, distinct across a PID reuse.
+    let secs = info.pbi_start_tvsec as i128;
+    let usec = info.pbi_start_tvusec as i128;
+    let micros = secs.saturating_mul(1_000_000).saturating_add(usec);
+    if micros <= 0 {
+        return None;
+    }
+    Some(micros as u64)
+}
+
+/// Other Unix (neither Linux nor macOS — e.g. a BSD without `libproc`): no
+/// supported start-time source. Returns `None`, yielding a degraded but honest
+/// fingerprint (pid-only). Ktesio's supported targets are Linux / macOS /
+/// Windows; this arm only keeps the backend COMPILING on other Unix.
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+fn process_start_time(_pid: u32) -> Option<u64> {
+    None
 }
 
 impl Drop for UnixProcess {
@@ -215,33 +369,65 @@ impl Drop for UnixProcess {
     /// the supervisor is torn down at engine shutdown, the handle drops and the
     /// whole group dies. Best-effort; a group already gone is fine.
     ///
-    /// NOTE (single-lifetime boundary, AD-5 is story 1-6): because the handle
-    /// lives only for one engine lifetime, a process started by one engine is
-    /// cleaned up when THAT engine ends. Carrying a running agent across engine
-    /// restarts (adopting an orphan by pid + fingerprint) is story 1-6.
+    /// NOTE (cross-lifetime, AD-5 is story 1-6): a handle for a SPAWNED process
+    /// is cleaned up when this engine ends (kill-on-drop). An ADOPTED handle
+    /// (re-acquired on engine start) likewise SIGKILLs its group on drop, but
+    /// cannot `wait` a non-child (the OS/init reaps it); this keeps the
+    /// no-survivor guarantee across engine restarts.
     fn drop(&mut self) {
-        // If already reaped/exited, nothing to do; otherwise SIGKILL the group
-        // and reap the direct child so no zombie remains.
+        // If already reaped/exited, nothing to do; otherwise SIGKILL the group.
         if let Ok(ProcessStatus::Alive) = self.reap_if_exited() {
             let _ = killpg(self.pgid, Signal::SIGKILL);
-            let _ = self.child.wait();
+            // Reap the direct child if it is ours (adopted: init reaps it).
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
         }
     }
 }
 
 impl UnixProcess {
     /// Non-blocking: reap the child if it has exited, returning its status.
+    ///
+    /// For a SPAWNED process (`child: Some`) this is `try_wait` (which reaps on
+    /// exit, no zombie). For an ADOPTED process (`child: None`, story 1-6) this
+    /// engine is not the parent and cannot `wait`, so liveness is `kill(pid, 0)`:
+    /// `ESRCH` means the process is gone (reaped by its real parent / init), any
+    /// other result means it is still alive. An adopted process reports
+    /// `Exited { code: None }` when gone — we cannot recover a non-child's exit
+    /// code, which is honest (the code is unknown to us).
     fn reap_if_exited(&mut self) -> Result<ProcessStatus, BackendError> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Ok(ProcessStatus::Exited {
-                code: status.code(),
-            }),
-            Ok(None) => Ok(ProcessStatus::Alive),
-            Err(e) => Err(BackendError::Control {
-                op: "wait",
-                detail: e.to_string(),
-            }),
+        match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => Ok(ProcessStatus::Exited {
+                    code: status.code(),
+                }),
+                Ok(None) => Ok(ProcessStatus::Alive),
+                Err(e) => Err(BackendError::Control {
+                    op: "wait",
+                    detail: e.to_string(),
+                }),
+            },
+            // Adopted (not our child): probe liveness via kill(pid, 0).
+            None => {
+                if pid_is_alive(self.pid) {
+                    Ok(ProcessStatus::Alive)
+                } else {
+                    Ok(ProcessStatus::Exited { code: None })
+                }
+            }
         }
+    }
+}
+
+/// Whether a pid is still alive: `kill(pid, 0)` succeeds (or fails with `EPERM`
+/// — alive but not ours to signal) while it lives, and fails with `ESRCH` once
+/// it is gone. Used for adopted-process liveness (no reap-able [`Child`]).
+fn pid_is_alive(pid: u32) -> bool {
+    match kill(Pid::from_raw(pid as i32), None) {
+        Err(nix::errno::Errno::ESRCH) => false,
+        // Ok (we can signal it) or EPERM (alive but not ours) → alive.
+        _ => true,
     }
 }
 
@@ -370,6 +556,112 @@ mod tests {
         assert_eq!(backend.pid(&proc), proc.pid);
         assert!(backend.pid(&proc) > 0);
         // Teardown.
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_across_reads_for_the_same_process() {
+        // AD-5: the fingerprint must be STABLE for a live process (two reads
+        // agree) so a write-ahead record can be reconciled later. On the
+        // supported hosts (Linux/macOS) the start-time is a real, non-zero token.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn");
+        let fp1 = backend.fingerprint(&proc);
+        let fp2 = backend.fingerprint(&proc);
+        assert_eq!(fp1, fp2, "fingerprint must be stable across reads");
+        assert_eq!(fp1.pid, proc.pid);
+        // On the two supported Unix hosts the start-time source is real.
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(fp1.start_time > 0, "start-time token should be populated");
+        }
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn adopt_reacquires_a_live_matching_process_and_can_stop_it() {
+        // AC7 (Unix): a live process whose start-time matches the recorded
+        // fingerprint is ADOPTED — the re-held handle can still stop the group.
+        // Spawn a long-lived child, capture its fingerprint, "adopt" it via a
+        // second backend (simulating a new engine), and stop it through the
+        // adopted handle. Leak-guard: keep the ORIGINAL handle so if adoption
+        // fails the child is still reaped on drop.
+        let backend = UnixBackend::new();
+        let mut original = backend
+            .spawn(&spec("sleep", &["600"]))
+            .expect("spawn sleep");
+        let fp = backend.fingerprint(&original);
+        assert!(pid_alive(fp.pid));
+
+        // Adopt via a fresh backend (the OS re-acquisition path).
+        let adopter = UnixBackend::new();
+        let adopted = adopter.adopt(&fp).expect("adopt call ok");
+        let mut adopted = adopted.expect("a live matching process must be adopted");
+        assert_eq!(adopter.pid(&adopted), fp.pid);
+        assert_eq!(adopter.poll(&mut adopted).unwrap(), ProcessStatus::Alive);
+
+        // Stopping through the ADOPTED handle terminates the process group.
+        let _ = adopter.stop(&mut adopted, Duration::from_millis(500));
+        // In the REAL orphan scenario the original engine has died, so the
+        // process's parent is init, which auto-reaps it. Here the original
+        // backend still owns the Child, so the killed process would linger as a
+        // ZOMBIE until reaped; poll the original handle in the loop to reap it
+        // (standing in for init) so `pid_alive` reflects the true end state.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // Reap via the original owner (init's role in production).
+            let reaped = backend
+                .poll(&mut original)
+                .map(|s| s.is_exited())
+                .unwrap_or(true);
+            if reaped && !pid_alive(fp.pid) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "adopted process must be killable via the re-held handle"
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn adopt_returns_none_for_a_gone_pid() {
+        // AC7: a fingerprint whose pid is gone yields Ok(None) → the caller
+        // reconciles the record to `failed`. Spawn `true`, let it exit, then try
+        // to adopt its (now-dead) fingerprint.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        let fp = backend.fingerprint(&proc);
+        // Wait for it to exit + reap.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backend.poll(&mut proc).unwrap().is_exited() {
+            assert!(Instant::now() < deadline);
+            sleep(Duration::from_millis(10));
+        }
+        // Give the OS a moment to fully release the pid.
+        sleep(Duration::from_millis(50));
+        let adopted = backend.adopt(&fp).expect("adopt call ok");
+        assert!(adopted.is_none(), "a gone pid must not be adopted");
+    }
+
+    #[test]
+    fn adopt_returns_none_on_start_time_mismatch_pid_reuse_guard() {
+        // AD-5 PID-reuse guard: a live pid whose start-time DIFFERS from the
+        // recorded one is a DIFFERENT process (the pid was recycled) and must NOT
+        // be adopted. Spawn a live process, then craft a fingerprint with its pid
+        // but a deliberately wrong start-time.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn");
+        let real = backend.fingerprint(&proc);
+        // Only meaningful where a real start-time source exists.
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let forged = ProcessFingerprint::new(real.pid, real.start_time.wrapping_add(1));
+            let adopted = backend.adopt(&forged).expect("adopt call ok");
+            assert!(
+                adopted.is_none(),
+                "a start-time mismatch (PID reuse) must not be adopted"
+            );
+        }
         let _ = backend.stop(&mut proc, Duration::from_secs(2));
     }
 
