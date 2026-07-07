@@ -147,6 +147,11 @@ class ReleaseDocsTests(unittest.TestCase):
             "|| cargo +stable install cargo-tarpaulin --locked",
             ci,
         )
+        # The instrumented run is serialised and given swap headroom: instrumented +
+        # parallel + subprocess-spawning tests overflowed the 7 GB runner's RAM and
+        # it "lost communication" (an OOM that drops the job with no log, AI-23).
+        self.assertIn('RUST_TEST_THREADS: "1"', ci)
+        self.assertIn("swapon /mnt/covswap", ci)
 
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the

@@ -357,11 +357,28 @@ jobs:
         # cache hit the binary is already on PATH, so the `command -v` guard skips
         # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
+      - name: Add swap headroom for the instrumented run
+        # The instrumented build + test run is far more memory-hungry than the
+        # normal `test` job: coverage counters, full debuginfo, and the fleet/
+        # adoption tests each spawning several instrumented child processes. On a
+        # 7 GB hosted runner that peaked over RAM and the runner "lost communication"
+        # — an OOM kill, which drops the whole job with no log (AI-23). A large swap
+        # file on the roomy /mnt temp disk lets a spike page instead of OOM-ing.
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 8G /mnt/covswap
+          sudo chmod 600 /mnt/covswap
+          sudo mkswap /mnt/covswap
+          sudo swapon /mnt/covswap
+          free -h
       - name: Enforce coverage
         # --engine llvm: parity with the local gate (see docs/testing.md).
-        # --skip-clean (tarpaulin's default, stated explicitly): reuse the cached
-        # instrumented target instead of rebuilding it. --timeout 180: raise the
-        # per-test cap from tarpaulin's 60 s default so a heavier supervision/
-        # survival test under instrumentation on a loaded runner is not killed
-        # spuriously. --verbose: surface compile-vs-test progress in the log.
+        # --skip-clean: reuse the cached instrumented target. --timeout 180: raise
+        # the per-test cap from tarpaulin's 60 s default. --verbose: log progress.
+        # RUST_TEST_THREADS=1: run the instrumented tests SERIALLY so only one
+        # subprocess-spawning test's process tree is resident at once — the main
+        # lever against the OOM (the normal test job parallelises freely, but
+        # instrumented + parallel + subprocess-spawning overflowed 7 GB of RAM).
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose --workspace --fail-under 95
