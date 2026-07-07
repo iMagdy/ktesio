@@ -49,6 +49,16 @@ pub const AGENTS_DIR: &str = "agents";
 /// File name of the per-instance config file inside an Agent Home. `[ASSUMPTION]`
 pub const INSTANCE_CONFIG_FILE: &str = "config.toml";
 
+/// File name of the persisted effective-config snapshot inside an Agent Home
+/// (story 2-3, spine AD-9 "the effective-config snapshot persisted in the Agent
+/// Home" + AD-6 "effective-config snapshots are files inside the Agent Home").
+/// Written at START (the resolved four-layer config + per-value provenance),
+/// OVERWRITTEN every start/restart. `[ASSUMPTION]` recorded (Decision 5): JSON,
+/// mirroring the `adapter.json` snapshot convention — OS-portable, serializes the
+/// provenance tags cleanly, and kept DISTINCT from the editable `config.toml`
+/// (this file is engine-owned, read-only-to-humans, never hand-edited).
+pub const EFFECTIVE_CONFIG_SNAPSHOT_FILE: &str = "effective-config.json";
+
 /// Computes engine-owned paths from a resolved state-dir base.
 ///
 /// Construct with [`EnginePaths::new`]; every path method derives from the
@@ -139,6 +149,14 @@ impl EnginePaths {
     pub fn instance_config(&self, name: &InstanceName) -> PathBuf {
         self.agent_home(name).join(INSTANCE_CONFIG_FILE)
     }
+
+    /// Absolute path to an Agent Home's persisted effective-config snapshot
+    /// (story 2-3, AD-9/AD-6). The engine is the SOLE writer (path authority);
+    /// `kt`/Hosts/adapters read it back but never construct the path. Mirrors
+    /// [`instance_config`](Self::instance_config), rooted at the same Agent Home.
+    pub fn effective_config_snapshot(&self, name: &InstanceName) -> PathBuf {
+        self.agent_home(name).join(EFFECTIVE_CONFIG_SNAPSHOT_FILE)
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +188,12 @@ mod tests {
         assert!(b.ends_with("agents/beta"));
         // Config file lives inside the home.
         assert_eq!(paths.instance_config(&name("alpha")), a.join("config.toml"));
+        // Story 2-3: the effective-config snapshot also lives inside the home,
+        // as effective-config.json, distinct from the editable config.toml.
+        assert_eq!(
+            paths.effective_config_snapshot(&name("alpha")),
+            a.join("effective-config.json")
+        );
     }
 
     #[test]

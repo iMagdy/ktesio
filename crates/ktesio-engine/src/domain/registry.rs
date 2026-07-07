@@ -103,6 +103,80 @@ struct AdapterSnapshot {
     declaration: CapabilityDeclaration,
 }
 
+/// The schema version stamped on the persisted [`EffectiveConfigSnapshot`]
+/// (story 2-3). A monotonically-increasing integer (the `adapter.json` snapshot
+/// has no version because it is engine-internal; the effective-config snapshot
+/// is a PROMISED AD-9 artifact for Hosts/debugging, so it carries a version — a
+/// later shape change bumps this, mirroring the `list`/`show` `--json`
+/// versioned-document convention `kt` already exposes). Starts at 1.
+const EFFECTIVE_CONFIG_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// One resolved leaf in the persisted effective-config snapshot (story 2-3): the
+/// dotted key, the RENDERED value, and its winning source layer.
+///
+/// The `value` is the [`ResolvedValue::display`] string — the SAME single
+/// display path the human `config get` table and `config get --json` render
+/// (AC8): routing every surface through `display()` keeps the 2-4 masking seam to
+/// ONE choke point. `source` is the kebab-case [`SourceLayer`] wire label (its
+/// serde form). A `secret:` value is opaque text here (masking is 2-4).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EffectiveConfigEntry {
+    /// The dotted leaf key (`model`, `agent.tools.web_search`, …).
+    key: String,
+    /// The rendered winning value (via the single `display()` path — AC8).
+    value: String,
+    /// The winning layer's stable label (`engine-default` / … / `invocation-override`).
+    source: SourceLayer,
+}
+
+/// The persisted effective-config snapshot written into an Agent Home at START
+/// (story 2-3, spine AD-9 "start resolves to an EffectiveConfig snapshot
+/// persisted in the Agent Home, every value tagged with its source layer" +
+/// AD-6 "effective-config snapshots are files inside the Agent Home").
+///
+/// This is the durable answer to FR-13's "what will actually apply on next
+/// start, and where each value came from" — a Host/operator/debugging artifact.
+/// It mirrors the [`AdapterSnapshot`] precedent EXACTLY (a dedicated
+/// `#[derive(Serialize, Deserialize)]` DTO, written with
+/// `serde_json::to_string_pretty` through path authority) — but written at start,
+/// not registration, and OVERWRITTEN every start/restart (AC7), since "effective
+/// config at start" does not exist until a start happens.
+///
+/// Built by ITERATING [`EffectiveConfig::iter`] into `entries` (the in-memory
+/// [`EffectiveConfig`]/[`ResolvedValue`] are deliberately NOT `Serialize` — the
+/// snapshot file schema stays decoupled from the internal type, matching the
+/// `adapter.json` DTO decision).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EffectiveConfigSnapshot {
+    /// The snapshot schema version ([`EFFECTIVE_CONFIG_SNAPSHOT_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// Every resolved leaf, sorted by key (the [`EffectiveConfig`] iteration
+    /// order is already deterministic via its `BTreeMap`).
+    entries: Vec<EffectiveConfigEntry>,
+}
+
+impl EffectiveConfigSnapshot {
+    /// Build the snapshot DTO from a resolved [`EffectiveConfig`] (story 2-3).
+    ///
+    /// Walks every leaf, rendering the value via the ONE [`ResolvedValue::display`]
+    /// path (AC8) and tagging it with the winning [`SourceLayer`]. Pure (no I/O),
+    /// so it is unit-testable in isolation; the writer serializes + persists it.
+    fn from_effective(effective: &EffectiveConfig) -> Self {
+        let entries = effective
+            .iter()
+            .map(|(key, resolved)| EffectiveConfigEntry {
+                key: key.clone(),
+                value: resolved.display(),
+                source: resolved.source,
+            })
+            .collect();
+        Self {
+            schema_version: EFFECTIVE_CONFIG_SNAPSHOT_SCHEMA_VERSION,
+            entries,
+        }
+    }
+}
+
 /// Retain or delete the Agent Home when removing an instance (AC4).
 ///
 /// Named directly from the acceptance criterion's "retain or delete". The DB
@@ -658,6 +732,42 @@ impl Registry {
             layer: SourceLayer::Instance,
             path: path.to_string_lossy().into_owned(),
             detail: format!("could not write the instance config: {source}"),
+        })?;
+        Ok(())
+    }
+
+    /// Persist the effective-config snapshot for an instance at START (story 2-3,
+    /// spine AD-9 + AD-6). Builds the [`EffectiveConfigSnapshot`] DTO from the
+    /// already-resolved `effective`, serializes it with
+    /// `serde_json::to_string_pretty`, and writes it to the Agent Home through
+    /// path authority ([`EnginePaths::effective_config_snapshot`]) — the engine is
+    /// the SOLE writer (AD-6). OVERWRITTEN in place every call (AC7): the supervisor
+    /// calls it on every successful start/restart so it always reflects the config
+    /// resolved for the CURRENT run. Mirrors `materialize_home`'s `adapter.json`
+    /// write mechanics; a write failure surfaces a typed
+    /// [`RegistryError::SnapshotWrite`] naming the instance + snapshot path (never a
+    /// panic — the caller rejects the start cleanly).
+    ///
+    /// The Agent Home already exists (created at registration), so no directory
+    /// creation is needed; the filename is engine-owned (not manifest-supplied), so
+    /// no `..`-escape check is required (unlike a rendered native config file).
+    pub(crate) fn write_effective_config_snapshot(
+        &self,
+        name: &InstanceName,
+        effective: &EffectiveConfig,
+    ) -> Result<(), RegistryError> {
+        let snapshot = EffectiveConfigSnapshot::from_effective(effective);
+        let path = self.paths.effective_config_snapshot(name);
+        let json =
+            serde_json::to_string_pretty(&snapshot).map_err(|e| RegistryError::SnapshotWrite {
+                name: name.as_str().to_string(),
+                path: path.to_string_lossy().into_owned(),
+                detail: format!("could not serialize the effective-config snapshot: {e}"),
+            })?;
+        std::fs::write(&path, json).map_err(|source| RegistryError::SnapshotWrite {
+            name: name.as_str().to_string(),
+            path: path.to_string_lossy().into_owned(),
+            detail: source.to_string(),
         })?;
         Ok(())
     }
@@ -1751,6 +1861,157 @@ source = "self-reported"
         let r = eff.get("model").unwrap();
         assert_eq!(r.value, toml::Value::String("override-model".into()));
         assert_eq!(r.source, SourceLayer::InvocationOverride);
+    }
+
+    // ---- Story 2-3: the persisted effective-config snapshot (AC5/AC7, AD-9/AD-6) ----
+
+    #[test]
+    fn effective_config_snapshot_dto_has_one_entry_per_leaf_with_value_and_source() {
+        // The DTO built from a multi-layer EffectiveConfig carries every resolved
+        // leaf (rendered value via the ONE display path + its source-layer label)
+        // and the schema version. Instance beats kind for the same key; a sibling
+        // from the weaker layer survives with its own provenance.
+        let layers = [
+            config::ConfigLayer::empty(),
+            config::ConfigLayer::parse(
+                SourceLayer::KindDefault,
+                "<k>",
+                "[a]\nb = \"kind-b\"\nc = \"kind-c\"\n",
+            )
+            .unwrap(),
+            config::ConfigLayer::parse(SourceLayer::Instance, "<i>", "[a]\nb = \"inst-b\"\n")
+                .unwrap(),
+            config::ConfigLayer::empty(),
+        ];
+        let eff = config::resolve(layers);
+        let snap = EffectiveConfigSnapshot::from_effective(&eff);
+        assert_eq!(
+            snap.schema_version,
+            EFFECTIVE_CONFIG_SNAPSHOT_SCHEMA_VERSION
+        );
+        // Two leaves: a.b (instance) and a.c (kind), sorted by key.
+        assert_eq!(snap.entries.len(), 2);
+        let ab = snap.entries.iter().find(|e| e.key == "a.b").unwrap();
+        assert_eq!(ab.value, "inst-b"); // rendered bare via display()
+        assert_eq!(ab.source, SourceLayer::Instance);
+        let ac = snap.entries.iter().find(|e| e.key == "a.c").unwrap();
+        assert_eq!(ac.value, "kind-c");
+        assert_eq!(ac.source, SourceLayer::KindDefault);
+    }
+
+    #[test]
+    fn effective_config_snapshot_round_trips_through_json() {
+        // The snapshot serializes to JSON and parses back identically; the source
+        // label is the kebab-case wire form (SourceLayer serde) and the value is
+        // the rendered string (a non-string scalar renders in TOML inline form).
+        let eff = config::resolve([
+            config::ConfigLayer::parse(SourceLayer::EngineDefault, "<e>", "n = 42\n").unwrap(),
+            config::ConfigLayer::empty(),
+            config::ConfigLayer::parse(SourceLayer::Instance, "<i>", "model = \"gpt-4\"\n")
+                .unwrap(),
+            config::ConfigLayer::empty(),
+        ]);
+        let snap = EffectiveConfigSnapshot::from_effective(&eff);
+        let json = serde_json::to_string_pretty(&snap).unwrap();
+        // The kebab-case source label appears in the wire form.
+        assert!(json.contains("\"instance\""), "json={json}");
+        assert!(json.contains("\"engine-default\""), "json={json}");
+        // A non-string scalar renders in inline form via display().
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let n = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == "n")
+            .unwrap();
+        assert_eq!(n["value"], serde_json::json!("42"));
+        assert_eq!(n["source"], serde_json::json!("engine-default"));
+    }
+
+    #[test]
+    fn write_effective_config_snapshot_writes_to_path_authority_and_parses_back() {
+        // The writer persists the snapshot at EnginePaths::effective_config_snapshot
+        // (path authority — the engine is the sole writer); the file parses back and
+        // carries the resolved leaf tagged with its source layer.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        reg.set_config(&name, "model", "claude-opus").unwrap();
+
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        reg.write_effective_config_snapshot(&name, &eff).unwrap();
+
+        let path = reg.paths().effective_config_snapshot(&name);
+        assert!(path.is_file(), "the snapshot file should exist at {path:?}");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], serde_json::json!(1));
+        let model = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == "model")
+            .unwrap();
+        assert_eq!(model["value"], serde_json::json!("claude-opus"));
+        assert_eq!(model["source"], serde_json::json!("instance"));
+    }
+
+    #[test]
+    fn write_effective_config_snapshot_overwrites_in_place() {
+        // AC7: the snapshot is OVERWRITTEN each write, always reflecting the latest
+        // resolved config — never a stale earlier resolution.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+
+        reg.set_config(&name, "model", "first").unwrap();
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        reg.write_effective_config_snapshot(&name, &eff).unwrap();
+
+        reg.set_config(&name, "model", "second").unwrap();
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        reg.write_effective_config_snapshot(&name, &eff).unwrap();
+
+        let path = reg.paths().effective_config_snapshot(&name);
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let model = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == "model")
+            .unwrap();
+        assert_eq!(
+            model["value"],
+            serde_json::json!("second"),
+            "the snapshot must reflect the latest resolved value (overwrite)"
+        );
+    }
+
+    #[test]
+    fn write_effective_config_snapshot_write_failure_is_typed_not_panic() {
+        // AC6: a snapshot-write failure surfaces a typed RegistryError::SnapshotWrite
+        // naming the instance + path (never a panic). Force the write to fail by
+        // making the snapshot path a DIRECTORY (std::fs::write on a dir errors).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let path = reg.paths().effective_config_snapshot(&name);
+        std::fs::create_dir(&path).unwrap();
+
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        let err = reg
+            .write_effective_config_snapshot(&name, &eff)
+            .unwrap_err();
+        match err {
+            RegistryError::SnapshotWrite {
+                name: n, path: p, ..
+            } => {
+                assert_eq!(n, "demo");
+                assert!(p.ends_with("effective-config.json"), "path={p}");
+            }
+            other => panic!("expected SnapshotWrite, got {other:?}"),
+        }
     }
 
     #[test]

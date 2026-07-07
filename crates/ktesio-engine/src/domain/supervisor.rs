@@ -216,6 +216,25 @@ impl Supervisor {
         adapter::apply_config_mapping(&mut launch, &mapping, &effective, &home)
             .map_err(|e| config_apply_to_engine(&name, e))?;
 
+        // (2c) Persist the effective-config snapshot into the Agent Home (story
+        // 2-3, spine AD-9 "start resolves to an EffectiveConfig snapshot persisted
+        // in the Agent Home, every value tagged with its source layer" + AD-6
+        // "effective-config snapshots are files inside the Agent Home"). The
+        // resolved `effective` is already in hand from (2b); write it HERE, right
+        // after the mapping application and BEFORE the `starting` transition below,
+        // so a snapshot-write failure rejects the start cleanly (NO state change —
+        // exactly mirroring how the config-apply failure at (2b) rejects before the
+        // transition). The snapshot is a PROMISED AD-9 artifact (a Host/debugging
+        // record of "what will apply on next start"), not a best-effort nicety, so
+        // its failure is a typed start error. Because RESTART also flows through
+        // this path (story 1-6), the snapshot is refreshed on restart too (AC7:
+        // OVERWRITTEN every successful start/restart, never a stale resolution). It
+        // is NOT written at registration (there is no "effective at start" until a
+        // start happens) and NOT deleted at stop.
+        registry
+            .write_effective_config_snapshot(&name, &effective)
+            .map_err(snapshot_to_engine)?;
+
         // Read the per-instance Restart Policy so the write-ahead record carries
         // it (AD-15 per-instance configurable). Read once, before any side effect.
         let policy = registry
@@ -1070,6 +1089,23 @@ fn config_apply_to_engine(name: &InstanceName, err: ConfigApplyError) -> EngineE
     }
 }
 
+/// Map an effective-config SNAPSHOT-write failure (story 2-3) into the lifecycle
+/// [`EngineError`]. The snapshot write lands BEFORE the `starting` transition, so
+/// a failure here rejects the start with no state change. A
+/// [`RegistryError::SnapshotWrite`] already carries the instance + snapshot path +
+/// detail; map it to the dedicated [`EngineError::Snapshot`] naming the same, so
+/// `kt` renders a precise "could not write the effective-config snapshot"
+/// diagnostic with a permissions/disk remediation (NFR-1). Any other registry
+/// error (not expected from this call) falls back to the shared registry mapper.
+fn snapshot_to_engine(err: super::error::RegistryError) -> EngineError {
+    match err {
+        super::error::RegistryError::SnapshotWrite { name, path, detail } => {
+            EngineError::Snapshot { name, path, detail }
+        }
+        other => registry_to_engine(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,6 +1395,144 @@ mod tests {
         );
         // Teardown.
         let _ = sup.stop(&registry, "pth", Some(Duration::from_millis(200)));
+    }
+
+    // ---- Story 2-3: the persisted effective-config snapshot at start (AC5/AC6/AC7) ----
+
+    /// Parse the persisted effective-config snapshot for `name` and return the
+    /// entry map (key → (rendered value, source label)). Panics if the file is
+    /// missing/unparseable (the test wants it present).
+    fn read_snapshot_entries(
+        registry: &Registry,
+        name: &str,
+    ) -> std::collections::BTreeMap<String, (String, String)> {
+        let path = registry
+            .paths()
+            .effective_config_snapshot(&InstanceName::new(name).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["key"].as_str().unwrap().to_string(),
+                    (
+                        e["value"].as_str().unwrap().to_string(),
+                        e["source"].as_str().unwrap().to_string(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn start_writes_the_effective_config_snapshot_tagged_with_source() {
+        // AC5 (AD-9/AD-6): starting an instance writes the effective-config
+        // snapshot FILE into the Agent Home at EnginePaths::effective_config_snapshot,
+        // and it parses + carries model=<v> tagged `instance`. Register a live
+        // fake_agent, set model, start it, assert the snapshot.
+        let (_state, _manifest, registry) = setup_fake("snp", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("snp").unwrap();
+        registry.set_config(&name, "model", "gpt-4o").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "snp").unwrap();
+        assert_eq!(state_of(&registry, "snp"), LifecycleState::Running);
+
+        let path = registry.paths().effective_config_snapshot(&name);
+        assert!(path.is_file(), "the snapshot must exist at {path:?}");
+        let entries = read_snapshot_entries(&registry, "snp");
+        assert_eq!(
+            entries.get("model"),
+            Some(&("gpt-4o".to_string(), "instance".to_string())),
+            "model must be present tagged `instance`; entries={entries:?}"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "snp", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn restart_via_start_inner_overwrites_the_snapshot_with_the_new_value() {
+        // AC7: the snapshot is OVERWRITTEN on every start — a re-start (which flows
+        // through the SAME start_inner seam, story 1-6) refreshes it with the newly
+        // resolved value, never a stale earlier resolution. Start, stop, change the
+        // value, start again; the snapshot reflects the LATEST value.
+        let (_state, _manifest, registry) = setup_fake("rsn", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("rsn").unwrap();
+        registry.set_config(&name, "model", "first").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "rsn").unwrap();
+        assert_eq!(
+            read_snapshot_entries(&registry, "rsn").get("model"),
+            Some(&("first".to_string(), "instance".to_string()))
+        );
+        sup.stop(&registry, "rsn", Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Change the value and start again (stopped → starting → running via
+        // start_inner). The snapshot must be overwritten with the new value.
+        registry.set_config(&name, "model", "second").unwrap();
+        sup.start(&registry, "rsn").unwrap();
+        assert_eq!(state_of(&registry, "rsn"), LifecycleState::Running);
+        assert_eq!(
+            read_snapshot_entries(&registry, "rsn").get("model"),
+            Some(&("second".to_string(), "instance".to_string())),
+            "the snapshot must reflect the latest resolved value after re-start (AC7)"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "rsn", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn snapshot_write_failure_rejects_the_start_before_the_starting_transition() {
+        // AC6: a snapshot-write failure rejects the start with NO state change (the
+        // write lands before the `starting` transition). Force the write to fail by
+        // making the snapshot path a DIRECTORY, then assert start errors and the
+        // instance stays in its prior state (`registered`), with NO agent spawned.
+        let (_state, _manifest, registry) = setup_fake("bad", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("bad").unwrap();
+        registry.set_config(&name, "model", "gpt-4").unwrap();
+        // A directory where the snapshot file must be → std::fs::write fails.
+        let snap_path = registry.paths().effective_config_snapshot(&name);
+        std::fs::create_dir(&snap_path).unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start(&registry, "bad").unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Snapshot { name, .. } if name == "bad"),
+            "expected a typed Snapshot error, got {err:?}"
+        );
+        // The instance stayed in its prior state — the start was rejected cleanly
+        // BEFORE the `starting` transition (no spurious state change, AC6).
+        assert_eq!(state_of(&registry, "bad"), LifecycleState::Registered);
+    }
+
+    #[test]
+    fn snapshot_to_engine_maps_snapshot_write_and_falls_back_for_others() {
+        // Unit-cover the snapshot error mapper: a SnapshotWrite maps to the
+        // dedicated EngineError::Snapshot naming the instance + path; any other
+        // registry error falls back to the shared registry mapper (NotFound here).
+        let mapped = snapshot_to_engine(crate::domain::RegistryError::SnapshotWrite {
+            name: "demo".into(),
+            path: "/x/agents/demo/effective-config.json".into(),
+            detail: "disk full".into(),
+        });
+        match mapped {
+            EngineError::Snapshot { name, path, detail } => {
+                assert_eq!(name, "demo");
+                assert!(path.ends_with("effective-config.json"), "path={path}");
+                assert_eq!(detail, "disk full");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        // Fallback: a non-snapshot registry error goes through registry_to_engine.
+        let fallback = snapshot_to_engine(crate::domain::RegistryError::NotFound {
+            name: "demo".into(),
+        });
+        assert!(matches!(fallback, EngineError::NotFound { name } if name == "demo"));
     }
 
     #[test]

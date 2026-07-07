@@ -140,9 +140,10 @@ Details:
   time — an unknown key outside the agent.* pass-through namespace is rejected
   with the nearest valid key suggested, and nothing is persisted); config get
   prints the effective (resolved) config, where a key set at the instance layer
-  overrides the same key at the kind/engine-default layer, every time (FR-11).
-  Per-value source layers are Epic 2.3, not shown here. Removing a running
-  instance requires --force.
+  overrides the same key at the kind/engine-default layer, every time (FR-11);
+  each value names its source layer (a Source column, or a source field with
+  --json), and starting an instance persists an effective-config snapshot in the
+  Agent Home. Removing a running instance requires --force.
 
 Examples:
   kt agent register demo --kind mock
@@ -157,6 +158,7 @@ Examples:
   kt agent config set demo model gpt-4
   kt agent config get demo
   kt agent config get demo model
+  kt agent config get demo --json
   kt agent remove demo --delete";
 
 #[derive(Parser)]
@@ -397,12 +399,15 @@ enum ConfigCommands {
         /// Value to set (stored verbatim; `secret:` values are opaque in Epic 2.1)
         value: String,
     },
-    /// Get an Agent Instance's effective (resolved) config value(s)
+    /// Get an Agent Instance's effective (resolved) config value(s) with per-value source
     Get {
         /// Name of the Agent Instance
         name: String,
         /// Optional config key; omitted prints the whole effective config
         key: Option<String>,
+        /// Emit the effective config (value + source layer per leaf) as JSON (FR-13)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -499,7 +504,9 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 ConfigCommands::Set { name, key, value } => {
                     cli::agent::config_set(&name, &key, &value)
                 }
-                ConfigCommands::Get { name, key } => cli::agent::config_get(&name, key.as_deref()),
+                ConfigCommands::Get { name, key, json } => {
+                    cli::agent::config_get(&name, key.as_deref(), json)
+                }
             },
         },
         None => {
@@ -566,6 +573,12 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo"]).is_ok());
         assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model"]).is_ok());
+        // Story 2-3: `config get` accepts `--json` (whole config or single key).
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model", "--json"])
+                .is_ok()
+        );
         // set requires all three positional args.
         assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model"]).is_err());
         assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo"]).is_err());

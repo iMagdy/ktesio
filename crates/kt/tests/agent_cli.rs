@@ -1472,15 +1472,18 @@ fn config_set_then_get_shows_the_value_on_stdout() {
         "stdout should list the key; stdout={}",
         get_all.stdout
     );
-    // AC11/AD-12: the source-layer note is on STDERR (Epic 2.3), never stdout.
+    // Story 2-3: the stale "provenance arrives in Epic 2.3" deferral note is
+    // RETIRED (the Source column now IS the provenance) — it must appear NOWHERE.
     assert!(
-        get_all.stderr.contains("Epic 2.3"),
-        "stderr should carry the provenance note; stderr={}",
+        !get_all.stderr.contains("Epic 2.3") && !get_all.stdout.contains("Epic 2.3"),
+        "the stale Epic 2.3 deferral note must be gone; stdout={} stderr={}",
+        get_all.stdout,
         get_all.stderr
     );
+    // The provenance now rides on STDOUT as a "Source" column (result → stdout).
     assert!(
-        !get_all.stdout.contains("Epic 2.3"),
-        "stdout must stay clean of the note; stdout={}",
+        get_all.stdout.contains("Source") && get_all.stdout.contains("instance"),
+        "config get must show a Source column with the instance layer; stdout={}",
         get_all.stdout
     );
 }
@@ -1706,8 +1709,8 @@ fn config_get_marks_agent_pass_through_leaf_unvalidated_and_known_key_validated(
     // AC-B / AC7 at the CLI: `config get <name>` renders a "Validated" marker per
     // row — an `agent.*` leaf is marked `unvalidated` (it bypassed known-key
     // validation), while a KNOWN key (`model`) is marked `validated`. The marker
-    // rides on STDOUT (part of the result table, AD-12); the Epic 2.3 provenance
-    // note stays on STDERR. NO source-layer column is added (that is 2-3).
+    // rides on STDOUT (part of the result table, AD-12). Story 2-3 ADDS the
+    // "Source" column beside it and RETIRES the stale Epic 2.3 note.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1753,17 +1756,18 @@ fn config_get_marks_agent_pass_through_leaf_unvalidated_and_known_key_validated(
         "stdout={}",
         get.stdout
     );
-    // The marker rides on STDOUT, not fabricated onto stderr; the provenance note
-    // (Epic 2.3) still rides on stderr and stdout stays clean of it.
+    // Story 2-3: the "Source" column now sits beside "Validated" on STDOUT, and
+    // the stale Epic 2.3 deferral note is gone from both streams.
     assert!(
-        get.stderr.contains("Epic 2.3"),
-        "the provenance note must stay on stderr; stderr={}",
-        get.stderr
+        get.stdout.contains("Source"),
+        "config get must show a Source column beside Validated; stdout={}",
+        get.stdout
     );
     assert!(
-        !get.stdout.contains("Epic 2.3"),
-        "stdout must not carry the provenance note; stdout={}",
-        get.stdout
+        !get.stderr.contains("Epic 2.3") && !get.stdout.contains("Epic 2.3"),
+        "the stale Epic 2.3 deferral note must be gone; stdout={} stderr={}",
+        get.stdout,
+        get.stderr
     );
 }
 
@@ -1807,4 +1811,216 @@ fn config_get_known_key_only_shows_no_unvalidated_marker() {
         "the known key must be marked validated (standalone token); stdout={}",
         get.stdout
     );
+}
+
+// ---- Story 2-3: per-value SOURCE-LAYER rendering (human + --json) (AC-A/AC3/AC4) ----
+
+#[test]
+fn config_get_human_shows_source_column_with_the_winning_layer() {
+    // AC3 (the FR-13 heart): `config get <name>` gains a "Source" column naming
+    // each leaf's winning layer. A key set at the instance layer shows source
+    // `instance`; the column rides on STDOUT (result), and the stale Epic 2.3
+    // deferral note is gone.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    // The Source column header + the `instance` label for the set key (STDOUT).
+    assert!(
+        get.stdout.contains("Source"),
+        "config get must have a Source column; stdout={}",
+        get.stdout
+    );
+    assert!(
+        get.stdout.contains("instance"),
+        "the instance-layer key must show source `instance`; stdout={}",
+        get.stdout
+    );
+    // The stale deferral note is retired from both streams.
+    assert!(
+        !get.stdout.contains("Epic 2.3") && !get.stderr.contains("Epic 2.3"),
+        "the stale Epic 2.3 note must be gone; stdout={} stderr={}",
+        get.stdout,
+        get.stderr
+    );
+}
+
+#[test]
+fn config_get_json_emits_source_per_leaf_on_stdout() {
+    // AC4 + AD-12: `config get <name> --json` writes ONE parseable JSON document
+    // to stdout — a versioned doc whose per-leaf objects carry { key, value,
+    // source, unvalidated }. A known key set at the instance layer is
+    // instance-sourced + validated; an agent.* leaf is unvalidated.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.custom_flag", "on"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.success,
+        "config get --json should exit 0; stderr={}",
+        get.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&get.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be pure JSON: {e}; stdout={}", get.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let entries = doc["entries"].as_array().unwrap();
+
+    let model = entries.iter().find(|e| e["key"] == "model").unwrap();
+    assert_eq!(model["value"], serde_json::json!("gpt-4"));
+    assert_eq!(model["source"], serde_json::json!("instance"));
+    assert_eq!(model["unvalidated"], serde_json::json!(false));
+
+    let flag = entries
+        .iter()
+        .find(|e| e["key"] == "agent.custom_flag")
+        .unwrap();
+    assert_eq!(flag["source"], serde_json::json!("instance"));
+    assert_eq!(flag["unvalidated"], serde_json::json!(true));
+    // Nothing but JSON on stdout (no note leaked there).
+    assert!(
+        !get.stdout.contains("Epic 2.3"),
+        "stdout must stay pure JSON; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_get_single_key_json_emits_just_that_leaf() {
+    // AC4: the single-key `config get <name> <key> --json` form emits exactly one
+    // leaf with its value + source, matching the human single-key value.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "claude-opus"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "model", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&get.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be pure JSON: {e}; stdout={}", get.stdout));
+    let entries = doc["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "single-key --json emits one leaf; {doc}");
+    assert_eq!(entries[0]["key"], serde_json::json!("model"));
+    assert_eq!(entries[0]["value"], serde_json::json!("claude-opus"));
+    assert_eq!(entries[0]["source"], serde_json::json!("instance"));
+}
+
+#[test]
+fn config_get_persists_effective_config_snapshot_at_start() {
+    // AC5 end-to-end through the CLI: starting an instance writes the
+    // effective-config snapshot (effective-config.json) into the Agent Home,
+    // carrying model=<v> tagged `instance`. Uses a live `fake_agent` manifest (the
+    // builtin `mock` is inert — its start rejects before the snapshot write), and
+    // reads the Agent Home path from `register`'s stdout (path authority — kt
+    // never constructs it). The started process is cleaned up on this CLI exit
+    // (kill-on-drop), so no separate stop is needed.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "snapcli",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register should exit 0; stderr={}", reg.stderr);
+    // The registered Agent Home path is the stdout result line (an absolute path).
+    let home = reg
+        .stdout
+        .lines()
+        .find(|l| l.contains("agents") && l.contains("snapcli"))
+        .unwrap_or_else(|| {
+            panic!(
+                "register stdout should name the home; stdout={}",
+                reg.stdout
+            )
+        })
+        .trim()
+        .to_string();
+
+    run_kt_agent(
+        &["agent", "config", "set", "snapcli", "model", "gpt-4o"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let start = run_kt_agent(&["agent", "start", "snapcli"], &ctx.project_dir, state_dir);
+    assert!(
+        start.success,
+        "start should exit 0; stderr={}",
+        start.stderr
+    );
+
+    // The snapshot exists in the Agent Home and carries the resolved value +
+    // provenance (written before the `starting` transition).
+    let snapshot_path = std::path::Path::new(&home).join("effective-config.json");
+    assert!(
+        snapshot_path.is_file(),
+        "the effective-config snapshot must exist at {snapshot_path:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let model = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "model")
+        .unwrap();
+    assert_eq!(model["value"], serde_json::json!("gpt-4o"));
+    assert_eq!(model["source"], serde_json::json!("instance"));
 }

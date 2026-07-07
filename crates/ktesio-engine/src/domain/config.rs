@@ -232,6 +232,17 @@ impl EffectiveConfig {
         self.leaves.get(key).map(|r| r.display())
     }
 
+    /// The stable SOURCE-LAYER label for a dotted key, if present — the winning
+    /// layer that supplied the value (`engine-default` / `kind-default` /
+    /// `instance` / `invocation-override`), read from the [`SourceLayer`] tag 2-1
+    /// records per leaf. This is the story-2-3 provenance accessor (FR-13): it
+    /// lets `kt` render "each value's source layer" WITHOUT owning `toml`/config
+    /// internals (AD-2), symmetric with [`value_display`](Self::value_display) and
+    /// [`is_unvalidated`](Self::is_unvalidated). `kt` never re-derives the layer.
+    pub fn source_label(&self, key: &str) -> Option<&'static str> {
+        self.leaves.get(key).map(|r| r.source.as_str())
+    }
+
     /// Iterate all resolved leaves (dotted key → value + provenance), sorted by
     /// key. The full-map `kt agent config get <name>` read.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &ResolvedValue)> {
@@ -1016,6 +1027,28 @@ mod tests {
         assert_eq!(eff.get("n").unwrap().display(), "42");
         // A missing key has no display.
         assert_eq!(eff.value_display("nope"), None);
+    }
+
+    #[test]
+    fn source_label_reports_the_winning_layer_for_each_leaf() {
+        // Story 2-3 (FR-13): the provenance accessor `kt` renders. A leaf resolved
+        // from each of the four layers reports the corresponding stable label; the
+        // label matches SourceLayer::as_str() (so it never diverges from the tag);
+        // a missing key has no label.
+        for source in SourceLayer::ORDER {
+            let eff = resolve(one_layer(source, "model = \"x\""));
+            assert_eq!(eff.source_label("model"), Some(source.as_str()));
+        }
+        // Precedence still governs the label: instance beats kind for the same key.
+        let eff = resolve(two_layers(
+            SourceLayer::KindDefault,
+            "model = \"kind\"",
+            SourceLayer::Instance,
+            "model = \"instance\"",
+        ));
+        assert_eq!(eff.source_label("model"), Some("instance"));
+        // A missing key has no source label (symmetric with value_display).
+        assert_eq!(eff.source_label("nope"), None);
     }
 
     #[test]
