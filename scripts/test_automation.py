@@ -121,16 +121,26 @@ class ReleaseDocsTests(unittest.TestCase):
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
         # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
         self.assertIn("cargo +stable test --workspace --all-targets", ci)
-        self.assertIn("cargo +stable tarpaulin --engine llvm --workspace --fail-under 95", ci)
-        # --engine llvm (not the default ptrace engine): near-native test speed —
-        # ptrace single-stepped the 800+-test suite past the timeout and the job
-        # was cancelled (AI-23) — plus parity with the local macOS gate. The
-        # llvm-tools-preview component supplies the llvm-profdata/llvm-cov it uses.
+        self.assertIn(
+            "cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 "
+            "--verbose --workspace --fail-under 95",
+            ci,
+        )
+        # --engine llvm: parity with the local macOS gate (ptrace is unavailable
+        # there). llvm-tools-preview supplies the llvm-profdata/llvm-cov it shells
+        # out to. --timeout 180 lifts tarpaulin's 60 s per-test default so a heavy
+        # survival test under instrumentation is not killed spuriously.
         self.assertIn("rustup component add llvm-tools-preview", ci)
-        # Coverage also caches the source-installed tarpaulin binary and makes the
-        # install idempotent (skipped on a cache hit) so warm runs skip the rebuild
-        # — good hygiene, mirroring the semver gate's binary cache (AI-1). (The
-        # real timeout cause was the ptrace run above, not this install; AI-23.)
+        # The coverage TIMEOUT fix (AI-23): a DEDICATED cache key so the instrumented
+        # target — whose fingerprints differ from the other jobs' normal-profile
+        # build — actually persists. The shared key gave coverage nothing reusable
+        # and, running last, never saved its own, so every run recompiled the graph
+        # cold and blew the cap — not the engine, not the tarpaulin binary install.
+        self.assertIn(
+            "${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}", ci
+        )
+        # The source-installed tarpaulin binary is still cached and its install made
+        # idempotent (hygiene, mirroring the semver gate's binary cache, AI-1).
         self.assertIn("${{ runner.os }}-cargo-tarpaulin-bin", ci)
         self.assertIn(
             "command -v cargo-tarpaulin >/dev/null 2>&1 "

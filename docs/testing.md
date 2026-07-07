@@ -54,7 +54,9 @@ cargo install cargo-tarpaulin
 cargo tarpaulin --engine llvm --workspace --fail-under 95
 ```
 
-The `--engine llvm` (source-based) engine is used everywhere, for two reasons. On Linux it runs the instrumented suite at near-native speed; the default ptrace engine single-steps every test and ran the 800+-test suite past 40 minutes, cancelling the CI job (AI-23). On macOS the ptrace engine is unavailable outright — tarpaulin errors with `missing section: CoverageFunctions` — so llvm is the only option on a macOS dev host. Using the same engine in both places keeps local and CI on the same reported percentage. CI also adds the `llvm-tools-preview` rustup component, which provides the `llvm-profdata`/`llvm-cov` the engine shells out to.
+Both CI and local use the `--engine llvm` (source-based) engine. On macOS the default ptrace engine is unavailable outright — tarpaulin errors with `missing section: CoverageFunctions` — so llvm is the only option on a macOS dev host; running the same engine on CI keeps the two on the same reported percentage. CI adds the `llvm-tools-preview` rustup component, which provides the `llvm-profdata`/`llvm-cov` the engine shells out to.
+
+CI also keeps a dedicated cargo cache key for coverage (`<os>-cargo-coverage-<lockhash>`), separate from the other jobs. Tarpaulin compiles the whole dependency graph with coverage instrumentation, whose fingerprints differ from the normal-profile artifacts the other jobs cache — so a shared key gave coverage nothing reusable and, because the job runs last, never saved its own instrumented target either. The effect was a full cold instrumented recompile every run, which is what blew the coverage timeout (AI-23) — not the engine, and not the test run. The dedicated key persists the instrumented target, so only the first run pays the cold-build cost.
 
 Generate an HTML report:
 

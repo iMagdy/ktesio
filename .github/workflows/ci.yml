@@ -304,26 +304,36 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test, build, docs, boundary, semver]
-    # 40, not 20: coverage runs the whole suite instrumented. The default (ptrace)
-    # engine single-stepped 800+ tests and ran >42 min → the job was cancelled at
-    # the cap. The fix is --engine llvm below (near-native test speed, and parity
-    # with the local gate); 40 min is generous headroom for the cold instrumented
-    # compile plus the cached-but-occasionally-cold tarpaulin binary (AI-23).
-    timeout-minutes: 40
+    # 75: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
+    # graph WITH coverage instrumentation — a separate fingerprint from the other
+    # jobs' normal-profile target, so nothing is reusable. That one-time cold build
+    # (not the test run) is what repeatedly blew the 20- then 40-min caps (AI-23);
+    # llvm did not help because the cost is compile, not execution. The dedicated
+    # coverage cache below persists the instrumented target so every later run is
+    # warm (~10 min); 75 is generous headroom for the single cold build.
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Cache cargo
+      - name: Cache cargo (coverage-specific)
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # DEDICATED key — not the shared ${{ runner.os }}-cargo-<lock> the other
+          # jobs use. Tarpaulin builds the whole graph with coverage instrumentation
+          # (different rustflags → different fingerprints), so it can NEVER reuse the
+          # other jobs' normal-profile target. Sharing the key also meant coverage
+          # restored useless artifacts and — the key already existing when this job
+          # (which `needs` the others) ran — never SAVED its own instrumented target,
+          # so every run recompiled the graph cold and blew the timeout (AI-23). This
+          # key persists the instrumented target; only the first run builds it cold.
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target/
-          restore-keys: ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-coverage-
       - name: Cache cargo-tarpaulin binary
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -348,7 +358,10 @@ jobs:
         # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
       - name: Enforce coverage
-        # --engine llvm: near-native test execution (the default ptrace engine ran
-        # >42 min and timed the job out on this suite) and parity with the local
-        # gate, which also runs --engine llvm (see docs/testing.md).
-        run: cargo +stable tarpaulin --engine llvm --workspace --fail-under 95
+        # --engine llvm: parity with the local gate (see docs/testing.md).
+        # --skip-clean (tarpaulin's default, stated explicitly): reuse the cached
+        # instrumented target instead of rebuilding it. --timeout 180: raise the
+        # per-test cap from tarpaulin's 60 s default so a heavier supervision/
+        # survival test under instrumentation on a loaded runner is not killed
+        # spuriously. --verbose: surface compile-vs-test progress in the log.
+        run: cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose --workspace --fail-under 95
