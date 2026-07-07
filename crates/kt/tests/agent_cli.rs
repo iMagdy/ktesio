@@ -845,6 +845,20 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
 
 #[test]
 fn pause_best_effort_prints_qualifier_note_to_stderr_only() {
+    // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
+    // outside the backends allowlist). This test drives the story-1-6 cross-
+    // process adoption harness (`start_via_surviving_engine`): a subprocess
+    // starts the agent and exits WITHOUT a graceful stop so the child re-parents
+    // and survives, then a separate `kt` command adopts it live. That survival
+    // relies on Unix re-parenting to init; on Windows JOB_OBJECT_LIMIT_KILL_ON_
+    // JOB_CLOSE kills the child when the helper exits, so the next `Engine::open`
+    // adoption reconciles the row to `failed` and pause can't run. Cross-lifetime
+    // survival genuinely can't be simulated on Windows (consistent with the
+    // engine's documented single-lifetime behavior); the pause/resume SEMANTICS
+    // are fully covered on Windows by `crates/ktesio-engine/tests/pause.rs`.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
     // AC2 + AC6 at the CLI: a best-effort pause prints the new state `paused` to
     // STDOUT and a VISIBLE qualifier NOTE to STDERR (never silent, never on
     // stdout). Mirrors the LOW-1 stdout/stderr-discipline assertion from 1-4.
@@ -889,6 +903,19 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only() {
 
 #[test]
 fn pause_unsupported_exits_nonzero_quoting_the_declaration() {
+    // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
+    // outside the backends allowlist). Like the best-effort case above, this test
+    // relies on the story-1-6 cross-process adoption harness
+    // (`start_via_surviving_engine`) to make the instance genuinely `running`
+    // before pause runs. On Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills the
+    // survivor when the helper subprocess exits, so the next `Engine::open`
+    // reconciles the row to `failed` and pause fails with a reconciled-to-failed
+    // error instead of the intended UNSUPPORTED diagnostic. Cross-lifetime
+    // survival can't be simulated on Windows; the pause semantics (including the
+    // unsupported projection) are covered by `crates/ktesio-engine/tests/pause.rs`.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
     // AC3 + AC6 at the CLI: a pause that is `unsupported` on this OS fails fast
     // with a non-zero exit and a diagnostic (on STDERR) that QUOTES the
     // declaration (names pause, the OS, the level) and points at `kt agent show`.
