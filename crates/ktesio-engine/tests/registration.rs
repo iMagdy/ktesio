@@ -220,6 +220,19 @@ fn conformance_mock_fixture_matches_builtin_shape() {
         }
     }
 
+    // Story 2-2: the two mocks must ALSO declare the identical config MAPPING
+    // (the shipping builtin's mapping via the public native table; the fixture's
+    // via its `config_mapping()` accessor). Both declare `model → env MODEL`; this
+    // guards the mapping half of the BuiltinMock/MockAdapter duplication against
+    // drift, exactly like the capability equality above.
+    let builtin_mapping = ktesio_engine::adapter::native_config_mapping("mock")
+        .expect("builtin mock has a config mapping");
+    let fixture_mapping = fixture.config_mapping();
+    assert_eq!(
+        builtin_mapping, fixture_mapping,
+        "shipping builtin `mock` and the conformance MockAdapter config mappings diverged"
+    );
+
     // The fixture is inert this story (execution is 1-4).
     assert!(fixture.scripted_fake_agent().is_inert());
 }

@@ -654,10 +654,23 @@ pub fn config_get(name: &str, key: Option<&str>) -> Result<(), Box<dyn std::erro
     }
 }
 
-/// Render the whole effective config as a Key/Value table (result → stdout,
-/// AD-12). VALUES only — source layers are Epic 2.3 (the caller prints the
-/// provenance note to stderr). An empty effective config prints a plain info
-/// line rather than an empty table.
+/// The per-row marker (story 2-2, AC-B/AC7) shown in the `config get` table's
+/// "Validated" column for a leaf that skipped known-key validation — i.e. a leaf
+/// under the `agent.*` pass-through namespace. A validated (known) key shows the
+/// affirmative marker. The marker is DERIVED from the pass-through prefix via the
+/// engine's [`EffectiveConfig::is_unvalidated`] accessor (so `kt` owns no config
+/// internals — AD-2), NOT from a new persisted field; the full per-value source
+/// layer stays Epic 2.3.
+const UNVALIDATED_MARKER: &str = "unvalidated";
+/// The affirmative counterpart shown for a validated (known) key.
+const VALIDATED_MARKER: &str = "validated";
+
+/// Render the whole effective config as a table (result → stdout, AD-12). VALUES
+/// plus the story-2-2 "Validated" marker column — a leaf under `agent.*` is marked
+/// **unvalidated** (it bypassed known-key validation, AC-B/AC7); a known key is
+/// marked validated. Source LAYERS remain Epic 2.3 (the caller prints that note to
+/// stderr — NOT a source-layer column here). An empty effective config prints a
+/// plain info line rather than an empty table.
 fn render_effective_config(name: &str, effective: &EffectiveConfig) {
     let title = format!("Effective config for {name}");
     if effective.is_empty() {
@@ -666,15 +679,25 @@ fn render_effective_config(name: &str, effective: &EffectiveConfig) {
     }
     let columns = [
         ui::TableColumn::new("Key", 12, 40),
-        ui::TableColumn::new("Value", 12, 60),
+        ui::TableColumn::new("Value", 12, 48),
+        ui::TableColumn::new("Validated", 9, 12),
     ];
     let rows: Vec<Vec<ui::TableCell>> = effective
         .iter()
         .map(|(key, resolved)| {
+            // The marker is derived from the `agent.*` pass-through prefix via the
+            // engine accessor (AD-2: `kt` never re-implements the boundary). A
+            // pass-through leaf is "unvalidated"; a known key is "validated".
+            let marker = if effective.is_unvalidated(key) {
+                ui::TableCell::muted(UNVALIDATED_MARKER)
+            } else {
+                ui::TableCell::plain(VALIDATED_MARKER)
+            };
             vec![
                 ui::TableCell::skill(key.clone()),
                 // The engine renders the value (no `toml::Value` in `kt` — AD-2).
                 ui::TableCell::plain(resolved.display()),
+                marker,
             ]
         })
         .collect();

@@ -41,6 +41,15 @@
 //!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
+//!
+//! * `--dump <path>` (story 2-2)  write a small observation file at startup: the
+//!   full received argv (one `arg=<token>` line each) followed by every
+//!   environment variable (one `env=<KEY>=<VALUE>` line each). The engine's
+//!   start-seam config mapping proof reads this back to confirm a mapped unified
+//!   key landed in the agent's native mechanism — a FLAG in the args, or an ENV
+//!   var in the environment — WITHOUT racing on stdout capture. Pure `std`, NO
+//!   OS-cfg. (A FILE-target mapping is observed directly as a rendered file in the
+//!   Agent Home, so it needs no dump.)
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -61,6 +70,9 @@ struct Opts {
     spawn_child: bool,
     linger: Duration,
     marker: Option<PathBuf>,
+    /// Dump the received argv + environment to this file at startup (story 2-2:
+    /// the config-mapping observation point). `None` = no dump.
+    dump: Option<PathBuf>,
     /// Heartbeat interval (story 1-5). `None` = no heartbeat (quiet sleep loop).
     heartbeat: Option<Duration>,
     /// Crash AFTER this interval (story 1-6): run normally, then exit non-zero.
@@ -79,6 +91,7 @@ fn parse() -> Opts {
     // fallback so a stray test never leaks a truly immortal process.
     let mut linger = Duration::from_secs(3600);
     let mut marker = None;
+    let mut dump = None;
     let mut heartbeat = None;
     let mut crash_after = None;
     let mut crash_with = 1;
@@ -116,6 +129,11 @@ fn parse() -> Opts {
                     marker = Some(PathBuf::from(path));
                 }
             }
+            "--dump" => {
+                if let Some(path) = args.next() {
+                    dump = Some(PathBuf::from(path));
+                }
+            }
             // Unknown args are ignored so a manifest can pass extra tokens.
             _ => {}
         }
@@ -126,6 +144,7 @@ fn parse() -> Opts {
         spawn_child,
         linger,
         marker,
+        dump,
         heartbeat,
         crash_after,
         crash_with,
@@ -172,6 +191,10 @@ fn main() {
     }
     let _ = stdout.flush();
     write_marker(&opts.marker, "ready");
+    // Story 2-2: dump the received argv + environment so the config-mapping proof
+    // can observe a mapped unified key that landed as a native FLAG (in the args)
+    // or ENV var (in the environment), without racing on stdout capture.
+    write_dump(&opts.dump);
 
     // Loop until we are killed, until the crash-after window elapses (story 1-6:
     // a simulated UNREQUESTED crash → non-zero exit), or until the linger window
@@ -221,4 +244,28 @@ fn write_marker(path: &Option<PathBuf>, phase: &str) {
             format!("fake_agent {phase} pid={}\n", std::process::id()),
         );
     }
+}
+
+/// Best-effort write of the received argv + environment to the `--dump` file
+/// (story 2-2). One `arg=<token>` line per argv entry (including argv[0]), then
+/// one `env=<KEY>=<VALUE>` line per environment variable. The config-mapping proof
+/// greps this for a mapped FLAG (an `arg=--model` / `arg=<value>` pair) or ENV var
+/// (an `env=MODEL=<value>` line). Best-effort so it never fails the process.
+#[cfg(not(tarpaulin_include))]
+fn write_dump(path: &Option<PathBuf>) {
+    let Some(path) = path else { return };
+    let mut body = String::new();
+    for arg in std::env::args() {
+        body.push_str("arg=");
+        body.push_str(&arg);
+        body.push('\n');
+    }
+    for (key, value) in std::env::vars() {
+        body.push_str("env=");
+        body.push_str(&key);
+        body.push('=');
+        body.push_str(&value);
+        body.push('\n');
+    }
+    let _ = std::fs::write(path, body);
 }

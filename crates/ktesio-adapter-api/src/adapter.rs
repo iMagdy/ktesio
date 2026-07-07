@@ -25,6 +25,7 @@
 use thiserror::Error;
 
 use crate::capability::CapabilityDeclaration;
+use crate::config::ConfigMapping;
 use crate::metering::MeteringSource;
 
 /// An error from an adapter lifecycle op (spine AD-3; seed surface).
@@ -71,6 +72,21 @@ pub trait AgentAdapter {
     /// Read at registration; the type guarantees a viable source (absence is a
     /// validation error before an adapter exists, per [`MeteringSource`]).
     fn metering_source(&self) -> MeteringSource;
+
+    /// The adapter's declared unified→native config [`ConfigMapping`] (story 2-2,
+    /// FR-12). Read by the engine's START seam to map each documented unified key
+    /// (2-1's resolved [`EffectiveConfig`]) into this adapter's native mechanism
+    /// (a config file, an env var, or a CLI flag).
+    ///
+    /// The DEFAULT is an EMPTY mapping (mirrors the "empty declaration" defaults):
+    /// a native adapter that maps no unified keys need not override it, and a
+    /// manifest adapter with no `[config]` section yields the same empty mapping —
+    /// the "two kinds, one trait" invariant (AD-3). An unmapped documented key is
+    /// delivered NOWHERE (a no-op — Decision 6), so this stays additive: adding a
+    /// mapping only makes MORE keys land, never changes an existing launch.
+    fn config_mapping(&self) -> ConfigMapping {
+        ConfigMapping::default()
+    }
 
     /// Start the agent. **Not executed this story** (1-4 owns execution).
     ///
@@ -167,5 +183,45 @@ mod tests {
         let p = probe();
         let err = p.pause().unwrap_err();
         assert!(err.to_string().contains("pause"));
+    }
+
+    #[test]
+    fn config_mapping_defaults_to_empty_and_can_be_overridden() {
+        use crate::config::ConfigTarget;
+
+        // Story 2-2: the default accessor is an EMPTY mapping (a native adapter
+        // that maps no unified keys — like the Probe — need not override it).
+        let p = probe();
+        assert!(p.config_mapping().is_empty());
+
+        // An adapter that DOES override it declares the same ConfigMapping shape.
+        struct Mapped {
+            caps: CapabilityDeclaration,
+        }
+        impl AgentAdapter for Mapped {
+            fn kind(&self) -> &str {
+                "mapped"
+            }
+            fn capabilities(&self) -> &CapabilityDeclaration {
+                &self.caps
+            }
+            fn metering_source(&self) -> MeteringSource {
+                MeteringSource::SelfReported
+            }
+            fn config_mapping(&self) -> crate::config::ConfigMapping {
+                crate::config::ConfigMapping::new().with("model", ConfigTarget::env("MODEL"))
+            }
+        }
+        let m = Mapped {
+            caps: CapabilityDeclaration::new().with(
+                Capability::Pause,
+                OsId::Linux,
+                SupportLevel::Guaranteed,
+            ),
+        };
+        assert_eq!(
+            m.config_mapping().target("model").unwrap().env_var(),
+            Some("MODEL")
+        );
     }
 }

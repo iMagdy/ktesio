@@ -37,6 +37,7 @@
 
 mod adapter;
 mod capability;
+mod config;
 mod manifest;
 mod metering;
 mod os;
@@ -47,10 +48,18 @@ mod os;
 /// here (epic 6.6 freezes v1 and adds negotiation). Manifests declare the
 /// version they target via `contract_version`; this story stores it, and does
 /// not yet negotiate or enforce compatibility beyond presence.
-pub const CONTRACT_VERSION: &str = "0.1.0";
+///
+/// Bumped `0.1.0 → 0.2.0` in story 2-2 (FR-12): the manifest schema gains an
+/// OPTIONAL `[config]` mapping section + the trait gains a `config_mapping()`
+/// accessor with an empty default — an ADDITIVE, backward-compatible extension
+/// (a manifest with no `[config]` and a native adapter that does not override
+/// `config_mapping()` both keep their 1-3 behavior). An additive minor bump under
+/// 0.x semver; nothing was removed or changed incompatibly.
+pub const CONTRACT_VERSION: &str = "0.2.0";
 
 pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
+pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
     AdapterIdentity, Interaction, Lifecycle, Manifest, ManifestError, Metering, OpTemplate,
 };
@@ -64,9 +73,11 @@ mod tests {
     #[test]
     fn contract_version_parses_as_semver() {
         // The seed must be a valid semver so 6.6 can build negotiation on it.
+        // Bumped to 0.2.0 in story 2-2 (additive optional `[config]` section +
+        // the `config_mapping()` accessor — an additive minor bump under 0.x).
         let parsed = semver::Version::parse(CONTRACT_VERSION).expect("CONTRACT_VERSION is semver");
         assert_eq!(parsed.major, 0);
-        assert_eq!(parsed.minor, 1);
+        assert_eq!(parsed.minor, 2);
         assert_eq!(parsed.patch, 0);
     }
 

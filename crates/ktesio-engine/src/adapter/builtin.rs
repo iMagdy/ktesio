@@ -19,8 +19,16 @@
 //! story 1-4.
 
 use ktesio_adapter_api::{
-    AgentAdapter, Capability, CapabilityDeclaration, MeteringSource, OsId, SupportLevel,
+    AgentAdapter, Capability, CapabilityDeclaration, ConfigMapping, ConfigTarget, MeteringSource,
+    OsId, SupportLevel,
 };
+
+/// The builtin `mock`'s code-declared config mapping (story 2-2, AC3/AC8): the
+/// documented unified key `model` → the ENV var `MODEL`. `env` is the clean,
+/// directly-assertable native target the inert-mock proof observes on the mapped
+/// launch (Decision 4/8). Kept in shape-parity with the conformance `MockAdapter`
+/// (the cross-boundary parity test guards it).
+pub const MOCK_MODEL_ENV_VAR: &str = "MODEL";
 
 /// Resolve a native `kind` to a boxed builtin adapter, or `None` if unknown.
 ///
@@ -31,6 +39,16 @@ pub fn native(kind: &str) -> Option<Box<dyn AgentAdapter>> {
         "mock" => Some(Box::new(BuiltinMock::new())),
         _ => None,
     }
+}
+
+/// The code-declared config [`ConfigMapping`] for a native `kind`, or `None` if
+/// the kind is unknown (story 2-2). This is how the engine's start seam obtains a
+/// NATIVE adapter's mapping (a manifest adapter's mapping comes from its parsed
+/// `[config]` section instead). A known native adapter that maps no unified keys
+/// returns an EMPTY mapping (its trait default). Reuses the same [`native`] table
+/// so the mapping can never drift from the adapter that declares it.
+pub fn native_config_mapping(kind: &str) -> Option<ConfigMapping> {
+    native(kind).map(|adapter| adapter.config_mapping())
 }
 
 /// The engine's builtin `mock` adapter (shipping counterpart of the conformance
@@ -82,6 +100,13 @@ impl AgentAdapter for BuiltinMock {
         MeteringSource::SelfReported
     }
 
+    /// The code-declared unified→native config mapping (story 2-2): `model` → the
+    /// ENV var [`MOCK_MODEL_ENV_VAR`]. Mirrors the conformance `MockAdapter` so the
+    /// fixture stays a faithful stand-in (the parity test guards it).
+    fn config_mapping(&self) -> ConfigMapping {
+        ConfigMapping::new().with("model", ConfigTarget::env(MOCK_MODEL_ENV_VAR))
+    }
+
     // Lifecycle ops use the trait's inert default bodies (execution is 1-4).
 }
 
@@ -101,6 +126,21 @@ mod tests {
     fn unknown_kind_returns_none() {
         assert!(native("nope").is_none());
         assert!(native("").is_none());
+    }
+
+    #[test]
+    fn builtin_mock_declares_the_model_env_mapping() {
+        // Story 2-2 (AC3/AC8): the builtin mock code-declares `model` → env
+        // `MODEL`, the single documented-key rule the inert-mock proof asserts on.
+        let adapter = native("mock").unwrap();
+        let mapping = adapter.config_mapping();
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(
+            mapping.target("model").unwrap().env_var(),
+            Some(MOCK_MODEL_ENV_VAR)
+        );
+        // An unmapped documented key has no rule (delivered nowhere — a no-op).
+        assert!(mapping.target("temperature").is_none());
     }
 
     #[test]

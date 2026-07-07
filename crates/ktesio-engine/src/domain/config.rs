@@ -260,6 +260,18 @@ impl EffectiveConfig {
         self.leaves.is_empty()
     }
 
+    /// Whether the leaf at `key` is UNVALIDATED — i.e. it lives under the
+    /// `agent.*` pass-through namespace and so bypassed known-key validation
+    /// (story 2-2, AC-B/AC7). The MINIMAL 2-3 seam: `kt agent config get` marks
+    /// each such leaf "unvalidated" in its output, derived PURELY from the
+    /// pass-through prefix (reusing [`is_pass_through`]) — NOT from a new persisted
+    /// field. A known key (e.g. `model`) is validated, so this is `false`. Lets
+    /// `kt` render the marker without owning the `agent.*` boundary or any config
+    /// internals (AD-2); 2-3's richer per-value provenance rendering is additive.
+    pub fn is_unvalidated(&self, key: &str) -> bool {
+        is_pass_through(key)
+    }
+
     /// Number of resolved leaf keys.
     pub fn len(&self) -> usize {
         self.leaves.len()
@@ -421,9 +433,26 @@ fn is_known_key(key: &str) -> bool {
 /// Whether `key` lives under the reserved `agent.*` pass-through namespace (AC7).
 /// Requires a non-empty child after the prefix (so a bare `agent` is NOT
 /// pass-through — it would be an ordinary unknown key).
-fn is_pass_through(key: &str) -> bool {
+///
+/// PUBLIC (story 2-2): both the start-seam mapping application (which delivers a
+/// pass-through leaf VERBATIM) and `kt`'s `config get` (which marks a pass-through
+/// leaf as "unvalidated") ask this ONE boundary rather than re-implementing the
+/// prefix check — so the `agent.*` namespace has a single source of truth. `kt`
+/// reaches it through the [`EffectiveConfig::is_unvalidated`] accessor (it never
+/// re-parses config — AD-2); the engine's mapping application calls it directly.
+pub fn is_pass_through(key: &str) -> bool {
     key.strip_prefix(PASS_THROUGH_PREFIX)
         .is_some_and(|rest| !rest.is_empty())
+}
+
+/// The pass-through KEY-TAIL: the part of a `agent.*` key AFTER the `agent.`
+/// prefix (story 2-2). Returns `Some("foo.bar")` for `agent.foo.bar`, `None` for a
+/// non-pass-through key. This is the VERBATIM name delivered into the native
+/// mechanism (AC6: no rewriting of the tail). Reuses [`is_pass_through`]'s
+/// non-empty-child rule (a bare `agent` yields `None`).
+pub fn pass_through_tail(key: &str) -> Option<&str> {
+    key.strip_prefix(PASS_THROUGH_PREFIX)
+        .filter(|rest| !rest.is_empty())
 }
 
 /// Validate a config WRITE at write time (spine AD-9, AC-B / AC6 / AC7), BEFORE

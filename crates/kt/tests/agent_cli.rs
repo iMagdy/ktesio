@@ -1698,3 +1698,113 @@ fn config_get_unknown_instance_exits_nonzero() {
         run.stderr
     );
 }
+
+// ---- Story 2-2: the `agent.*`-unvalidated marker in `config get` (AC-B/AC7) ----
+
+#[test]
+fn config_get_marks_agent_pass_through_leaf_unvalidated_and_known_key_validated() {
+    // AC-B / AC7 at the CLI: `config get <name>` renders a "Validated" marker per
+    // row — an `agent.*` leaf is marked `unvalidated` (it bypassed known-key
+    // validation), while a KNOWN key (`model`) is marked `validated`. The marker
+    // rides on STDOUT (part of the result table, AD-12); the Epic 2.3 provenance
+    // note stays on STDERR. NO source-layer column is added (that is 2-3).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A known key (validated) and an agent.* pass-through key (unvalidated).
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.custom_flag", "on"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    // The Validated column header is present, and the unvalidated marker appears
+    // for the agent.* leaf (result → stdout).
+    assert!(
+        get.stdout.contains("Validated"),
+        "config get must have a Validated column; stdout={}",
+        get.stdout
+    );
+    assert!(
+        get.stdout.contains("unvalidated"),
+        "the agent.* leaf must be marked unvalidated; stdout={}",
+        get.stdout
+    );
+    // Both keys are listed.
+    assert!(get.stdout.contains("model"), "stdout={}", get.stdout);
+    assert!(
+        get.stdout.contains("agent.custom_flag"),
+        "stdout={}",
+        get.stdout
+    );
+    // The marker rides on STDOUT, not fabricated onto stderr; the provenance note
+    // (Epic 2.3) still rides on stderr and stdout stays clean of it.
+    assert!(
+        get.stderr.contains("Epic 2.3"),
+        "the provenance note must stay on stderr; stderr={}",
+        get.stderr
+    );
+    assert!(
+        !get.stdout.contains("Epic 2.3"),
+        "stdout must not carry the provenance note; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_get_known_key_only_shows_no_unvalidated_marker() {
+    // AC-B companion: with ONLY a known key set (no agent.* leaf), `config get`
+    // shows the value marked `validated` and NO `unvalidated` marker anywhere —
+    // the marker is present only for pass-through leaves.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    // No `unvalidated` marker anywhere (the only key is a known one).
+    assert!(
+        !get.stdout.contains("unvalidated"),
+        "a known-key-only config must show NO unvalidated marker; stdout={}",
+        get.stdout
+    );
+    // The affirmative `validated` marker IS present — checked unambiguously (not
+    // via a bare `contains("validated")`, which is a substring of "unvalidated").
+    // Since no `unvalidated` occurs (asserted above), stripping it is a no-op here;
+    // the check stays correct even if the two ever co-occur in some future row.
+    assert!(
+        get.stdout.replace("unvalidated", "").contains("validated"),
+        "the known key must be marked validated (standalone token); stdout={}",
+        get.stdout
+    );
+}

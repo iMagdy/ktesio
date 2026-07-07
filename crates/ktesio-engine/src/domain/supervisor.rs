@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use ktesio_adapter_api::{Capability, OsId, SupportLevel};
 
-use crate::adapter::{self, LaunchResolveError};
+use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
 use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnRecord, SpawnSpec};
 use crate::time::now_rfc3339;
@@ -192,8 +192,29 @@ impl Supervisor {
         let (kind, manifest_path) = registry
             .adapter_launch_facts(&name)
             .map_err(registry_to_engine)?;
-        let launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
+        let mut launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
+        // (story 2-2, FR-12) — still before any persisted state change, so a
+        // config/mapping failure rejects the start cleanly (no spurious state
+        // change, no half-launched process). Resolve the instance's effective
+        // config (2-1's four-layer fold; empty invocation overrides for a plain
+        // start — the parameter is threaded so a future `start --set k=v` supplies
+        // it without an API change), the adapter's declared mapping (manifest
+        // `[config]` or the native code-declared table), then apply: known keys
+        // land in their declared native target (env → launch.env; flag →
+        // launch.args; file → a rendered file in the Agent Home), and `agent.*`
+        // pass-through leaves are delivered VERBATIM (AC6). The Agent Home already
+        // exists (created at registration); file targets render into it here.
+        let home = registry.agent_home(&name);
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .map_err(|e| config_to_engine(&name, e))?;
+        let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+        adapter::apply_config_mapping(&mut launch, &mapping, &effective, &home)
+            .map_err(|e| config_apply_to_engine(&name, e))?;
 
         // Read the per-instance Restart Policy so the write-ahead record carries
         // it (AD-15 per-instance configurable). Read once, before any side effect.
@@ -201,7 +222,6 @@ impl Supervisor {
             .effective_restart_policy(&name)
             .map_err(registry_to_engine)?;
 
-        let home = registry.agent_home(&name);
         // The spawned agent's stdout/stderr go to a SEPARATE agent.log, never the
         // engine's JSON-Lines transition-event log (instance.log) — otherwise the
         // agent's plain-text output would corrupt the structured event log.
@@ -1025,10 +1045,35 @@ fn launch_to_engine(name: &InstanceName, err: LaunchResolveError) -> EngineError
     }
 }
 
+/// Map a config-resolution failure (story 2-2) encountered while mapping the
+/// resolved unified config into the launch into the lifecycle [`EngineError`]. A
+/// malformed config layer / missing instance surfaces as an unresolved-adapter
+/// launch failure (the config could not be mapped into the launch), naming the
+/// instance + detail; the start rejects BEFORE any state change (mirrors a bad
+/// manifest).
+fn config_to_engine(name: &InstanceName, err: crate::domain::ConfigError) -> EngineError {
+    EngineError::AdapterUnresolved {
+        name: name.as_str().to_string(),
+        detail: err.to_string(),
+    }
+}
+
+/// Map a config-mapping APPLICATION failure (story 2-2) — a FILE target that
+/// could not be rendered into the Agent Home — into the lifecycle [`EngineError`].
+/// Surfaces as an unresolved-adapter launch failure naming the instance + detail;
+/// the start rejects before any state change (the file write happens before the
+/// `starting` transition), so a bad file target never leaves a spurious state.
+fn config_apply_to_engine(name: &InstanceName, err: ConfigApplyError) -> EngineError {
+    EngineError::AdapterUnresolved {
+        name: name.as_str().to_string(),
+        detail: err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::AdapterRef;
+    use crate::adapter::{AdapterRef, StartLaunch};
     use crate::domain::RestartPolicy;
     use std::time::Instant;
 
@@ -1070,6 +1115,64 @@ mod tests {
         (state, manifest, registry)
     }
 
+    /// Story 2-2: write a `fake_agent` manifest with `args` PLUS a `[config]`
+    /// mapping section (`config_toml` is the section body, e.g.
+    /// `"[config.model]\nflag = \"--model\"\n"`). Used by the manifest end-to-end
+    /// mapping proofs.
+    fn write_fake_manifest_with_config(dir: &Path, kind: &str, args: &[&str], config_toml: &str) {
+        let bin = ktesio_conformance::fake_agent_bin();
+        let args_toml = args
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "contract_version = \"0.1.0\"\n\n\
+             [adapter]\nkind = \"{kind}\"\n\n\
+             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"self-reported\"\n\n\
+             {config_toml}",
+            exec = bin.to_string_lossy(),
+        );
+        std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    }
+
+    /// Register a `fake_agent`-backed instance carrying a `[config]` mapping.
+    /// Returns the (state dir, manifest dir, registry).
+    fn setup_fake_with_config(
+        name: &str,
+        args: &[&str],
+        config_toml: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_fake_manifest_with_config(manifest.path(), name, args, config_toml);
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry
+            .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+            .unwrap();
+        (state, manifest, registry)
+    }
+
+    /// Poll for a `--dump` file to appear (the spawned `fake_agent` writes it at
+    /// startup) and return its contents, bounded — avoids racing the spawn.
+    fn wait_for_dump(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dump file never appeared at {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Poll until `poll_once` reports the crash (returns its plans), bounded.
     fn wait_for_crash(sup: &mut Supervisor, registry: &Registry) -> Vec<RestartPlan> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1096,6 +1199,166 @@ mod tests {
             .lookup(&InstanceName::new(name).unwrap())
             .unwrap()
             .state
+    }
+
+    // ---- Story 2-2: unified→native config mapping proven at start (AC-A/AC-B) ----
+
+    #[test]
+    fn mock_native_start_maps_model_to_the_declared_env_target() {
+        // AC-A + AC8 (the MOCK/native proof). The builtin `mock` is INERT (no live
+        // process — NativeHasNoLaunch), so a `mock` start cannot spawn to observe.
+        // Per the recorded inert-mock strategy (Decision 8), we assert on the
+        // MAPPED launch the mapping application PRODUCES: register a mock, set the
+        // documented `model` key (2-1), then resolve the mock's code-declared
+        // mapping + the effective config and apply — the mock's declared native
+        // target (env `MODEL`) must carry the value. This is exactly the transform
+        // the start seam runs; a launchable native agent is a manifest adapter.
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry.register("mck", "mock").unwrap();
+        let name = InstanceName::new("mck").unwrap();
+        registry.set_config(&name, "model", "gpt-4").unwrap();
+
+        // Resolve exactly as start_inner would for a native adapter.
+        let (kind, manifest_path) = registry.adapter_launch_facts(&name).unwrap();
+        assert_eq!(kind, "mock");
+        assert!(manifest_path.is_none(), "mock is native (no manifest)");
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref()).unwrap();
+        // The mock declares `model` → env `MODEL`.
+        assert_eq!(mapping.target("model").unwrap().env_var(), Some("MODEL"));
+
+        // Apply onto a bare launch (the mock has no [lifecycle.start] template;
+        // this is the launch shape the mapping would produce).
+        let mut launch = StartLaunch {
+            exec: "mock".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        };
+        adapter::apply_config_mapping(
+            &mut launch,
+            &mapping,
+            &effective,
+            &registry.agent_home(&name),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some("gpt-4"),
+            "the documented model key must land in the mock's declared env target"
+        );
+    }
+
+    #[test]
+    fn manifest_start_maps_model_to_the_declared_flag_target_live() {
+        // AC-A + AC8 (the MANIFEST proof, live). A `fake_agent` manifest declares
+        // `[config.model]` → flag `--model`; set model, start the REAL process
+        // with `--dump`, and assert the mapped flag landed in the spawned
+        // process's argv (observed via the dump file — no stdout race).
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("argv.txt");
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "flg",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+            "[config.model]\nflag = \"--model\"\n",
+        );
+        let name = InstanceName::new("flg").unwrap();
+        registry.set_config(&name, "model", "gpt-4o").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "flg").unwrap();
+        assert_eq!(state_of(&registry, "flg"), LifecycleState::Running);
+
+        // The spawned fake_agent dumped its argv; the mapped flag + value are there.
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == "arg=--model"),
+            "the mapped --model flag must reach the process argv; dump=\n{dumped}"
+        );
+        assert!(
+            dumped.lines().any(|l| l == "arg=gpt-4o"),
+            "the mapped model VALUE must reach the process argv; dump=\n{dumped}"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "flg", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn manifest_start_maps_model_to_the_declared_file_target_live() {
+        // AC-A + AC4 (the MANIFEST FILE proof, live). A `fake_agent` manifest
+        // declares `[config.model]` → a file target; set model, start, and assert
+        // the engine RENDERED the native config file into the Agent Home at the
+        // declared native key (the engine is the sole writer — path authority).
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "fil",
+            &["--linger-ms", "600000"],
+            "[config.model]\nfile = { path = \"config/agent.toml\", key = \"llm.model\" }\n",
+        );
+        let name = InstanceName::new("fil").unwrap();
+        registry.set_config(&name, "model", "claude-opus").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "fil").unwrap();
+        assert_eq!(state_of(&registry, "fil"), LifecycleState::Running);
+
+        // The engine rendered the native config file into the Agent Home.
+        let rendered = registry.agent_home(&name).join("config/agent.toml");
+        assert!(
+            rendered.is_file(),
+            "the file target must render into the home"
+        );
+        let parsed: toml::Table = std::fs::read_to_string(&rendered).unwrap().parse().unwrap();
+        assert_eq!(
+            parsed["llm"]["model"].as_str(),
+            Some("claude-opus"),
+            "the documented model key must land at the declared native key path"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "fil", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn manifest_start_delivers_agent_pass_through_verbatim_live() {
+        // AC-B (the `agent.*` verbatim proof, live). Set an `agent.*` pass-through
+        // key, start the REAL fake_agent with `--dump`, and assert the value was
+        // delivered VERBATIM into the native mechanism (an env var named by the
+        // verbatim key-tail) — no rewriting, no known-key mapping.
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("env.txt");
+        // No [config] mapping at all — pass-through does not need one (AC6).
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "pth",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+            "",
+        );
+        let name = InstanceName::new("pth").unwrap();
+        registry
+            .set_config(&name, "agent.CUSTOM_TOKEN", "verbatim-xyz")
+            .unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "pth").unwrap();
+        assert_eq!(state_of(&registry, "pth"), LifecycleState::Running);
+
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == "env=CUSTOM_TOKEN=verbatim-xyz"),
+            "the agent.* value must be delivered verbatim into the native env; dump=\n{dumped}"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "pth", Some(Duration::from_millis(200)));
     }
 
     #[test]
@@ -1434,6 +1697,75 @@ mod tests {
             }
             other => panic!("expected AdapterUnresolved, got {other}"),
         }
+    }
+
+    #[test]
+    fn config_to_engine_and_config_apply_to_engine_wrap_as_adapter_unresolved() {
+        // Story 2-2: a config-resolution failure and a config-apply (file-render)
+        // failure both surface as an unresolved-adapter launch failure naming the
+        // instance + preserving the detail, so `start` rejects cleanly.
+        let name = InstanceName::new("svc").unwrap();
+        let cfg_err = config_to_engine(
+            &name,
+            crate::domain::ConfigError::NotFound { name: "svc".into() },
+        );
+        match cfg_err {
+            EngineError::AdapterUnresolved { name, detail } => {
+                assert_eq!(name, "svc");
+                assert!(detail.contains("svc"), "detail preserved: {detail}");
+            }
+            other => panic!("expected AdapterUnresolved, got {other}"),
+        }
+        let apply_err = config_apply_to_engine(
+            &name,
+            ConfigApplyError::FileRender {
+                key: "config/agent.toml".into(),
+                path: "config/agent.toml".into(),
+                detail: "disk full".into(),
+            },
+        );
+        match apply_err {
+            EngineError::AdapterUnresolved { name, detail } => {
+                assert_eq!(name, "svc");
+                assert!(detail.contains("config/agent.toml"), "{detail}");
+                assert!(detail.contains("disk full"), "{detail}");
+            }
+            other => panic!("expected AdapterUnresolved, got {other}"),
+        }
+    }
+
+    #[test]
+    fn start_with_an_unwritable_file_target_rejects_before_any_state_change() {
+        // Story 2-2 end-to-end error path (accurate atomicity, Fix #5): a manifest
+        // `[config.model]` FILE target whose parent path is blocked (a regular file
+        // sits where the config directory must be in the Agent Home) fails the
+        // config-mapping application at start. Because the mapping is applied BEFORE
+        // the `starting` transition, the start REJECTS (AdapterUnresolved) and the
+        // instance stays in its PRIOR state (`registered`) — it does NOT land
+        // `failed`, and never reaches `running`. Exercises the start_inner
+        // config-apply error branch + config_apply_to_engine.
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "badfile",
+            &["--linger-ms", "600000"],
+            "[config.model]\nfile = { path = \"blocked/agent.toml\", key = \"k\" }\n",
+        );
+        let name = InstanceName::new("badfile").unwrap();
+        registry.set_config(&name, "model", "gpt-4").unwrap();
+        // Block the file target's parent: put a regular FILE at <home>/blocked so
+        // create_dir_all(<home>/blocked) fails when rendering blocked/agent.toml.
+        let home = registry.agent_home(&name);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("blocked"), b"not a dir").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start(&registry, "badfile").unwrap_err();
+        assert!(
+            matches!(err, EngineError::AdapterUnresolved { .. }),
+            "a bad file target must fail the start; got {err}"
+        );
+        // Never reached running (the failure was before the starting transition, so
+        // the instance stays registered).
+        assert_eq!(state_of(&registry, "badfile"), LifecycleState::Registered);
     }
 
     #[test]

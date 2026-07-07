@@ -22,8 +22,8 @@ mod supervisor;
 mod transition;
 
 pub use config::{
-    resolve, ConfigError, ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer,
-    PASS_THROUGH_PREFIX,
+    is_pass_through, pass_through_tail, resolve, ConfigError, ConfigLayer, EffectiveConfig,
+    ResolvedValue, SourceLayer, PASS_THROUGH_PREFIX,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION};
