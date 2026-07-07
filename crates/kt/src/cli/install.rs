@@ -821,6 +821,14 @@ fn parse_named_target(
         return Ok(None);
     }
 
+    // A bare local path is not a `name:url` spec. This guards against Windows
+    // absolute paths (e.g. `C:\repo`), whose drive-letter colon would otherwise
+    // be mistaken for the `name:` separator by `split_once(':')` below. On Unix
+    // a local path has no colon, so this only changes Windows behavior.
+    if install_target::is_local_path_target(target) {
+        return Ok(None);
+    }
+
     let Some((name, repo)) = target.split_once(':') else {
         return Ok(None);
     };
@@ -1299,10 +1307,7 @@ mod tests {
         let missing_repo = dir.join("missing-repo");
         std::fs::write(
             dir.join("skills.json"),
-            format!(
-                r#"{{"dependencies": {{"test": {{"repo": "{}"}}}}, "publish": []}}"#,
-                missing_repo.display()
-            ),
+            manifest_json_with_repo("test", &missing_repo),
         )
         .unwrap();
         let result = run_in(&dir, None);
@@ -1883,10 +1888,7 @@ mod tests {
         let repo = create_local_repo(&dir, "source");
         std::fs::write(
             dir.join("skills.json"),
-            format!(
-                r#"{{"dependencies": {{"source": {{"repo": "{}"}}}}, "publish": []}}"#,
-                repo.display()
-            ),
+            manifest_json_with_repo("source", &repo),
         )
         .unwrap();
 
@@ -1906,10 +1908,7 @@ mod tests {
         let missing_repo = dir.join("missing-repo");
         std::fs::write(
             dir.join("skills.json"),
-            format!(
-                r#"{{"dependencies": {{"test": {{"repo": "{}"}}}}, "publish": []}}"#,
-                missing_repo.display()
-            ),
+            manifest_json_with_repo("test", &missing_repo),
         )
         .unwrap();
         let result = run_bulk_with_manifest(&dir, &dir.join("skills.json"));
@@ -2893,5 +2892,17 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Builds a `skills.json` body with a single remote dependency pointing at a
+    /// filesystem path. Serializing the path through `serde_json` escapes it
+    /// correctly on every OS; a raw `format!("{}", repo.display())` would embed
+    /// Windows backslashes as invalid JSON escapes and fail to parse.
+    fn manifest_json_with_repo(name: &str, repo: &Path) -> String {
+        serde_json::json!({
+            "dependencies": { name: { "repo": repo.to_string_lossy() } },
+            "publish": []
+        })
+        .to_string()
     }
 }

@@ -200,15 +200,14 @@ mod tests {
             ],
         );
         let old_commit = "a".repeat(40);
-        std::fs::write(
-            dir.join("skills.lock"),
-            format!(
-                r#"{{"test": {{"commit": "{}", "repo": "{}"}}}}"#,
-                old_commit,
-                source.display()
-            ),
-        )
-        .unwrap();
+        // Build the fixture via serde_json so the repo path is JSON-escaped;
+        // on Windows a raw `format!("{}", source.display())` embeds backslashes
+        // that are invalid JSON escapes and would fail to parse.
+        let lockfile_json = serde_json::json!({
+            "test": { "commit": old_commit, "repo": source.to_string_lossy() }
+        })
+        .to_string();
+        std::fs::write(dir.join("skills.lock"), lockfile_json).unwrap();
 
         let result = run_in(&dir);
 

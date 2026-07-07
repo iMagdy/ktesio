@@ -4,6 +4,7 @@ use dialoguer::MultiSelect;
 
 use crate::error::{ManifestInvalidName, SkillCopyFailed};
 use crate::git;
+use crate::install_target;
 use crate::manifest::{DependencyEntry, Manifest};
 use crate::ui;
 
@@ -169,10 +170,11 @@ fn add_publish_candidate(
             }
             .into());
         }
-        let relative_path = candidate_path
-            .strip_prefix(&project_root)?
-            .to_string_lossy()
-            .to_string();
+        let relative_path = install_target::normalize_separators_to_slash(
+            &candidate_path
+                .strip_prefix(&project_root)?
+                .to_string_lossy(),
+        );
         manifest.add_local_dependency(candidate.name.clone(), relative_path);
     }
 
@@ -231,10 +233,9 @@ fn validate_publish_path(
         .into());
     }
 
-    Ok(absolute_path
-        .strip_prefix(&project_root)?
-        .to_string_lossy()
-        .to_string())
+    Ok(install_target::normalize_separators_to_slash(
+        &absolute_path.strip_prefix(&project_root)?.to_string_lossy(),
+    ))
 }
 
 fn is_valid_skill_name(name: &str) -> bool {
