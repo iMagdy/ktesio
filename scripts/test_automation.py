@@ -122,6 +122,17 @@ class ReleaseDocsTests(unittest.TestCase):
         # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
         self.assertIn("cargo +stable test --workspace --all-targets", ci)
         self.assertIn("cargo +stable tarpaulin --workspace --fail-under 95", ci)
+        # Coverage caches the source-installed tarpaulin binary so it is not
+        # rebuilt (~10 min) on every fresh runner, and the install is idempotent
+        # (skipped on a cache hit) — the job was being cancelled by its timeout
+        # mid-rebuild (AI-23). Mirrors the semver gate's binary cache (AI-1),
+        # asserted in test_ci_enforces_workspace_boundary_and_semver_gates.
+        self.assertIn("${{ runner.os }}-cargo-tarpaulin-bin", ci)
+        self.assertIn(
+            "command -v cargo-tarpaulin >/dev/null 2>&1 "
+            "|| cargo +stable install cargo-tarpaulin --locked",
+            ci,
+        )
 
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the

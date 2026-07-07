@@ -304,7 +304,11 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test, build, docs, boundary, semver]
-    timeout-minutes: 20
+    # 40, not 20: the source install of cargo-tarpaulin is a ~10-min build. The
+    # binary is cached below (AI-23) so warm runs skip it, but the FIRST run on a
+    # fresh cache (or a version bump) still pays that cost before coverage itself
+    # runs — 20 min cancelled the job mid-build. 40 absorbs the cold build safely.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -319,9 +323,24 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Cache cargo-tarpaulin binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-tarpaulin so coverage does not
+          # rebuild it (~10 min) on every fresh runner (AI-23) — mirrors the
+          # semver job's cargo-semver-checks-bin cache (AI-1). restore-keys lets a
+          # partial-key match seed ~/.cargo/bin so a bumped exact key still warms
+          # from the prior binary instead of a cold rebuild (AI-3: a constant key
+          # can freeze an empty entry).
+          key: ${{ runner.os }}-cargo-tarpaulin-bin
+          path: |
+            ~/.cargo/bin
+          restore-keys: ${{ runner.os }}-cargo-tarpaulin-bin
       - name: Install cargo-tarpaulin
         # Explicit +stable (see fmt job): coverage runs on latest stable; the root
-        # rust-toolchain.toml pins only local bare cargo.
-        run: cargo +stable install cargo-tarpaulin
+        # rust-toolchain.toml pins only local bare cargo. Idempotent install: on a
+        # cache hit the binary is already on PATH, so the `command -v` guard skips
+        # the ~10-min rebuild (matches the semver gate's guarded install, AI-23).
+        run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
       - name: Enforce coverage
         run: cargo +stable tarpaulin --workspace --fail-under 95
