@@ -47,18 +47,14 @@ Only the `test` job matrixes; the other jobs (fmt, clippy, build, docs, boundary
 
 ## Coverage
 
-CI runs `cargo tarpaulin --workspace --fail-under 95` as the coverage gate, on Linux only. To run it locally:
+CI runs `cargo tarpaulin --engine llvm --workspace --fail-under 95` as the coverage gate, on Linux only. To run it locally:
 
 ```bash
 cargo install cargo-tarpaulin
-cargo tarpaulin --workspace --fail-under 95
-```
-
-On macOS the default ptrace engine is unavailable — tarpaulin errors with `missing section: CoverageFunctions` — so run the LLVM source-based engine instead (this is how the gate is reproduced on a macOS dev host):
-
-```bash
 cargo tarpaulin --engine llvm --workspace --fail-under 95
 ```
+
+The `--engine llvm` (source-based) engine is used everywhere, for two reasons. On Linux it runs the instrumented suite at near-native speed; the default ptrace engine single-steps every test and ran the 800+-test suite past 40 minutes, cancelling the CI job (AI-23). On macOS the ptrace engine is unavailable outright — tarpaulin errors with `missing section: CoverageFunctions` — so llvm is the only option on a macOS dev host. Using the same engine in both places keeps local and CI on the same reported percentage. CI also adds the `llvm-tools-preview` rustup component, which provides the `llvm-profdata`/`llvm-cov` the engine shells out to.
 
 Generate an HTML report:
 

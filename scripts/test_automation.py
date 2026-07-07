@@ -121,12 +121,16 @@ class ReleaseDocsTests(unittest.TestCase):
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
         # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
         self.assertIn("cargo +stable test --workspace --all-targets", ci)
-        self.assertIn("cargo +stable tarpaulin --workspace --fail-under 95", ci)
-        # Coverage caches the source-installed tarpaulin binary so it is not
-        # rebuilt (~10 min) on every fresh runner, and the install is idempotent
-        # (skipped on a cache hit) — the job was being cancelled by its timeout
-        # mid-rebuild (AI-23). Mirrors the semver gate's binary cache (AI-1),
-        # asserted in test_ci_enforces_workspace_boundary_and_semver_gates.
+        self.assertIn("cargo +stable tarpaulin --engine llvm --workspace --fail-under 95", ci)
+        # --engine llvm (not the default ptrace engine): near-native test speed —
+        # ptrace single-stepped the 800+-test suite past the timeout and the job
+        # was cancelled (AI-23) — plus parity with the local macOS gate. The
+        # llvm-tools-preview component supplies the llvm-profdata/llvm-cov it uses.
+        self.assertIn("rustup component add llvm-tools-preview", ci)
+        # Coverage also caches the source-installed tarpaulin binary and makes the
+        # install idempotent (skipped on a cache hit) so warm runs skip the rebuild
+        # — good hygiene, mirroring the semver gate's binary cache (AI-1). (The
+        # real timeout cause was the ptrace run above, not this install; AI-23.)
         self.assertIn("${{ runner.os }}-cargo-tarpaulin-bin", ci)
         self.assertIn(
             "command -v cargo-tarpaulin >/dev/null 2>&1 "

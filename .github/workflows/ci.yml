@@ -304,10 +304,11 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test, build, docs, boundary, semver]
-    # 40, not 20: the source install of cargo-tarpaulin is a ~10-min build. The
-    # binary is cached below (AI-23) so warm runs skip it, but the FIRST run on a
-    # fresh cache (or a version bump) still pays that cost before coverage itself
-    # runs — 20 min cancelled the job mid-build. 40 absorbs the cold build safely.
+    # 40, not 20: coverage runs the whole suite instrumented. The default (ptrace)
+    # engine single-stepped 800+ tests and ran >42 min → the job was cancelled at
+    # the cap. The fix is --engine llvm below (near-native test speed, and parity
+    # with the local gate); 40 min is generous headroom for the cold instrumented
+    # compile plus the cached-but-occasionally-cold tarpaulin binary (AI-23).
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -336,11 +337,18 @@ jobs:
           path: |
             ~/.cargo/bin
           restore-keys: ${{ runner.os }}-cargo-tarpaulin-bin
+      - name: Add llvm coverage tooling
+        # --engine llvm (below) shells out to llvm-profdata / llvm-cov to merge the
+        # profraw output; llvm-tools-preview provides them for the stable toolchain.
+        run: rustup component add llvm-tools-preview
       - name: Install cargo-tarpaulin
         # Explicit +stable (see fmt job): coverage runs on latest stable; the root
         # rust-toolchain.toml pins only local bare cargo. Idempotent install: on a
         # cache hit the binary is already on PATH, so the `command -v` guard skips
-        # the ~10-min rebuild (matches the semver gate's guarded install, AI-23).
+        # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
       - name: Enforce coverage
-        run: cargo +stable tarpaulin --workspace --fail-under 95
+        # --engine llvm: near-native test execution (the default ptrace engine ran
+        # >42 min and timed the job out on this suite) and parity with the local
+        # gate, which also runs --engine llvm (see docs/testing.md).
+        run: cargo +stable tarpaulin --engine llvm --workspace --fail-under 95
