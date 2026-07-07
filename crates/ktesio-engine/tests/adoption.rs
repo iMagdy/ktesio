@@ -287,6 +287,15 @@ fn engine_kill_adopts_live_child_and_fails_gone_record() {
     // process) opens the SAME state dir and must: ADOPT `survivor` (row `running`,
     // and a subsequent `stop` truly kills it — no orphan), and reconcile `ghost`
     // to `failed` (AI-8: no phantom `running`).
+    //
+    // Runtime-skip on Windows: this asserts a child SURVIVES its parent engine's
+    // death, which needs Unix re-parenting to init; on Windows KILL_ON_JOB_CLOSE
+    // kills the child when the `run_engine1` helper exits. The gone-process →
+    // reconcile-to-`failed` adoption path IS covered on Windows by the other
+    // adoption tests. NO `#[cfg]` (this file is outside the backends allowlist).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
@@ -351,6 +360,16 @@ fn whole_fleet_survives_a_reboot_and_reconciles_running_to_failed() {
     // live agent process (fabricating "all processes gone" — their PIDs would not
     // survive a reboot) and opens a NEW engine over the SAME state dir. The test
     // asserts the reboot INVARIANTS, not a literal reboot.
+    //
+    // Runtime-skip on Windows: the harness relies on `worker` SURVIVING the
+    // engine-1 crash (Unix re-parenting to init) before we fabricate the reboot;
+    // on Windows KILL_ON_JOB_CLOSE kills it when the `run_engine1` helper exits.
+    // The reboot INVARIANTS (running → reconcile-to-`failed` for gone processes)
+    // are covered on Windows by the other adoption tests. NO `#[cfg]` (this file
+    // is outside the backends allowlist).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
