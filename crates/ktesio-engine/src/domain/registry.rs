@@ -911,6 +911,18 @@ impl Registry {
         self.instance_log_dir(name).join("agent.log")
     }
 
+    /// The per-instance BUDGET-BREACH log FILE — the JSON-Lines
+    /// [`crate::domain::BudgetBreachEvent`] log (story 3-2, AD-14). Engine-owned,
+    /// SEPARATE from the transition log so the ALWAYS-recorded breach event is a
+    /// durable fact independent of any lifecycle transition (FR-21 "breaches are
+    /// always recorded as events regardless of action") — a `warn` breach (no
+    /// transition) still lands here, and a breach whose pause/stop fails is still
+    /// recorded here. Full subscription delivery is 7-2's; this is the durable
+    /// record + the seed the future bus reads.
+    pub(crate) fn instance_breach_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("breaches.log")
+    }
+
     /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;
     /// story 3-1 populates the table so this returns a real count).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {

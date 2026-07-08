@@ -9,6 +9,7 @@
 //! seed), and the [`Supervisor`] that drives start/stop through the process
 //! backend. Budgets and config resolution arrive with their stories.
 
+mod budget;
 mod config;
 mod error;
 mod event;
@@ -23,14 +24,21 @@ mod supervisor;
 mod transition;
 mod usage;
 
+pub use budget::{
+    BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,
+};
 pub use config::{
-    is_pass_through, is_secret_ref, pass_through_tail, resolve, secret_name, ConfigError,
-    ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer, PASS_THROUGH_PREFIX, SECRET_MASK,
-    SECRET_PREFIX,
+    is_pass_through, is_secret_ref, pass_through_tail, resolve, resolve_token_budget, secret_name,
+    ConfigError, ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer,
+    BUDGET_BREACH_ACTION_KEY, BUDGET_TOKENS_CUMULATIVE_KEY, BUDGET_TOKENS_PER_RUN_KEY,
+    PASS_THROUGH_PREFIX, SECRET_MASK, SECRET_PREFIX,
 };
 pub use error::{EngineError, RegistryError};
-pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION};
-pub use fleet::{FleetEntry, FleetListing, MeteringSeed, UsageView};
+pub use event::{
+    BudgetBreachEvent, TransitionCause, TransitionEvent, BUDGET_SCHEMA_VERSION,
+    EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
+};
+pub use fleet::{BudgetView, FleetEntry, FleetListing, UsageView};
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};

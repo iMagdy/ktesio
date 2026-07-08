@@ -33,9 +33,9 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    AgentInstance, ConfigError, ConfigLayer, EffectiveConfig, EngineError, FleetEntry,
-    InstanceName, LifecycleState, Registry, RegistryError, RemoveDisposition, RestartPolicy,
-    Supervisor, TransitionCause, TransitionEvent,
+    AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, EffectiveConfig, EngineError,
+    FleetEntry, InstanceName, LifecycleState, Registry, RegistryError, RemoveDisposition,
+    RestartPolicy, Supervisor, TransitionCause, TransitionEvent,
 };
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
@@ -387,8 +387,9 @@ impl Engine {
     /// ([`Engine::instance_status`]) the CLI already surfaces — the restart
     /// count/policy + (for a `failed` instance) the last-known cause — plus the
     /// story-3-1 metering surface: the real Usage-Ledger token totals + the active
-    /// Metering Source (AC-C/AC11), and the still-honest `budget` `None` seed
-    /// (budgets are story 3-2). Reading live persisted state on every call is what
+    /// Metering Source (AC-C/AC11), and the story-3-2 real TOKEN `budget` (the
+    /// configured ceilings + Breach Action + remaining, or an honest absent budget
+    /// when none is configured; dollars stay → 3-3). Reading live persisted state on every call is what
     /// makes the listing ≤2s fresh (AC6): there is no cache, so any committed
     /// transition is reflected on the next `fleet()` (a single DB read, far under 2s).
     ///
@@ -419,8 +420,8 @@ impl Engine {
     /// runtime status through the SAME registry lock (one read pass, no
     /// re-entrancy). A status read-back failure degrades the runtime fields to
     /// their defaults rather than failing the whole Fleet (the 1-6 `list`
-    /// fallback). `budget` is the honest `None` seed (story 3-2); `usage` +
-    /// `metering_source` are real (story 3-1).
+    /// fallback). `budget` (story 3-2), `usage` + `metering_source` (story 3-1) are
+    /// all real; `budget` is `None` only when no budget is configured.
     fn fleet_entry_for(
         registry: &Registry,
         supervisor: &Supervisor,
@@ -461,6 +462,26 @@ impl Engine {
             .and_then(|run_id| registry.run_usage_totals(&instance.name, &run_id).ok())
             .unwrap_or_default();
         let usage = crate::domain::UsageView::new(cumulative, current_run);
+        // Story 3-2 budget surface (AC9): the CURRENT resolved Token Budget +
+        // Breach Action + remaining tokens per scope, TOKENS ONLY (dollars stay
+        // absent → 3-3). Read through the SAME live config resolve the evaluator
+        // uses (so the Fleet view matches what enforcement sees). A degraded config
+        // read falls back to no budget (honest absence), never failing the Fleet.
+        // Remaining is computed from the SAME ledger totals `usage` reports, so it
+        // equals the Usage Ledger exactly (FR-22). An instance with no budget
+        // configured surfaces an honest absent budget (never a fabricated ceiling).
+        let budget = registry
+            .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
+            .ok()
+            .and_then(|effective| {
+                let (token_budget, action) = crate::domain::resolve_token_budget(&effective);
+                crate::domain::BudgetView::from_budget(
+                    &token_budget,
+                    action,
+                    current_run.total_tokens(),
+                    cumulative.total_tokens(),
+                )
+            });
         // The active Metering Source is visible in Fleet detail (AC-C), read from the
         // persisted adapter snapshot. A degraded read falls back to the honest
         // "unknown" marker rather than fabricating a source.
@@ -474,11 +495,13 @@ impl Engine {
             restart_count,
             restart_policy,
             failed_cause,
-            // `budget` stays the honest seed: budgets + enforcement are story 3-2, so
-            // this is always `None` (JSON `null`), never `0` and never fabricated.
-            budget: None,
-            // `usage` is REAL now (story 3-1): the Usage-Ledger token totals, tokens
-            // only (dollars/headroom are 3-3/3-5). `metering_source` is surfaced too.
+            // `budget` is REAL now for TOKENS (story 3-2): the configured ceilings +
+            // Breach Action + remaining tokens per scope, or `None` when no budget is
+            // configured (an honest absence, never a fabricated `0`). Dollars stay
+            // absent → 3-3/3-5.
+            budget,
+            // `usage` is REAL (story 3-1): the Usage-Ledger token totals, tokens only
+            // (dollars/headroom are 3-3/3-5). `metering_source` is surfaced too.
             usage,
             metering_source,
             agent_home: instance.agent_home,
@@ -757,6 +780,23 @@ impl Engine {
         .await
     }
 
+    /// The recorded [`BudgetBreachEvent`]s for an instance (story 3-2, AC7 — the
+    /// ALWAYS-recorded breach log). Reads back the durable per-instance breach log
+    /// (an observation helper for embedders / tests — the AD-14 seed, NOT the 7-2
+    /// subscription bus). Empty vec if no breach has been recorded yet.
+    pub async fn budget_breach_events(
+        &self,
+        name: &str,
+    ) -> Result<Vec<BudgetBreachEvent>, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            Supervisor::read_breach_events(&registry, &name)
+        })
+        .await
+    }
+
     /// Run a blocking closure on tokio's blocking pool and await its result.
     ///
     /// Centralizes the `spawn_blocking` bridge so every async wrapper follows the
@@ -856,6 +896,13 @@ impl Blocking<'_> {
     /// Blocking [`Engine::transition_events`].
     pub fn transition_events(&self, name: &str) -> Result<Vec<TransitionEvent>, EngineError> {
         self.engine.rt.block_on(self.engine.transition_events(name))
+    }
+
+    /// Blocking [`Engine::budget_breach_events`] (story 3-2, AC7).
+    pub fn budget_breach_events(&self, name: &str) -> Result<Vec<BudgetBreachEvent>, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.budget_breach_events(name))
     }
 
     /// Blocking [`Engine::instance_status`] (story 1-6, AC9).

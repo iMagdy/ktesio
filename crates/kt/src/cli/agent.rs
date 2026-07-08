@@ -15,9 +15,9 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, Capability, ConfigError, ConfigLayer, EffectiveCapabilities, EffectiveConfig,
-    Engine, EngineError, FleetEntry, FleetListing, RegistryError, RemoveDisposition, SupportLevel,
-    UsageView, FLEET_SCHEMA_VERSION,
+    AdapterRef, BudgetView, Capability, ConfigError, ConfigLayer, EffectiveCapabilities,
+    EffectiveConfig, Engine, EngineError, FleetEntry, FleetListing, RegistryError,
+    RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -205,9 +205,9 @@ fn serialize_error(what: &str, err: serde_json::Error) -> Box<dyn std::error::Er
 /// `kt agent show <name> [--json]` — render an instance's effective Capability
 /// Declaration (AC1 "visible for the instance") plus its runtime status (story
 /// 1-6, AC9): the current Lifecycle State, the active Restart Policy, the restart
-/// count, the REAL story-3-1 Usage token totals + the honest Budget/cap seed
-/// (still `—`/`null` — budgets are story 3-2), and — for a `failed` instance — the
-/// failed cause.
+/// count, the REAL story-3-1 Usage token totals + the REAL story-3-2 Token Budget
+/// (ceilings + remaining + Breach Action, or `—`/`null` when un-budgeted), and —
+/// for a `failed` instance — the failed cause.
 ///
 /// `--json` mode (story 1-7) writes a single versioned document to STDOUT and
 /// nothing else there: `{ schema_version, instance: <FleetEntry> }` — the SAME
@@ -262,14 +262,16 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Render the per-instance runtime status (story 1-6, AC9) as a small table:
-/// State, Restart Policy, Restart count, the honest Budget/cap seed (story 3-2,
-/// rendered `—`), the REAL story-3-1 Usage token totals + the active Metering
-/// Source, and — for a `failed` instance — the failed cause below (result →
-/// stdout, AD-12). The caller prints the metering note to stderr. `entry` is the
-/// instance's Fleet entry (the same read `list` uses), or `None` if that read
-/// degraded — in which case the usage/metering rows fall back to zero/unknown so
-/// the table still renders (mirroring the runtime-field degradation).
+/// Render the per-instance runtime status (story 1-6, AC9) as a small table.
+///
+/// Rows: State, Restart Policy, Restart count, the REAL story-3-2 Token Budget
+/// (ceilings, remaining, Breach Action — or `—` when un-budgeted), the REAL
+/// story-3-1 Usage token totals, the active Metering Source, and — for a `failed`
+/// instance — the failed cause below (result to stdout, AD-12). The caller prints
+/// the metering note to stderr. `entry` is the instance's Fleet entry (the same
+/// read `list` uses), or `None` if that read degraded — in which case the
+/// usage/metering/budget rows fall back to zero/unknown/absent so the table still
+/// renders (mirroring the runtime-field degradation).
 fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&FleetEntry>) {
     let title = format!("Runtime status for {}", status.instance.name.as_str());
     let columns = [
@@ -284,6 +286,10 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&
     let metering_value = entry
         .map(|e| e.metering_source.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    // Budget from the Fleet entry (story 3-2): the token ceiling(s) + remaining +
+    // Breach Action, or the honest `—` absence when no budget is configured (or the
+    // read degraded). Tokens only.
+    let budget_value = budget_cell(entry.and_then(|e| e.budget.as_ref()));
     let rows = vec![
         vec![
             ui::TableCell::plain("State"),
@@ -297,10 +303,11 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&
             ui::TableCell::plain("Restart count"),
             ui::TableCell::plain(status.restart_count.to_string()),
         ],
-        // Budget/cap stays the honest `—` seed (budgets are story 3-2).
+        // Budget is REAL now for TOKENS (story 3-2): the ceiling(s) + remaining +
+        // Breach Action, or `—` when no budget is configured. Dollars stay → 3-3.
         vec![
-            ui::TableCell::plain("Budget/cap"),
-            ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+            ui::TableCell::plain("Budget (tokens)"),
+            ui::TableCell::plain(budget_value),
         ],
         // Usage is REAL now (story 3-1): the cumulative token totals (tokens only).
         vec![
@@ -374,13 +381,14 @@ pub fn remove(
 }
 
 /// The one-line stderr NOTE (AD-12: notices → stderr) about the honest metering
-/// boundary now that story 3-1 ships the Usage Ledger: `usage` shows REAL token
-/// totals, but budgets/caps (story 3-2) and dollar figures (3-3) are still to
-/// come — so the budget cell stays `—` and no dollar figure is shown (tokens
-/// only). Shared by `list` and `show` so both surfaces state it identically.
+/// boundary now that stories 3-1/3-2 ship: `usage` shows REAL token totals and
+/// `budget` shows the REAL token ceilings + remaining + Breach Action (or `—`
+/// when un-budgeted), but DOLLAR figures (3-3) are still to come — no dollar
+/// figure is shown (tokens only). Shared by `list` and `show` so both surfaces
+/// state it identically.
 const METERING_NOTE: &str =
-    "usage totals are real token counts from the Usage Ledger; budget/cap status \
-     (JSON null / '—') and dollar figures arrive with later Epic-3 stories (tokens only for now).";
+    "usage + budget are real TOKEN counts from the Usage Ledger (budget '—' means \
+     no budget configured); dollar figures arrive with a later Epic-3 story (tokens only for now).";
 
 /// Render a [`UsageView`]'s CUMULATIVE token totals as a compact human cell, e.g.
 /// `in 120 / out 340` (tokens only — AD-8, no dollars this story). Kept here so
@@ -392,11 +400,37 @@ fn usage_cell(usage: &UsageView) -> String {
     )
 }
 
+/// Render a [`BudgetView`] as a compact human `budget` cell (story 3-2, AC9):
+/// the configured token ceiling(s) + remaining tokens per scope + the Breach
+/// Action, e.g. `cum 380/500 (pause)` or `run 70/100, cum 600/1000 (stop)`. An
+/// UN-budgeted instance (`None`) renders the honest absence token `—` (never a
+/// fabricated ceiling). TOKENS ONLY — no dollar figure (AD-8). Kept here so `list`
+/// and `show` render the budget identically.
+fn budget_cell(budget: Option<&BudgetView>) -> String {
+    let Some(b) = budget else {
+        return FleetEntry::METERING_SEED_CELL.to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let (Some(limit), Some(remaining)) = (b.per_run_limit, b.per_run_remaining) {
+        parts.push(format!("run {remaining}/{limit}"));
+    }
+    if let (Some(limit), Some(remaining)) = (b.cumulative_limit, b.cumulative_remaining) {
+        parts.push(format!("cum {remaining}/{limit}"));
+    }
+    // A budget with an action but somehow no scope (defensive) still shows the
+    // action honestly rather than an empty cell.
+    if parts.is_empty() {
+        return format!("({})", b.breach_action.as_str());
+    }
+    format!("{} ({})", parts.join(", "), b.breach_action.as_str())
+}
+
 /// `kt agent list [--json]` — render the Fleet (FR-4).
 ///
 /// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the REAL
-/// story-3-1 Usage token totals + the honest Budget/cap seed column (still `—` —
-/// budgets are story 3-2), and the Agent Home; one stderr note explains the
+/// story-3-2 Token Budget column (ceilings + remaining + Breach Action, or `—`
+/// when un-budgeted) + the REAL story-3-1 Usage token totals, and the Agent Home;
+/// one stderr note explains the
 /// metering boundary (AD-12: result → stdout, note → stderr). `--json` mode writes a single versioned
 /// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `kt --json`
 /// serializes the same struct the Host event stream will publish). Freshness
@@ -437,20 +471,29 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
         ui::TableColumn::new("Restarts", 8, 10),
-        ui::TableColumn::new("Budget/cap", 10, 12),
+        ui::TableColumn::new("Budget (tokens)", 15, 34),
         ui::TableColumn::new("Usage (tokens)", 14, 24),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
     let rows: Vec<Vec<ui::TableCell>> = entries
         .iter()
         .map(|entry| {
+            // Budget is REAL now for TOKENS (story 3-2): ceiling(s) + remaining +
+            // action, or `—` when un-budgeted. A budgeted cell is `plain`, an
+            // absent one stays `muted` (the honest `—`).
+            let budget = entry.budget.as_ref();
+            let budget_text = budget_cell(budget);
+            let budget_cell = if budget.is_some() {
+                ui::TableCell::plain(budget_text)
+            } else {
+                ui::TableCell::muted(budget_text)
+            };
             vec![
                 ui::TableCell::skill(entry.name.as_str()),
                 ui::TableCell::plain(entry.kind.clone()),
                 ui::TableCell::status(entry.state.as_str()),
                 ui::TableCell::plain(entry.restart_count.to_string()),
-                // Budget/cap stays the honest `—` seed (budgets are story 3-2).
-                ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+                budget_cell,
                 // Usage is REAL now (story 3-1): the cumulative token totals.
                 ui::TableCell::plain(usage_cell(&entry.usage)),
                 ui::TableCell::muted(entry.agent_home.clone()),
@@ -965,6 +1008,14 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
                 "{detail}. Set the environment variable, or add it to the engine secrets file \
                  (chmod 600), then try --reveal again."
             ),
+        }
+        .into(),
+        // Story 3-2 (AC-C): a KNOWN budget key with a malformed VALUE — a
+        // `budget.tokens.*` that is not a whole number, or a `budget.breach_action`
+        // that is not pause/stop/warn. Rejected before any persistence (nothing
+        // changed); the message names the key + value + the accepted form.
+        ConfigError::InvalidValue { .. } => AgentConfig {
+            message: format!("{err}. Nothing was changed. Fix the value and try again."),
         }
         .into(),
     }

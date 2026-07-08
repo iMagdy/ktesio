@@ -54,6 +54,24 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use toml::Value;
 
+use super::budget::{BreachAction, TokenBudget};
+
+/// The engine-namespace config key for the PER-RUN token ceiling (story 3-2,
+/// AD-9). A validated key (NOT `agent.*` pass-through): its value parses as a
+/// `u64` at write time. Absent → the per-run scope is unset (never breaches).
+pub const BUDGET_TOKENS_PER_RUN_KEY: &str = "budget.tokens.per_run";
+
+/// The engine-namespace config key for the CUMULATIVE token ceiling (story 3-2).
+/// A validated key; its value parses as a `u64` at write time. Absent → the
+/// cumulative scope is unset.
+pub const BUDGET_TOKENS_CUMULATIVE_KEY: &str = "budget.tokens.cumulative";
+
+/// The engine-namespace config key for the Breach Action (story 3-2, AC-C). A
+/// validated key; its value parses as a [`BreachAction`] (`pause`/`stop`/`warn`)
+/// at write time. Absent → [`BreachAction::default`] (`pause`, the ratified
+/// default).
+pub const BUDGET_BREACH_ACTION_KEY: &str = "budget.breach_action";
+
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
 /// delivered verbatim (the mapping into an agent's native mechanism is 2-2,
@@ -478,7 +496,18 @@ fn merge_table_into(
 /// freeze the schema. Keys are compared as full DOTTED paths. (The resolver
 /// itself is key-agnostic — it merges whatever TOML the layers hold; this set
 /// governs only WRITE validation.)
-const KNOWN_KEYS: &[&str] = &["model"];
+///
+/// Story 3-2 (AD-7/AD-9) ADDS the three engine-namespace Token-Budget keys
+/// ([`BUDGET_TOKENS_PER_RUN_KEY`], [`BUDGET_TOKENS_CUMULATIVE_KEY`],
+/// [`BUDGET_BREACH_ACTION_KEY`]) — validated keys whose VALUES are additionally
+/// type-checked by [`validate_write`] (a budget number must parse as `u64`, the
+/// breach action as [`BreachAction`]); they are NOT `agent.*` pass-through.
+const KNOWN_KEYS: &[&str] = &[
+    "model",
+    BUDGET_TOKENS_PER_RUN_KEY,
+    BUDGET_TOKENS_CUMULATIVE_KEY,
+    BUDGET_BREACH_ACTION_KEY,
+];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
 /// against [`KNOWN_KEYS`]).
@@ -551,20 +580,24 @@ pub fn secret_name(value: &str) -> Option<&str> {
 /// [`SUGGESTION_MAX_DISTANCE`], so the diagnostic says "no close match" rather
 /// than suggesting nonsense).
 ///
-/// `_value` is accepted for signature-completeness (the write API passes it) but
-/// is NOT inspected here: validation is the KEY namespace only. In particular a
-/// `secret:NAME` VALUE is stored verbatim as an ordinary TOML string — write-time
-/// validation neither resolves nor rejects it (story 2-4 resolves + masks a
-/// `secret:` value at START and DISPLAY, not at write; the reference is what is
-/// persisted, AD-10). So a `set model secret:OPENAI_KEY` is accepted here exactly
-/// like any other known-key write.
+/// `value` is inspected ONLY for the keys that carry a typed contract — the
+/// story-3-2 Token-Budget keys (AC-C: an unknown Breach-Action string or a
+/// malformed budget number is rejected at WRITE time with a clear diagnostic,
+/// never silently defaulted). For every OTHER known key (e.g. `model`) and for
+/// `agent.*` pass-through keys the value is NOT inspected: validation is the KEY
+/// namespace only. In particular a `secret:NAME` VALUE is stored verbatim as an
+/// ordinary TOML string — write-time validation neither resolves nor rejects it
+/// (story 2-4 resolves + masks a `secret:` value at START and DISPLAY, not at
+/// write; the reference is what is persisted, AD-10). So a
+/// `set model secret:OPENAI_KEY` is accepted here exactly like any other
+/// known-key write.
 ///
 /// A key with an EMPTY dotted segment (`agent..b`, `agent.foo.`, `.x`, a bare
 /// `.`) is rejected up front (review patch #5): an empty segment would otherwise
 /// persist a `""` key in the TOML tree — a malformed, un-addressable key. It is
 /// reported as an [`ConfigError::UnknownKey`] with no suggestion (the shape is
 /// wrong, not a near-miss of a known key).
-pub fn validate_write(key: &str, _value: &str) -> Result<(), ConfigError> {
+pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
     // Reject empty dotted segments first (a malformed key shape). An empty `key`
     // has one empty segment and is caught here too.
     if has_empty_segment(key) {
@@ -573,13 +606,100 @@ pub fn validate_write(key: &str, _value: &str) -> Result<(), ConfigError> {
             suggestion: None,
         });
     }
-    if is_known_key(key) || is_pass_through(key) {
+    if is_known_key(key) {
+        // The story-3-2 budget keys additionally TYPE-CHECK their value at write
+        // time (AC-C — never silently defaulted). `model` (and any future value-
+        // free known key) skips this.
+        validate_budget_value(key, value)?;
+        return Ok(());
+    }
+    if is_pass_through(key) {
         return Ok(());
     }
     Err(ConfigError::UnknownKey {
         key: key.to_string(),
         suggestion: nearest_known_key(key),
     })
+}
+
+/// Type-check the VALUE of a story-3-2 Token-Budget key at write time (AC-C).
+/// A budget number (`budget.tokens.*`) must parse as a `u64`; the breach action
+/// (`budget.breach_action`) must parse as a [`BreachAction`]. A non-budget key is
+/// a no-op (its value is not inspected). Rejects with [`ConfigError::InvalidValue`]
+/// naming the key + reason so `kt` renders a remediation (the write is rejected
+/// BEFORE any persistence — the "validate then persist" atomicity).
+fn validate_budget_value(key: &str, value: &str) -> Result<(), ConfigError> {
+    match key {
+        BUDGET_TOKENS_PER_RUN_KEY | BUDGET_TOKENS_CUMULATIVE_KEY => value
+            .trim()
+            .parse::<u64>()
+            .map(|_| ())
+            .map_err(|_| ConfigError::InvalidValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                reason: "expected a non-negative whole number of tokens (u64)".to_string(),
+            }),
+        BUDGET_BREACH_ACTION_KEY => value
+            .trim()
+            .parse::<BreachAction>()
+            .map(|_| ())
+            .map_err(|e| ConfigError::InvalidValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                reason: e.to_string(),
+            }),
+        _ => Ok(()),
+    }
+}
+
+/// Resolve the current [`TokenBudget`] + [`BreachAction`] from an already-resolved
+/// [`EffectiveConfig`] (story 3-2, AC-B/AC-C — the LIVE read the evaluator calls on
+/// EACH ingestion).
+///
+/// A read of the CURRENT resolved config (NOT a start-time snapshot): a budget
+/// changed while `running` is reflected on the very next `UsageEvent` (AC-B
+/// "changes apply immediately") because the supervisor re-resolves + re-reads here
+/// each time. Absent scopes → `None` (never breach); an absent action →
+/// [`BreachAction::default`] (`pause`).
+///
+/// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
+/// somehow present but MALFORMED (e.g. a negative or non-integer that slipped past
+/// write-validation via a hand-edited `config.toml`, or an unknown action string)
+/// is treated as ABSENT for that scope/action rather than erroring — the honest
+/// degrade is "no ceiling / default action", never a panic mid-ingestion. Write
+/// validation ([`validate_write`]) is the primary gate; this read is defensive.
+pub fn resolve_token_budget(effective: &EffectiveConfig) -> (TokenBudget, BreachAction) {
+    let per_run = budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY);
+    let cumulative = budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY);
+    let action = effective
+        .value(BUDGET_BREACH_ACTION_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<BreachAction>().ok())
+        .unwrap_or_default();
+    (
+        TokenBudget {
+            per_run,
+            cumulative,
+        },
+        action,
+    )
+}
+
+/// Read a `u64` budget ceiling from a resolved leaf, coercing the TOML value
+/// (story 3-2). Accepts a TOML integer (the natural `set` form) or a numeric
+/// STRING (a `secret:`-free string leaf), rejecting a negative / non-integer as
+/// ABSENT (the defensive degrade — see [`resolve_token_budget`]).
+fn budget_u64(effective: &EffectiveConfig, key: &str) -> Option<u64> {
+    let value = effective.value(key)?;
+    match value {
+        // A TOML integer: accept only a non-negative value (a negative ceiling is
+        // meaningless — treat as absent).
+        Value::Integer(i) => u64::try_from(*i).ok(),
+        // A string leaf that parses as u64 (defensive; the `set` path stores a
+        // number, but a hand-edited quoted value still resolves honestly).
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 /// Whether a dotted key has any EMPTY segment (a leading/trailing/doubled dot, or
@@ -669,6 +789,23 @@ pub enum ConfigError {
         key: String,
         /// The ancestor segment that is a scalar (so a child cannot be nested).
         conflicting_ancestor: String,
+    },
+
+    /// A config write supplied a VALUE that failed the key's typed contract
+    /// (story 3-2, AC-C) — a `budget.tokens.*` value that is not a `u64`, or a
+    /// `budget.breach_action` that is not `pause`/`stop`/`warn`. Rejected BEFORE
+    /// any persistence (the instance `config.toml` is left byte-unchanged), NAMES
+    /// the key + the offending value + the reason so `kt` renders a remediation.
+    /// (Distinct from [`ConfigError::UnknownKey`]: the KEY is known/valid — its
+    /// VALUE is wrong.)
+    #[error("invalid value '{value}' for config key '{key}': {reason}")]
+    InvalidValue {
+        /// The (known) key whose value was rejected.
+        key: String,
+        /// The offending value.
+        value: String,
+        /// Why it was rejected (the expected type / accepted set).
+        reason: String,
     },
 
     /// A config layer's TOML failed to parse OR the instance layer could not be
@@ -1246,7 +1383,16 @@ mod tests {
         // sole known key.
         assert!(!is_known_key("restart.policy"));
         assert!(validate_write("restart.policy", "never").is_err());
-        assert_eq!(KNOWN_KEYS, &["model"]);
+        // `model` plus the three story-3-2 Token-Budget keys are the known set.
+        assert_eq!(
+            KNOWN_KEYS,
+            &[
+                "model",
+                "budget.tokens.per_run",
+                "budget.tokens.cumulative",
+                "budget.breach_action",
+            ]
+        );
     }
 
     #[test]
@@ -1427,5 +1573,136 @@ mod tests {
             ConfigLayer::from_table(full.as_table().clone()).as_table(),
             full.as_table()
         );
+    }
+
+    // ---- Story 3-2: Token-Budget config keys (AC-B/AC-C, AD-9) ----
+
+    #[test]
+    fn validate_write_accepts_valid_budget_keys() {
+        // The three budget keys are known validated keys; a well-typed value passes.
+        assert!(validate_write("budget.tokens.per_run", "1000").is_ok());
+        assert!(validate_write("budget.tokens.cumulative", "50000").is_ok());
+        assert!(validate_write("budget.breach_action", "pause").is_ok());
+        assert!(validate_write("budget.breach_action", "stop").is_ok());
+        assert!(validate_write("budget.breach_action", "warn").is_ok());
+        // Zero is a valid (if degenerate) ceiling.
+        assert!(validate_write("budget.tokens.per_run", "0").is_ok());
+        // Surrounding whitespace is tolerated (trimmed).
+        assert!(validate_write("budget.tokens.cumulative", "  42  ").is_ok());
+    }
+
+    #[test]
+    fn validate_write_rejects_a_malformed_budget_number() {
+        // AC-C: a non-numeric / negative budget value is rejected at write time
+        // (InvalidValue), naming the key + value — never silently defaulted.
+        for bad in ["lots", "-5", "1.5", "12x", ""] {
+            let err = validate_write("budget.tokens.per_run", bad).unwrap_err();
+            match err {
+                ConfigError::InvalidValue { key, value, .. } => {
+                    assert_eq!(key, "budget.tokens.per_run");
+                    assert_eq!(value, bad);
+                }
+                other => panic!("expected InvalidValue for {bad:?}, got {other:?}"),
+            }
+        }
+        // The message is a helpful remediation.
+        let msg = validate_write("budget.tokens.cumulative", "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("budget.tokens.cumulative"), "{msg}");
+        assert!(msg.contains("nope"), "{msg}");
+    }
+
+    #[test]
+    fn validate_write_rejects_an_unknown_breach_action() {
+        // AC-C: an unknown Breach-Action string is rejected at write time, naming
+        // it + the accepted set.
+        let err = validate_write("budget.breach_action", "throttle").unwrap_err();
+        match err {
+            ConfigError::InvalidValue { key, value, reason } => {
+                assert_eq!(key, "budget.breach_action");
+                assert_eq!(value, "throttle");
+                assert!(reason.contains("pause"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_token_budget_reads_the_current_resolved_values() {
+        // AC-B: the evaluator's live read. A resolved config with both scopes + an
+        // action yields the right TokenBudget + BreachAction.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget]\nbreach_action = \"stop\"\n[budget.tokens]\nper_run = 100\ncumulative = 5000\n",
+        ));
+        let (budget, action) = resolve_token_budget(&eff);
+        assert_eq!(budget.per_run, Some(100));
+        assert_eq!(budget.cumulative, Some(5000));
+        assert_eq!(action, BreachAction::Stop);
+    }
+
+    #[test]
+    fn resolve_token_budget_absent_keys_yield_none_and_pause_default() {
+        // Absent scopes → None (never breach); absent action → Pause (the ratified
+        // default).
+        let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
+        let (budget, action) = resolve_token_budget(&eff);
+        assert_eq!(budget.per_run, None);
+        assert_eq!(budget.cumulative, None);
+        assert!(!budget.is_set());
+        assert_eq!(action, BreachAction::Pause);
+    }
+
+    #[test]
+    fn resolve_token_budget_reflects_a_changed_value_no_caching() {
+        // AC-B "changes apply immediately": resolving a config with a LOWERED
+        // ceiling yields the new value — there is no caching in the resolve path.
+        let high = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\ncumulative = 10000\n",
+        ));
+        assert_eq!(resolve_token_budget(&high).0.cumulative, Some(10000));
+        let low = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\ncumulative = 10\n",
+        ));
+        assert_eq!(resolve_token_budget(&low).0.cumulative, Some(10));
+    }
+
+    #[test]
+    fn resolve_token_budget_degrades_a_malformed_present_value_to_absent() {
+        // Defensive read (AD-12): a value that slipped past write-validation (a
+        // hand-edited negative / non-integer, or an unknown action string) is
+        // treated as ABSENT rather than crashing ingestion.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget]\nbreach_action = \"bogus\"\n[budget.tokens]\nper_run = -3\ncumulative = \"lots\"\n",
+        ));
+        let (budget, action) = resolve_token_budget(&eff);
+        assert_eq!(
+            budget.per_run, None,
+            "a negative ceiling degrades to absent"
+        );
+        assert_eq!(
+            budget.cumulative, None,
+            "a non-numeric string ceiling degrades to absent"
+        );
+        assert_eq!(
+            action,
+            BreachAction::Pause,
+            "an unknown action degrades to the default"
+        );
+    }
+
+    #[test]
+    fn resolve_token_budget_accepts_a_numeric_string_ceiling() {
+        // A quoted numeric value (a hand-edited string leaf) still resolves to the
+        // ceiling (defensive coercion).
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\nper_run = \"250\"\n",
+        ));
+        assert_eq!(resolve_token_budget(&eff).0.per_run, Some(250));
     }
 }

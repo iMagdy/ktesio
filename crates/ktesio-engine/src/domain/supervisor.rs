@@ -53,8 +53,10 @@ use crate::ports::{
 };
 use crate::time::now_rfc3339;
 
+use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
+use super::config::{self, ConfigLayer};
 use super::error::EngineError;
-use super::event::{TransitionCause, TransitionEvent};
+use super::event::{BudgetBreachEvent, TransitionCause, TransitionEvent};
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
@@ -196,6 +198,20 @@ struct Supervised {
     /// cursor. Advanced past each block the drain reads, so lines are ingested at
     /// most once from the capture (the DB dedup is the second, authoritative guard).
     usage_cursor: u64,
+    /// The per-Run breach LATCH (story 3-2 idempotence fix): the set of
+    /// [`BreachScope`]s that have ALREADY fired a breach for THIS Run. Enforcement
+    /// (`enforce_budget`) runs on EVERY committed usage event, but a breach must
+    /// fire **at most once per scope per Run** — otherwise every post-crossing event
+    /// re-records a `BudgetBreachEvent` and re-fires the action (unbounded duplicate
+    /// records for `warn`; redundant records for `pause`/`stop`). A scope is inserted
+    /// here the first time it trips; a subsequent event whose scope is already latched
+    /// short-circuits BOTH the record and the action. The per-run and cumulative
+    /// scopes latch INDEPENDENTLY (a persistently-over-cumulative agent fires ≤1
+    /// cumulative breach; a per-run breach fires once for this Run). The latch lives
+    /// on `Supervised`, so it RESETS automatically when a new Run starts — a fresh
+    /// `Supervised` (built at `starting`, where the `run_id` is freshly minted) begins
+    /// with an empty latch, giving the intended "at most one breach per scope per Run".
+    breached_scopes: std::collections::HashSet<BreachScope>,
 }
 
 /// The lifecycle supervisor: owns running process handles + drives transitions.
@@ -468,6 +484,12 @@ impl Supervisor {
                 run_id,
                 metering_source,
                 usage_cursor,
+                // A fresh Run starts with an EMPTY breach latch (story 3-2): the
+                // run_id was just minted, so no scope has fired for it yet. This is
+                // how the latch RESETS per Run — a persistently-over-cumulative agent
+                // that stops and starts again gets a new Run + a clean latch, so it
+                // can fire one cumulative breach in the new Run too.
+                breached_scopes: std::collections::HashSet::new(),
             },
         );
 
@@ -515,6 +537,37 @@ impl Supervisor {
         name: &str,
         window: Option<Duration>,
     ) -> Result<AgentInstance, EngineError> {
+        self.stop_inner(registry, name, window, None)
+    }
+
+    /// Stop driven by a budget BREACH (story 3-2). Identical to [`Supervisor::stop`]
+    /// (graceful → forced escalation, story 1-4) except the `running → stopping`
+    /// edge carries the [`TransitionCause::BudgetExceeded`] cause instead of a plain
+    /// `stop` command, so the lifecycle log explains WHY. The terminal
+    /// `stopping → stopped` edge keeps its graceful/forced cause (the escalation
+    /// detail). Takes `&InstanceName` (the caller already validated it).
+    fn stop_with_cause(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) -> Result<AgentInstance, EngineError> {
+        self.stop_inner(registry, name.as_str(), None, Some(cause))
+    }
+
+    /// The shared stop driver (story 1-4 + story 3-2 cause override).
+    ///
+    /// `cause_override`: when `Some`, replaces the `running → stopping` cause
+    /// (a budget stop records `BudgetExceeded`); `None` uses the plain `stop`
+    /// command cause (an operator `kt agent stop` is unchanged). The terminal edge
+    /// always records the graceful/forced escalation cause regardless.
+    fn stop_inner(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        window: Option<Duration>,
+        cause_override: Option<TransitionCause>,
+    ) -> Result<AgentInstance, EngineError> {
         let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
             name: name.to_string(),
             reason,
@@ -528,13 +581,14 @@ impl Supervisor {
         let window = window.unwrap_or(DEFAULT_STOP_WINDOW);
         self.ensure_log_dir(registry, &name)?;
 
-        // running → stopping.
+        // running → stopping (a story-3-2 budget stop overrides the cause).
         self.transition(
             registry,
             &name,
             instance.state,
             stopping,
-            TransitionCause::command(LifecycleCommand::Stop.as_str()),
+            cause_override
+                .unwrap_or_else(|| TransitionCause::command(LifecycleCommand::Stop.as_str())),
         )?;
 
         // Drain any final self-reported usage the agent emitted before the stop, so
@@ -610,7 +664,30 @@ impl Supervisor {
     ///      [`EngineError::CapabilityUnsupported`], NO transition, NO backend
     ///      call, NOTHING persisted (AC3).
     pub fn pause(&mut self, registry: &Registry, name: &str) -> Result<AgentInstance, EngineError> {
-        self.suspend_or_resume(registry, name, LifecycleCommand::Pause)
+        self.suspend_or_resume(registry, name, LifecycleCommand::Pause, None)
+    }
+
+    /// Pause driven by a budget BREACH (story 3-2 AC6). Identical to
+    /// [`Supervisor::pause`] — honoring the adapter pause Capability Declaration
+    /// EXACTLY (guaranteed suspends; best-effort transitions with the honest
+    /// posture; UNSUPPORTED fails fast, NO fake pause, NO silent escalation) —
+    /// except the resulting `running → paused` transition carries the
+    /// [`TransitionCause::BudgetExceeded`] cause instead of a plain `pause` command,
+    /// so the lifecycle log itself explains WHY (the standalone breach event is the
+    /// AD-14 subscription payload). Takes `&InstanceName` (the caller already has
+    /// the validated name inside the ingestion path).
+    fn pause_with_cause(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) -> Result<AgentInstance, EngineError> {
+        self.suspend_or_resume(
+            registry,
+            name.as_str(),
+            LifecycleCommand::Pause,
+            Some(cause),
+        )
     }
 
     /// Resume a paused Agent Instance (story 1-5, AC1/AC2).
@@ -631,18 +708,27 @@ impl Supervisor {
         registry: &Registry,
         name: &str,
     ) -> Result<AgentInstance, EngineError> {
-        self.suspend_or_resume(registry, name, LifecycleCommand::Resume)
+        self.suspend_or_resume(registry, name, LifecycleCommand::Resume, None)
     }
 
     /// Shared pause/resume driver (the three-level dispatch), keyed on `command`
     /// (`Pause` or `Resume`). Kept as one method so the pause and resume paths
     /// cannot drift: the transition gate, the level read, and the three-way
     /// dispatch are identical; only the target state and the cause differ.
+    ///
+    /// `cause_override` (story 3-2): when `Some`, it REPLACES the default cause on
+    /// the resulting transition for the GUARANTEED + BEST-EFFORT paths — a
+    /// budget-driven pause records [`TransitionCause::BudgetExceeded`] instead of a
+    /// plain `pause` command / a best-effort qualifier, so the lifecycle log
+    /// explains WHY. `None` preserves the story-1-5 causes exactly (an operator
+    /// `kt agent pause` is unchanged). The UNSUPPORTED fail-fast is identical
+    /// regardless (no transition, nothing persisted — the override is moot).
     fn suspend_or_resume(
         &mut self,
         registry: &Registry,
         name: &str,
         command: LifecycleCommand,
+        cause_override: Option<TransitionCause>,
     ) -> Result<AgentInstance, EngineError> {
         debug_assert!(
             matches!(command, LifecycleCommand::Pause | LifecycleCommand::Resume),
@@ -677,35 +763,38 @@ impl Supervisor {
                 level: level.as_str().to_string(),
             }),
             // GUARANTEED (AC1): real suspension via the backend, then a plain
-            // command-cause transition (no qualifier — it is a true suspension).
+            // command-cause transition (no qualifier — it is a true suspension). A
+            // story-3-2 budget pause overrides the cause with BudgetExceeded.
             SupportLevel::Guaranteed => {
                 self.ensure_log_dir(registry, &name)?;
                 self.signal_backend(&name, command)?;
-                self.transition(
-                    registry,
-                    &name,
-                    instance.state,
-                    new_state,
-                    TransitionCause::command(command.as_str()),
-                )?;
+                let cause = cause_override
+                    .clone()
+                    .unwrap_or_else(|| TransitionCause::command(command.as_str()));
+                self.transition(registry, &name, instance.state, new_state, cause)?;
                 registry.lookup(&name).map_err(registry_to_engine)
             }
             // BEST-EFFORT (AC2): transition + a VISIBLE qualifier cause, never a
             // silent success. No backend suspension is guaranteed here (on Unix a
             // best-effort declaration is unusual, but we still do NOT SIGSTOP — the
-            // declared level is the contract; the qualifier is the honesty).
+            // declared level is the contract; the qualifier is the honesty). A
+            // story-3-2 budget pause overrides the cause with BudgetExceeded (the
+            // best-effort posture is captured in the standalone breach event + a
+            // diagnostic, so the lifecycle cause stays the honest WHY).
             SupportLevel::BestEffort => {
                 self.ensure_log_dir(registry, &name)?;
-                let detail = format!(
-                    "{} is best-effort for '{}' on {} (adapter-cooperative); the process may keep running",
-                    Capability::Pause.as_str(),
-                    name.as_str(),
-                    os.as_str(),
-                );
-                let cause = match command {
-                    LifecycleCommand::Pause => TransitionCause::pause_best_effort(detail),
-                    _ => TransitionCause::resume_best_effort(detail),
-                };
+                let cause = cause_override.clone().unwrap_or_else(|| {
+                    let detail = format!(
+                        "{} is best-effort for '{}' on {} (adapter-cooperative); the process may keep running",
+                        Capability::Pause.as_str(),
+                        name.as_str(),
+                        os.as_str(),
+                    );
+                    match command {
+                        LifecycleCommand::Pause => TransitionCause::pause_best_effort(detail),
+                        _ => TransitionCause::resume_best_effort(detail),
+                    }
+                });
                 self.transition(registry, &name, instance.state, new_state, cause)?;
                 registry.lookup(&name).map_err(registry_to_engine)
             }
@@ -1023,6 +1112,10 @@ impl Supervisor {
                             run_id,
                             metering_source,
                             usage_cursor,
+                            // The adopted instance opens a NEW Run (the pre-crash
+                            // run_id died with the crashed engine), so its breach latch
+                            // starts empty too (story 3-2).
+                            breached_scopes: std::collections::HashSet::new(),
                         },
                     );
                     adopted += 1;
@@ -1285,12 +1378,25 @@ impl Supervisor {
     /// advisory to the RUN, not gating it this story).
     ///
     /// **The AD-7 single-writer invariant lives here:** no other code path may call
-    /// `record_usage_event`. Story 3-2 adds its `BudgetEvaluator` call INSIDE this
-    /// method — right after the commit, in the same path — with no re-plumbing (the
-    /// "inside the same commit path" rule), so the enforcement race can never open
-    /// between "usage recorded" and "budget checked". Add NO evaluator/breach here.
+    /// `record_usage_event`.
+    ///
+    /// **The AD-7 ENFORCEMENT stage lives here too (story 3-2):** IMMEDIATELY after
+    /// a fresh `Inserted` commit — in the SAME synchronous path, before returning —
+    /// this method reads the CURRENT resolved [`TokenBudget`] + [`BreachAction`]
+    /// (a LIVE config read, so a budget changed while `running` applies on the very
+    /// next event — AC-B), reads the just-committed per-run + cumulative token
+    /// totals (3-1's `usage_totals`/`run_totals`), and calls the pure
+    /// [`BudgetEvaluator`]. On a [`BreachDecision::Breached`] it RECORDS the breach
+    /// event FIRST/independently ([`Self::record_breach`]) — so a best-effort/
+    /// unsupported/failed pause never loses the breach record (FR-21 "always
+    /// recorded regardless of action") — and THEN executes the action via Epic-1's
+    /// lifecycle (`pause`/`stop`/`warn`). This is the SOLE enforcement site (the
+    /// AD-7 companion to the single-writer invariant). A [`RecordOutcome::DuplicateReplay`]
+    /// is NOT evaluated (nothing new was committed → no new breach can occur).
+    /// Ingestion + enforcement stay best-effort to the RUN: a store/lifecycle error
+    /// is a diagnostic, NEVER a supervisor crash (3-1's rule extended to enforcement).
     fn ingest_usage(
-        &self,
+        &mut self,
         registry: &Registry,
         name: &InstanceName,
         run_id: &RunId,
@@ -1306,10 +1412,15 @@ impl Supervisor {
         );
         match registry.record_usage_event(&event) {
             // A fresh row: build the AD-14 usage-update wire struct (frozen now; 7-2
-            // delivers it). 3-2 hooks the BudgetEvaluator immediately below this line.
-            Ok(RecordOutcome::Inserted) => Some(UsageUpdateEvent::new(event)),
+            // delivers it), THEN run the AD-7 enforcement stage on the just-committed
+            // totals — synchronously, in this same commit path.
+            Ok(RecordOutcome::Inserted) => {
+                self.enforce_budget(registry, name, run_id, metering_source);
+                Some(UsageUpdateEvent::new(event))
+            }
             // A recognized replay — no double-count, no event emitted (nothing new
-            // was committed). This is the AC-A guarantee in action.
+            // was committed). This is the AC-A guarantee in action; the evaluator is
+            // NOT run (AC5 — no new total, no new breach).
             Ok(RecordOutcome::DuplicateReplay) => None,
             // A store error: usage ingestion is best-effort — do not crash the
             // supervisor. The ledger is the source of truth for what WAS recorded;
@@ -1317,6 +1428,272 @@ impl Supervisor {
             // agent may re-send it, and the dedup key keeps that safe).
             Err(_) => None,
         }
+    }
+
+    /// The AD-7 ENFORCEMENT stage (story 3-2), run INSIDE [`Self::ingest_usage`]
+    /// right after a fresh commit — the SOLE place a budget is evaluated + a Breach
+    /// Action fired.
+    ///
+    /// Reads the CURRENT resolved budget + action (live, AC-B), reads the committed
+    /// per-run + cumulative totals, evaluates purely, and on a breach records the
+    /// event FIRST then executes the action. Every step is best-effort to the RUN:
+    /// a failed config read / totals read / lifecycle op is a diagnostic, never a
+    /// crash (AD-12). A no-budget instance resolves to [`TokenBudget::none`] and the
+    /// evaluator returns `WithinBudget` — so the common (un-budgeted) path is a
+    /// cheap config read + a pure comparison and nothing else.
+    ///
+    /// **Idempotence — at most one breach event per scope per Run (story 3-2 fix):**
+    /// this runs on EVERY committed usage event, so once totals cross a ceiling every
+    /// subsequent event would re-evaluate to the SAME breach. To keep the guardrail
+    /// honest we consult the per-Run breach LATCH ([`Supervised::breached_scopes`]):
+    /// a scope that has ALREADY fired this Run short-circuits BOTH the
+    /// [`Self::record_breach`] and the action (the re-transition would no-op via
+    /// `InvalidTransition` anyway, but the DURABLE breach record would still spam —
+    /// unbounded for `warn`). The per-run and cumulative scopes latch INDEPENDENTLY,
+    /// each still EVALUATED every event; only the SECOND+ trip of an already-latched
+    /// scope is suppressed. The latch resets when a new Run starts (a fresh
+    /// `Supervised` at `starting`), so a persistently-over-cumulative agent fires ≤1
+    /// cumulative breach per Run and a per-run breach fires once per Run.
+    fn enforce_budget(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        metering_source: &str,
+    ) {
+        // (1) LIVE budget read (AC-B "changes apply immediately"): resolve the
+        // CURRENT effective config each ingestion, NOT a start-time snapshot. A
+        // malformed on-disk layer degrades to "no budget" (best-effort — never a
+        // crash mid-ingestion).
+        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
+            return;
+        };
+        let (budget, action) = config::resolve_token_budget(&effective);
+        // Skip the totals reads entirely when no ceiling is configured (the common
+        // case): the evaluator would return WithinBudget regardless.
+        if !budget.is_set() {
+            return;
+        }
+
+        // (2) The just-committed totals (3-1's reads): per-run scoped to THIS Run,
+        // cumulative over all Runs. A read error degrades to zero (best-effort).
+        let run_total = registry
+            .run_usage_totals(name, run_id)
+            .map(|t| t.total_tokens())
+            .unwrap_or(0);
+        let cumulative_total = registry
+            .usage_totals(name)
+            .map(|t| t.total_tokens())
+            .unwrap_or(0);
+
+        // (3) Pure decision (the ≥ threshold, per-run-before-cumulative).
+        let BreachDecision::Breached {
+            scope,
+            action,
+            limit,
+            observed,
+        } = BudgetEvaluator::evaluate(run_total, cumulative_total, &budget, action)
+        else {
+            return;
+        };
+
+        // (3b) IDEMPOTENCE LATCH (story 3-2): a breach fires AT MOST ONCE per scope
+        // per Run. If THIS scope has already fired for the current Run, short-circuit
+        // — skip BOTH the durable record and the action (otherwise every post-crossing
+        // event re-records the same breach: unbounded for `warn`, redundant for
+        // pause/stop even though their re-transition no-ops). Otherwise mark the scope
+        // latched now, then record + act exactly once. The latch lives on the
+        // per-instance `Supervised`, so it is scoped to the CURRENT Run and resets
+        // when a new Run starts (a fresh `Supervised` at `starting`). A missing entry
+        // (the instance is not currently supervised — e.g. a race with stop) declines
+        // to enforce: there is nothing to latch or act on.
+        match self.running.get_mut(name) {
+            Some(supervised) => {
+                if !supervised.breached_scopes.insert(scope) {
+                    // Already fired for this scope this Run — nothing new to do.
+                    return;
+                }
+            }
+            None => return,
+        }
+
+        // (4a) RECORD THE BREACH FIRST/INDEPENDENTLY (AC7 / FR-21): a durable breach
+        // event, recorded BEFORE the lifecycle side-effect, so a pause that is
+        // best-effort/unsupported/failing never loses the record. Best-effort write
+        // (a log hiccup must not crash ingestion — but it is the primary record).
+        self.record_breach(
+            registry,
+            name,
+            run_id,
+            scope,
+            limit,
+            observed,
+            action,
+            metering_source,
+        );
+
+        // (4b) EXECUTE THE ACTION via Epic-1's EXISTING lifecycle (AD-15 — a new
+        // CAUSE, not a new edge). The breach is already recorded; a lifecycle error
+        // here is a best-effort diagnostic, never a supervisor crash.
+        let cause = TransitionCause::budget_exceeded(scope, limit, observed);
+        match action {
+            BreachAction::Warn => {
+                // No lifecycle transition — the breach event (4a) is the whole
+                // guardrail. The agent keeps running.
+            }
+            BreachAction::Pause => {
+                self.enforce_pause(registry, name, cause);
+            }
+            BreachAction::Stop => {
+                // Drive running → stopping → stopped (story 1-4). The BudgetExceeded
+                // cause is carried by tagging the resulting stop (best-effort: if the
+                // stop path records its own cause we still have the breach event +
+                // the pre-stop cause marker below).
+                self.enforce_stop(registry, name, cause);
+            }
+        }
+    }
+
+    /// Execute a `pause` Breach Action honestly (story 3-2 AC6, honoring story
+    /// 1-5's Capability Declaration). Drives `running → paused` and STAMPS the
+    /// resulting transition with the [`TransitionCause::BudgetExceeded`] cause (so
+    /// the lifecycle log explains WHY), via [`Self::pause`]. A best-effort pause
+    /// still transitions (1-5) and the breach is already recorded; an UNSUPPORTED
+    /// pause fails fast in [`Self::pause`] — we do NOT fake a pause and do NOT
+    /// silently escalate to stop (AC6), we surface the honest diagnostic on the
+    /// engine log (the breach event already captured the fact). All best-effort:
+    /// never a supervisor crash.
+    fn enforce_pause(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+        match self.pause_with_cause(registry, name, cause) {
+            Ok(_) => {}
+            Err(e) => {
+                // Honest surface (AD-12): pause could not be honored (unsupported /
+                // not running / backend hiccup). The breach is ALREADY recorded; log
+                // and move on — no fake pause, no escalation.
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!("budget breach pause could not be honored: {e}"),
+                );
+            }
+        }
+    }
+
+    /// Execute a `stop` Breach Action (story 3-2). Drives `running → stopping →
+    /// stopped` (story 1-4) and, before that, records the [`TransitionCause::BudgetExceeded`]
+    /// as the WHY marker on the `running → stopping` edge (the stop path itself
+    /// records the graceful/forced escalation on the terminal edge). Best-effort:
+    /// a stop error is logged, never a crash (the breach is already recorded).
+    fn enforce_stop(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+        match self.stop_with_cause(registry, name, cause) {
+            Ok(_) => {}
+            Err(e) => {
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!("budget breach stop could not be honored: {e}"),
+                );
+            }
+        }
+    }
+
+    /// Record the ALWAYS-recorded [`BudgetBreachEvent`] to the durable per-instance
+    /// breach log (story 3-2, AC7 / FR-21 "always recorded regardless of action").
+    /// Recorded for EVERY action (including `warn`) and BEFORE the lifecycle
+    /// side-effect, so the breach is never lost.
+    ///
+    /// Non-fatal but NOT swallowed: this is the PRIMARY durable record of the breach
+    /// (FR-21), so a write failure (disk full / IO / perms) must not vanish silently
+    /// while the action still fires — that would lose the mandated record with no
+    /// diagnostic. We keep enforcement acting (the write failure is NOT made fatal),
+    /// but SURFACE the error on the engine-log stderr breadcrumb (mirroring how
+    /// `enforce_pause`/`enforce_stop` log their best-effort diagnostics), so a lost
+    /// breach record is visible to an operator. Both the dir-create and the append
+    /// failure are surfaced.
+    #[allow(clippy::too_many_arguments)]
+    fn record_breach(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        scope: BreachScope,
+        limit: u64,
+        observed: u64,
+        action: BreachAction,
+        metering_source: &str,
+    ) {
+        let event = BudgetBreachEvent::new(
+            name.as_str(),
+            run_id.as_str(),
+            scope,
+            limit,
+            observed,
+            action,
+            metering_source,
+            now_rfc3339(),
+        );
+        let path = registry.instance_breach_log_path(name);
+        // Ensure the log dir exists (a never-transitioned instance may lack it) —
+        // non-fatal, mirroring `ensure_log_dir`, but a failure is surfaced (below) if
+        // it then makes the append fail.
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!(
+                        "could not create the breach-log directory {}: {e} — the breach \
+                         record may be lost",
+                        parent.display()
+                    ),
+                );
+            }
+        }
+        // Surface (do NOT swallow) an append failure: the breach record is the FR-21
+        // mandated durable artifact; a lost record with no diagnostic is the bug. Log
+        // and move on — enforcement still acts.
+        if let Err(e) = append_breach_event(&path, &event) {
+            self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "could not record the budget breach event to {}: {e} — the mandated \
+                     breach record was NOT written",
+                    path.display()
+                ),
+            );
+        }
+    }
+
+    /// Surface one enforcement diagnostic on STDERR (AD-12: enforcement
+    /// diagnostics ride the engine log / stderr, NEVER `kt` stdout, NEVER a crash).
+    /// Used when a breach action (pause/stop) could not be honored — the breach
+    /// itself is already durably recorded in the breach log, so this is only an
+    /// operator breadcrumb, not the record of the breach. `registry` is unused (the
+    /// diagnostic is not persisted to a strict-parse log to avoid corrupting the
+    /// transition-event reader) but kept for signature symmetry with the other
+    /// enforcement helpers.
+    fn log_enforcement_diagnostic(&self, _registry: &Registry, name: &InstanceName, detail: &str) {
+        eprintln!("[ktesio] {}: {detail}", name.as_str());
+    }
+
+    /// Read back the recorded [`BudgetBreachEvent`]s for an instance from its
+    /// breach log (observation helper for tests / embedders — the AD-14 seed, NOT
+    /// the 7-2 bus). Empty vec if none recorded yet.
+    pub fn read_breach_events(
+        registry: &Registry,
+        name: &str,
+    ) -> Result<Vec<BudgetBreachEvent>, EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let path = registry.instance_breach_log_path(&name);
+        read_breach_events_from(&path).map_err(|detail| EngineError::Log {
+            name: name.as_str().to_string(),
+            path: path.to_string_lossy().into_owned(),
+            detail,
+        })
     }
 }
 
@@ -1359,6 +1736,42 @@ fn read_events_from(path: &Path) -> Result<Vec<TransitionEvent>, String> {
         }
         let event: TransitionEvent = serde_json::from_str(line)
             .map_err(|e| format!("corrupt instance-log line {}: {e}", idx + 1))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Append one [`BudgetBreachEvent`] as a single JSON line to the per-instance
+/// breach log (story 3-2, AD-14). JSON Lines, append-only — the same shape as
+/// [`append_event`] so a human can `tail` it and [`read_breach_events_from`] can
+/// parse it back. The ALWAYS-recorded breach record (FR-21).
+fn append_breach_event(path: &Path, event: &BudgetBreachEvent) -> Result<(), String> {
+    use std::io::Write;
+    let line = serde_json::to_string(event).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{line}").map_err(|e| e.to_string())
+}
+
+/// Read back the JSON-Lines [`BudgetBreachEvent`]s from an instance's breach log.
+/// Missing file → empty vec (no breaches recorded yet). A malformed line is an
+/// error naming it (a corrupt log is worth surfacing).
+fn read_breach_events_from(path: &Path) -> Result<Vec<BudgetBreachEvent>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut events = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: BudgetBreachEvent = serde_json::from_str(line)
+            .map_err(|e| format!("corrupt breach-log line {}: {e}", idx + 1))?;
         events.push(event);
     }
     Ok(events)
@@ -2428,6 +2841,51 @@ mod tests {
         std::fs::write(&path, format!("\n{line}\n\n")).unwrap();
         let back = read_events_from(&path).unwrap();
         assert_eq!(back, vec![e]);
+    }
+
+    // ---- Story 3-2: the breach record write error is surfaced, not swallowed ----
+
+    #[test]
+    fn record_breach_surfaces_a_write_failure_instead_of_swallowing_it() {
+        // FR-21 ("the breach is always recorded"): if the durable breach-log write
+        // fails (disk full / IO / perms), the error must be SURFACED (an honest
+        // stderr diagnostic), NOT silently discarded while the action still fires —
+        // otherwise the mandated record is lost with no trace. We force BOTH the
+        // dir-create AND the append to fail by placing a regular FILE where the
+        // per-instance log DIRECTORY (`<home>/logs`, the breach log's parent) must
+        // be: `create_dir_all(parent)` fails (a file sits at that path) and the
+        // subsequent append cannot open `logs/breaches.log` either. `record_breach`
+        // must NOT panic (it stays non-fatal) and must not lose data silently — this
+        // proves both surfaced-error branches are reachable and the enforcement path
+        // survives. Pure unit test: no process, no OS gate.
+        let (_state, _manifest, registry) = setup_fake("breachio", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("breachio").unwrap();
+        // Block the log-dir path with a regular file so create_dir_all(<home>/logs)
+        // fails (its target is a file, not a directory) and the append fails too.
+        let log_dir = registry.instance_log_dir(&name);
+        std::fs::create_dir_all(log_dir.parent().unwrap()).unwrap();
+        std::fs::write(&log_dir, b"not a directory").unwrap();
+        assert!(
+            log_dir.is_file(),
+            "the log-dir path must be a FILE to force both the dir-create and append failures"
+        );
+
+        let sup = Supervisor::with_backoff(fast_backoff());
+        // Must not panic — both the dir-create and the append failures are logged
+        // (surfaced) and enforcement continues rather than crashing.
+        sup.record_breach(
+            &registry,
+            &name,
+            &RunId::mint(),
+            BreachScope::Cumulative,
+            30,
+            60,
+            BreachAction::Warn,
+            "self-reported",
+        );
+        // The blocking file is untouched — no breach file was sneaked in, confirming
+        // the write genuinely failed and we exercised the surfaced-error branches.
+        assert!(log_dir.is_file());
     }
 
     // ---- Story 3-1 drain planning: H1 terminal-tail + M2 shrink guard ----

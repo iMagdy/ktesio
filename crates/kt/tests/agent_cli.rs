@@ -1342,10 +1342,10 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
 }
 
 #[test]
-fn human_list_shows_the_budget_seed_and_real_usage_columns() {
-    // Story 1-7 (AC4) + story 3-1 (AC-C): the human `list` renders the Budget/cap
-    // column as the honest `—` seed (budgets are 3-2) AND a real Usage (tokens) +
-    // Metering column; the metering note is on stderr.
+fn human_list_shows_the_budget_column_and_real_usage_columns() {
+    // Story 1-7 (AC4) + story 3-1/3-2 (AC-C/AC9): the human `list` renders a Budget
+    // (tokens) column — the honest `—` for an UN-budgeted instance — AND a real
+    // Usage (tokens) column; the metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1357,15 +1357,14 @@ fn human_list_shows_the_budget_seed_and_real_usage_columns() {
 
     let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
-    // The columns are present (headers): Budget/cap (seed) + Usage (real). The
-    // Metering Source rides the Fleet DETAIL (`show` + `--json`), not this compact
-    // human list table, so it is asserted there (AC-C).
-    assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
+    // The columns are present (headers): Budget (tokens) + Usage (real). The
+    // header may truncate on a narrow terminal, so match a stable prefix.
+    assert!(run.stdout.contains("Budget"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
-    // Budget/cap still renders the honest `—` seed.
+    // An un-budgeted instance's budget cell renders the honest `—` absence.
     assert!(
         run.stdout.contains('—'),
-        "the budget seed cell must render the em dash; stdout={}",
+        "the un-budgeted cell must render the em dash; stdout={}",
         run.stdout
     );
     // The metering note is on stderr (AD-12), never stdout.
@@ -1422,10 +1421,11 @@ fn show_json_surfaces_the_same_entry_shape_with_budget_seed_and_real_usage() {
 }
 
 #[test]
-fn human_show_surfaces_the_budget_seed_and_real_usage_rows() {
-    // Story 1-7 (AC4) + story 3-1 (AC-C): human `show` renders a Budget/cap seed row
-    // (`—`, budgets are 3-2) plus REAL Usage (tokens) + Metering source rows in the
-    // runtime-status block, with the metering note on stderr.
+fn human_show_surfaces_the_budget_row_and_real_usage_rows() {
+    // Story 1-7 (AC4) + story 3-1/3-2 (AC-C/AC9): human `show` renders a Budget
+    // (tokens) row (the honest `—` for an un-budgeted instance) plus REAL Usage
+    // (tokens) + Metering source rows in the runtime-status block, with the
+    // metering note on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1437,7 +1437,7 @@ fn human_show_surfaces_the_budget_seed_and_real_usage_rows() {
 
     let run = run_kt_agent(&["agent", "show", "alpha"], &ctx.project_dir, state_dir);
     assert!(run.success, "show should exit 0; stderr={}", run.stderr);
-    assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
+    assert!(run.stdout.contains("Budget"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
     // The Metering source row + the self-reported value are surfaced (AC-C).
     assert!(
@@ -1450,7 +1450,7 @@ fn human_show_surfaces_the_budget_seed_and_real_usage_rows() {
         "stdout={}",
         run.stdout
     );
-    // Budget/cap still renders the honest `—` seed.
+    // The un-budgeted budget row renders the honest `—` absence.
     assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
     assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
@@ -2516,6 +2516,182 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
     assert_eq!(
         state, "registered",
         "the instance must stay registered after a rejected start; list=\n{}",
+        list.stdout
+    );
+}
+
+// ---- Story 3-2: Token-Budget config + Fleet-detail budget surface (AC-C, AC9) ----
+
+#[test]
+fn budget_config_keys_set_and_surface_in_list_json() {
+    // AC9: a budgeted instance surfaces the ceiling(s) + remaining + Breach Action
+    // in `list --json` (tokens only, deterministic — no process spawn needed since
+    // the budget is a config read). AC-C: the budget + action keys are settable.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Set a cumulative budget + a non-default action.
+    let set = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.tokens.cumulative",
+            "5000",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "set budget should exit 0; stderr={}",
+        set.stderr
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.breach_action",
+            "stop",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        list.success,
+        "list --json should exit 0; stderr={}",
+        list.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout)
+        .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
+    let budget = &doc["instances"][0]["budget"];
+    assert_eq!(
+        budget["cumulative_limit"], 5000,
+        "the cumulative ceiling surfaces in --json; doc={}",
+        list.stdout
+    );
+    // Never metered → remaining equals the ceiling (ledger is zero).
+    assert_eq!(budget["cumulative_remaining"], 5000);
+    assert_eq!(budget["breach_action"], "stop");
+    // Tokens only — no dollar cap/headroom.
+    assert!(budget.get("cost_cap").is_none(), "no dollars: {budget}");
+
+    // The human table shows the token budget cell (not `—`). The cell may truncate
+    // on a narrow terminal, so match a stable prefix; the exact values are asserted
+    // on --json above. `show` uses a wider Value column, so assert the full cell
+    // there for the action + remaining.
+    let show = run_kt_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
+    assert!(
+        show.stdout.contains("cum 5000/5000") && show.stdout.contains("stop"),
+        "human show must render the full token budget cell; stdout=\n{}",
+        show.stdout
+    );
+}
+
+#[test]
+fn an_unbudgeted_instance_shows_the_honest_absent_budget() {
+    // AC9: an instance with NO budget configured shows an honest absent budget
+    // (`null` in --json, `—` in the human table) — never a fabricated ceiling.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "bare", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout)
+        .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
+    assert_eq!(
+        doc["instances"][0]["budget"],
+        serde_json::Value::Null,
+        "an un-budgeted instance's budget is null; doc={}",
+        list.stdout
+    );
+
+    // The human table shows the `—` absence in the budget cell.
+    let human = run_kt_agent(&["agent", "show", "bare"], &ctx.project_dir, state_dir);
+    assert!(
+        human.stdout.contains("Budget (tokens)") && human.stdout.contains('—'),
+        "human show must render the honest absent budget; stdout=\n{}",
+        human.stdout
+    );
+}
+
+#[test]
+fn a_malformed_budget_value_is_rejected_at_write_time() {
+    // AC-C: a malformed budget number / unknown Breach-Action string is rejected at
+    // config-write time (non-zero exit, a clear diagnostic on stderr, nothing
+    // persisted) — never silently defaulted.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let bad_num = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.tokens.per_run",
+            "lots",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!bad_num.success, "a non-numeric budget must be rejected");
+    assert!(
+        bad_num.stderr.contains("budget.tokens.per_run"),
+        "the diagnostic names the key; stderr={}",
+        bad_num.stderr
+    );
+
+    let bad_action = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.breach_action",
+            "throttle",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !bad_action.success,
+        "an unknown breach action must be rejected"
+    );
+    assert!(
+        bad_action.stderr.contains("pause") && bad_action.stderr.contains("throttle"),
+        "the diagnostic names the accepted set + the offending value; stderr={}",
+        bad_action.stderr
+    );
+
+    // Nothing was persisted: the budget is still absent in --json.
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(
+        doc["instances"][0]["budget"],
+        serde_json::Value::Null,
+        "a rejected write must persist nothing; doc={}",
         list.stdout
     );
 }

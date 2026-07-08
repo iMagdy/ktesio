@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::budget::{BreachAction, BreachScope};
 use super::lifecycle::LifecycleState;
 
 /// The schema version stamped on every emitted [`TransitionEvent`].
@@ -25,10 +26,11 @@ use super::lifecycle::LifecycleState;
 /// unversioned event.
 ///
 /// NOTE (additive vs breaking): story 1-5 ADDS `TransitionCause` variants
-/// (`pause-best-effort` / `resume-best-effort`) and story 1-6 ADDS `crashed` /
-/// `restarted`. Adding a new closed-vocabulary variant is a backward-ADDITIVE
-/// change: a NEW reader parses every OLD event, and no field is renamed or
-/// removed, so the version is NOT bumped. (The
+/// (`pause-best-effort` / `resume-best-effort`), story 1-6 ADDS `crashed` /
+/// `restarted`, and story 3-2 ADDS `budget-exceeded` (the Breach-Action cause on
+/// the `running → paused`/`stopping` edge). Adding a new closed-vocabulary variant
+/// is a backward-ADDITIVE change: a NEW reader parses every OLD event, and no
+/// field is renamed or removed, so the version is NOT bumped. (The
 /// converse — an OLD reader meeting a NEW cause — is a separate forward-compat
 /// question: because `TransitionCause` is `#[serde(tag = "kind")]` with no
 /// `#[serde(other)]` fallback, an old reader that hits an unknown tag ERRORS
@@ -55,6 +57,20 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 /// type) is backward-ADDITIVE and does NOT bump the version — a new reader
 /// parses every old document and no field is renamed or removed.
 pub const FLEET_SCHEMA_VERSION: u32 = 1;
+
+/// The schema version stamped on every emitted [`BudgetBreachEvent`] (story 3-2,
+/// AD-14).
+///
+/// AD-14 names "breaches" explicitly among the versioned engine event structs the
+/// subscription API + `kt --json` share. 3-2 FREEZES the breach-event wire shape
+/// now — a versioned serde struct carrying the TOKEN breach fields — so `kt --json`
+/// and the future 7-2 Host stream cannot drift into two dialects. A SEPARATE
+/// constant from the sibling schemas ([`EVENT_SCHEMA_VERSION`],
+/// [`FLEET_SCHEMA_VERSION`], [`crate::USAGE_SCHEMA_VERSION`]) — the wire shapes
+/// evolve independently, so a change to one must not force a version bump on the
+/// others. It starts at 1, aligned with the siblings. Bumped only on an
+/// INCOMPATIBLE change; adding a field is backward-additive and does NOT bump it.
+pub const BUDGET_SCHEMA_VERSION: u32 = 1;
 
 /// Why a lifecycle transition happened (the transition event's `cause`).
 ///
@@ -127,6 +143,22 @@ pub enum TransitionCause {
         /// The backoff waited before this restart, in milliseconds.
         waited_ms: u64,
     },
+    /// A Token-Budget BREACH drove the transition (story 3-2, AD-7/AD-15): the
+    /// Breach Action `pause`/`stop` pulled the EXISTING `running → paused` /
+    /// `running → stopping` lever, so the lifecycle log itself explains WHY. Wire
+    /// tag `budget-exceeded`. Carries the breached scope + the ceiling that was
+    /// reached + the observed total (tokens only — no dollars, 3-3), so a
+    /// log/`--json`/7-2 consumer sees the honest reason without the standalone
+    /// breach event. A `warn` action produces NO transition, so it NEVER carries
+    /// this cause (only the standalone [`BudgetBreachEvent`] records a `warn`).
+    BudgetExceeded {
+        /// Which budget scope tripped (`per-run` / `cumulative`).
+        scope: BreachScope,
+        /// The token ceiling that was reached.
+        limit: u64,
+        /// The committed token total that reached it (`>= limit`).
+        observed: u64,
+    },
 }
 
 impl TransitionCause {
@@ -177,6 +209,18 @@ impl TransitionCause {
     pub fn restarted(count: u32, waited_ms: u64) -> Self {
         TransitionCause::Restarted { count, waited_ms }
     }
+
+    /// A BUDGET-EXCEEDED cause recording the breached `scope` + the `limit`
+    /// reached + the `observed` total (story 3-2, AC7). Mirrors the other
+    /// constructors; used on the `running → paused`/`stopping` transition the
+    /// Breach Action drives.
+    pub fn budget_exceeded(scope: BreachScope, limit: u64, observed: u64) -> Self {
+        TransitionCause::BudgetExceeded {
+            scope,
+            limit,
+            observed,
+        }
+    }
 }
 
 /// A recorded lifecycle state transition (spine AD-14 seed).
@@ -220,6 +264,74 @@ impl TransitionEvent {
             prior_state,
             new_state,
             cause,
+            at: at.into(),
+        }
+    }
+}
+
+/// A recorded Token-Budget BREACH (spine AD-14, story 3-2) — the ALWAYS-recorded
+/// event FR-21 requires "regardless of action".
+///
+/// Emitted from the ledger-commit choke point the instant a just-committed total
+/// reaches a configured ceiling ([`super::budget::BudgetEvaluator`] returns
+/// `Breached`), recorded BEFORE/independently of the lifecycle side-effect so a
+/// best-effort/unsupported/failed pause NEVER loses the breach record (the FR-21
+/// invariant + the NFR safety note). Recorded for EVERY action — including `warn`
+/// (no transition) — as a durable JSON line, and (for `pause`/`stop`) mirrored as
+/// a [`TransitionCause::BudgetExceeded`] on the resulting transition.
+///
+/// TOKENS ONLY (AD-8): the `limit`/`observed` are token counts, no dollars (3-3).
+/// A [`BUDGET_SCHEMA_VERSION`]-stamped serde struct (snake_case) so `kt --json` +
+/// the future 7-2 Host subscription share ONE schema. Full subscription DELIVERY
+/// is 7-2's; 3-2 records + freezes the struct (the discipline 3-1 used for
+/// [`crate::UsageUpdateEvent`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetBreachEvent {
+    /// The breach-event schema version ([`BUDGET_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The Agent Instance whose ledger crossed the ceiling.
+    pub instance: String,
+    /// The Run (spine AD-7) the breaching event was committed under.
+    pub run_id: String,
+    /// Which budget scope tripped (`per-run` / `cumulative`).
+    pub scope: BreachScope,
+    /// The token ceiling that was reached.
+    pub limit: u64,
+    /// The committed token total that reached it (`>= limit`).
+    pub observed: u64,
+    /// The Breach Action taken (`pause` / `stop` / `warn`).
+    pub action: BreachAction,
+    /// The Metering Source that produced the breaching event's usage, as its wire
+    /// string (`self-reported` / `engine-observed`).
+    pub metering_source: String,
+    /// RFC 3339 UTC timestamp the engine stamped when it recorded the breach.
+    pub at: String,
+}
+
+impl BudgetBreachEvent {
+    /// Build a breach event, stamping the current [`BUDGET_SCHEMA_VERSION`]. `at`
+    /// is an RFC 3339 UTC timestamp (a parameter so the struct stays pure and
+    /// unit-testable with a fixed clock, like [`TransitionEvent::new`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instance: impl Into<String>,
+        run_id: impl Into<String>,
+        scope: BreachScope,
+        limit: u64,
+        observed: u64,
+        action: BreachAction,
+        metering_source: impl Into<String>,
+        at: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: BUDGET_SCHEMA_VERSION,
+            instance: instance.into(),
+            run_id: run_id.into(),
+            scope,
+            limit,
+            observed,
+            action,
+            metering_source: metering_source.into(),
             at: at.into(),
         }
     }
@@ -286,11 +398,84 @@ mod tests {
             ),
             (TransitionCause::crashed("x"), "crashed"),
             (TransitionCause::restarted(1, 1000), "restarted"),
+            (
+                TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
+                "budget-exceeded",
+            ),
         ];
         for (cause, tag) in cases {
             let json = serde_json::to_string(&cause).unwrap();
             assert!(json.contains(&format!("\"kind\":\"{tag}\"")), "{json}");
         }
+    }
+
+    #[test]
+    fn budget_exceeded_cause_round_trips_with_its_fields() {
+        // AC7: the Breach-Action cause carries the honest WHY (scope + limit +
+        // observed, tokens only) and survives a JSON round-trip through the log.
+        let cause = TransitionCause::budget_exceeded(BreachScope::Cumulative, 500, 512);
+        let json = serde_json::to_string(&cause).unwrap();
+        assert!(json.contains("\"kind\":\"budget-exceeded\""), "{json}");
+        assert!(json.contains("\"scope\":\"cumulative\""), "{json}");
+        // Tokens only — no dollar field leaked into the cause payload.
+        assert!(!json.contains("cost"), "{json}");
+        let back: TransitionCause = serde_json::from_str(&json).unwrap();
+        match back {
+            TransitionCause::BudgetExceeded {
+                scope,
+                limit,
+                observed,
+            } => {
+                assert_eq!(scope, BreachScope::Cumulative);
+                assert_eq!(limit, 500);
+                assert_eq!(observed, 512);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_breach_event_round_trips_with_schema_version_and_snake_case() {
+        // AC10: the versioned breach wire struct `kt --json` + 7-2 share. Carries
+        // the schema version + the token breach fields, snake_case, tokens only.
+        let e = BudgetBreachEvent::new(
+            "web-1",
+            "run-42-7",
+            BreachScope::PerRun,
+            1000,
+            1000,
+            BreachAction::Pause,
+            "self-reported",
+            "2026-07-08T00:00:00Z",
+        );
+        assert_eq!(e.schema_version, BUDGET_SCHEMA_VERSION);
+        let value: serde_json::Value = serde_json::to_value(&e).unwrap();
+        let obj = value.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "action",
+                "at",
+                "instance",
+                "limit",
+                "metering_source",
+                "observed",
+                "run_id",
+                "schema_version",
+                "scope",
+            ]
+        );
+        assert_eq!(value["scope"], serde_json::json!("per-run"));
+        assert_eq!(value["action"], serde_json::json!("pause"));
+        assert_eq!(value["limit"], serde_json::json!(1000));
+        // Tokens only — no dollars in the payload.
+        assert!(obj.get("cost").is_none());
+        assert!(obj.get("dollars").is_none());
+        let json = serde_json::to_string(&e).unwrap();
+        let back: BudgetBreachEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
     }
 
     #[test]
