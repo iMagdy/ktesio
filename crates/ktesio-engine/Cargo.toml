@@ -1,0 +1,65 @@
+[package]
+name = "ktesio-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Ktesio agent-runner engine; its public API is the Embedding Interface"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# TODO(story 7-4): remove `publish = false` when the boundary is proven and
+# the workspace crates are published to crates.io.
+publish = false
+
+[dependencies]
+ktesio-adapter-api = { workspace = true }
+# State store (AD-6): rusqlite with bundled SQLite (WAL, synchronous=NORMAL,
+# foreign_keys=ON). No system SQLite dependency; first build compiles it.
+rusqlite = { workspace = true }
+# Path authority (cfg-free): cross-platform data-dir resolution. All OS `cfg`
+# lives inside this crate, keeping the engine free of #[cfg(unix/windows)]
+# (OS-cfg CI gate).
+directories = { workspace = true }
+# thiserror in the engine lib (no miette here — conventions).
+thiserror = { workspace = true }
+# serde derives on domain types (LifecycleState wire form, etc.).
+serde = { workspace = true }
+# Persist the effective per-OS Capability Declaration snapshot as a JSON file in
+# the Agent Home (AD-6: structured artifacts are files in the home, DB stays
+# lean). JSON (not TOML) so the engine does not depend on `toml` — that crate is
+# owned by ktesio-adapter-api alone (AD-3).
+serde_json = { workspace = true }
+# Async supervision core (AD-13). The engine owns the tokio runtime; the
+# blocking() facade drives it for kt. Not a ktesio-* crate, so it is fine on the
+# AD-2 boundary gate (a normal edge, but not an internal one).
+tokio = { workspace = true }
+
+# Unix ProcessBackend (AD-4): dedicated process groups (setpgid) + signal
+# delivery to the group (SIGTERM/SIGKILL via killpg). Target-gated so it is only
+# pulled on Unix; the cfg lives in Cargo.toml (the OS-cfg CI gate greps *.rs, not
+# manifests). Minimal features — nix is heavily feature-gated. MSRV 1.69.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+
+# Windows ProcessBackend (AD-4): one Job Object per Agent Instance
+# (CreateJobObjectW / AssignProcessToJobObject / SetInformationJobObject
+# kill-on-close / TerminateJobObject). Per-API feature gating — enable only the
+# Job-Object + threading + foundation surfaces. MSRV 1.71.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+# Hermetic temp base dir for engine unit + integration tests.
+tempfile = { workspace = true }
+# Test-only: the reusable conformance mock adapter + scripted fake agent. This
+# is a DEV dependency ONLY — a normal edge would be transitive into `kt` and
+# trip the AD-2 boundary gate (which excludes dev-deps). The shipping engine
+# resolves `--kind mock` via its own internal builtin, not this crate.
+ktesio-conformance = { path = "../ktesio-conformance", version = "0.1.0" }
+
+[lints]
+workspace = true

@@ -1,0 +1,55 @@
+[package]
+# crates.io package name stays "ktesio" for install continuity (FR-39);
+# "kt" is the directory/colloquial name and the shipped binary name.
+name = "ktesio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Agentic skills package manager"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["agentic", "skills", "package-manager", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "kt"
+path = "src/main.rs"
+
+[dependencies]
+ktesio-engine = { workspace = true }
+clap = { workspace = true }
+console = { workspace = true }
+miette = { workspace = true }
+indicatif = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
+dialoguer = { workspace = true }
+ureq = { workspace = true }
+urlencoding = { workspace = true }
+semver = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Test-only: seed a `running` instance directly into the engine's SQLite state
+# so the `kt agent remove` running-guard (AC5) can be exercised end-to-end.
+# Dev-only — excluded from the boundary gate (`cargo tree -e normal,build`), so
+# the shipping `kt` crate still never depends on SQLite.
+rusqlite = { workspace = true }
+# Test-only (story 1-6): the `fake_agent` helper binary, so a CLI test can point
+# a manifest adapter's launch exec at a real spawnable process and prove
+# `kt agent start` restarts a `failed` instance to `running`. Dev-only — excluded
+# from the boundary gate (`cargo tree -e normal,build`), so the shipping `kt`
+# graph still never depends on it (same rationale as the engine's dev-dep).
+ktesio-conformance = { path = "../ktesio-conformance", version = "0.1.0" }
+
+[lints]
+workspace = true

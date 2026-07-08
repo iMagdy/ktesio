@@ -130,7 +130,6 @@ During install and upgrade, Ktesio shows progress bars for long-running git work
 - [Architecture](docs/architecture.md)
 - [Testing](docs/testing.md)
 - [Release process](docs/release-process.md)
-- [GitHub project sync](docs/github-project-sync.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)
 

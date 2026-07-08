@@ -54,8 +54,8 @@ Use `scripts/prepare_kt_release.py` as the source of truth for the release seque
 - Validate repository identity and clean release state.
 - Fetch `origin main` and tags.
 - Infer the release kind and target version.
-- Update `Cargo.toml` and `Cargo.lock`.
-- Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`.
+- Update the root `Cargo.toml` (`[workspace.package]` version, inherited by the `ktesio` package in `crates/kt/`) and `Cargo.lock`.
+- Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets`.
 - Commit `Cargo.toml` and `Cargo.lock` with `chore(release): bump version to X.Y.Z` and `--signoff`.
 - Push `HEAD:main`.
 - Create and push the lightweight `vX.Y.Z` tag.

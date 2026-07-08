@@ -183,17 +183,3 @@ Check the release workflow logs and open pull requests for a branch named like:
 ```text
 release-docs/<tag>
 ```
-
-## Speckit Issue Sync Cannot Find the Project
-
-Confirm the project title and owner:
-
-```bash
-gh project list --owner iMagdy
-```
-
-Then refresh auth if needed:
-
-```bash
-gh auth refresh -s project
-```

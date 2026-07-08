@@ -102,16 +102,33 @@ def git(args: list[str], *, cwd: Path, capture: bool = True) -> str:
     return completed.stdout.strip() if capture else ""
 
 
-def cargo_package(cargo_toml: Path) -> tuple[str, Version]:
+def cargo_package(repo: Path) -> tuple[str, Version]:
+    """Resolve the shipping package name and version in the workspace layout.
+
+    The repository root is a virtual `[workspace]` manifest: the `ktesio`
+    package lives at crates/kt/Cargo.toml and inherits its version from the
+    root `[workspace.package]` table.
+    """
     if tomllib is None:
         raise ReleaseError("Python 3.11+ is required so tomllib can parse Cargo.toml.")
-    with cargo_toml.open("rb") as handle:
-        data = tomllib.load(handle)
-    package = data.get("package") or {}
+    package_toml = repo / "crates" / "kt" / "Cargo.toml"
+    if not package_toml.exists():
+        raise ReleaseError(f"{package_toml} not found. Run this from the Ktesio checkout.")
+    with package_toml.open("rb") as handle:
+        package = tomllib.load(handle).get("package") or {}
     name = package.get("name")
+    if not isinstance(name, str):
+        raise ReleaseError("crates/kt/Cargo.toml is missing package.name.")
     raw_version = package.get("version")
-    if not isinstance(name, str) or not isinstance(raw_version, str):
-        raise ReleaseError("Cargo.toml is missing package.name or package.version.")
+    if isinstance(raw_version, dict) and raw_version.get("workspace") is True:
+        with (repo / "Cargo.toml").open("rb") as handle:
+            workspace = tomllib.load(handle).get("workspace") or {}
+        raw_version = (workspace.get("package") or {}).get("version")
+    if not isinstance(raw_version, str):
+        raise ReleaseError(
+            "Could not resolve the package version from crates/kt/Cargo.toml "
+            "or the root [workspace.package] table."
+        )
     return name, Version.parse(raw_version)
 
 
@@ -124,7 +141,7 @@ def ensure_repository(repo: Path, branch: str, remote: str, fetch: bool) -> None
     cargo_toml = repo / "Cargo.toml"
     if not cargo_toml.exists():
         raise ReleaseError(f"Cargo.toml not found in {repo}. Run this from the Ktesio checkout.")
-    package_name, _ = cargo_package(cargo_toml)
+    package_name, _ = cargo_package(repo)
     if package_name != "ktesio":
         raise ReleaseError(f"Expected package 'ktesio', found '{package_name}'.")
 
@@ -196,25 +213,26 @@ def classify(commits: list[tuple[str, str, str]]) -> tuple[str, list[CommitSigna
 
 
 def replace_cargo_version(cargo_toml: Path, target: Version) -> None:
+    """Rewrite the version where it lives now: root [workspace.package]."""
     text = cargo_toml.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
-    in_package = False
+    in_workspace_package = False
     replaced = False
     output: list[str] = []
     for line in lines:
         section = re.match(r"\s*\[([^\]]+)\]\s*$", line)
         if section:
-            in_package = section.group(1) == "package"
-        if in_package and re.match(r'\s*version\s*=\s*"', line):
+            in_workspace_package = section.group(1) == "workspace.package"
+        if in_workspace_package and re.match(r'\s*version\s*=\s*"', line):
             newline = "\n" if line.endswith("\n") else ""
             prefix = re.match(r'(\s*version\s*=\s*)"', line)
             if prefix is None:
-                raise ReleaseError("Could not rewrite package.version in Cargo.toml.")
+                raise ReleaseError("Could not rewrite workspace.package.version in Cargo.toml.")
             line = f'{prefix.group(1)}"{target}"{newline}'
             replaced = True
         output.append(line)
     if not replaced:
-        raise ReleaseError("Could not find package.version in Cargo.toml.")
+        raise ReleaseError("Could not find workspace.package.version in Cargo.toml.")
     cargo_toml.write_text("".join(output), encoding="utf-8")
 
 
@@ -223,9 +241,9 @@ def update_cargo_lock(repo: Path) -> None:
 
 
 def run_checks(repo: Path) -> None:
-    run(["cargo", "fmt", "--check"], cwd=repo, capture=False)
-    run(["cargo", "clippy", "--all-targets", "--", "-D", "warnings"], cwd=repo, capture=False)
-    run(["cargo", "test", "--all-targets"], cwd=repo, capture=False)
+    run(["cargo", "fmt", "--all", "--check"], cwd=repo, capture=False)
+    run(["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"], cwd=repo, capture=False)
+    run(["cargo", "test", "--workspace", "--all-targets"], cwd=repo, capture=False)
 
 
 def ensure_only_release_files_changed(repo: Path) -> None:
@@ -284,7 +302,7 @@ def main() -> int:
         repo = git_root(Path.cwd())
         os.chdir(repo)
         ensure_repository(repo, args.branch, args.remote, fetch=not args.no_fetch)
-        package_name, cargo_version = cargo_package(repo / "Cargo.toml")
+        package_name, cargo_version = cargo_package(repo)
         latest_tag, latest_version = latest_semver_tag(repo)
         commits = unreleased_commits(repo, latest_tag)
         kind, signals = classify(commits)

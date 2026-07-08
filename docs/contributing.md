@@ -13,29 +13,29 @@ This page is the hands-on development guide. For project rules and the Contribut
 git clone https://github.com/iMagdy/ktesio.git
 cd ktesio
 cargo build
-cargo test --all-targets
+cargo test --workspace --all-targets
 ```
 
 ## Development Loop
 
 ```bash
 cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 python3 scripts/check_docs.py
 ```
 
 ## Adding CLI Behavior
 
-- Update `src/main.rs` command parsing.
-- Add or update a module under `src/cli/`.
+- Update `crates/kt/src/main.rs` command parsing.
+- Add or update a module under `crates/kt/src/cli/`.
 - Add unit tests for command logic with explicit project roots.
-- Add integration tests under `tests/` for user-facing workflows.
+- Add integration tests under `crates/kt/tests/` for user-facing workflows.
 - Update [commands.md](commands.md) and [get-started.md](get-started.md) when behavior changes.
 
 ## Test Fixtures
 
-Integration tests use local temporary git repositories through `tests/helpers/mod.rs`. Avoid network-only tests in the default suite.
+Integration tests use local temporary git repositories through `crates/kt/tests/helpers/mod.rs`. Avoid network-only tests in the default suite.
 
 ## Pull Requests
 
