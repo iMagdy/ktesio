@@ -657,6 +657,35 @@ impl Engine {
         .await
     }
 
+    /// Reveal the resolved cleartext of every `secret:NAME` leaf for a
+    /// `config get --reveal` read (story 2-4, AC-C/AC11). Returns the dotted key →
+    /// REVEALED cleartext string for the secret leaves ONLY; `kt` overlays them onto
+    /// the (masked) effective config to un-mask exactly those leaves. The engine
+    /// re-resolves secrets LIVE (env → the 0600 file); `kt` never resolves secrets
+    /// itself (AD-2). A resolution failure is a typed [`ConfigError::SecretReveal`]
+    /// (a stderr diagnostic in `kt`, never a crash). This NEVER touches the
+    /// snapshot/logs/events — it is a read-only path. Runs on the blocking pool.
+    pub async fn reveal_secrets(
+        &self,
+        name: &str,
+        overrides: ConfigLayer,
+    ) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let iname = InstanceName::new(&name).map_err(|reason| ConfigError::InvalidName {
+                name: name.clone(),
+                reason: reason.to_string(),
+            })?;
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .reveal_secrets(&iname, overrides)
+        })
+        .await
+    }
+
     /// Set one unified-config key on an instance's INSTANCE layer (story 2-1,
     /// spine AD-9, AC-B / AC10). This is the write `kt agent config set` uses.
     ///
@@ -828,6 +857,19 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.set_config(name, key, value))
+    }
+
+    /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The
+    /// `config get --reveal` un-mask uses this to fetch the resolved cleartext of
+    /// the secret leaves.
+    pub fn reveal_secrets(
+        &self,
+        name: &str,
+        overrides: ConfigLayer,
+    ) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
+        self.engine
+            .rt
+            .block_on(self.engine.reveal_secrets(name, overrides))
     }
 }
 

@@ -383,14 +383,25 @@ pub fn resolve_config_mapping(
 /// per-file merge keyed by the native key), so the same inputs always yield the
 /// same launch + files.
 ///
-/// SEAMS for later stories (recorded, built here as no-ops): a leaf's value is a
-/// plain string here; story 2-4 will intercept a `secret:` value and resolve/mask
-/// it BEFORE this placement (here it is delivered as-is, opaque). The per-leaf
-/// `SourceLayer` (2-1) rides on the `EffectiveConfig` untouched; 2-3 renders it.
+/// SECRET DELIVERY (story 2-4, AC9 — display and delivery DIVERGE). `secrets` maps
+/// a dotted leaf key → the RESOLVED cleartext
+/// [`SecretString`](crate::domain::SecretString) the supervisor resolved at start
+/// (env → the 0600 file) for each `secret:NAME` leaf. For a secret-classified leaf,
+/// the value placed into the native mechanism is `secrets[key].expose_secret()` —
+/// the REAL key the agent needs — NOT `resolved.display()` (which now MASKS a
+/// secret) and NOT the `secret:NAME` reference. Non-secret leaves keep
+/// `resolved.display()`. This is the crux: the SAME leaf renders masked in
+/// `config get`/the snapshot/logs while delivering cleartext into the adapter's
+/// PRIVATE native config (the rendered file the agent reads holds cleartext by
+/// necessity — an accepted FR-2/NFR-6 boundary, the Agent Home is
+/// filesystem-isolated, not a sandbox). A secret leaf whose key is absent from
+/// `secrets` (should not happen — the supervisor resolves every secret leaf before
+/// calling this) falls back to the MASKED `display()` — fail-CLOSED, never a leak.
 pub fn apply_config_mapping(
     launch: &mut StartLaunch,
     mapping: &ConfigMapping,
     effective: &EffectiveConfig,
+    secrets: &std::collections::BTreeMap<String, crate::domain::SecretString>,
     home: &Path,
 ) -> Result<(), ConfigApplyError> {
     // Accumulate FILE-target writes keyed by target path, so multiple keys
@@ -400,7 +411,15 @@ pub fn apply_config_mapping(
     let mut files: std::collections::BTreeMap<String, FileDoc> = std::collections::BTreeMap::new();
 
     for (dotted_key, resolved) in effective.iter() {
-        let value = resolved.display();
+        // Secret delivery (AC9): a secret-classified leaf delivers the RESOLVED
+        // CLEARTEXT (from the SecretString), never the mask. A non-secret leaf uses
+        // the plain display(); a secret leaf missing from `secrets` fails CLOSED to
+        // the masked display() (never a leak). This is the ONE place cleartext is
+        // exposed for delivery — display() everywhere else stays masked.
+        let value = match secrets.get(dotted_key) {
+            Some(secret) => secret.expose_secret().to_string(),
+            None => resolved.display(),
+        };
         if let Some(tail) = pass_through_tail(dotted_key) {
             // AC6: pass-through delivered VERBATIM into the native mechanism (the
             // recorded convention: an env var named by the verbatim key-tail).
@@ -418,6 +437,20 @@ pub fn apply_config_mapping(
                 launch.env.insert(env.clone(), value);
             }
             ConfigTarget::Flag { .. } => {
+                // A secret mapped to a `flag` target lands its CLEARTEXT here as a
+                // command-line argument. This is a STRICTER exposure than the env /
+                // rendered-file boundaries: argv is world-readable CROSS-USER via
+                // `ps` / `/proc/<pid>/cmdline`, whereas those live in the
+                // filesystem-isolated Agent Home. It is an accepted boundary
+                // (documented in docs/architecture.md Secrets / AD-10) — the agent
+                // needs a usable key and Ktesio's own surfaces stay masked — but
+                // operators should prefer `env`/`file` targets for secret-carrying
+                // keys.
+                // TODO(follow-up): surface a one-time operator warning when a
+                // `secret:` leaf resolves into a `flag` target. Deferred: the `start`
+                // seam has no existing engine→CLI note channel that reaches this
+                // fact without new cross-boundary machinery (unlike pause's
+                // best-effort re-read, which reuses `effective_capabilities`).
                 if let Some([flag, val]) = target.render_flag_args(&value) {
                     launch.args.push(flag);
                     launch.args.push(val);
@@ -950,6 +983,13 @@ source = "self-reported"
         }
     }
 
+    /// The empty resolved-secrets map — no leaf is a secret (the story-2-2
+    /// mapping-mechanics tests carry no `secret:` values). Story 2-4 added the
+    /// `secrets` parameter to `apply_config_mapping`; these tests pass an empty map.
+    fn no_secrets() -> std::collections::BTreeMap<String, crate::domain::SecretString> {
+        std::collections::BTreeMap::new()
+    }
+
     #[test]
     fn apply_maps_model_to_env_target() {
         // AC-A / AC4 (env): a `model` value lands in the declared env var.
@@ -957,7 +997,7 @@ source = "self-reported"
         let effective = effective_from_instance("model = \"gpt-4\"\n");
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         assert_eq!(launch.env.get("MODEL").map(String::as_str), Some("gpt-4"));
         assert!(launch.args.is_empty());
     }
@@ -969,7 +1009,7 @@ source = "self-reported"
         let effective = effective_from_instance("model = \"gpt-4\"\n");
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         assert_eq!(
             launch.args,
             vec!["--model".to_string(), "gpt-4".to_string()]
@@ -988,7 +1028,7 @@ source = "self-reported"
         let effective = effective_from_instance("model = \"gpt-4\"\n");
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         // The launch env/args are untouched (the value went into the file).
         assert!(launch.env.is_empty());
         assert!(launch.args.is_empty());
@@ -1014,12 +1054,105 @@ source = "self-reported"
         let effective = effective_from_instance("[agent]\nCUSTOM_FLAG = \"verbatim\"\n");
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         assert_eq!(
             launch.env.get("CUSTOM_FLAG").map(String::as_str),
             Some("verbatim"),
             "pass-through delivered verbatim by key-tail"
         );
+    }
+
+    #[test]
+    fn apply_delivers_resolved_cleartext_for_a_secret_leaf_not_the_mask() {
+        // Story 2-4 AC9 (delivery diverges from display): a `secret:NAME` leaf whose
+        // resolved cleartext is in the `secrets` map delivers the REAL value into
+        // the native env target, NOT the mask and NOT the reference. This is the
+        // crux — `display()` would mask this same leaf.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::env("MODEL"));
+        let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        // The supervisor would resolve `secret:MODEL_KEY` → this cleartext.
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "model".to_string(),
+            crate::domain::SecretString::new("sk-real-key-123"),
+        );
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &secrets, tmp.path()).unwrap();
+        // The adapter's native env holds the CLEARTEXT (usable key), not the mask.
+        assert_eq!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some("sk-real-key-123"),
+            "a secret leaf must deliver resolved cleartext to the adapter"
+        );
+        // Sanity: the masked display of the same leaf is NOT what was delivered.
+        assert_ne!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some(ktesio_adapter_api::OsId::current().as_str()), // arbitrary non-equal
+        );
+        assert_ne!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some("secret:MODEL_KEY")
+        );
+    }
+
+    #[test]
+    fn apply_delivers_resolved_cleartext_for_a_secret_leaf_into_a_flag_arg() {
+        // Story 2-4 AC9 + the flag/argv boundary (documented in the Flag arm and
+        // docs/architecture.md Secrets): a `secret:NAME` leaf mapped to a FLAG target
+        // delivers its resolved CLEARTEXT as an argv token, NOT the mask and NOT the
+        // reference. This is the STRICTER exposure the docs call out (argv is
+        // cross-user readable via `ps`/`/proc/<pid>/cmdline`), so it is proven
+        // explicitly alongside the env path.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::flag("--model"));
+        let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "model".to_string(),
+            crate::domain::SecretString::new("sk-real-key-123"),
+        );
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &secrets, tmp.path()).unwrap();
+        // The flag value token carries the CLEARTEXT (what the child sees in argv).
+        assert_eq!(
+            launch.args,
+            vec!["--model".to_string(), "sk-real-key-123".to_string()],
+            "a secret leaf mapped to a flag must deliver resolved cleartext into argv"
+        );
+        // Sanity: neither the mask nor the raw reference reaches argv.
+        assert!(
+            !launch.args.iter().any(|a| a == "secret:MODEL_KEY"),
+            "the raw reference must not reach argv"
+        );
+        assert!(
+            !launch.args.iter().any(|a| a == crate::domain::SECRET_MASK),
+            "the mask must not reach argv (delivery diverges from display)"
+        );
+    }
+
+    #[test]
+    fn apply_secret_leaf_missing_from_map_fails_closed_to_the_mask() {
+        // Defense-in-depth: if a secret leaf is (unexpectedly) absent from the
+        // `secrets` map, the placement falls back to the MASKED display() — never
+        // the cleartext, never the raw reference. Fail-closed: a bug in resolution
+        // yields a broken-but-safe agent config, not a leak.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::env("MODEL"));
+        let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty secrets map (the leaf is secret but unresolved in the map).
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some(ktesio_engine_secret_mask()),
+            "a secret leaf missing from the map must fail closed to the mask, not leak"
+        );
+    }
+
+    /// The config-layer secret mask token (re-exported), for the fail-closed test.
+    fn ktesio_engine_secret_mask() -> &'static str {
+        crate::domain::SECRET_MASK
     }
 
     #[test]
@@ -1030,7 +1163,7 @@ source = "self-reported"
         let effective = effective_from_instance("model = \"gpt-4\"\n");
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         assert!(launch.env.is_empty(), "unmapped key must not land anywhere");
         assert!(launch.args.is_empty());
         assert!(!tmp.path().join("config").exists(), "no file rendered");
@@ -1047,15 +1180,15 @@ source = "self-reported"
         let empty = EffectiveConfig::default();
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &empty, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &empty, &no_secrets(), tmp.path()).unwrap();
         assert_eq!(launch, empty_launch(), "empty config is a no-op");
 
         // Determinism: two applies of the same non-empty config yield equal launches.
         let effective = effective_from_instance("model = \"m\"\n[agent]\nx = \"y\"\n");
         let mut a = empty_launch();
         let mut b = empty_launch();
-        apply_config_mapping(&mut a, &mapping, &effective, tmp.path()).unwrap();
-        apply_config_mapping(&mut b, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut a, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        apply_config_mapping(&mut b, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         assert_eq!(a, b);
         // model flag present; the agent.* leaf delivered verbatim by its tail (NOT
         // via the env rule keyed at "agent.a").
@@ -1177,7 +1310,9 @@ file = { path = "../escape.toml", key = "k" }
         let tmp = tempfile::tempdir().unwrap();
         // Put a regular FILE at `blocked` so create_dir_all(blocked) fails.
         std::fs::write(tmp.path().join("blocked"), b"not a dir").unwrap();
-        let err = apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap_err();
+        let err =
+            apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path())
+                .unwrap_err();
         match err {
             ConfigApplyError::FileRender { key, path, .. } => {
                 assert_eq!(key, "blocked/agent.toml");
@@ -1185,9 +1320,15 @@ file = { path = "../escape.toml", key = "k" }
             }
         }
         // The error message names the key + path (defensive Display coverage).
-        let msg = apply_config_mapping(&mut empty_launch(), &mapping, &effective, tmp.path())
-            .unwrap_err()
-            .to_string();
+        let msg = apply_config_mapping(
+            &mut empty_launch(),
+            &mapping,
+            &effective,
+            &no_secrets(),
+            tmp.path(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(msg.contains("blocked/agent.toml"), "{msg}");
         assert!(msg.contains("Agent Home"), "{msg}");
     }
@@ -1205,7 +1346,7 @@ file = { path = "../escape.toml", key = "k" }
         let effective = effective_from_instance("model = \"m\"\ntemperature = \"t\"\n");
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, tmp.path()).unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
         let rendered = tmp.path().join("f.toml");
         let parsed: toml::Table = std::fs::read_to_string(&rendered).unwrap().parse().unwrap();
         // `a` became a table with `b = "t"`; the scalar `a = "m"` was masked.

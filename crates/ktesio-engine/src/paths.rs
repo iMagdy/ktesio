@@ -43,6 +43,16 @@ pub const STATE_DIR_ENV: &str = "KTESIO_STATE_DIR";
 /// File name of the SQLite state store inside the state base. `[ASSUMPTION]`
 pub const STATE_DB_FILE: &str = "state.db";
 
+/// File name of the engine SECRETS store inside the state base (story 2-4, spine
+/// AD-10 "the engine secrets file, mode 0600"). A state-dir-level file (NOT
+/// per-Agent-Home — it is the engine's SHARED secret store, resolving every
+/// instance's `secret:NAME` references), beside [`STATE_DB_FILE`]. `[ASSUMPTION]`
+/// recorded (Assumption 5): TOML `NAME = "value"` (reuses the engine's `toml`
+/// dep), at `<state base>/secrets.toml`, expected mode `0600` (owner-only —
+/// enforced on Unix by the backend permission check, AD-4). It is NOT a SQLite
+/// blob (AD-6): secrets are files under path authority, never a DB column.
+pub const SECRETS_FILE: &str = "secrets.toml";
+
 /// Directory (under the state base) that holds all Agent Homes. `[ASSUMPTION]`
 pub const AGENTS_DIR: &str = "agents";
 
@@ -132,6 +142,16 @@ impl EnginePaths {
         self.state_base.join(STATE_DB_FILE)
     }
 
+    /// Absolute path to the engine secrets file (story 2-4, AD-10) — the
+    /// state-dir-level TOML `NAME = "value"` store the 0600-file
+    /// [`crate::ports::SecretResolver`] reads. Mirrors [`state_db`](Self::state_db);
+    /// the engine is the SOLE path authority (AD-6). The file is optional (a
+    /// missing secrets file is not an error — env may resolve every reference);
+    /// only its PRESENCE triggers the permission check + lookup.
+    pub fn secrets_file(&self) -> PathBuf {
+        self.state_base.join(SECRETS_FILE)
+    }
+
     /// Directory holding all Agent Homes.
     pub fn agents_dir(&self) -> PathBuf {
         self.state_base.join(AGENTS_DIR)
@@ -175,6 +195,9 @@ mod tests {
         assert_eq!(paths.state_base(), tmp.path());
         assert_eq!(paths.state_db(), tmp.path().join("state.db"));
         assert_eq!(paths.agents_dir(), tmp.path().join("agents"));
+        // Story 2-4: the engine secrets file is a state-dir-level file beside the
+        // state DB (NOT per-Agent-Home), named secrets.toml.
+        assert_eq!(paths.secrets_file(), tmp.path().join("secrets.toml"));
     }
 
     #[test]

@@ -18,12 +18,14 @@ mod lifecycle;
 mod name;
 mod registry;
 mod restart;
+mod secret;
 mod supervisor;
 mod transition;
 
 pub use config::{
-    is_pass_through, pass_through_tail, resolve, ConfigError, ConfigLayer, EffectiveConfig,
-    ResolvedValue, SourceLayer, PASS_THROUGH_PREFIX,
+    is_pass_through, is_secret_ref, pass_through_tail, resolve, secret_name, ConfigError,
+    ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer, PASS_THROUGH_PREFIX, SECRET_MASK,
+    SECRET_PREFIX,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION};
@@ -33,6 +35,7 @@ pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};
 pub use registry::{Registry, RemoveDisposition};
 pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
+pub use secret::{SecretString, REDACTED};
 pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
 pub use supervisor::{RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
 pub use transition::{next_state, LifecycleCommand, LifecycleError};

@@ -85,7 +85,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::ports::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
+    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec,
+    StopOutcome,
 };
 
 /// `STILL_ACTIVE` (259): the exit code a process reports while still running.
@@ -514,4 +515,25 @@ impl Drop for JobGuard {
 fn last_error() -> u32 {
     // SAFETY: GetLastError is always safe to call and has no preconditions.
     unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+/// Check the engine secrets file's permissions on Windows (story 2-4 AC6, spine
+/// AD-10/AD-4) — the OS-specific INSPECTION confined to `backends/`.
+///
+/// DECISION (Assumption 7, option B — documented portable skip): Unix mode bits do
+/// not exist on Windows, and a faithful DACL inspection (option A) needs `windows`
+/// ACL FFI that is over-scope for v1's tiny-secrets budget. So this does NOT
+/// attempt a Unix-style refusal: it returns `Ok(())` and relies on the DEFAULT
+/// per-user profile ACLs — the state dir lives under the user's profile
+/// (`%APPDATA%`/`%LOCALAPPDATA%` via the `directories` crate), which is
+/// per-user-protected by Windows by default. This is an HONEST boundary (documented
+/// in `docs/architecture.md`, NFR-6): it avoids a FALSE PASS masquerading as a
+/// Unix-grade check AND avoids a hard failure that would make secrets UNUSABLE on
+/// Windows. A future ACL-checking resolver can strengthen this behind the same
+/// port without a schema/API change. The `_path` is accepted for signature
+/// symmetry with the Unix backend.
+pub fn check_secrets_file_permissions(_path: &std::path::Path) -> Result<(), SecretError> {
+    // Portable skip (option B): Windows relies on default per-user profile ACLs.
+    // Never a false pass framed as a Unix-grade check; never a hard failure.
+    Ok(())
 }

@@ -47,6 +47,19 @@ pub fn current() -> Backend {
     Backend::new()
 }
 
+/// Check the engine secrets file's permissions for the running OS (story 2-4 AC6,
+/// spine AD-10). The OS-specific permission INSPECTION — Unix refuses a
+/// group/other-accessible (non-`0600`) file with a `chmod 600` remediation; Windows
+/// is a documented portable skip relying on default per-user profile ACLs (see the
+/// per-backend docs). This is the ONLY seam that reaches the per-OS check; the
+/// OS-agnostic file resolver ([`crate::ports::FileSecretResolver`]) calls THIS, so
+/// no `#[cfg]` leaks out of `backends/`. Re-exported cfg-selected exactly like
+/// [`Backend`].
+#[cfg(unix)]
+pub use unix::check_secrets_file_permissions;
+#[cfg(windows)]
+pub use windows::check_secrets_file_permissions;
+
 #[cfg(test)]
 mod tests {
     use super::*;

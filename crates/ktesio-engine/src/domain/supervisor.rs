@@ -213,7 +213,19 @@ impl Supervisor {
             .map_err(|e| config_to_engine(&name, e))?;
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
-        adapter::apply_config_mapping(&mut launch, &mapping, &effective, &home)
+        // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
+        // the mapping application (story 2-4, spine AD-10, AC-A/AC9). This is where
+        // display and delivery DIVERGE: `effective`'s `display()`-based surfaces
+        // (the snapshot at (2c), `config get`) stay MASKED, but the resolved
+        // cleartext flows into `apply_config_mapping` so the ADAPTER gets a usable
+        // key. Resolution (env → the 0600 secrets file) runs here, still before any
+        // persisted state change, so an unresolved/ill-permissioned secret REJECTS
+        // the start cleanly (no half-launch, mirroring the config-apply + snapshot
+        // failures) — a typed `EngineError::Secret` that NEVER echoes a value.
+        let secrets = registry
+            .resolve_secrets(&effective)
+            .map_err(|e| secret_to_engine(&name, e))?;
+        adapter::apply_config_mapping(&mut launch, &mapping, &effective, &secrets, &home)
             .map_err(|e| config_apply_to_engine(&name, e))?;
 
         // (2c) Persist the effective-config snapshot into the Agent Home (story
@@ -1106,6 +1118,19 @@ fn snapshot_to_engine(err: super::error::RegistryError) -> EngineError {
     }
 }
 
+/// Map a SECRET-resolution failure (story 2-4) into the lifecycle [`EngineError`].
+/// The resolution runs BEFORE the config mapping + the `starting` transition, so a
+/// failure here rejects the start with no state change (mirroring
+/// [`snapshot_to_engine`]). The [`SecretError`] message names the `NAME` + the
+/// resolvers tried (or the `chmod 600` remediation) but NEVER a resolved value, so
+/// mapping it into [`EngineError::Secret`]'s `detail` cannot leak a secret (AC-B).
+fn secret_to_engine(name: &InstanceName, err: crate::ports::SecretError) -> EngineError {
+    EngineError::Secret {
+        name: name.as_str().to_string(),
+        detail: err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,6 +1302,7 @@ mod tests {
             &mut launch,
             &mapping,
             &effective,
+            &std::collections::BTreeMap::new(),
             &registry.agent_home(&name),
         )
         .unwrap();
@@ -1324,6 +1350,107 @@ mod tests {
         );
         // Teardown.
         let _ = sup.stop(&registry, "flg", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn secret_leaf_delivers_cleartext_to_the_adapter_but_masks_snapshot_and_events() {
+        // Story 2-4 (AC-A/AC9 delivery + AC-B no-leak, engine level). A
+        // `model = secret:NAME` leaf resolves (env resolver) to a sentinel; the
+        // spawned agent's argv carries the CLEARTEXT (usable), while the persisted
+        // snapshot AND every transition event carry the MASK, never the sentinel.
+        // Uses a UNIQUE env-var name to avoid racing sibling in-process tests.
+        const SENTINEL: &str = "s3cr3t-engine-sentinel-abc";
+        let env_key = "KTESIO_SUP_SECRET_TEST_KEY";
+        let prev = std::env::var_os(env_key);
+        std::env::set_var(env_key, SENTINEL);
+
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("argv.txt");
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "sekeng",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+            "[config.model]\nflag = \"--model\"\n",
+        );
+        let name = InstanceName::new("sekeng").unwrap();
+        registry
+            .set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "sekeng").unwrap();
+        assert_eq!(state_of(&registry, "sekeng"), LifecycleState::Running);
+
+        // (POSITIVE) the spawned process argv carries the resolved CLEARTEXT.
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == format!("arg={SENTINEL}")),
+            "the resolved secret cleartext must reach the process argv; dump=\n{dumped}"
+        );
+
+        // (NO-LEAK) the persisted snapshot masks the secret.
+        let snapshot = std::fs::read_to_string(registry.paths().effective_config_snapshot(&name))
+            .expect("snapshot written");
+        assert!(
+            !snapshot.contains(SENTINEL),
+            "the snapshot leaked the secret:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("secret:****"),
+            "snapshot must mask; {snapshot}"
+        );
+
+        // (NO-LEAK) no transition event payload carries the sentinel (AD-14).
+        let events = Supervisor::read_events(&registry, "sekeng").unwrap();
+        let events_json = serde_json::to_string(&events).unwrap();
+        assert!(
+            !events_json.contains(SENTINEL),
+            "a transition event leaked the secret:\n{events_json}"
+        );
+
+        // Teardown + restore env.
+        let _ = sup.stop(&registry, "sekeng", Some(Duration::from_millis(200)));
+        match prev {
+            Some(v) => std::env::set_var(env_key, v),
+            None => std::env::remove_var(env_key),
+        }
+    }
+
+    #[test]
+    fn unresolved_secret_rejects_start_before_any_state_change() {
+        // Story 2-4 (AC5/AC9, engine level): a `secret:NAME` unresolved by env AND
+        // the (absent) secrets file rejects the start with a typed EngineError::Secret
+        // that NEVER echoes a value, leaving the instance in its PRIOR state and NO
+        // snapshot written. The env var is deliberately unset.
+        let env_key = "KTESIO_SUP_DEFINITELY_UNSET_SECRET_KEY_XYZ";
+        std::env::remove_var(env_key);
+        let (_state, _manifest, registry) = setup_fake("noresolve_eng", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("noresolve_eng").unwrap();
+        registry
+            .set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+        let prior = state_of(&registry, "noresolve_eng");
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start(&registry, "noresolve_eng").unwrap_err();
+        match &err {
+            EngineError::Secret { name: n, detail } => {
+                assert_eq!(n, "noresolve_eng");
+                // Names the NAME + resolvers, NEVER a value.
+                assert!(detail.contains(env_key), "detail must name NAME; {detail}");
+            }
+            other => panic!("expected EngineError::Secret, got {other:?}"),
+        }
+        // Prior state preserved; no snapshot written (rejected before both).
+        assert_eq!(state_of(&registry, "noresolve_eng"), prior);
+        assert!(
+            !registry.paths().effective_config_snapshot(&name).exists(),
+            "an unresolved secret must reject before the snapshot write"
+        );
     }
 
     #[test]

@@ -257,6 +257,22 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// A `secret:NAME` config reference could not be RESOLVED at start (story 2-4,
+    /// spine AD-10, FR-14). The resolution runs BEFORE the config mapping + the
+    /// `starting` transition, so a failure FAILS the start cleanly — the instance
+    /// stays in its prior state, NO half-launch (mirroring the snapshot-write
+    /// failure). `detail` carries the underlying [`crate::ports::SecretError`]
+    /// message, which names the `NAME` + the resolvers tried (or the `chmod 600`
+    /// remediation) but NEVER a resolved secret VALUE (NFR-6). Names the instance.
+    #[error("could not resolve a secret for Agent Instance '{name}': {detail}")]
+    Secret {
+        /// The instance whose secret failed to resolve.
+        name: String,
+        /// The underlying secret-resolution detail (names the NAME + resolvers +
+        /// remediation, never a value).
+        detail: String,
+    },
+
     /// A per-instance log I/O operation failed (AD-12 seed). Names the path.
     #[error("could not write the instance log for '{name}' at {path}: {detail}")]
     Log {

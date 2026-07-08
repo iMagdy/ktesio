@@ -30,9 +30,19 @@
 //!   2-1 only reserves the `agent.*` pass-through namespace + honors the bypass.
 //! * Provenance RENDERING + the persisted `EffectiveConfig` snapshot — **2-3
 //!   (FR-13)**. 2-1 only leaves the [`SourceLayer`] seam.
-//! * SECRETS (`secret:` resolvers, `SecretString`, masking) — **2-4 (FR-14,
-//!   AD-10)**. A `secret:`-prefixed value is an ORDINARY opaque string here that
-//!   round-trips untouched; this module builds NONE of the secret machinery.
+//!
+//! ## SECRETS masking lives here now (story 2-4, FR-14, AD-10)
+//!
+//! A `secret:NAME`-prefixed leaf VALUE is classified by [`is_secret_ref`] /
+//! [`secret_name`] (beside [`is_pass_through`] / [`pass_through_tail`], same
+//! non-empty-child discipline) and MASKED by [`ResolvedValue::display`] — the ONE
+//! render path the human table, `config get --json`, AND the persisted
+//! `effective-config.json` snapshot all share (2-3 AC8), so this single choke
+//! point masks all three at once. Resolution (env + the 0600 secrets file) lives
+//! in [`super::super::ports`] / the supervisor, not here: this module stays I/O-free
+//! and only CLASSIFIES + MASKS. The resolved cleartext reaches the adapter through
+//! the supervisor's start seam ([`super::supervisor`]) via
+//! [`super::secret::SecretString::expose_secret`] — display and delivery diverge.
 //!
 //! The on-disk layer plumbing (loading the instance `config.toml`, the embedded
 //! engine defaults, writing a key) lives alongside the registry under path
@@ -50,6 +60,29 @@ use toml::Value;
 /// FR-12). Recorded decision: the exact prefix is `agent.` (a dotted segment, so
 /// a key named exactly `agent` — with no child — is NOT pass-through).
 pub const PASS_THROUGH_PREFIX: &str = "agent.";
+
+/// The reserved SECRET-reference prefix (spine AD-10's `secret:NAME`), story 2-4
+/// (FR-14, AC4). A resolved leaf VALUE whose string form begins with this prefix
+/// followed by a NON-empty `NAME` is secret-classified: it is RESOLVED (env → the
+/// 0600 secrets file) to a [`super::secret::SecretString`] at start and MASKED
+/// everywhere it is displayed/logged/serialized. Recorded decision (Assumption 1):
+/// the prefix is `secret:` and a bare `secret:` with NO name is NOT a secret
+/// reference — it is ordinary opaque text (mirroring how a bare `agent` is not
+/// pass-through). `NAME` is the lookup key handed to the resolver, not the secret,
+/// so it MAY remain visible; the VALUE never is.
+pub const SECRET_PREFIX: &str = "secret:";
+
+/// The fixed masked rendering a secret-classified leaf shows in every display
+/// surface (the human table, `config get --json`, and the persisted
+/// `effective-config.json` snapshot), story 2-4 (AC8). Recorded decision
+/// (Assumption 8): a fixed token that HIDES the value while still signaling "a
+/// secret is here". It deliberately does NOT echo the resolved cleartext; the
+/// `NAME` is not shown either (the mask is value-independent), so two different
+/// secret leaves render identically. The SOLE un-mask is the `--reveal` read flag
+/// (AC-C), which never routes through this method. Kept distinct from
+/// [`super::secret::REDACTED`] (the `SecretString` `Display`/`Debug` token) only in
+/// spelling — both communicate "redacted".
+pub const SECRET_MASK: &str = "secret:****";
 
 /// The Levenshtein distance threshold for the nearest-valid-key suggestion
 /// (AC-B / AC6). A candidate is only suggested when its edit distance to the
@@ -183,17 +216,29 @@ impl ResolvedValue {
     /// dependency — AD-2 keeps the engine the sole owner of the config TOML
     /// crate). A string renders as its bare contents (`gpt-4`, no quotes); every
     /// other scalar/array uses TOML's own inline form (`42`, `true`,
-    /// `["a", "b"]`). A `secret:` value renders as-is (opaque text in 2-1;
-    /// masking is Epic 2.4 — and 2-1 resolves no real secret to leak).
+    /// `["a", "b"]`).
+    ///
+    /// SECRET MASKING (story 2-4, AC8 — the single choke point): a
+    /// secret-classified string value ([`is_secret_ref`], i.e. `secret:NAME`)
+    /// renders as the fixed [`SECRET_MASK`], NEVER as-is and never as the resolved
+    /// cleartext. Because 2-3 routed the human table, `config get --json`, AND the
+    /// persisted `effective-config.json` snapshot through THIS one method, masking
+    /// here masks all three at once (no per-surface branch). The `--reveal` read
+    /// (AC-C) is the SOLE un-mask and does NOT go through `display()`; the adapter
+    /// delivery path (AC9) reaches the real cleartext via
+    /// [`super::secret::SecretString::expose_secret`], not here — display and
+    /// delivery deliberately diverge.
     pub fn display(&self) -> String {
         display_value(&self.value)
     }
 }
 
 /// Render a resolved [`toml::Value`] leaf for human/plain output (see
-/// [`ResolvedValue::display`]).
+/// [`ResolvedValue::display`]). A secret-classified string ([`is_secret_ref`])
+/// masks to [`SECRET_MASK`] (story 2-4, AC8) — the ONE place the mask is applied.
 fn display_value(value: &Value) -> String {
     match value {
+        Value::String(s) if is_secret_ref(s) => SECRET_MASK.to_string(),
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
@@ -466,6 +511,33 @@ pub fn pass_through_tail(key: &str) -> Option<&str> {
         .filter(|rest| !rest.is_empty())
 }
 
+/// Whether a resolved leaf VALUE is a `secret:NAME` reference (story 2-4, AC4).
+/// A value is secret-classified iff its string form begins with [`SECRET_PREFIX`]
+/// followed by a NON-empty `NAME` — mirroring [`is_pass_through`]'s non-empty-child
+/// rule (a bare `secret:` with no name is NOT a secret reference; recorded
+/// Assumption 1). This ONE predicate governs BOTH resolution (at start, in the
+/// supervisor) and masking (at display, in [`ResolvedValue::display`]), so the two
+/// can never disagree — a value is secret for masking exactly when it is secret for
+/// resolution. Operates on the VALUE string (not a key); the classified value's
+/// key is irrelevant (a `secret:` under `model` classifies exactly like one under
+/// `agent.foo`).
+pub fn is_secret_ref(value: &str) -> bool {
+    value
+        .strip_prefix(SECRET_PREFIX)
+        .is_some_and(|name| !name.is_empty())
+}
+
+/// The secret NAME: the lookup key AFTER the `secret:` prefix (story 2-4, AC4/AC5).
+/// Returns `Some("OPENAI_KEY")` for `secret:OPENAI_KEY`, `None` for a non-secret or
+/// bare-`secret:` value. This is the key the [`super::super::ports::SecretResolver`]
+/// looks up (env var name / secrets-file key). Reuses [`is_secret_ref`]'s
+/// non-empty-child rule, so it is the exact mirror of [`pass_through_tail`].
+pub fn secret_name(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(SECRET_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
 /// Validate a config WRITE at write time (spine AD-9, AC-B / AC6 / AC7), BEFORE
 /// anything is persisted — a rejected write must leave the instance config
 /// byte-unchanged (the caller enforces the "validate then persist" ordering; this
@@ -480,9 +552,12 @@ pub fn pass_through_tail(key: &str) -> Option<&str> {
 /// than suggesting nonsense).
 ///
 /// `_value` is accepted for signature-completeness (the write API passes it) but
-/// is NOT inspected here: 2-1 validates the KEY namespace only. In particular a
-/// `secret:`-prefixed VALUE is an ordinary opaque string in 2-1 (secrets are 2-4,
-/// AD-10) — this function neither resolves nor rejects it.
+/// is NOT inspected here: validation is the KEY namespace only. In particular a
+/// `secret:NAME` VALUE is stored verbatim as an ordinary TOML string — write-time
+/// validation neither resolves nor rejects it (story 2-4 resolves + masks a
+/// `secret:` value at START and DISPLAY, not at write; the reference is what is
+/// persisted, AD-10). So a `set model secret:OPENAI_KEY` is accepted here exactly
+/// like any other known-key write.
 ///
 /// A key with an EMPTY dotted segment (`agent..b`, `agent.foo.`, `.x`, a bare
 /// `.`) is rejected up front (review patch #5): an empty segment would otherwise
@@ -639,6 +714,20 @@ pub enum ConfigError {
         /// The instance the operation was for.
         name: String,
         /// The underlying store error detail.
+        detail: String,
+    },
+
+    /// A `secret:NAME` reference could not be REVEALED for a `config get --reveal`
+    /// read (story 2-4, AC-C/AC11). The `--reveal` flag re-resolves secrets LIVE
+    /// through the resolver; a resolution failure here is a DIAGNOSTIC on the read
+    /// surface (stderr, non-zero exit), NEVER a crash and NEVER a leak — `detail`
+    /// carries the [`crate::ports::SecretError`] message, which names the `NAME` +
+    /// resolvers tried but no value. Kept on the config-surface error so `kt`'s
+    /// `config get` maps it consistently with the other config diagnostics.
+    #[error("could not reveal a secret for the config read: {detail}")]
+    SecretReveal {
+        /// The underlying secret-resolution detail (names the NAME + resolvers,
+        /// never a value).
         detail: String,
     },
 }
@@ -1029,6 +1118,82 @@ mod tests {
         assert_eq!(eff.value_display("nope"), None);
     }
 
+    // ---- Story 2-4: the secret:NAME classifier + extractor (AC4) ----
+
+    #[test]
+    fn is_secret_ref_requires_the_prefix_and_a_non_empty_name() {
+        // A `secret:NAME` with a non-empty NAME classifies; a bare `secret:` does
+        // NOT (Assumption 1 — ordinary opaque text, mirroring a bare `agent`);
+        // a value without the prefix never classifies.
+        assert!(is_secret_ref("secret:OPENAI_KEY"));
+        assert!(is_secret_ref("secret:A")); // a single-char name is enough
+        assert!(!is_secret_ref("secret:")); // bare prefix, no name → not a secret
+        assert!(!is_secret_ref("not-a-secret"));
+        assert!(!is_secret_ref("secretsomething")); // no colon → not the namespace
+        assert!(!is_secret_ref("")); // empty value
+                                     // The prefix must be at the START (a secret: mid-string is not a ref).
+        assert!(!is_secret_ref("model=secret:X"));
+    }
+
+    #[test]
+    fn secret_name_extracts_the_lookup_key_after_the_prefix() {
+        // secret_name is the mirror of pass_through_tail: Some(NAME) for a real
+        // reference, None for a bare prefix or a non-secret value.
+        assert_eq!(secret_name("secret:OPENAI_KEY"), Some("OPENAI_KEY"));
+        // A dotted / structured NAME is returned verbatim (the resolver's key).
+        assert_eq!(secret_name("secret:MY.KEY"), Some("MY.KEY"));
+        assert_eq!(secret_name("secret:"), None);
+        assert_eq!(secret_name("not-a-secret"), None);
+        assert_eq!(secret_name(""), None);
+    }
+
+    #[test]
+    fn is_secret_ref_classifies_by_value_regardless_of_key() {
+        // The classification is on the VALUE, not the key: a `secret:` value under
+        // the known key `model` classifies exactly like one under `agent.foo`, so
+        // resolution + masking agree wherever the reference sits.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "model = \"secret:MODEL_KEY\"\n[agent]\ntoken = \"secret:TOK\"\n",
+        ));
+        assert!(is_secret_ref(eff.value("model").unwrap().as_str().unwrap()));
+        assert!(is_secret_ref(
+            eff.value("agent.token").unwrap().as_str().unwrap()
+        ));
+    }
+
+    // ---- Story 2-4: display() masks a secret-classified value (AC8) ----
+
+    #[test]
+    fn display_masks_a_secret_classified_value_at_the_single_choke_point() {
+        // AC8: a `secret:NAME` leaf renders as the fixed SECRET_MASK through the ONE
+        // display path (value_display + ResolvedValue::display), NOT as the
+        // reference and NEVER as cleartext. A non-secret leaf is unchanged.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "key = \"secret:OPENAI_KEY\"\nmodel = \"gpt-4\"\nn = 42\n",
+        ));
+        // The secret leaf masks (via value_display AND the ResolvedValue method).
+        assert_eq!(eff.value_display("key").as_deref(), Some(SECRET_MASK));
+        assert_eq!(eff.get("key").unwrap().display(), SECRET_MASK);
+        // The mask never contains the NAME's value nor the word cleartext.
+        assert!(!eff
+            .value_display("key")
+            .unwrap()
+            .contains("OPENAI_KEY_VALUE"));
+        // Non-secret leaves are UNCHANGED (regression guard for the 2-1 renderer).
+        assert_eq!(eff.value_display("model").as_deref(), Some("gpt-4"));
+        assert_eq!(eff.value_display("n").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn display_does_not_mask_a_bare_secret_prefix_value() {
+        // A bare `secret:` (no NAME) is NOT a secret reference (Assumption 1), so it
+        // renders as-is opaque text, NOT the mask.
+        let eff = resolve(one_layer(SourceLayer::Instance, "key = \"secret:\"\n"));
+        assert_eq!(eff.value_display("key").as_deref(), Some("secret:"));
+    }
+
     #[test]
     fn source_label_reports_the_winning_layer_for_each_leaf() {
         // Story 2-3 (FR-13): the provenance accessor `kt` renders. A leaf resolved
@@ -1183,8 +1348,9 @@ mod tests {
 
     #[test]
     fn validate_write_does_not_inspect_the_value_secret_is_opaque() {
-        // 2-1 validates the KEY only; a `secret:` VALUE is opaque text here (2-4
-        // owns resolution/masking). A known key with a secret: value is accepted.
+        // validate_write checks the KEY only; a `secret:` VALUE is stored verbatim
+        // (story 2-4 resolves + masks it at START/DISPLAY, not at write time). A
+        // known key with a secret: value is accepted.
         assert!(validate_write("model", "secret:OPENAI_KEY").is_ok());
     }
 

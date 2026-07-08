@@ -143,7 +143,10 @@ Details:
   overrides the same key at the kind/engine-default layer, every time (FR-11);
   each value names its source layer (a Source column, or a source field with
   --json), and starting an instance persists an effective-config snapshot in the
-  Agent Home. Removing a running instance requires --force.
+  Agent Home. A secret:NAME value is resolved from the environment or the engine
+  secrets file at start and delivered to the agent, but is MASKED in config get,
+  the snapshot, logs, and events (FR-14); config get --reveal is the sole way to
+  print it unmasked. Removing a running instance requires --force.
 
 Examples:
   kt agent register demo --kind mock
@@ -156,9 +159,11 @@ Examples:
   kt agent list
   kt agent list --json
   kt agent config set demo model gpt-4
+  kt agent config set demo agent.api_key secret:OPENAI_KEY
   kt agent config get demo
   kt agent config get demo model
   kt agent config get demo --json
+  kt agent config get demo --reveal
   kt agent remove demo --delete";
 
 #[derive(Parser)]
@@ -396,7 +401,8 @@ enum ConfigCommands {
         name: String,
         /// Config key (a known unified key, or an `agent.*` pass-through key)
         key: String,
-        /// Value to set (stored verbatim; `secret:` values are opaque in Epic 2.1)
+        /// Value to set (stored verbatim; a `secret:NAME` reference is resolved +
+        /// masked at start/read, FR-14 — the reference is what is stored here)
         value: String,
     },
     /// Get an Agent Instance's effective (resolved) config value(s) with per-value source
@@ -408,6 +414,13 @@ enum ConfigCommands {
         /// Emit the effective config (value + source layer per leaf) as JSON (FR-13)
         #[arg(long)]
         json: bool,
+        /// Reveal secret values unmasked (the SOLE explicit acknowledgment; FR-14).
+        /// Without it, `secret:` values are masked in both the table and --json.
+        /// Never un-masks the persisted snapshot, logs, or events. Re-resolves
+        /// secrets LIVE (env, then the secrets file) at read time, so a revealed
+        /// value may differ from what a running instance resolved at its start.
+        #[arg(long)]
+        reveal: bool,
     },
 }
 
@@ -504,9 +517,12 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 ConfigCommands::Set { name, key, value } => {
                     cli::agent::config_set(&name, &key, &value)
                 }
-                ConfigCommands::Get { name, key, json } => {
-                    cli::agent::config_get(&name, key.as_deref(), json)
-                }
+                ConfigCommands::Get {
+                    name,
+                    key,
+                    json,
+                    reveal,
+                } => cli::agent::config_get(&name, key.as_deref(), json, reveal),
             },
         },
         None => {

@@ -68,7 +68,7 @@ pub use domain::{
     EngineError, FleetEntry, FleetListing, InstanceName, LifecycleCommand, LifecycleError,
     LifecycleState, MeteringSeed, NameError, Registry, RegistryError, RemoveDisposition,
     ResolvedValue, RestartPolicy, SourceLayer, TransitionCause, TransitionEvent,
-    EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, PASS_THROUGH_PREFIX,
+    EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, PASS_THROUGH_PREFIX, SECRET_MASK,
 };
 pub use engine::{Blocking, Engine, InstanceStatus};
 

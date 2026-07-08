@@ -20,7 +20,7 @@ use ktesio_adapter_api::{
 
 use crate::adapter::{self, AdapterRef, ResolvedAdapter};
 use crate::paths::EnginePaths;
-use crate::ports::{SpawnRecord, StateStore, StoreError};
+use crate::ports::{CompositeSecretResolver, SecretError, SpawnRecord, StateStore, StoreError};
 use crate::store::SqliteStore;
 use crate::time::now_rfc3339;
 
@@ -30,6 +30,7 @@ use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
 use super::restart::RestartPolicy;
+use super::secret::SecretString;
 
 /// The engine-owned DEFAULTS layer (spine AD-9 layer 1), story 2-1.
 ///
@@ -116,9 +117,11 @@ const EFFECTIVE_CONFIG_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 ///
 /// The `value` is the [`ResolvedValue::display`] string — the SAME single
 /// display path the human `config get` table and `config get --json` render
-/// (AC8): routing every surface through `display()` keeps the 2-4 masking seam to
-/// ONE choke point. `source` is the kebab-case [`SourceLayer`] wire label (its
-/// serde form). A `secret:` value is opaque text here (masking is 2-4).
+/// (AC8): routing every surface through `display()` keeps the story-2-4 masking
+/// seam to ONE choke point, so a `secret:NAME` value is MASKED (`secret:****`) in
+/// this persisted snapshot exactly as in `config get` (never the cleartext — the
+/// resolved secret reaches only the adapter, FR-14). `source` is the kebab-case
+/// [`SourceLayer`] wire label (its serde form).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct EffectiveConfigEntry {
     /// The dotted leaf key (`model`, `agent.tools.web_search`, …).
@@ -700,8 +703,9 @@ impl Registry {
     /// like `restart.policy` writes the right nested table and existing siblings
     /// survive) and the whole instance layer is re-serialized to disk through path
     /// authority. Pass-through (`agent.*`) keys round-trip verbatim (AC7); the
-    /// value is stored as an ordinary TOML STRING (a `secret:` value is opaque
-    /// text in 2-1 — secrets are 2-4).
+    /// value is stored as an ordinary TOML STRING — a `secret:NAME` REFERENCE is
+    /// what is persisted here (story 2-4 resolves + masks it at start/read, FR-14;
+    /// this write neither resolves nor echoes a secret).
     pub(crate) fn set_config(
         &self,
         name: &InstanceName,
@@ -770,6 +774,79 @@ impl Registry {
             detail: source.to_string(),
         })?;
         Ok(())
+    }
+
+    /// Resolve every `secret:NAME` leaf in an already-resolved effective config
+    /// into a cleartext [`SecretString`], keyed by dotted leaf key (story 2-4, spine
+    /// AD-10, AC-A/AC5/AC9). The engine is the path authority, so it builds the
+    /// composite resolver (env → the 0600 secrets file at
+    /// [`EnginePaths::secrets_file`]) HERE and resolves each secret-classified leaf
+    /// (identified by [`config::is_secret_ref`] on the leaf's underlying string
+    /// value, using [`config::secret_name`] for the lookup key).
+    ///
+    /// A leaf that is NOT a `secret:` reference contributes nothing to the map (it
+    /// is delivered via its plain `display()`). A `secret:NAME` that resolves in
+    /// NEITHER resolver is a hard [`SecretError`] the caller maps to a
+    /// start-rejecting [`EngineError::Secret`] (no half-launch). The returned map is
+    /// consumed by [`crate::adapter::apply_config_mapping`], which places
+    /// `expose_secret()` (the REAL cleartext) into the adapter's native mechanism —
+    /// so the SAME leaf renders MASKED via `display()` (the snapshot/`config get`)
+    /// while delivering cleartext to the agent (display and delivery diverge, AC9).
+    ///
+    /// `kt` never calls this — it reads rendered (masked or `--reveal`ed) strings
+    /// (AD-2). The resolved secrets are transient (resolved at start, handed to the
+    /// adapter, dropped) and NEVER persisted by the engine except into the agent's
+    /// own native config file it needs to run (the accepted FR-2 boundary, AC9).
+    pub(crate) fn resolve_secrets(
+        &self,
+        effective: &EffectiveConfig,
+    ) -> Result<std::collections::BTreeMap<String, SecretString>, SecretError> {
+        let resolver = CompositeSecretResolver::env_then_file(self.paths.secrets_file());
+        let mut resolved = std::collections::BTreeMap::new();
+        for (key, value) in effective.iter() {
+            // Only a STRING leaf can be a secret reference; classify on its raw
+            // string (the same predicate masking uses, so the two never disagree).
+            let toml::Value::String(s) = &value.value else {
+                continue;
+            };
+            let Some(name) = config::secret_name(s) else {
+                continue;
+            };
+            let secret = resolver.require(name)?;
+            resolved.insert(key.clone(), secret);
+        }
+        Ok(resolved)
+    }
+
+    /// Resolve secret leaves for a `--reveal` READ (story 2-4, AC-C/AC11): the
+    /// dotted key → REVEALED cleartext string for each `secret:NAME` leaf of the
+    /// instance's effective config, so the on-demand `config get --reveal` surface
+    /// can emit the real value. Resolves the effective config THEN reveals each
+    /// secret leaf's cleartext (LIVE re-resolution — Assumption 11). Mirrors
+    /// [`resolve_secrets`] but returns the exposed cleartext string directly (the
+    /// read path renders it; it is not handed to an adapter). `kt` never resolves
+    /// secrets itself — it asks the engine (AD-2).
+    ///
+    /// A resolution failure surfaces as [`ConfigError::SecretReveal`] the CLI turns
+    /// into a stderr diagnostic (never a crash). `--reveal` NEVER touches the
+    /// snapshot/logs/events (this is a read-only path — resolution here writes
+    /// nothing). Only the secret leaves are returned; a caller overlays them onto
+    /// the (masked) effective config, un-masking exactly the secret leaves.
+    pub(crate) fn reveal_secrets(
+        &self,
+        name: &InstanceName,
+        overrides: ConfigLayer,
+    ) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
+        let effective = self.effective_config(name, overrides)?;
+        let resolved = self
+            .resolve_secrets(&effective)
+            .map_err(|e| ConfigError::SecretReveal {
+                detail: e.to_string(),
+            })?;
+        Ok(resolved
+            .into_iter()
+            .map(|(key, secret)| (key, secret.expose_secret().to_string()))
+            .collect())
     }
 
     /// Confirm an instance is registered, returning it (for its kind) — mapping
@@ -1671,6 +1748,74 @@ source = "self-reported"
         let r = eff.get("model").unwrap();
         assert_eq!(r.value, toml::Value::String("gpt-4".into()));
         assert_eq!(r.source, SourceLayer::Instance);
+    }
+
+    #[test]
+    fn resolve_secrets_maps_only_secret_leaves_to_resolved_cleartext() {
+        // Story 2-4 (AC5/AC9): resolve_secrets returns the resolved cleartext for a
+        // `secret:NAME` leaf (env resolver) and IGNORES non-secret leaves. The
+        // effective config's display() still MASKS the secret leaf (delivery vs
+        // display diverge). Uses a unique env-var name (in-process env is global).
+        let env_key = "KTESIO_REG_SECRET_TEST_KEY";
+        let prev = std::env::var_os(env_key);
+        std::env::set_var(env_key, "resolved-cleartext");
+
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        reg.set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+        reg.set_config(&name, "agent.plain", "visible").unwrap();
+
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        // display() masks the secret leaf, leaves the plain leaf alone.
+        assert_eq!(eff.value_display("model").as_deref(), Some("secret:****"));
+        assert_eq!(eff.value_display("agent.plain").as_deref(), Some("visible"));
+
+        // resolve_secrets returns the CLEARTEXT for the secret leaf ONLY.
+        let secrets = reg.resolve_secrets(&eff).unwrap();
+        assert_eq!(
+            secrets.get("model").map(|s| s.expose_secret()),
+            Some("resolved-cleartext")
+        );
+        assert!(!secrets.contains_key("agent.plain"), "only secret leaves");
+
+        // reveal_secrets returns the same cleartext as plain strings for the read.
+        let revealed = reg.reveal_secrets(&name, ConfigLayer::empty()).unwrap();
+        assert_eq!(
+            revealed.get("model").map(String::as_str),
+            Some("resolved-cleartext")
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(env_key, v),
+            None => std::env::remove_var(env_key),
+        }
+    }
+
+    #[test]
+    fn resolve_secrets_unresolved_is_a_typed_error_naming_the_name() {
+        // A `secret:NAME` unresolved by env + the (absent) secrets file is a typed
+        // SecretError::Unresolved naming NAME + resolvers, NEVER a value; reveal
+        // surfaces it as ConfigError::SecretReveal.
+        let env_key = "KTESIO_REG_UNSET_SECRET_KEY_XYZ";
+        std::env::remove_var(env_key);
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        reg.set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+
+        let err = reg.resolve_secrets(&eff).unwrap_err();
+        assert!(err.to_string().contains(env_key), "names NAME: {err}");
+
+        // reveal surfaces the SecretReveal config error (a read diagnostic).
+        let rev_err = reg.reveal_secrets(&name, ConfigLayer::empty()).unwrap_err();
+        assert!(
+            matches!(rev_err, ConfigError::SecretReveal { .. }),
+            "got {rev_err:?}"
+        );
     }
 
     #[test]

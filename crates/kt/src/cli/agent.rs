@@ -582,8 +582,9 @@ fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &st
 /// anything is written (the on-disk config is byte-unchanged) and a miette
 /// diagnostic naming the offending key + the nearest valid key goes to STDERR
 /// with a non-zero exit. On success `ui::success` confirms to stdout. The value
-/// is stored verbatim (a `secret:` value is opaque text in 2-1 — masking is
-/// Epic 2.4; this command resolves no secret).
+/// is stored verbatim — a `secret:NAME` REFERENCE is what is persisted here
+/// (story 2-4 resolves + masks it at start/read, FR-14; this write neither
+/// resolves nor echoes a secret).
 pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     match engine.blocking().set_config(name, key, value) {
@@ -620,16 +621,38 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
 /// with any note on stderr. The 2-1/2-2 "provenance arrives in Epic 2.3" stderr
 /// note is RETIRED here (Decision 3) — the "Source" column now IS the provenance,
 /// so a residual deferral note would be false.
+///
+/// SECRETS (story 2-4, AC-C/AC11): `secret:NAME` values are MASKED by default (the
+/// engine's [`ResolvedValue::display`] masks them — `kt` renders whatever the
+/// engine hands it, AD-2). `--reveal` (`reveal == true`) is the SOLE un-mask: it
+/// asks the engine to re-resolve the secret leaves LIVE and overlays their
+/// cleartext into BOTH the human table and `--json` (Assumption 11 — symmetric). A
+/// reveal resolution failure is a stderr diagnostic (mapped from
+/// [`ConfigError::SecretReveal`]), never a crash; `--reveal` NEVER touches the
+/// snapshot/logs/events.
 pub fn config_get(
     name: &str,
     key: Option<&str>,
     json: bool,
+    reveal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
-    let effective = engine
-        .blocking()
+    let blocking = engine.blocking();
+    let effective = blocking
         .effective_config(name, ConfigLayer::empty())
         .map_err(map_config_error)?;
+
+    // With --reveal, ask the ENGINE for the resolved cleartext of the secret leaves
+    // (kt never resolves secrets itself, AD-2). A live-resolution failure surfaces
+    // as a stderr diagnostic (never a crash). Without --reveal, an empty overlay
+    // leaves every secret masked via the engine's display().
+    let revealed = if reveal {
+        blocking
+            .reveal_secrets(name, ConfigLayer::empty())
+            .map_err(map_config_error)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     match key {
         Some(key) => {
@@ -647,27 +670,41 @@ pub fn config_get(
             }
             if json {
                 // Emit just that one leaf as the same per-leaf object shape.
-                let document = config_json(&effective, Some(key))?;
+                let document = config_json(&effective, Some(key), &revealed)?;
                 println!("{document}");
             } else {
-                // Command result to stdout: just the effective value.
-                // (get() is Some here — checked above.)
-                if let Some(value) = effective.value_display(key) {
-                    println!("{value}");
-                }
+                // Command result to stdout: the effective value (revealed cleartext
+                // for a secret leaf under --reveal, else the masked display).
+                println!("{}", leaf_display(&effective, key, &revealed));
             }
             Ok(())
         }
         None => {
             if json {
                 // AC4/AD-12: the whole result is ONE JSON document to stdout.
-                let document = config_json(&effective, None)?;
+                let document = config_json(&effective, None, &revealed)?;
                 println!("{document}");
             } else {
-                render_effective_config(name, &effective);
+                render_effective_config(name, &effective, &revealed);
             }
             Ok(())
         }
+    }
+}
+
+/// The display string for one leaf, honoring a `--reveal` overlay (story 2-4). If
+/// `revealed` holds this key (a secret leaf under `--reveal`), its CLEARTEXT is
+/// shown; otherwise the engine's masked/plain `value_display` is used. The overlay
+/// only ever contains secret leaves the engine resolved, so a non-secret key is
+/// always the plain display.
+fn leaf_display(
+    effective: &EffectiveConfig,
+    key: &str,
+    revealed: &std::collections::BTreeMap<String, String>,
+) -> String {
+    match revealed.get(key) {
+        Some(cleartext) => cleartext.clone(),
+        None => effective.value_display(key).unwrap_or_default(),
     }
 }
 
@@ -677,7 +714,9 @@ pub fn config_get(
 /// `--json`; recorded Decision 4) — carrying each resolved leaf as
 /// `{ key, value, source, unvalidated }`: `value` is the rendered display string
 /// (the ONE display path shared with the human table + the persisted snapshot, so
-/// story 2-4 masks at a single choke point — AC8); `source` is the kebab-case
+/// story 2-4 masks a `secret:` value at this single choke point — AC8), OVERLAID
+/// with the engine-resolved cleartext for a secret leaf when `--reveal` is passed
+/// (AC-C — the sole un-mask of machine-readable output); `source` is the kebab-case
 /// [`ktesio_engine::SourceLayer`] wire label; `unvalidated` is the story-2-2
 /// pass-through marker (derived via the engine accessor, AD-2). When `only` is
 /// `Some(key)` the document carries just that one leaf (the single-key
@@ -721,15 +760,22 @@ struct ConfigDocument {
 fn config_json(
     effective: &EffectiveConfig,
     only: Option<&str>,
+    revealed: &std::collections::BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let entries: Vec<ConfigLeaf> = effective
         .iter()
         .filter(|(key, _)| only.is_none_or(|k| k == key.as_str()))
         .map(|(key, resolved)| ConfigLeaf {
             key: key.clone(),
-            // The engine renders the value (the ONE display path — AC8), so `kt`
-            // needs no `toml` dependency and 2-4 masks here (AD-2/AD-10).
-            value: resolved.display(),
+            // The engine renders the value (the ONE display path — AC8), which
+            // MASKS a secret by default, so `kt` needs no `toml` dep and cannot leak
+            // (AD-2/AD-10). `--reveal` overlays the engine-resolved cleartext for a
+            // secret leaf (AC-C) — the SOLE way machine-readable output carries an
+            // unmasked secret; a non-secret leaf is never in the overlay.
+            value: match revealed.get(key.as_str()) {
+                Some(cleartext) => cleartext.clone(),
+                None => resolved.display(),
+            },
             // The source layer is READ from the engine tag, never re-derived.
             source: resolved.source.as_str().to_string(),
             unvalidated: effective.is_unvalidated(key),
@@ -761,7 +807,15 @@ const VALIDATED_MARKER: &str = "validated";
 /// label (`engine-default` / `kind-default` / `instance` / `invocation-override`),
 /// read per leaf from the engine's `source` tag (AD-2: `kt` never re-derives it).
 /// An empty effective config prints a plain info line rather than an empty table.
-fn render_effective_config(name: &str, effective: &EffectiveConfig) {
+///
+/// `revealed` (story 2-4, AC-C) overlays the engine-resolved cleartext for a secret
+/// leaf under `--reveal`; without it (empty map) every `secret:` value stays masked
+/// via the engine's `display()`.
+fn render_effective_config(
+    name: &str,
+    effective: &EffectiveConfig,
+    revealed: &std::collections::BTreeMap<String, String>,
+) {
     let title = format!("Effective config for {name}");
     if effective.is_empty() {
         ui::info(format!("{title}: no config keys set"));
@@ -784,10 +838,15 @@ fn render_effective_config(name: &str, effective: &EffectiveConfig) {
             } else {
                 ui::TableCell::plain(VALIDATED_MARKER)
             };
+            // The engine renders the value (no `toml::Value` in `kt` — AD-2),
+            // masking a secret by default; --reveal overlays the resolved cleartext.
+            let value = match revealed.get(key.as_str()) {
+                Some(cleartext) => cleartext.clone(),
+                None => resolved.display(),
+            };
             vec![
                 ui::TableCell::skill(key.clone()),
-                // The engine renders the value (no `toml::Value` in `kt` — AD-2).
-                ui::TableCell::plain(resolved.display()),
+                ui::TableCell::plain(value),
                 marker,
                 // The source layer is READ from the engine tag (story 2-3, FR-13);
                 // `kt` never re-derives it (AD-2).
@@ -854,6 +913,17 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
             message: format!(
                 "State store error for Agent Instance '{name}': {detail}. The state database may \
                  be inaccessible."
+            ),
+        }
+        .into(),
+        // Story 2-4 (AC-C/AC11): `--reveal` re-resolved a secret and it failed
+        // (unset env var, ill-permissioned/absent secrets file). A read-surface
+        // DIAGNOSTIC (stderr, non-zero exit) — the detail names the NAME + the
+        // resolvers tried + a remediation, never a value.
+        ConfigError::SecretReveal { detail } => AgentConfig {
+            message: format!(
+                "{detail}. Set the environment variable, or add it to the engine secrets file \
+                 (chmod 600), then try --reveal again."
             ),
         }
         .into(),
@@ -1058,6 +1128,18 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Could not write the effective-config snapshot for '{name}' at '{path}': {detail}. \
                  Check directory permissions and available disk space, then start it again."
+            ),
+        }
+        .into(),
+        // Story 2-4 (AC-A/AC9): a `secret:NAME` reference could not be resolved at
+        // start (unset env var, ill-permissioned/absent secrets file). Resolution
+        // runs before the `starting` transition, so the instance stays in its prior
+        // state; the detail names the NAME + resolvers + a remediation, never a
+        // value (NFR-6).
+        EngineError::Secret { name, detail } => AgentConfig {
+            message: format!(
+                "Agent Instance '{name}' could not start: {detail}. Nothing was changed; set the \
+                 secret and start it again."
             ),
         }
         .into(),
@@ -1376,7 +1458,7 @@ mod tests {
         // instance-sourced + validated; the agent.* leaf is engine-sourced +
         // unvalidated. Values render via the ONE display path (bare strings).
         let eff = sample_effective();
-        let doc = config_json(&eff, None).unwrap();
+        let doc = config_json(&eff, None, &std::collections::BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(value["schema_version"], serde_json::json!(1));
         let entries = value["entries"].as_array().unwrap();
@@ -1397,7 +1479,7 @@ mod tests {
         // The single-key `config get <name> <key> --json` form emits exactly one
         // leaf, sourced + rendered identically to the whole-config form.
         let eff = sample_effective();
-        let doc = config_json(&eff, Some("model")).unwrap();
+        let doc = config_json(&eff, Some("model"), &std::collections::BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         let entries = value["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -1416,7 +1498,7 @@ mod tests {
             ConfigLayer::parse(SourceLayer::Instance, "<i>", "n = 42\narr = [1, 2]\n").unwrap(),
             ConfigLayer::empty(),
         ]);
-        let doc = config_json(&eff, None).unwrap();
+        let doc = config_json(&eff, None, &std::collections::BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         let entries = value["entries"].as_array().unwrap();
         let n = entries.iter().find(|e| e["key"] == "n").unwrap();
@@ -1453,15 +1535,78 @@ mod tests {
             blocking.set_config("demo", "agent.flag", "on").unwrap();
         }
         // Whole-config: human + JSON. Single-key: human + JSON.
-        config_get("demo", None, false).unwrap();
-        config_get("demo", None, true).unwrap();
-        config_get("demo", Some("model"), false).unwrap();
-        config_get("demo", Some("model"), true).unwrap();
+        config_get("demo", None, false, false).unwrap();
+        config_get("demo", None, true, false).unwrap();
+        config_get("demo", Some("model"), false, false).unwrap();
+        config_get("demo", Some("model"), true, false).unwrap();
         // A not-set key is a non-zero (Err) diagnostic in both modes.
-        assert!(config_get("demo", Some("missing"), false).is_err());
-        assert!(config_get("demo", Some("missing"), true).is_err());
+        assert!(config_get("demo", Some("missing"), false, false).is_err());
+        assert!(config_get("demo", Some("missing"), true, false).is_err());
         unsafe {
             std::env::remove_var("KTESIO_STATE_DIR");
+        }
+    }
+
+    #[test]
+    fn config_get_reveal_overlays_resolved_cleartext_in_process() {
+        // Story 2-4 (AC-C): cover the `--reveal` paths in-process — the reveal
+        // overlay (`leaf_display`, `config_json` + `render_effective_config` with a
+        // non-empty overlay) and the `leaf_display` fallback. Sets a secret env var
+        // so the engine resolves it. Holds the shared env lock (mutates
+        // KTESIO_STATE_DIR + the secret env var).
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sentinel = "s3cr3t-inproc-reveal";
+        let secret_key = "KTESIO_INPROC_REVEAL_KEY";
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+            std::env::set_var(secret_key, sentinel);
+        }
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            let blocking = engine.blocking();
+            blocking.register("sec", "mock").unwrap();
+            blocking
+                .set_config("sec", "model", &format!("secret:{secret_key}"))
+                .unwrap();
+            blocking
+                .set_config("sec", "agent.plain", "visible")
+                .unwrap();
+
+            // reveal_secrets returns the resolved cleartext for the secret leaf only.
+            let revealed = blocking
+                .reveal_secrets("sec", ktesio_engine::ConfigLayer::empty())
+                .unwrap();
+            assert_eq!(revealed.get("model").map(String::as_str), Some(sentinel));
+            assert!(!revealed.contains_key("agent.plain"), "only secret leaves");
+        }
+        // The reveal render paths run without error (whole + single-key, human +
+        // JSON), and the default (masked) paths too.
+        config_get("sec", None, true, true).unwrap(); // --json --reveal (whole)
+        config_get("sec", None, false, true).unwrap(); // human --reveal (whole)
+        config_get("sec", Some("model"), true, true).unwrap(); // single-key reveal
+        config_get("sec", Some("model"), false, true).unwrap(); // single-key human reveal
+        config_get("sec", None, true, false).unwrap(); // default masked --json
+
+        // leaf_display: revealed overlay wins; absent key falls back to display().
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let eff = engine
+            .blocking()
+            .effective_config("sec", ktesio_engine::ConfigLayer::empty())
+            .unwrap();
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert("model".to_string(), sentinel.to_string());
+        assert_eq!(leaf_display(&eff, "model", &overlay), sentinel);
+        // A non-overlaid secret leaf falls back to the masked display().
+        assert_eq!(
+            leaf_display(&eff, "model", &std::collections::BTreeMap::new()),
+            ktesio_engine::SECRET_MASK
+        );
+
+        unsafe {
+            std::env::remove_var("KTESIO_STATE_DIR");
+            std::env::remove_var(secret_key);
         }
     }
 

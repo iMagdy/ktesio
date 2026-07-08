@@ -2024,3 +2024,437 @@ fn config_get_persists_effective_config_snapshot_at_start() {
     assert_eq!(model["value"], serde_json::json!("gpt-4o"));
     assert_eq!(model["source"], serde_json::json!("instance"));
 }
+
+// ============================================================================
+// Story 2-4: SECRETS — the no-leak guarantee (FR-14, NFR-6, AD-10).
+//
+// The sentinel cleartext used across the matrix. If it ever appears in a
+// no-leak surface (engine/instance log, event payload, config get --json, the
+// snapshot), the guarantee is broken. It DOES appear in the adapter's native
+// mechanism (the --dump file) and under `config get --reveal`.
+// ============================================================================
+
+const SECRET_SENTINEL: &str = "s3cr3t-sentinel-VALUE-xyz";
+
+/// A `kt` run with ONE extra environment variable set on the child (so the env
+/// SecretResolver can resolve `secret:NAME` at start). Mirrors `run_kt_agent` but
+/// adds `env(key, value)`; the child `kt` process inherits it, and the engine it
+/// spawns reads it via `std::env::var`. Local to the secret tests (the shared
+/// helper does not need a general env knob).
+fn run_kt_agent_env(
+    args: &[&str],
+    working_dir: &Path,
+    state_dir: &Path,
+    env_key: &str,
+    env_val: &str,
+) -> (bool, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(args)
+        .current_dir(working_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .env(env_key, env_val)
+        .output()
+        .expect("Failed to execute kt");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Write a `fake_agent` manifest that (a) dumps its received argv + env to
+/// `dump_path` at startup (`--dump`, the config-mapping observation point) and (b)
+/// maps the unified `model` key into the native env var `MODEL` (`[config.model]
+/// env = "MODEL"`). So a `model = "secret:NAME"` leaf, once resolved, lands in the
+/// child's `MODEL` env — captured in the dump as `env=MODEL=<cleartext>`.
+fn fake_agent_manifest_secret_env(dir: &Path, dump_path: &Path) -> std::path::PathBuf {
+    let m = dir.join("fake-agent-secret-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fake"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000", "--dump", {dump:?}]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config.model]
+env = "MODEL"
+"#,
+        exec = bin.to_string_lossy(),
+        dump = dump_path.to_string_lossy(),
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+/// Recursively collect the text of every file under `dir` into one string (for the
+/// no-leak sweep of an Agent Home / logs directory). Missing/binary files are
+/// skipped. Also returns each scanned path so a failure names WHERE a leak was.
+fn read_tree_text(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(read_tree_text(&path));
+        } else if let Ok(text) = std::fs::read_to_string(&path) {
+            out.push((path, text));
+        }
+    }
+    out
+}
+
+#[test]
+fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
+    // THE no-leak matrix (AC-B, the security heart of FR-14/NFR-6), end-to-end
+    // through the real `kt` binary:
+    //   - a `secret:MODEL_KEY` leaf resolves (env resolver) to a sentinel cleartext;
+    //   - the sentinel REACHES the adapter's native mechanism (env=MODEL=<sentinel>
+    //     in the --dump file) — the value is USABLE (AC9 delivery);
+    //   - the sentinel appears in NONE of: the persisted effective-config snapshot,
+    //     `config get --json`, the human `config get`, or ANY file in the Agent Home
+    //     (logs + event payloads included) — the MASK appears instead (AC-A/AC-B);
+    //   - `config get --json --reveal` DOES carry the sentinel (AC-C, the sole
+    //     un-mask), and the default `--json` carries the mask.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    // The dump file the agent writes its received env into (outside the state dir,
+    // so the no-leak Agent-Home sweep does not scan the intended-cleartext dump).
+    let dump = ctx.project_dir.join("agent-received.dump");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+
+    // Register + set `model = secret:MODEL_KEY` (the reference is what is stored).
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "sek",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register failed; stderr={}", reg.stderr);
+    let home = reg
+        .stdout
+        .lines()
+        .find(|l| l.contains("agents") && l.contains("sek"))
+        .expect("register stdout names the home")
+        .trim()
+        .to_string();
+    let set = run_kt_agent(
+        &["agent", "config", "set", "sek", "model", "secret:MODEL_KEY"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(set.success, "set failed; stderr={}", set.stderr);
+
+    // Start with MODEL_KEY set in the environment → the env resolver resolves the
+    // secret to the sentinel, which apply_config_mapping delivers into env MODEL.
+    let (ok, out, err) = run_kt_agent_env(
+        &["agent", "start", "sek"],
+        &ctx.project_dir,
+        state_dir,
+        "MODEL_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(ok, "start should succeed; stdout={out} stderr={err}");
+    // Neither start's stdout nor stderr may carry the sentinel.
+    assert!(
+        !out.contains(SECRET_SENTINEL),
+        "start stdout leaked the secret"
+    );
+    assert!(
+        !err.contains(SECRET_SENTINEL),
+        "start stderr leaked the secret"
+    );
+
+    // (POSITIVE) The sentinel REACHED the adapter's native env (the value is usable).
+    let dump_text = {
+        // The agent writes the dump at startup; poll briefly for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&dump) {
+                if t.contains("env=MODEL=") {
+                    break t;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent never wrote its dump at {dump:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    assert!(
+        dump_text.contains(&format!("env=MODEL={SECRET_SENTINEL}")),
+        "the resolved cleartext must reach the adapter's native env; dump=\n{dump_text}"
+    );
+
+    // (NO-LEAK) The persisted snapshot masks the secret (never the sentinel).
+    let snapshot_path = std::path::Path::new(&home).join("effective-config.json");
+    let snapshot = std::fs::read_to_string(&snapshot_path).unwrap();
+    assert!(
+        !snapshot.contains(SECRET_SENTINEL),
+        "the effective-config snapshot leaked the secret:\n{snapshot}"
+    );
+    assert!(
+        snapshot.contains("secret:****"),
+        "the snapshot must carry the mask; snapshot=\n{snapshot}"
+    );
+
+    // (NO-LEAK) Every file in the Agent Home — logs + event payloads included —
+    // is free of the sentinel. This is the log + event-payload half of AC-B.
+    for (path, text) in read_tree_text(std::path::Path::new(&home)) {
+        assert!(
+            !text.contains(SECRET_SENTINEL),
+            "the secret leaked into an Agent Home file: {path:?}\n{text}"
+        );
+    }
+
+    // (NO-LEAK) `config get --json` (default, no --reveal) masks the secret.
+    let get_json = run_kt_agent(
+        &["agent", "config", "get", "sek", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get_json.success,
+        "get --json failed; stderr={}",
+        get_json.stderr
+    );
+    assert!(
+        !get_json.stdout.contains(SECRET_SENTINEL),
+        "config get --json leaked the secret by default:\n{}",
+        get_json.stdout
+    );
+    assert!(
+        get_json.stdout.contains("secret:****"),
+        "config get --json must mask by default:\n{}",
+        get_json.stdout
+    );
+
+    // (NO-LEAK) The human `config get` table masks too (same display path).
+    let get_human = run_kt_agent(
+        &["agent", "config", "get", "sek"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !get_human.stdout.contains(SECRET_SENTINEL),
+        "the human config get leaked the secret:\n{}",
+        get_human.stdout
+    );
+
+    // (REVEAL) `config get --json --reveal` re-resolves LIVE and DOES carry the
+    // sentinel — the sole un-mask (AC-C). Needs MODEL_KEY in the env for the read.
+    let (rok, rout, rerr) = run_kt_agent_env(
+        &["agent", "config", "get", "sek", "--json", "--reveal"],
+        &ctx.project_dir,
+        state_dir,
+        "MODEL_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(rok, "get --reveal failed; stderr={rerr}");
+    let doc: serde_json::Value = serde_json::from_str(&rout)
+        .unwrap_or_else(|e| panic!("--reveal --json must be pure JSON: {e}; out={rout}"));
+    let model = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "model")
+        .expect("the model leaf is present");
+    assert_eq!(
+        model["value"],
+        serde_json::json!(SECRET_SENTINEL),
+        "--reveal must emit the unmasked cleartext; doc={doc}"
+    );
+}
+
+#[test]
+fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
+    // AC-C single-key form: `config get <name> <key> --json [--reveal]`. Default
+    // masks that one leaf; --reveal shows just its cleartext. A --reveal on a
+    // NON-secret leaf is a harmless no-op (the plain value).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let dump = ctx.project_dir.join("agent.dump");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "one",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register failed; stderr={}", reg.stderr);
+    // A secret leaf (agent.token) + a plain leaf (agent.mode).
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "one",
+            "agent.token",
+            "secret:TOKEN_KEY",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "one", "agent.mode", "fast"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // Default single-key --json masks the secret leaf.
+    let masked = run_kt_agent(
+        &["agent", "config", "get", "one", "agent.token", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(masked.success, "get failed; stderr={}", masked.stderr);
+    let d: serde_json::Value = serde_json::from_str(&masked.stdout).unwrap();
+    assert_eq!(d["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(d["entries"][0]["value"], serde_json::json!("secret:****"));
+
+    // --reveal on the single secret leaf shows only its cleartext.
+    let (rok, rout, _e) = run_kt_agent_env(
+        &[
+            "agent",
+            "config",
+            "get",
+            "one",
+            "agent.token",
+            "--json",
+            "--reveal",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        "TOKEN_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(rok, "reveal single-key failed");
+    let d: serde_json::Value = serde_json::from_str(&rout).unwrap();
+    assert_eq!(d["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(d["entries"][0]["value"], serde_json::json!(SECRET_SENTINEL));
+
+    // --reveal on a NON-secret leaf is a harmless no-op: the plain value.
+    let (pok, pout, _e) = run_kt_agent_env(
+        &[
+            "agent",
+            "config",
+            "get",
+            "one",
+            "agent.mode",
+            "--json",
+            "--reveal",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        "TOKEN_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(pok, "reveal on non-secret failed");
+    let d: serde_json::Value = serde_json::from_str(&pout).unwrap();
+    assert_eq!(d["entries"][0]["value"], serde_json::json!("fast"));
+}
+
+#[test]
+fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
+    // AC5/AC9: a `secret:NAME` that resolves in NEITHER env nor the (absent)
+    // secrets file REJECTS the start — non-zero exit, a stderr diagnostic naming the
+    // NAME (never a value), and the instance stays in its PRIOR state (the snapshot
+    // is not even written). The env var is deliberately NOT set.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let dump = ctx.project_dir.join("agent.dump");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "noresolve",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register failed; stderr={}", reg.stderr);
+    let home = reg
+        .stdout
+        .lines()
+        .find(|l| l.contains("agents") && l.contains("noresolve"))
+        .expect("register stdout names the home")
+        .trim()
+        .to_string();
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "noresolve",
+            "model",
+            "secret:DEFINITELY_UNSET_KEY_XYZ",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // Start WITHOUT the env var → unresolved → non-zero, diagnostic names the NAME.
+    let start = run_kt_agent(
+        &["agent", "start", "noresolve"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!start.success, "start must fail on an unresolved secret");
+    assert!(
+        start.stderr.contains("DEFINITELY_UNSET_KEY_XYZ"),
+        "the diagnostic must name the secret NAME; stderr={}",
+        start.stderr
+    );
+    // The instance stayed in its prior state: the snapshot was never written (the
+    // resolution failure rejects before the snapshot write + the `starting`
+    // transition).
+    let snapshot_path = std::path::Path::new(&home).join("effective-config.json");
+    assert!(
+        !snapshot_path.exists(),
+        "an unresolved secret must reject the start before the snapshot is written"
+    );
+    // And `agent list` still shows it as `registered` (never `running`/`failed`
+    // from a half-launch).
+    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(
+        list.stdout.contains("registered"),
+        "the instance must stay registered after a rejected start; list=\n{}",
+        list.stdout
+    );
+}
