@@ -50,6 +50,29 @@
 //!   var in the environment — WITHOUT racing on stdout capture. Pure `std`, NO
 //!   OS-cfg. (A FILE-target mapping is observed directly as a rendered file in the
 //!   Agent Home, so it needs no dump.)
+//! * `--emit-usage <N>` (story 3-1)  after announcing readiness, emit `<N>`
+//!   self-reported usage sentinel lines — `KTESIO_USAGE {json}` — on stdout, with
+//!   monotonic `sequence` 0..N and FIXED token sentinels (`input_tokens = 10`,
+//!   `output_tokens = 20` per event), spaced across the loop so the engine's reaper
+//!   ingests them into the Usage Ledger. This is the `self-reported` half of FR-19:
+//!   the engine parses these captured lines into UsageEvents. Determinism: the test
+//!   waits for the KNOWN number of committed rows (the DB is the source of truth),
+//!   NOT a wall-clock sleep. Pure `std`, NO OS-cfg (the parser + this emitter share
+//!   the documented convention; the OS-cfg gate covers this crate).
+//! * `--replay-usage` (story 3-1)  after the `--emit-usage` batch, re-emit
+//!   `sequence 0` ONCE (a DELAYED/replayed batch). The engine's ledger dedup must
+//!   recognize it and NOT double-count — the AC-A no-double-count proof.
+//! * `--usage-input-tokens <N>` / `--usage-output-tokens <N>` (story 3-1)  override
+//!   the FIXED per-event token sentinels so a test can emit an arbitrary value —
+//!   notably `u64::MAX` — to prove the storage boundary SATURATE-CLAMPS the `u64`
+//!   into SQLite's signed `i64` column (a positive `i64::MAX`) rather than a raw
+//!   `as i64` that bit-wraps NEGATIVE and poisons the billing SUM (the C1/C2
+//!   boundary). Default to the fixed sentinels when absent.
+//! * `--final-usage-no-newline` (story 3-1)  after the batch (+ any replay), emit
+//!   ONE more usage line WITHOUT a trailing newline (`sequence = emit_usage`), then
+//!   exit immediately. The process dies with a half-line in the log, so ONLY the
+//!   engine's TERMINAL drain-on-reap can rescue it — the H1 under-count proof (a
+//!   mid-run drain, which stops at the last newline, would strand it forever).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -80,6 +103,42 @@ struct Opts {
     crash_after: Option<Duration>,
     /// The exit code the `--crash-after-ms` self-crash uses (default 1).
     crash_with: i32,
+    /// Emit this many self-reported usage sentinel lines (story 3-1). `0` = none.
+    emit_usage: u64,
+    /// After the usage batch, re-emit `sequence 0` once — a replayed batch for the
+    /// no-double-count proof (story 3-1). Ignored unless `emit_usage > 0`.
+    replay_usage: bool,
+    /// Override the per-event input-token sentinel (story 3-1 C1/C2 boundary test).
+    /// `None` = the fixed [`USAGE_INPUT_TOKENS`]. Lets a test emit a huge value (e.g.
+    /// `u64::MAX`) to prove the storage boundary saturate-clamps rather than wraps.
+    usage_input_tokens: Option<u64>,
+    /// Override the per-event output-token sentinel (see `usage_input_tokens`).
+    usage_output_tokens: Option<u64>,
+    /// Emit ONE final usage sentinel line WITHOUT a trailing newline, then exit
+    /// promptly (story 3-1 H1 under-count test). Its `sequence` is `emit_usage` (one
+    /// past the batch), so the TERMINAL drain-on-reap must consume the newline-less
+    /// tail or that event is stranded and lost.
+    final_usage_no_newline: bool,
+}
+
+/// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
+/// test asserting the ledger total is an exact-match (`N * INPUT` etc.), never a
+/// fuzzy range. Kept small + memorable.
+const USAGE_INPUT_TOKENS: u64 = 10;
+const USAGE_OUTPUT_TOKENS: u64 = 20;
+
+/// Format ONE `KTESIO_USAGE {json}` self-reported usage sentinel line (story 3-1).
+///
+/// MUST match the engine's `ktesio_engine::ports::parse_usage_line` convention:
+/// the prefix `KTESIO_USAGE ` + a JSON object with snake_case `sequence`,
+/// `input_tokens`, `output_tokens`. This binary cannot depend on the engine, so it
+/// re-implements the shared shape in pure `std`; the engine's
+/// `format_and_parse_round_trip_agree_on_the_convention` test guards the two
+/// against drift. NO OS-cfg — the line is identical text on every OS.
+fn usage_line(sequence: u64, input_tokens: u64, output_tokens: u64) -> String {
+    format!(
+        "KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens}}}"
+    )
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -95,6 +154,11 @@ fn parse() -> Opts {
     let mut heartbeat = None;
     let mut crash_after = None;
     let mut crash_with = 1;
+    let mut emit_usage = 0;
+    let mut replay_usage = false;
+    let mut usage_input_tokens = None;
+    let mut usage_output_tokens = None;
+    let mut final_usage_no_newline = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -103,6 +167,23 @@ fn parse() -> Opts {
                 let code = args.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
                 exit_fast = Some(code);
             }
+            "--emit-usage" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    emit_usage = n;
+                }
+            }
+            "--replay-usage" => replay_usage = true,
+            "--usage-input-tokens" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    usage_input_tokens = Some(n);
+                }
+            }
+            "--usage-output-tokens" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    usage_output_tokens = Some(n);
+                }
+            }
+            "--final-usage-no-newline" => final_usage_no_newline = true,
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -148,6 +229,11 @@ fn parse() -> Opts {
         heartbeat,
         crash_after,
         crash_with,
+        emit_usage,
+        replay_usage,
+        usage_input_tokens,
+        usage_output_tokens,
+        final_usage_no_newline,
     }
 }
 
@@ -195,6 +281,49 @@ fn main() {
     // can observe a mapped unified key that landed as a native FLAG (in the args)
     // or ENV var (in the environment), without racing on stdout capture.
     write_dump(&opts.dump);
+
+    // Story 3-1: emit self-reported usage sentinel lines (readiness-gated — AFTER
+    // the ready line, so the instance has reached `running` and the engine's reaper
+    // is ingesting). Monotonic `sequence` 0..N with fixed token sentinels; a small
+    // pause between lines lets the ~250ms reaper cadence drain them. If asked, then
+    // re-emit `sequence 0` once — a DELAYED/replayed batch the ledger must dedup
+    // (AC-A no-double-count). The test waits for the KNOWN committed row count in the
+    // DB, so this schedule is a nudge, not a timing dependency. Pure `std`, NO OS-cfg.
+    let input_tokens = opts.usage_input_tokens.unwrap_or(USAGE_INPUT_TOKENS);
+    let output_tokens = opts.usage_output_tokens.unwrap_or(USAGE_OUTPUT_TOKENS);
+    for sequence in 0..opts.emit_usage {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            usage_line(sequence, input_tokens, output_tokens)
+        );
+        let _ = stdout.flush();
+        sleep(Duration::from_millis(20));
+    }
+    if opts.emit_usage > 0 && opts.replay_usage {
+        let _ = writeln!(stdout, "{}", usage_line(0, input_tokens, output_tokens));
+        let _ = stdout.flush();
+    }
+    // Story 3-1 (H1): a Run's FINAL usage line, flushed WITHOUT a trailing newline,
+    // must not be stranded when the process exits. First stay alive PAST the engine's
+    // ~300ms startup readiness window (so `start` confirms `running` — an immediate
+    // exit would instead be read as a launch failure and never reach the reaper).
+    // Then emit ONE usage line WITHOUT a newline (`sequence = emit_usage`, one past
+    // the batch, so the test counts it distinctly) and exit. Because the process then
+    // dies with a half-line in the log, ONLY the engine's TERMINAL drain-on-reap can
+    // rescue it — a MidRun drain (which stops at the last newline) would strand it.
+    // `write!` (not `writeln!`) leaves NO trailing newline; flush so the bytes reach
+    // the captured log before exit.
+    if opts.final_usage_no_newline {
+        sleep(Duration::from_millis(500));
+        let _ = write!(
+            stdout,
+            "{}",
+            usage_line(opts.emit_usage, input_tokens, output_tokens)
+        );
+        let _ = stdout.flush();
+        std::process::exit(0);
+    }
 
     // Loop until we are killed, until the crash-after window elapses (story 1-6:
     // a simulated UNREQUESTED crash → non-zero exit), or until the linger window

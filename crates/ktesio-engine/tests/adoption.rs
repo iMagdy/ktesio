@@ -610,10 +610,13 @@ fn instance_status_and_set_policy_reject_an_invalid_name() {
 }
 
 #[test]
-fn fleet_composes_status_and_carries_the_honest_metering_seed() {
-    // Story 1-7 (Task 1, AC4/AC5): Engine::fleet() composes list() + the
-    // per-instance runtime status into FleetEntry rows, ordered by name, and the
-    // Epic-1 metering seed (budget/usage) is None — never fabricated.
+fn fleet_composes_status_and_carries_the_metering_surface() {
+    // Story 1-7 (Task 1, AC4/AC5) + story 3-1 (AC-C/AC11): Engine::fleet() composes
+    // list() + the per-instance runtime status into FleetEntry rows, ordered by
+    // name. `budget` stays the honest `None` seed (budgets are story 3-2), while
+    // `usage` is now REAL — an all-zero UsageView for a never-metered instance (a
+    // truthful zero, never null/fabricated) — and the active Metering Source is
+    // surfaced.
     let state = TempDir::new().unwrap();
     let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
@@ -625,10 +628,14 @@ fn fleet_composes_status_and_carries_the_honest_metering_seed() {
     let names: Vec<&str> = fleet.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["alpha", "beta"]);
     for entry in &fleet {
-        // The honest Epic-1 seed: metering is Epic 3, so both are None (JSON
-        // null), never 0 and never fabricated.
+        // budget: the honest seed (JSON null), never 0 and never fabricated.
         assert!(entry.budget.is_none(), "budget must be the null seed");
-        assert!(entry.usage.is_none(), "usage must be the null seed");
+        // usage: real, all-zero token totals for a never-metered instance.
+        assert_eq!(entry.usage.cumulative_input_tokens, 0);
+        assert_eq!(entry.usage.cumulative_output_tokens, 0);
+        assert_eq!(entry.usage.current_run_input_tokens, 0);
+        // The mock declares self-reported metering (surfaced — AC-C).
+        assert_eq!(entry.metering_source, "self-reported");
         // Runtime fields match the per-instance status the CLI already surfaces.
         let status = facade.instance_status(entry.name.as_str()).unwrap();
         assert_eq!(entry.state, status.instance.state);
@@ -637,7 +644,7 @@ fn fleet_composes_status_and_carries_the_honest_metering_seed() {
         assert_eq!(entry.kind, status.instance.kind);
         assert_eq!(entry.agent_home, status.instance.agent_home);
     }
-    // The human metering-seed token is the em dash (consistent list + show).
+    // The human budget-seed token is the em dash (consistent list + show).
     assert_eq!(FleetEntry::METERING_SEED_CELL, "—");
 }
 

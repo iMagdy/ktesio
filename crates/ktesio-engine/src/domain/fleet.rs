@@ -7,18 +7,19 @@
 //! than hand-rolling field serialization, so `kt --json` and the future 7-2 Host
 //! event stream share ONE schema (AD-14: "one event schema, two consumers").
 //!
-//! ## The honest Epic-1 metering seed (get this right)
+//! ## Metering fields — usage is real (3-1), budget stays a seed (→ 3-2)
 //!
-//! Budgets/caps and the Usage Ledger are **Epic 3** (metering, AD-7) — they do
-//! NOT exist in Epic 1. [`FleetEntry::budget`] and [`FleetEntry::usage`] are
-//! therefore `Option`-typed and ALWAYS `None` in Epic 1: they serialize as JSON
-//! `null` (a TYPED absence, never `0`, never a fabricated number). The fields are
-//! PRESENT so the `--json` shape is stable for Epic 3 to populate additively
-//! (AD-14 wants the schema not to churn); the truthful Epic-1 value is "none
-//! yet". When Epic 3 lands it replaces the `Option<Never>`-shaped seed with the
-//! real budget/usage types — a backward-additive change that does not bump
-//! [`crate::FLEET_SCHEMA_VERSION`]. Until then, `kt` renders the human cell as a
-//! single `—` and prints one stderr note that metering arrives in Epic 3.
+//! Metering is Epic 3 (AD-7). Story 3-1 makes [`FleetEntry::usage`] REAL: a
+//! [`UsageView`] carrying the instance's cumulative (and current-Run) TOKEN totals
+//! from the Usage Ledger — tokens only (AD-8: NO dollars/headroom this story). It
+//! is still `Option`-typed: `None` for an instance that has never metered anything
+//! yet (a truthful absence). The active [`FleetEntry::metering_source`] rides
+//! alongside it (AC-C — read from the persisted adapter snapshot). [`FleetEntry::budget`]
+//! stays the honest Epic-1 [`MeteringSeed`] absence (always `None`) — budgets +
+//! enforcement are story 3-2, and dollars are 3-3/3-5 — so `kt` still renders the
+//! budget cell as a single `—`. Populating `usage` from the `Option<Never>` seed to
+//! a real [`UsageView`] is a backward-additive change that does not bump
+//! [`crate::FLEET_SCHEMA_VERSION`] (a new reader parses every old document).
 //!
 //! ## Boundary (what this is NOT)
 //!
@@ -33,19 +34,63 @@ use super::event::FLEET_SCHEMA_VERSION;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
 use super::restart::RestartPolicy;
+use super::usage::UsageTotals;
 
-/// The honest Epic-1 metering seed for the `budget`/`usage` columns.
+/// The honest Epic-1 metering seed for the `budget` column.
 ///
-/// Metering is Epic 3 (AD-7); in Epic 1 there is NO budget/cap evaluation and NO
-/// Usage Ledger, so every metering cell is a typed ABSENCE. This uninhabited
-/// enum makes that a compile-time guarantee: an [`Option<MeteringSeed>`] can only
-/// ever be `None` (there is no way to construct a `Some`), so the `--json`
-/// `budget`/`usage` fields are ALWAYS `null` and the human cells are ALWAYS `—`.
-/// Epic 3 replaces this seed with the real budget/usage types (a backward-
-/// additive change). It derives `Serialize`/`Deserialize` only so the `Option`
-/// wrapper is (de)serializable; no value is ever produced.
+/// Budgets/caps + enforcement are story 3-2 (AD-7); until then there is NO
+/// budget/cap evaluation, so the Fleet `budget` cell is a typed ABSENCE. This
+/// uninhabited enum makes that a compile-time guarantee: an [`Option<MeteringSeed>`]
+/// can only ever be `None` (there is no way to construct a `Some`), so the `--json`
+/// `budget` field is ALWAYS `null` and the human cell is ALWAYS `—`. Story 3-2
+/// replaces this seed with the real budget type (a backward-additive change). It
+/// derives `Serialize`/`Deserialize` only so the `Option` wrapper is
+/// (de)serializable; no value is ever produced.
+///
+/// (Story 3-1 RETIRED the `usage` half of this seed — `usage` is now a real
+/// [`UsageView`]; only `budget` remains a seed.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MeteringSeed {}
+
+/// The per-instance Usage Ledger totals surfaced in Fleet detail (story 3-1,
+/// AC-C/AC11) — TOKENS ONLY (AD-8).
+///
+/// Carries the CUMULATIVE token totals (summed over every Run) and the
+/// CURRENT-RUN totals (the active `starting`→terminal span, or zero when the
+/// instance is not currently running). NO dollars, NO headroom, NO budget — those
+/// are 3-2/3-3/3-5; the honest boundary is "tokens now, money later". The
+/// Fleet-detail totals equal the Usage Ledger exactly (the FR-22 discipline
+/// seeded here for the read story 3-5). snake_case on the wire (AD-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageView {
+    /// Cumulative input (prompt) tokens over all of the instance's Runs.
+    pub cumulative_input_tokens: u64,
+    /// Cumulative output (completion) tokens over all of the instance's Runs.
+    pub cumulative_output_tokens: u64,
+    /// Input tokens for the CURRENT Run (0 when the instance is not running).
+    pub current_run_input_tokens: u64,
+    /// Output tokens for the CURRENT Run (0 when the instance is not running).
+    pub current_run_output_tokens: u64,
+}
+
+impl UsageView {
+    /// Build a [`UsageView`] from the cumulative + current-run [`UsageTotals`] the
+    /// Fleet read summed from the ledger.
+    pub fn new(cumulative: UsageTotals, current_run: UsageTotals) -> Self {
+        Self {
+            cumulative_input_tokens: cumulative.input_tokens,
+            cumulative_output_tokens: cumulative.output_tokens,
+            current_run_input_tokens: current_run.input_tokens,
+            current_run_output_tokens: current_run.output_tokens,
+        }
+    }
+
+    /// The cumulative total tokens (input + output over all Runs), saturating.
+    pub fn cumulative_total_tokens(&self) -> u64 {
+        self.cumulative_input_tokens
+            .saturating_add(self.cumulative_output_tokens)
+    }
+}
 
 /// One Agent Instance as the Fleet listing / `--json` document sees it (story
 /// 1-7, FR-4).
@@ -71,12 +116,19 @@ pub struct FleetEntry {
     /// `None` (JSON `null`) otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_cause: Option<String>,
-    /// Budget / cap status — the HONEST Epic-1 seed. Metering is Epic 3 (AD-7),
+    /// Budget / cap status — the HONEST seed. Budgets + enforcement are story 3-2,
     /// so this is ALWAYS `None` (JSON `null`) today; never `0`, never fabricated.
     pub budget: Option<MeteringSeed>,
-    /// Usage Ledger totals — the HONEST Epic-1 seed. Metering is Epic 3 (AD-7),
-    /// so this is ALWAYS `None` (JSON `null`) today; never `0`, never fabricated.
-    pub usage: Option<MeteringSeed>,
+    /// Usage Ledger token totals (story 3-1, AC-C/AC11) — cumulative + current-Run,
+    /// TOKENS ONLY (AD-8). ALWAYS PRESENT (a concrete object, never `null`): a
+    /// never-metered instance shows an honest all-ZERO [`UsageView`] (a truthful
+    /// zero — the ledger genuinely holds zero tokens for it), distinct from the
+    /// Epic-1 `budget` `null` "does not exist yet". The totals equal the ledger
+    /// exactly (the FR-22 discipline). Dollars/headroom stay absent until 3-3/3-5.
+    pub usage: UsageView,
+    /// The active Metering Source wire string (`self-reported` / `engine-observed`),
+    /// visible in Fleet detail (AC-C). Read from the persisted adapter snapshot.
+    pub metering_source: String,
     /// Absolute Agent Home path (engine-computed; the path authority).
     pub agent_home: String,
 }
@@ -127,22 +179,70 @@ mod tests {
             restart_policy: RestartPolicy::OnFailure,
             failed_cause: None,
             budget: None,
-            usage: None,
+            usage: UsageView::new(UsageTotals::zero(), UsageTotals::zero()),
+            metering_source: "self-reported".to_string(),
             agent_home: format!("/x/agents/{name}"),
         }
     }
 
     #[test]
-    fn entry_serializes_budget_and_usage_as_null_the_honest_seed() {
-        // THE Epic-1-has-no-metering nuance: budget/usage MUST be JSON `null`
-        // (a typed absence), never `0` and never a fabricated number.
+    fn entry_serializes_budget_as_null_seed_and_usage_as_real_zero_tokens() {
+        // Story 3-1: `budget` stays the honest `null` seed (budgets are 3-2), but
+        // `usage` is now a REAL UsageView — a concrete all-zero object for a
+        // never-metered instance (a truthful zero, never `null`, never fabricated).
         let entry = sample_entry("demo");
         let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        // budget: still the typed-absence seed.
         assert_eq!(value["budget"], serde_json::Value::Null, "{value}");
-        assert_eq!(value["usage"], serde_json::Value::Null, "{value}");
-        // Never a zero (the tempting-but-dishonest value).
-        assert_ne!(value["budget"], serde_json::json!(0));
-        assert_ne!(value["usage"], serde_json::json!(0));
+        // usage: a real object with zero token totals (NOT null, NOT a number).
+        assert!(
+            value["usage"].is_object(),
+            "usage must be an object: {value}"
+        );
+        assert_eq!(
+            value["usage"]["cumulative_input_tokens"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            value["usage"]["cumulative_output_tokens"],
+            serde_json::json!(0)
+        );
+        // The active Metering Source is surfaced (AC-C).
+        assert_eq!(value["metering_source"], serde_json::json!("self-reported"));
+    }
+
+    #[test]
+    fn entry_carries_real_usage_totals_when_metered() {
+        // A metered instance surfaces real cumulative + current-run token totals,
+        // snake_case on the wire (AC11).
+        let mut entry = sample_entry("demo");
+        entry.usage = UsageView::new(
+            UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+            },
+            UsageTotals {
+                input_tokens: 40,
+                output_tokens: 60,
+            },
+        );
+        let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            value["usage"]["cumulative_input_tokens"],
+            serde_json::json!(100)
+        );
+        assert_eq!(
+            value["usage"]["cumulative_output_tokens"],
+            serde_json::json!(250)
+        );
+        assert_eq!(
+            value["usage"]["current_run_input_tokens"],
+            serde_json::json!(40)
+        );
+        assert_eq!(entry.usage.cumulative_total_tokens(), 350);
+        // Still tokens only — no dollars leaked into the view.
+        assert!(value["usage"].get("cost").is_none());
+        assert!(value["usage"].get("dollars").is_none());
     }
 
     #[test]

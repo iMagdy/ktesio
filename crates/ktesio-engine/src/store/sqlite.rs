@@ -13,27 +13,36 @@
 //! [`SCHEMA_VERSION`], applying each version's DDL in order and stamping the new
 //! version. Reopening an existing DB is idempotent (already at the target → no
 //! DDL runs). Story 1-6 adds v2: the `agent_runtime` write-ahead spawn-record
-//! table (AD-5/AD-6). A DB ahead of this build is refused (forward-compat guard).
+//! table (AD-5/AD-6). Story 3-1 adds v3: the Usage Ledger's `sequence` ordinal
+//! column + a `UNIQUE(instance_id, run_id, sequence)` dedup index, so a replayed
+//! usage batch is a DB-level no-op (AC-A). A DB ahead of this build is refused
+//! (forward-compat guard).
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::domain::{AgentInstance, InstanceName, LifecycleState, RestartPolicy};
+use crate::domain::{
+    AgentInstance, InstanceName, LifecycleState, RecordOutcome, RestartPolicy, RunId, UsageEvent,
+    UsageTotals,
+};
 use crate::ports::{ProcessFingerprint, SpawnRecord, StateStore, StoreError};
 
 /// Current schema version applied by this build.
 ///
 /// v1: registry + lifecycle + Usage Ledger. v2 (story 1-6): the `agent_runtime`
-/// write-ahead spawn-record table (AD-5).
-const SCHEMA_VERSION: i64 = 2;
+/// write-ahead spawn-record table (AD-5). v3 (story 3-1): the Usage Ledger's
+/// `sequence` dedup ordinal column + a `UNIQUE(instance_id, run_id, sequence)`
+/// index (the no-double-count invariant, AC-A).
+const SCHEMA_VERSION: i64 = 3;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
-/// `usage_events` is created EMPTY this story; its shape is frozen per AD-7's
-/// minimum UsageEvent fields so story 3.1 (which populates it) needs no
-/// breaking migration. `ON DELETE CASCADE` + `foreign_keys=ON` makes removing
-/// an instance clean up its ledger rows automatically.
+/// `usage_events` froze its columns per AD-7's minimum UsageEvent fields in Epic
+/// 1; story 3-1 POPULATES it (and adds a `sequence` column + dedup index as the
+/// additive v3 step below — no breaking change). `ON DELETE CASCADE` +
+/// `foreign_keys=ON` makes removing an instance clean up its ledger rows
+/// automatically.
 const SCHEMA_V1: &str = "\
 CREATE TABLE agent_instances (
     id           INTEGER PRIMARY KEY,
@@ -75,6 +84,23 @@ CREATE TABLE agent_runtime (
     restart_count    INTEGER NOT NULL DEFAULT 0,
     last_known_cause TEXT
 );
+";
+
+/// Schema v3 DDL (story 3-1): the Usage Ledger's replay-dedup discipline (spine
+/// AD-6/AD-7, AC-A).
+///
+/// ADDITIVE over the frozen v1 `usage_events` columns: add a `sequence` ordinal
+/// column (the agent-supplied, per-Run-monotonic key) DEFAULT 0 so any pre-
+/// existing rows migrate cleanly, then a `UNIQUE(instance_id, run_id, sequence)`
+/// index. The index makes "no double-count on replay" a DATABASE INVARIANT: a
+/// re-delivered event hits the constraint and `record_usage_event` classifies it
+/// as a duplicate replay (a no-op), exactly the way `classify_insert` maps a
+/// `UNIQUE` violation for duplicate instance names. No column is renamed/removed,
+/// so v1/v2 → v3 preserves every existing row.
+const SCHEMA_V3: &str = "\
+ALTER TABLE usage_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX idx_usage_events_dedup
+    ON usage_events(instance_id, run_id, sequence);
 ";
 
 /// A SQLite-backed state store over a single connection.
@@ -202,6 +228,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 2 {
         conn.execute_batch(SCHEMA_V2).map_err(backend)?;
     }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3).map_err(backend)?;
+    }
 
     if version < SCHEMA_VERSION {
         // pragma_update cannot bind user_version; format the constant in. It is
@@ -215,6 +244,21 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 /// Map an arbitrary `rusqlite::Error` into a backend [`StoreError`].
 fn backend(err: rusqlite::Error) -> StoreError {
     StoreError::Backend(err.to_string())
+}
+
+/// Saturate-clamp a token `u64` into the signed `i64` a SQLite `INTEGER` column
+/// stores (story 3-1 billing-corruption guard, C1/C2).
+///
+/// SQLite integers are signed-64 only. A raw `value as i64` on a `u64` above
+/// `i64::MAX` (e.g. `u64::MAX`, or a buggy agent reporting a giant cumulative
+/// counter) BIT-WRAPS to a NEGATIVE `i64` — which would poison the per-instance /
+/// Run `SUM` and then be hidden by the read's `.max(0)` clamp (a silent
+/// under-count). Clamping to `i64::MAX` instead makes a negative row impossible:
+/// `i64::MAX` tokens (~9.2e18) is implausibly large for a real per-event count, so
+/// the clamp loses nothing real. This is the SOLE conversion used to write a token
+/// column — never a bare `as i64`.
+fn clamp_tokens(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 /// Classify an insert failure: a `UNIQUE` (or primary-key) constraint
@@ -237,6 +281,61 @@ fn classify_insert(err: rusqlite::Error, name: &str) -> StoreError {
         }
     }
     backend(err)
+}
+
+/// Classify a `usage_events` insert failure (story 3-1, AC-A). A
+/// `UNIQUE(instance_id, run_id, sequence)` violation means the event's dedup key
+/// already exists — a re-delivered batch — so it maps to
+/// `Some(RecordOutcome::DuplicateReplay)` (a no-op, the no-double-count invariant),
+/// mirroring how [`classify_insert`] maps a duplicate-name `UNIQUE`. Any OTHER
+/// failure (a non-unique constraint, a SQL error) maps to `None`, which the caller
+/// surfaces as a backend error — the same discipline
+/// [`non_unique_constraint_maps_to_backend_not_duplicate`] guards for names.
+fn classify_usage_insert(err: &rusqlite::Error) -> Option<RecordOutcome> {
+    if let rusqlite::Error::SqliteFailure(inner, _) = err {
+        let ext = inner.extended_code;
+        if ext == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            || ext == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+        {
+            return Some(RecordOutcome::DuplicateReplay);
+        }
+    }
+    None
+}
+
+/// Sum the `(input_tokens, output_tokens)` columns of a per-instance/Run scope
+/// into [`UsageTotals`], with SATURATING `u64` semantics (story 3-1 overflow-safe
+/// read, C1/C2).
+///
+/// Deliberately NOT a SQL `SUM(...)`: SQLite's `SUM` over `INTEGER`s accumulates in
+/// a signed `i64` and, on overflow, silently switches the result to a lossy
+/// floating-point value — either way the surfaced number could go wrong (a
+/// negative that the old `.max(0)` masked, or a float that loses low-order token
+/// counts). Post the write-side `clamp_tokens` guard each row is already a
+/// non-negative `i64`, so we read the rows and fold them in Rust with
+/// `saturating_add` on `u64`: an astronomically large scope caps at `u64::MAX`
+/// rather than wrapping or turning lossy. `stmt` is the caller's prepared statement
+/// (the scope predicate + its bound params differ between cumulative and per-Run).
+fn sum_tokens_saturating(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Result<UsageTotals, StoreError> {
+    let rows = stmt
+        .query_map(params, |row| {
+            let input: i64 = row.get(0)?;
+            let output: i64 = row.get(1)?;
+            // Each stored value is non-negative (clamp_tokens on write), so `.max(0)`
+            // is belt-and-suspenders against a hand-written legacy row.
+            Ok((input.max(0) as u64, output.max(0) as u64))
+        })
+        .map_err(backend)?;
+    let mut totals = UsageTotals::zero();
+    for row in rows {
+        let (input, output) = row.map_err(backend)?;
+        totals.input_tokens = totals.input_tokens.saturating_add(input);
+        totals.output_tokens = totals.output_tokens.saturating_add(output);
+    }
+    Ok(totals)
 }
 
 /// Build an [`AgentInstance`] from a result row, decoding domain types.
@@ -360,6 +459,92 @@ impl StateStore for SqliteStore {
             )
             .map_err(backend)?;
         Ok(count.max(0) as u64)
+    }
+
+    fn record_usage_event(&self, event: &UsageEvent) -> Result<RecordOutcome, StoreError> {
+        // Resolve the instance row id (the FK). An absent instance is NotFound —
+        // the commit choke point only records for a supervised (looked-up) instance,
+        // so this is a defensive guard (the instance was removed concurrently).
+        let iname = InstanceName::new(&event.instance).map_err(|e| StoreError::CorruptRow {
+            name: event.instance.clone(),
+            detail: format!("invalid instance name on usage event: {e}"),
+        })?;
+        let id = self
+            .instance_id(&iname)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: event.instance.clone(),
+            })?;
+        // One single-statement INSERT = one transaction (AD-6). A
+        // UNIQUE(instance_id, run_id, sequence) violation means this exact event was
+        // already recorded (a re-delivered batch) → classify DuplicateReplay (a
+        // no-op, NOT an error), the no-double-count DB invariant (AC-A).
+        let result = self.conn.execute(
+            "INSERT INTO usage_events \
+             (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, sequence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                event.run_id.as_str(),
+                // Saturate-clamp the u64 token counts into the signed i64 column: a
+                // bare `as i64` on a value above i64::MAX bit-wraps NEGATIVE and
+                // poisons the SUM (C1/C2). Sequence is likewise clamped so a giant
+                // ordinal cannot land a negative dedup key.
+                clamp_tokens(event.input_tokens),
+                clamp_tokens(event.output_tokens),
+                event.metering_source,
+                event.occurred_at,
+                clamp_tokens(event.sequence),
+            ],
+        );
+        match result {
+            Ok(_) => Ok(RecordOutcome::Inserted),
+            Err(err) => match classify_usage_insert(&err) {
+                Some(outcome) => Ok(outcome),
+                // Not a recognized replay: surface the ORIGINAL error text so a real
+                // write fault (disk full, a genuine constraint problem) is
+                // diagnosable, rather than a hardcoded misleading string.
+                None => Err(StoreError::Backend(format!(
+                    "usage-event insert failed: {err}"
+                ))),
+            },
+        }
+    }
+
+    fn usage_totals(&self, name: &InstanceName) -> Result<UsageTotals, StoreError> {
+        // Cumulative over ALL the instance's rows. An absent instance totals zero
+        // (mirrors count_usage_events).
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(UsageTotals::zero());
+        };
+        // Sum the rows in Rust with saturating u64 semantics (not a SQL SUM, which
+        // can overflow to a lossy float / negative — see `sum_tokens_saturating`).
+        let mut stmt = self
+            .conn
+            .prepare("SELECT input_tokens, output_tokens FROM usage_events WHERE instance_id = ?1")
+            .map_err(backend)?;
+        sum_tokens_saturating(&mut stmt, [id])
+    }
+
+    fn run_usage_totals(
+        &self,
+        name: &InstanceName,
+        run_id: &RunId,
+    ) -> Result<UsageTotals, StoreError> {
+        // Per-run: scope to a single (instance_id, run_id) (AC-B). An absent
+        // instance / unknown Run totals zero.
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(UsageTotals::zero());
+        };
+        // Per-Run scope, summed with the same saturating discipline as the cumulative
+        // read (overflow-safe — no SQL SUM).
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT input_tokens, output_tokens \
+                 FROM usage_events WHERE instance_id = ?1 AND run_id = ?2",
+            )
+            .map_err(backend)?;
+        sum_tokens_saturating(&mut stmt, rusqlite::params![id, run_id.as_str()])
     }
 
     fn upsert_spawn_record(&self, record: &SpawnRecord) -> Result<(), StoreError> {
@@ -695,9 +880,10 @@ mod tests {
         assert_eq!(fk, 1, "foreign_keys should be ON");
         // AD-6 / story-1.7 AC-C durability substrate: WAL + synchronous=NORMAL is
         // what bounds the crash loss window to ≤1s (one committed transaction per
-        // state mutation). synchronous=NORMAL reports as 1. Epic 1 persists
-        // lifecycle state per-event, so the loss window already holds; the same
-        // bound governs the Usage Ledger once Epic 3 adds `usage_events`.
+        // state mutation). synchronous=NORMAL reports as 1. Lifecycle state is
+        // persisted per-event, and story 3-1's `record_usage_event` is likewise one
+        // single-statement transaction per usage event, so the same ≤1s bound now
+        // governs the Usage Ledger too (AD-6).
         let sync: i64 = store
             .conn
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
@@ -1125,5 +1311,401 @@ mod tests {
             .upsert_spawn_record(&record("legacy", 3, 30, 0))
             .unwrap();
         assert!(store.get_spawn_record(&name("legacy")).unwrap().is_some());
+    }
+
+    // ---- Story 3-1: the Usage Ledger write + reads + dedup (AD-6/AD-7) ----
+
+    fn usage_event(instance: &str, run: &str, seq: u64, input: u64, output: u64) -> UsageEvent {
+        UsageEvent {
+            instance: instance.to_string(),
+            run_id: RunId::from_wire(run),
+            input_tokens: input,
+            output_tokens: output,
+            metering_source: "self-reported".to_string(),
+            sequence: seq,
+            occurred_at: "2026-07-06T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn record_usage_event_inserts_then_dedups_a_replay() {
+        // AC-A: a new event inserts (Inserted); the SAME event replayed returns
+        // DuplicateReplay and does NOT add a row — the no-double-count DB invariant.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+
+        let first = store
+            .record_usage_event(&usage_event("demo", "run-1", 0, 10, 20))
+            .unwrap();
+        assert_eq!(first, RecordOutcome::Inserted);
+        assert_eq!(store.count_usage_events(&name("demo")).unwrap(), 1);
+
+        // Replay the exact same (run_id, sequence): recognized, NOT re-inserted.
+        let replay = store
+            .record_usage_event(&usage_event("demo", "run-1", 0, 10, 20))
+            .unwrap();
+        assert_eq!(replay, RecordOutcome::DuplicateReplay);
+        assert_eq!(
+            store.count_usage_events(&name("demo")).unwrap(),
+            1,
+            "a replayed batch must not add a row (no double-count)"
+        );
+        // And the totals are unchanged (10/20, not 20/40).
+        let totals = store.usage_totals(&name("demo")).unwrap();
+        assert_eq!(totals.input_tokens, 10);
+        assert_eq!(totals.output_tokens, 20);
+    }
+
+    #[test]
+    fn per_run_and_cumulative_totals_sum_across_two_runs() {
+        // AC-B: per-run totals scope to (instance, run_id); cumulative sums all runs.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        // Run 1: two events.
+        store
+            .record_usage_event(&usage_event("demo", "run-1", 0, 10, 1))
+            .unwrap();
+        store
+            .record_usage_event(&usage_event("demo", "run-1", 1, 20, 2))
+            .unwrap();
+        // Run 2: one event (same sequence 0 is fine — different run_id).
+        store
+            .record_usage_event(&usage_event("demo", "run-2", 0, 100, 5))
+            .unwrap();
+
+        let run1 = store
+            .run_usage_totals(&name("demo"), &RunId::from_wire("run-1"))
+            .unwrap();
+        assert_eq!(run1.input_tokens, 30);
+        assert_eq!(run1.output_tokens, 3);
+        let run2 = store
+            .run_usage_totals(&name("demo"), &RunId::from_wire("run-2"))
+            .unwrap();
+        assert_eq!(run2.input_tokens, 100);
+        assert_eq!(run2.output_tokens, 5);
+        // Cumulative = sum over all rows (input 10+20+100=130, output 1+2+5=8).
+        let cumulative = store.usage_totals(&name("demo")).unwrap();
+        assert_eq!(cumulative.input_tokens, 130);
+        assert_eq!(cumulative.output_tokens, 8);
+    }
+
+    #[test]
+    fn same_sequence_different_run_is_not_a_duplicate() {
+        // The dedup key is (instance_id, run_id, sequence): the SAME sequence under a
+        // DIFFERENT run_id is a distinct event (a restart opens a new Run — AC-B).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        assert_eq!(
+            store
+                .record_usage_event(&usage_event("demo", "run-a", 0, 1, 1))
+                .unwrap(),
+            RecordOutcome::Inserted
+        );
+        assert_eq!(
+            store
+                .record_usage_event(&usage_event("demo", "run-b", 0, 1, 1))
+                .unwrap(),
+            RecordOutcome::Inserted,
+            "same sequence, different run → a new event, not a replay"
+        );
+        assert_eq!(store.count_usage_events(&name("demo")).unwrap(), 2);
+    }
+
+    #[test]
+    fn usage_totals_of_absent_or_unmetered_instance_is_zero() {
+        // Mirrors count_usage_events: an absent instance and an instance with no
+        // events both total zero (a truthful zero, not an error).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        assert_eq!(
+            store.usage_totals(&name("demo")).unwrap(),
+            UsageTotals::zero()
+        );
+        assert_eq!(
+            store.usage_totals(&name("absent")).unwrap(),
+            UsageTotals::zero()
+        );
+        assert_eq!(
+            store
+                .run_usage_totals(&name("absent"), &RunId::from_wire("run-x"))
+                .unwrap(),
+            UsageTotals::zero()
+        );
+    }
+
+    #[test]
+    fn record_usage_event_for_missing_instance_is_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .record_usage_event(&usage_event("ghost", "run-1", 0, 1, 1))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn recorded_usage_cascades_on_instance_delete() {
+        // ON DELETE CASCADE removes the instance's ledger rows (the FR-22 discipline
+        // + the existing cascade test, now via the real writer).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .record_usage_event(&usage_event("demo", "run-1", 0, 5, 5))
+            .unwrap();
+        store.delete_instance(&name("demo")).unwrap();
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "usage rows must cascade-delete with the instance"
+        );
+    }
+
+    #[test]
+    fn classify_usage_insert_maps_unique_to_replay_and_others_to_none() {
+        // Directly exercise the classifier: a CHECK-constraint failure (a
+        // ConstraintViolation that is NOT unique/primary-key) maps to None (→ the
+        // caller surfaces a backend error), while a genuine UNIQUE maps to a replay.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch("CREATE TABLE check_probe (n INTEGER CHECK (n > 0))")
+            .unwrap();
+        let check_err = store
+            .conn
+            .execute("INSERT INTO check_probe (n) VALUES (0)", [])
+            .unwrap_err();
+        assert_eq!(
+            classify_usage_insert(&check_err),
+            None,
+            "a non-unique constraint must not masquerade as a replay"
+        );
+        // A real UNIQUE violation: insert the same ledger key twice at the SQL level.
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .record_usage_event(&usage_event("demo", "run-1", 0, 1, 1))
+            .unwrap();
+        let id = store.instance_id(&name("demo")).unwrap().unwrap();
+        let dup_err = store
+            .conn
+            .execute(
+                "INSERT INTO usage_events \
+                 (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, sequence) \
+                 VALUES (?1, 'run-1', 1, 1, 'self-reported', '2026-07-06T00:00:00Z', 0)",
+                [id],
+            )
+            .unwrap_err();
+        assert_eq!(
+            classify_usage_insert(&dup_err),
+            Some(RecordOutcome::DuplicateReplay)
+        );
+    }
+
+    #[test]
+    fn huge_u64_tokens_clamp_positive_and_do_not_poison_the_sum() {
+        // C1/C2 (billing-corruption boundary): a u64 token count above i64::MAX
+        // (here u64::MAX) must be SATURATE-CLAMPED to a positive i64 on write, never
+        // a bare `as i64` that bit-wraps NEGATIVE and then hides under the read's
+        // `.max(0)` (a silent under-count). Assert the stored row is positive and the
+        // surfaced cumulative is the correct clamped POSITIVE value — not negative,
+        // not 0.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        // u64::MAX is i64::MAX + 1 (as u64) + i64::MAX; clamp_tokens caps it at i64::MAX.
+        store
+            .record_usage_event(&usage_event("demo", "run-1", 0, u64::MAX, u64::MAX))
+            .unwrap();
+
+        // The persisted row is a POSITIVE i64 (the clamp made a negative row
+        // impossible), equal to i64::MAX.
+        let (raw_in, raw_out): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT input_tokens, output_tokens FROM usage_events \
+                 WHERE run_id = 'run-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw_in, i64::MAX, "input must clamp to i64::MAX, not wrap");
+        assert_eq!(raw_out, i64::MAX, "output must clamp to i64::MAX, not wrap");
+        assert!(
+            raw_in > 0 && raw_out > 0,
+            "a token row can never be negative"
+        );
+
+        // The surfaced cumulative is the clamped POSITIVE value (i64::MAX as u64),
+        // NOT a negative masked to 0.
+        let totals = store.usage_totals(&name("demo")).unwrap();
+        assert_eq!(totals.input_tokens, i64::MAX as u64);
+        assert_eq!(totals.output_tokens, i64::MAX as u64);
+        // Per-Run read agrees.
+        let run = store
+            .run_usage_totals(&name("demo"), &RunId::from_wire("run-1"))
+            .unwrap();
+        assert_eq!(run.input_tokens, i64::MAX as u64);
+    }
+
+    #[test]
+    fn cumulative_read_saturates_rather_than_wrapping_across_clamped_rows() {
+        // C1/C2 read half: THREE clamped-max rows sum past u64::MAX; the Rust-side
+        // saturating fold caps the surfaced total at u64::MAX instead of wrapping or
+        // turning into a lossy float (a SQL SUM would overflow its i64 accumulator).
+        // Distinct run_ids keep all three rows (the dedup key differs). Three, not
+        // two, because 2*i64::MAX still fits in u64 (= u64::MAX-1) — it takes a third
+        // to genuinely cross the boundary and force saturation.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        for run in ["run-1", "run-2", "run-3"] {
+            store
+                .record_usage_event(&usage_event("demo", run, 0, u64::MAX, u64::MAX))
+                .unwrap();
+        }
+        // 3 * i64::MAX overflows u64 → saturates at u64::MAX (never negative/lossy).
+        let totals = store.usage_totals(&name("demo")).unwrap();
+        assert_eq!(totals.input_tokens, u64::MAX, "saturating, never wraps");
+        assert_eq!(totals.output_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn non_replay_usage_insert_error_surfaces_the_original_text() {
+        // Low-4: a usage-insert failure that is NOT a recognized replay must surface
+        // the ORIGINAL rusqlite error text (diagnosable), not a hardcoded string.
+        // Dropping the table makes the INSERT fail with "no such table" — a
+        // non-constraint SqliteFailure the classifier maps to None.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        // Resolve the id BEFORE dropping (record_usage_event looks it up first).
+        // Drop only usage_events so the instance lookup still succeeds and the INSERT
+        // is what fails.
+        store.conn.execute_batch("DROP TABLE usage_events").unwrap();
+        let err = store
+            .record_usage_event(&usage_event("demo", "run-1", 0, 1, 1))
+            .unwrap_err();
+        match err {
+            StoreError::Backend(msg) => {
+                assert!(
+                    msg.contains("usage-event insert failed:") && msg.contains("usage_events"),
+                    "must include the original error text, got: {msg}"
+                );
+            }
+            other => panic!("expected Backend with original text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migration_v2_db_upgrades_to_v3_preserving_rows_and_adding_dedup() {
+        // A DB written at schema v2 (usage_events without `sequence`, no dedup index)
+        // upgrades to v3 on open: the v3 step ADDS the column + index WITHOUT dropping
+        // v2 rows, and dedup then works. Mirrors migration_v1_db_upgrades_to_v2.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            // A pre-v3 usage row (no `sequence` column yet — the v1 shape).
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO usage_events \
+                 (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at) \
+                 VALUES (?1, 'run-old', 7, 8, 'self-reported', '2026-07-03T00:00:00Z')",
+                [id],
+            )
+            .unwrap();
+        }
+        // Reopen: migrator steps 2 → 3, adds `sequence` + the dedup index, keeps rows.
+        let store = SqliteStore::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The pre-existing usage row survived (migrated with sequence defaulted to 0).
+        assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
+        let totals = store.usage_totals(&name("legacy")).unwrap();
+        assert_eq!(totals.input_tokens, 7);
+        assert_eq!(totals.output_tokens, 8);
+        // Dedup now works on the upgraded DB: a replay of the migrated row's key is a
+        // no-op (the legacy row defaulted to sequence 0 under run-old).
+        assert_eq!(
+            store
+                .record_usage_event(&usage_event("legacy", "run-old", 0, 7, 8))
+                .unwrap(),
+            RecordOutcome::DuplicateReplay,
+            "the dedup index applies to migrated rows too"
+        );
+        assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
+    }
+
+    #[test]
+    fn migration_v1_db_upgrades_straight_to_v3() {
+        // A v1 DB (no agent_runtime, no sequence) steps 1 → 2 → 3 in one open, and the
+        // Usage Ledger dedup works afterward.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&db).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The v3 Usage Ledger write works on the fully-migrated DB.
+        assert_eq!(
+            store
+                .record_usage_event(&usage_event("legacy", "run-1", 0, 3, 4))
+                .unwrap(),
+            RecordOutcome::Inserted
+        );
+        assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
     }
 }

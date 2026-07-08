@@ -21,6 +21,7 @@ mod restart;
 mod secret;
 mod supervisor;
 mod transition;
+mod usage;
 
 pub use config::{
     is_pass_through, is_secret_ref, pass_through_tail, resolve, secret_name, ConfigError,
@@ -29,7 +30,7 @@ pub use config::{
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{TransitionCause, TransitionEvent, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION};
-pub use fleet::{FleetEntry, FleetListing, MeteringSeed};
+pub use fleet::{FleetEntry, FleetListing, MeteringSeed, UsageView};
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};
@@ -39,3 +40,6 @@ pub use secret::{SecretString, REDACTED};
 pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
 pub use supervisor::{RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
 pub use transition::{next_state, LifecycleCommand, LifecycleError};
+pub use usage::{
+    RecordOutcome, RunId, UsageEvent, UsageTotals, UsageUpdateEvent, USAGE_SCHEMA_VERSION,
+};

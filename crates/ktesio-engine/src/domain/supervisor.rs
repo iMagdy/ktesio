@@ -47,7 +47,10 @@ use ktesio_adapter_api::{Capability, OsId, SupportLevel};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
-use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnRecord, SpawnSpec};
+use crate::ports::{
+    assemble_usage_event, BackendError, ParsedUsage, ProcessBackend, ProcessStatus,
+    SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+};
 use crate::time::now_rfc3339;
 
 use super::error::EngineError;
@@ -58,6 +61,7 @@ use super::name::InstanceName;
 use super::registry::Registry;
 use super::restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
 use super::transition::{next_state, LifecycleCommand};
+use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
 
 /// The default graceful-shutdown window before a stop escalates to a forced kill
 /// (AC3). Per-instance configurable via [`Supervisor::stop`]'s `window` argument;
@@ -103,15 +107,109 @@ struct RestartDecision {
     plan: Option<RestartPlan>,
 }
 
+/// How [`Supervisor::drain_usage_for`] treats the tail of the agent-output log
+/// (story 3-1 under-count fix, H1) — the difference is whether a final line that
+/// lacks a trailing newline is consumed now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainMode {
+    /// The process is (believed) still alive — the reaper cadence. Consume only up
+    /// to the last newline; a partial final line may still be completed, so it waits
+    /// for the next pass.
+    MidRun,
+    /// The process is DEAD (drain-on-stop / drain-on-reap) — no more bytes will ever
+    /// append. Consume the WHOLE tail, INCLUDING a final newline-less line, so a last
+    /// usage line flushed without a trailing `\n` is not stranded and lost when the
+    /// next Run's cursor anchors past it.
+    Terminal,
+}
+
+/// What a single [`Supervisor::drain_usage_for`] pass should do with the captured
+/// log, decided purely from `(bytes, cursor, mode)` (story 3-1 — the H1 terminal-
+/// tail rule + the M2 shrink guard, unit-testable without a process handle).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DrainPlan {
+    /// The log shrank below the cursor (a truncate/rotation — M2). Snap the cursor
+    /// to `new_cursor` (the new length) and ingest NOTHING — never re-read from 0
+    /// under the same live `run_id` (that would double-count → an inflated bill).
+    Shrunk { new_cursor: u64 },
+    /// No complete unit to consume this pass (an empty tail, or a MidRun tail with no
+    /// newline yet). Leave the cursor where it is.
+    Nothing,
+    /// Consume `bytes[range]` and set the cursor to `new_cursor`.
+    Consume {
+        range: std::ops::Range<usize>,
+        new_cursor: u64,
+    },
+}
+
+/// Decide what one drain pass reads (spine AD-7; story 3-1 H1/M2). Pure — no I/O.
+///
+/// * Shrink (M2): `cursor > len` ⇒ [`DrainPlan::Shrunk`] (snap to `len`, ingest
+///   nothing) — the anti-double-count fallback for a truncated/rotated log.
+/// * Otherwise consume the tail `bytes[cursor..]`:
+///   - [`DrainMode::Terminal`] consumes the WHOLE tail (the process is dead; a
+///     final newline-less usage line must land now or be lost — H1).
+///   - [`DrainMode::MidRun`] consumes only up to the last `\n` (a live process may
+///     still complete a partial final line on a later pass); no newline ⇒ nothing.
+fn plan_drain(bytes: &[u8], cursor: u64, mode: DrainMode) -> DrainPlan {
+    let len = bytes.len() as u64;
+    if cursor > len {
+        return DrainPlan::Shrunk { new_cursor: len };
+    }
+    let start = cursor as usize;
+    let tail = &bytes[start..];
+    let consumable = match mode {
+        DrainMode::Terminal => tail.len(),
+        DrainMode::MidRun => match tail.iter().rposition(|b| *b == b'\n') {
+            Some(pos) => pos + 1, // include the newline
+            None => 0,            // no complete line yet — nothing to consume
+        },
+    };
+    if consumable == 0 {
+        return DrainPlan::Nothing;
+    }
+    DrainPlan::Consume {
+        range: start..start + consumable,
+        new_cursor: cursor + consumable as u64,
+    }
+}
+
+/// The in-memory supervision state for ONE running Agent Instance (story 3-1).
+///
+/// Beyond the process [`Handle`](backends::Handle) the supervisor has always held,
+/// this carries the metering context ingestion needs during the instance's Run:
+/// the current [`RunId`] (minted at `starting`, spine AD-7), the declared metering
+/// source (its wire string, stamped on every ingested [`UsageEvent`]), and a byte
+/// CURSOR into the per-instance agent-output log so each reaper pass ingests only
+/// the NEWLY-captured tail (never re-reading — and never re-attributing a prior
+/// Run's lines under a fresh Run id after a stop→start). It lives for THIS engine
+/// lifetime alongside the handle, exactly like the handle map it replaced.
+struct Supervised {
+    /// The backend-owned process handle (group/job control).
+    handle: backends::Handle,
+    /// The current Run this instance is in (spine AD-7) — minted at `starting`.
+    run_id: RunId,
+    /// The declared Metering Source wire string (`self-reported` / `engine-observed`),
+    /// stamped on every [`UsageEvent`] ingested during this Run.
+    metering_source: String,
+    /// Byte offset already consumed from the agent-output log — the ingestion read
+    /// cursor. Advanced past each block the drain reads, so lines are ingested at
+    /// most once from the capture (the DB dedup is the second, authoritative guard).
+    usage_cursor: u64,
+}
+
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
 /// [`ProcessBackend`](crate::ports::ProcessBackend) (the current OS's), a map of
-/// the instances it currently supervises, and the [`BackoffSchedule`] the restart
-/// executor uses (production 1s×2 cap 60s; tests inject a scaled one).
+/// the instances it currently supervises (each with its process handle + metering
+/// context, story 3-1), the self-reported [`UsageSource`](crate::ports::UsageSource)
+/// ingestion adapter, and the [`BackoffSchedule`] the restart executor uses
+/// (production 1s×2 cap 60s; tests inject a scaled one).
 pub struct Supervisor {
     backend: backends::Backend,
-    running: HashMap<InstanceName, backends::Handle>,
+    running: HashMap<InstanceName, Supervised>,
+    usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
 }
 
@@ -122,6 +220,7 @@ impl Supervisor {
         Self {
             backend: backends::current(),
             running: HashMap::new(),
+            usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
         }
     }
@@ -135,6 +234,7 @@ impl Supervisor {
         Self {
             backend: backends::current(),
             running: HashMap::new(),
+            usage_source: SelfReportedUsageSource::new(),
             backoff,
         }
     }
@@ -194,6 +294,14 @@ impl Supervisor {
             .map_err(registry_to_engine)?;
         let mut launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // Read the declared Metering Source (story 3-1) from the persisted adapter
+        // snapshot — stamped on every UsageEvent ingested during this Run. Read here
+        // (a pure snapshot read) before any side effect; a corrupt snapshot surfaces
+        // the same way the launch-facts read above would.
+        let metering_source = registry
+            .metering_source(&name)
+            .map_err(registry_to_engine)?;
 
         // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
         // (story 2-2, FR-12) — still before any persisted state change, so a
@@ -260,6 +368,16 @@ impl Supervisor {
         // Ensure the log directory exists (AD-12 seed) so spawn can redirect
         // stdout/stderr into it and we can append transition events.
         self.ensure_log_dir(registry, &name)?;
+
+        // Anchor the usage-ingestion cursor at the agent-output log length BEFORE
+        // the spawn (story 3-1). This Run's own output is appended AFTER this point,
+        // so ingestion reads ALL of it — while a PRIOR Run's already-captured lines
+        // (a stop→start reuses the same append-only agent.log) stay BEHIND the cursor
+        // and are never re-ingested under this fresh Run id. Capturing it HERE (not
+        // after the readiness watch below) is essential: a fast agent emits its first
+        // usage lines within the ~300ms readiness window, so a cursor set post-
+        // readiness would skip them — the ingestion bug this prevents.
+        let usage_cursor = self.agent_log_len(registry, &name);
 
         // (3) registered/stopped/failed → starting.
         self.transition(
@@ -337,7 +455,21 @@ impl Supervisor {
             LifecycleState::Running,
             ready_cause,
         )?;
-        self.running.insert(name.clone(), handle);
+        // Mint the fresh Run id for this `starting`→terminal span (spine AD-7). Each
+        // `starting` — operator start OR restart (story 1-6) — mints a distinct id
+        // (AC-B), so a restarted instance opens a NEW Run whose per-run totals never
+        // bleed in the previous Run's usage. The ingestion cursor was anchored at the
+        // pre-spawn log length (above), so this Run ingests all of its own output.
+        let run_id = RunId::mint();
+        self.running.insert(
+            name.clone(),
+            Supervised {
+                handle,
+                run_id,
+                metering_source,
+                usage_cursor,
+            },
+        );
 
         registry.lookup(&name).map_err(registry_to_engine)
     }
@@ -405,6 +537,14 @@ impl Supervisor {
             TransitionCause::command(LifecycleCommand::Stop.as_str()),
         )?;
 
+        // Drain any final self-reported usage the agent emitted before the stop, so
+        // the last batch of a Run is not lost to the race between "agent printed it"
+        // and "we killed the process" (story 3-1). TERMINAL drain: the process is
+        // about to be gone, so a final newline-less usage line is consumed to
+        // end-of-log rather than stranded (H1). Best-effort — a drain hiccup never
+        // blocks the stop.
+        self.drain_usage_for(registry, &name, DrainMode::Terminal);
+
         // Ask the backend to stop the process (group/job). If we have no handle
         // for it (the row says running but this engine holds no handle AND orphan
         // adoption found no live process), the desired end state "no process of
@@ -413,9 +553,9 @@ impl Supervisor {
         // started by a PRIOR engine IS re-held (via `adopt_orphans`), so a
         // cross-restart stop now really terminates it.
         let outcome = match self.running.get_mut(&name) {
-            Some(handle) => {
+            Some(supervised) => {
                 self.backend
-                    .stop(handle, window)
+                    .stop(&mut supervised.handle, window)
                     .map_err(|source| EngineError::Backend {
                         name: name.as_str().to_string(),
                         source,
@@ -423,7 +563,8 @@ impl Supervisor {
             }
             None => crate::ports::StopOutcome { forced: false },
         };
-        // Drop the handle (also closes the Job / releases the child on Windows).
+        // Drop the handle (also closes the Job / releases the child on Windows) and
+        // the Run's metering context — the Run ends at this terminal transition.
         self.running.remove(&name);
 
         // Clear the write-ahead spawn record (AD-5): a cleanly-stopped instance
@@ -588,17 +729,26 @@ impl Supervisor {
         name: &InstanceName,
         command: LifecycleCommand,
     ) -> Result<(), EngineError> {
-        let Some(handle) = self.running.get_mut(name) else {
+        let Some(supervised) = self.running.get_mut(name) else {
             return Ok(());
         };
         let result = match command {
-            LifecycleCommand::Pause => self.backend.pause(handle),
-            _ => self.backend.resume(handle),
+            LifecycleCommand::Pause => self.backend.pause(&mut supervised.handle),
+            _ => self.backend.resume(&mut supervised.handle),
         };
         result.map_err(|source| EngineError::Backend {
             name: name.as_str().to_string(),
             source,
         })
+    }
+
+    /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if
+    /// this engine holds no live handle for it (never started this lifetime, or
+    /// already stopped/crashed). The Fleet read uses it to scope the current-Run
+    /// token totals; a `None` simply means "no active Run" (current-run totals are
+    /// zero). Held in memory alongside the process handle for this engine lifetime.
+    pub fn current_run_id(&self, name: &InstanceName) -> Option<RunId> {
+        self.running.get(name).map(|s| s.run_id.clone())
     }
 
     /// Read the recorded [`TransitionEvent`]s for an instance from its log
@@ -641,6 +791,12 @@ impl Supervisor {
     /// moved to `failed` and its handle removed, a later pass will not see it in
     /// `self.running` again.
     pub fn poll_once(&mut self, registry: &Registry) -> Vec<RestartPlan> {
+        // First, INGEST self-reported usage from every running instance's captured
+        // output (story 3-1): the reaper is the natural cadence for draining the
+        // agent-output log into the Usage Ledger while an instance is `running`.
+        // Best-effort per instance; a drain hiccup never blocks crash detection.
+        self.drain_usage_all(registry);
+
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
@@ -649,7 +805,7 @@ impl Supervisor {
             // Poll liveness. A poll error is treated as still-alive (transient);
             // the next pass re-checks. Reap on exit is done inside `poll`.
             let exited = match self.running.get_mut(&name) {
-                Some(handle) => match self.backend.poll(handle) {
+                Some(supervised) => match self.backend.poll(&mut supervised.handle) {
                     Ok(ProcessStatus::Exited { code }) => Some(code),
                     Ok(ProcessStatus::Alive) => None,
                     Err(_) => None,
@@ -657,6 +813,11 @@ impl Supervisor {
                 None => continue,
             };
             let Some(code) = exited else { continue };
+            // The process exited: drain any usage it emitted right before dying, so a
+            // final batch is not lost between "agent printed it" and this reap.
+            // TERMINAL drain — the process is dead, so consume a final newline-less
+            // usage line to end-of-log instead of stranding it (H1).
+            self.drain_usage_for(registry, &name, DrainMode::Terminal);
 
             // Read the store state: only an instance the store still shows
             // running/paused is an UNREQUESTED crash. A `stopping` (operator
@@ -841,7 +1002,29 @@ impl Supervisor {
                 Ok(Some(handle)) => {
                     // Live match: re-hold the handle. State stays as persisted
                     // (running/paused). AI-7: a paused process is now resumable.
-                    self.running.insert(name, handle);
+                    //
+                    // Metering across a crash/adoption (story 3-1, documented
+                    // assumption): the pre-crash Run id lived only in the crashed
+                    // engine's memory, so the adopted instance opens a NEW Run and
+                    // begins ingestion at the CURRENT end of its agent-output log
+                    // (skipping pre-crash lines). This keeps per-run totals honest for
+                    // the post-adoption span without re-attributing (or double-
+                    // counting) the old Run's already-captured usage; the DB dedup key
+                    // includes the run id, so even an overlapping sequence is safe.
+                    let run_id = RunId::mint();
+                    let usage_cursor = self.agent_log_len(registry, &name);
+                    let metering_source = registry
+                        .metering_source(&name)
+                        .unwrap_or_else(|_| "self-reported".to_string());
+                    self.running.insert(
+                        name,
+                        Supervised {
+                            handle,
+                            run_id,
+                            metering_source,
+                            usage_cursor,
+                        },
+                    );
                     adopted += 1;
                 }
                 Ok(None) => {
@@ -995,6 +1178,145 @@ impl Supervisor {
             path: dir.to_string_lossy().into_owned(),
             detail: e.to_string(),
         })
+    }
+
+    // ---- Self-reported usage ingestion → the ONE ledger-commit choke point ----
+    //      (story 3-1, spine AD-6/AD-7/AD-12)
+
+    /// The current byte length of an instance's agent-output log, or 0 if it does
+    /// not exist yet. Used to set the ingestion cursor at a Run's start so a new
+    /// Run never re-reads a prior Run's already-captured lines.
+    fn agent_log_len(&self, registry: &Registry, name: &InstanceName) -> u64 {
+        std::fs::metadata(registry.agent_output_log_path(name))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Drain self-reported usage from EVERY currently-running instance (the reaper
+    /// cadence). Best-effort per instance — one instance's drain failure never
+    /// blocks another's or crash detection.
+    ///
+    /// This is the MID-RUN cadence: the process is (believed) still alive, so a
+    /// half-written final line is left for the next pass ([`DrainMode::MidRun`]).
+    fn drain_usage_all(&mut self, registry: &Registry) {
+        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.drain_usage_for(registry, &name, DrainMode::MidRun);
+        }
+    }
+
+    /// Drain the NEWLY-captured tail of one instance's agent-output log, ingesting
+    /// each well-formed usage sentinel line through the commit choke point
+    /// ([`Supervisor::ingest_usage`]), and advance the read cursor.
+    ///
+    /// Reads from the per-instance cursor to the file's end (only the bytes written
+    /// since the last drain), parses usage lines via the self-reported
+    /// [`UsageSource`](crate::ports::UsageSource), and records each. A read error
+    /// (log gone / unreadable) is a best-effort skip — the DB is the source of
+    /// truth, and the next pass retries. Malformed usage lines are skipped inside
+    /// the parser (a diagnostic, never fatal — AD-12).
+    ///
+    /// The `mode` decides how the TAIL is treated (story 3-1 under-count fix, H1):
+    /// * [`DrainMode::MidRun`] — the process may still be mid-`writeln!`, so only
+    ///   bytes UP TO the last newline are consumed; a partial trailing line waits
+    ///   for the next drain (it lands whole then).
+    /// * [`DrainMode::Terminal`] — the process is DEAD (drain-on-stop / drain-on-
+    ///   reap); no more bytes will ever append, so a final usage line flushed
+    ///   WITHOUT a trailing newline is consumed to end-of-log rather than stranded
+    ///   (which the next Run's cursor would skip past → a permanent under-count).
+    ///
+    /// Log-shrink guard (M2): if the file is shorter than the cursor (a truncate /
+    /// rotation — nothing in-tree does this yet; Epic 4 owns rotation), we do NOT
+    /// re-read from 0 under the same live `run_id` (that would re-ingest already-
+    /// counted lines → a double-count, an INFLATED bill). We instead treat it as an
+    /// anomaly: advance the cursor to the new length and ingest nothing this pass.
+    /// Proper rotation handling is deferred to Epic 4.
+    fn drain_usage_for(&mut self, registry: &Registry, name: &InstanceName, mode: DrainMode) {
+        // Only running/adopted instances have a cursor + metering context.
+        let (cursor, run_id, metering_source) = match self.running.get(name) {
+            Some(s) => (s.usage_cursor, s.run_id.clone(), s.metering_source.clone()),
+            None => return,
+        };
+        let path = registry.agent_output_log_path(name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        // Decide (purely) what this pass reads: a shrink anomaly (M2), nothing yet,
+        // or a byte range to consume + the resulting cursor (H1 terminal-tail rule).
+        match plan_drain(&bytes, cursor, mode) {
+            DrainPlan::Shrunk { new_cursor } => {
+                // M2: the file is shorter than where we last read — do NOT restart
+                // from 0 (that double-counts). Snap the cursor to the new end and
+                // ingest nothing this pass.
+                if let Some(s) = self.running.get_mut(name) {
+                    s.usage_cursor = new_cursor;
+                }
+            }
+            DrainPlan::Nothing => {}
+            DrainPlan::Consume { range, new_cursor } => {
+                let block = String::from_utf8_lossy(&bytes[range]);
+                let parsed = self.usage_source.drain(&block);
+                // Advance the cursor FIRST (past the consumed lines) so a mid-batch
+                // record failure does not re-ingest earlier lines on the next pass —
+                // the DB dedup key is the ultimate guard, but not re-reading keeps it
+                // cheap.
+                if let Some(s) = self.running.get_mut(name) {
+                    s.usage_cursor = new_cursor;
+                }
+                for usage in parsed {
+                    self.ingest_usage(registry, name, &run_id, &metering_source, &usage);
+                }
+            }
+        }
+    }
+
+    /// THE ledger-commit choke point (story 3-1, spine AD-7) — the SOLE writer of
+    /// the `usage_events` table.
+    ///
+    /// Constructs the full [`UsageEvent`] from the agent-supplied [`ParsedUsage`]
+    /// plus the engine-stamped fields (the current Run id, the instance name, the
+    /// metering source, and the commit timestamp), then records it in its OWN
+    /// transaction via `record_usage_event` (AD-6: one transaction per event). A
+    /// re-delivered batch is classified [`RecordOutcome::DuplicateReplay`] by the
+    /// DB `UNIQUE` index and is a no-op (AC-A no-double-count). On a fresh insert it
+    /// builds the AD-14 [`UsageUpdateEvent`] (the wire shape frozen now; Host
+    /// delivery is story 7-2). A store error is a best-effort diagnostic — usage
+    /// ingestion must never crash the supervisor or a lifecycle op (the ledger is
+    /// advisory to the RUN, not gating it this story).
+    ///
+    /// **The AD-7 single-writer invariant lives here:** no other code path may call
+    /// `record_usage_event`. Story 3-2 adds its `BudgetEvaluator` call INSIDE this
+    /// method — right after the commit, in the same path — with no re-plumbing (the
+    /// "inside the same commit path" rule), so the enforcement race can never open
+    /// between "usage recorded" and "budget checked". Add NO evaluator/breach here.
+    fn ingest_usage(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        metering_source: &str,
+        parsed: &ParsedUsage,
+    ) -> Option<UsageUpdateEvent> {
+        let event = assemble_usage_event(
+            parsed,
+            name.as_str(),
+            run_id.clone(),
+            metering_source,
+            now_rfc3339(),
+        );
+        match registry.record_usage_event(&event) {
+            // A fresh row: build the AD-14 usage-update wire struct (frozen now; 7-2
+            // delivers it). 3-2 hooks the BudgetEvaluator immediately below this line.
+            Ok(RecordOutcome::Inserted) => Some(UsageUpdateEvent::new(event)),
+            // A recognized replay — no double-count, no event emitted (nothing new
+            // was committed). This is the AC-A guarantee in action.
+            Ok(RecordOutcome::DuplicateReplay) => None,
+            // A store error: usage ingestion is best-effort — do not crash the
+            // supervisor. The ledger is the source of truth for what WAS recorded;
+            // a transient write failure just means this event is not counted (the
+            // agent may re-send it, and the dedup key keeps that safe).
+            Err(_) => None,
+        }
     }
 }
 
@@ -2106,5 +2428,93 @@ mod tests {
         std::fs::write(&path, format!("\n{line}\n\n")).unwrap();
         let back = read_events_from(&path).unwrap();
         assert_eq!(back, vec![e]);
+    }
+
+    // ---- Story 3-1 drain planning: H1 terminal-tail + M2 shrink guard ----
+
+    #[test]
+    fn plan_drain_midrun_stops_at_the_last_newline() {
+        // MID-RUN: a live process may still finish a partial final line, so only bytes
+        // up to the last newline are consumed; the trailing partial waits.
+        let bytes = b"a\nb\nhalf-written";
+        let plan = plan_drain(bytes, 0, DrainMode::MidRun);
+        // Consumes "a\nb\n" (4 bytes), leaving "half-written" for the next pass.
+        assert_eq!(
+            plan,
+            DrainPlan::Consume {
+                range: 0..4,
+                new_cursor: 4
+            }
+        );
+    }
+
+    #[test]
+    fn plan_drain_midrun_with_no_newline_yet_consumes_nothing() {
+        // A tail with no complete line yet: nothing to consume this pass (MidRun).
+        assert_eq!(
+            plan_drain(b"no newline yet", 0, DrainMode::MidRun),
+            DrainPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn plan_drain_terminal_consumes_a_newline_less_final_line() {
+        // H1: on a TERMINAL drain the process is dead, so a final usage line flushed
+        // WITHOUT a trailing newline must be consumed to end-of-log (or it is stranded
+        // and the next Run's cursor skips past it → a permanent under-count).
+        let bytes = b"a\nKTESIO_USAGE {\"sequence\":0,\"input_tokens\":10,\"output_tokens\":20}";
+        let plan = plan_drain(bytes, 0, DrainMode::Terminal);
+        // The WHOLE tail is consumed (no trailing newline required).
+        assert_eq!(
+            plan,
+            DrainPlan::Consume {
+                range: 0..bytes.len(),
+                new_cursor: bytes.len() as u64
+            }
+        );
+    }
+
+    #[test]
+    fn plan_drain_terminal_from_a_cursor_consumes_only_the_new_tail() {
+        // The terminal tail is measured FROM the cursor (already-read bytes are not
+        // re-consumed) and still needs no trailing newline.
+        let bytes = b"old\nnew-tail-no-nl";
+        let plan = plan_drain(bytes, 4, DrainMode::Terminal); // cursor past "old\n"
+        assert_eq!(
+            plan,
+            DrainPlan::Consume {
+                range: 4..bytes.len(),
+                new_cursor: bytes.len() as u64
+            }
+        );
+    }
+
+    #[test]
+    fn plan_drain_shrink_snaps_the_cursor_and_ingests_nothing() {
+        // M2: the log is shorter than the cursor (a truncate/rotation). We must NOT
+        // re-read from 0 (double-count → inflated bill); instead snap the cursor to
+        // the new length and ingest nothing. Holds for BOTH modes.
+        let bytes = b"short"; // len 5
+        assert_eq!(
+            plan_drain(bytes, 100, DrainMode::MidRun),
+            DrainPlan::Shrunk { new_cursor: 5 }
+        );
+        assert_eq!(
+            plan_drain(bytes, 100, DrainMode::Terminal),
+            DrainPlan::Shrunk { new_cursor: 5 },
+            "the shrink guard applies on the terminal path too"
+        );
+    }
+
+    #[test]
+    fn plan_drain_at_end_of_log_consumes_nothing() {
+        // Cursor exactly at len (all bytes already read): an empty tail → Nothing, in
+        // both modes (no phantom terminal consume of zero bytes).
+        let bytes = b"a\nb\n";
+        assert_eq!(plan_drain(bytes, 4, DrainMode::MidRun), DrainPlan::Nothing);
+        assert_eq!(
+            plan_drain(bytes, 4, DrainMode::Terminal),
+            DrainPlan::Nothing
+        );
     }
 }

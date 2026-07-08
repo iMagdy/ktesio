@@ -17,7 +17,7 @@ use std::time::Duration;
 use ktesio_engine::{
     AdapterRef, Capability, ConfigError, ConfigLayer, EffectiveCapabilities, EffectiveConfig,
     Engine, EngineError, FleetEntry, FleetListing, RegistryError, RemoveDisposition, SupportLevel,
-    FLEET_SCHEMA_VERSION,
+    UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -205,8 +205,9 @@ fn serialize_error(what: &str, err: serde_json::Error) -> Box<dyn std::error::Er
 /// `kt agent show <name> [--json]` — render an instance's effective Capability
 /// Declaration (AC1 "visible for the instance") plus its runtime status (story
 /// 1-6, AC9): the current Lifecycle State, the active Restart Policy, the restart
-/// count, the honest Budget/cap + Usage metering seed (Epic 3 — `—`/`null`), and
-/// — for a `failed` instance — the failed cause.
+/// count, the REAL story-3-1 Usage token totals + the honest Budget/cap seed
+/// (still `—`/`null` — budgets are story 3-2), and — for a `failed` instance — the
+/// failed cause.
 ///
 /// `--json` mode (story 1-7) writes a single versioned document to STDOUT and
 /// nothing else there: `{ schema_version, instance: <FleetEntry> }` — the SAME
@@ -234,21 +235,27 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
             })?;
         let json = show_json(entry)?;
         println!("{json}");
-        // The metering-seed note rides on stderr (AD-12), keeping stdout pure JSON.
-        ui::note(METERING_EPIC3_NOTE);
+        // The metering note rides on stderr (AD-12), keeping stdout pure JSON.
+        ui::note(METERING_NOTE);
         return Ok(());
     }
 
     let caps = facade.effective_capabilities(name).map_err(map_error)?;
     render_capabilities(name, &caps);
     // Runtime status (story 1-6, AC9): state + policy + restart count + failed
-    // cause. A status read-back failure must not fail `show` (the capabilities
-    // already printed); note it and continue.
+    // cause + the story-3-1 usage totals + Metering Source. A status read-back
+    // failure must not fail `show` (the capabilities already printed); note it and
+    // continue. The usage/metering rows come from the Fleet entry (the same read
+    // `list` uses), so `show` and `list` agree exactly.
     match facade.instance_status(name) {
         Ok(status) => {
-            render_runtime_status(&status);
-            // One stderr note (AD-12) that the budget/usage rows are Epic-3 seeds.
-            ui::note(METERING_EPIC3_NOTE);
+            let entry = facade
+                .fleet()
+                .ok()
+                .and_then(|f| f.into_iter().find(|e| e.name.as_str() == name));
+            render_runtime_status(&status, entry.as_ref());
+            // One stderr note (AD-12): usage is real tokens; budget/dollars are later.
+            ui::note(METERING_NOTE);
         }
         Err(err) => ui::warning(format!("Could not read runtime status for '{name}': {err}")),
     }
@@ -256,16 +263,27 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Render the per-instance runtime status (story 1-6, AC9) as a small table:
-/// State, Restart Policy, Restart count, and the honest Budget/cap + Usage
-/// metering seed (story 1-7 — Epic 3, rendered `—`); for a `failed` instance the
-/// failed cause is printed below (result → stdout, AD-12). The caller prints the
-/// Epic-3 metering note to stderr.
-fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
+/// State, Restart Policy, Restart count, the honest Budget/cap seed (story 3-2,
+/// rendered `—`), the REAL story-3-1 Usage token totals + the active Metering
+/// Source, and — for a `failed` instance — the failed cause below (result →
+/// stdout, AD-12). The caller prints the metering note to stderr. `entry` is the
+/// instance's Fleet entry (the same read `list` uses), or `None` if that read
+/// degraded — in which case the usage/metering rows fall back to zero/unknown so
+/// the table still renders (mirroring the runtime-field degradation).
+fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&FleetEntry>) {
     let title = format!("Runtime status for {}", status.instance.name.as_str());
     let columns = [
         ui::TableColumn::new("Field", 14, 20),
         ui::TableColumn::new("Value", 14, 48),
     ];
+    // Usage + Metering Source from the Fleet entry (story 3-1); a degraded read
+    // falls back to zero usage / "unknown" source so `show` never fails on it.
+    let usage_value = entry
+        .map(|e| usage_cell(&e.usage))
+        .unwrap_or_else(|| "in 0 / out 0".to_string());
+    let metering_value = entry
+        .map(|e| e.metering_source.clone())
+        .unwrap_or_else(|| "unknown".to_string());
     let rows = vec![
         vec![
             ui::TableCell::plain("State"),
@@ -279,15 +297,20 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
             ui::TableCell::plain("Restart count"),
             ui::TableCell::plain(status.restart_count.to_string()),
         ],
-        // The honest Epic-1 metering seed rows (story 1-7): a single `—`, never a
-        // fabricated number. Populated by Epic 3 metering.
+        // Budget/cap stays the honest `—` seed (budgets are story 3-2).
         vec![
             ui::TableCell::plain("Budget/cap"),
             ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
         ],
+        // Usage is REAL now (story 3-1): the cumulative token totals (tokens only).
         vec![
-            ui::TableCell::plain("Usage"),
-            ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+            ui::TableCell::plain("Usage (tokens)"),
+            ui::TableCell::plain(usage_value),
+        ],
+        // The active Metering Source (AC-C).
+        vec![
+            ui::TableCell::plain("Metering source"),
+            ui::TableCell::plain(metering_value),
         ],
     ];
     ui::print_table(&title, &columns, &rows);
@@ -350,19 +373,31 @@ pub fn remove(
     }
 }
 
-/// The one-line stderr NOTE (AD-12: notices → stderr) that the budget/cap +
-/// Usage Ledger columns are HONEST Epic-1 seeds — metering arrives in Epic 3.
-/// Shared by `list` and `show` so both surfaces state it identically.
-const METERING_EPIC3_NOTE: &str =
-    "budget/cap status and Usage Ledger totals arrive with metering in Epic 3; \
-     they show as '—' (JSON null) until then.";
+/// The one-line stderr NOTE (AD-12: notices → stderr) about the honest metering
+/// boundary now that story 3-1 ships the Usage Ledger: `usage` shows REAL token
+/// totals, but budgets/caps (story 3-2) and dollar figures (3-3) are still to
+/// come — so the budget cell stays `—` and no dollar figure is shown (tokens
+/// only). Shared by `list` and `show` so both surfaces state it identically.
+const METERING_NOTE: &str =
+    "usage totals are real token counts from the Usage Ledger; budget/cap status \
+     (JSON null / '—') and dollar figures arrive with later Epic-3 stories (tokens only for now).";
+
+/// Render a [`UsageView`]'s CUMULATIVE token totals as a compact human cell, e.g.
+/// `in 120 / out 340` (tokens only — AD-8, no dollars this story). Kept here so
+/// `list` and `show` render usage identically.
+fn usage_cell(usage: &UsageView) -> String {
+    format!(
+        "in {} / out {}",
+        usage.cumulative_input_tokens, usage.cumulative_output_tokens
+    )
+}
 
 /// `kt agent list [--json]` — render the Fleet (FR-4).
 ///
-/// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the honest
-/// Budget/cap + Usage metering-seed columns (Epic 3 — rendered `—`), and the
-/// Agent Home; one stderr note explains the metering seed (AD-12: result →
-/// stdout, note → stderr). `--json` mode writes a single versioned
+/// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the REAL
+/// story-3-1 Usage token totals + the honest Budget/cap seed column (still `—` —
+/// budgets are story 3-2), and the Agent Home; one stderr note explains the
+/// metering boundary (AD-12: result → stdout, note → stderr). `--json` mode writes a single versioned
 /// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `kt --json`
 /// serializes the same struct the Host event stream will publish). Freshness
 /// (≤2s, AC6) is structural: each invocation opens the engine and reads live
@@ -383,8 +418,8 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         if empty {
             ui::note("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
         }
-        // The metering-seed note still rides on stderr (AD-12).
-        ui::note(METERING_EPIC3_NOTE);
+        // The metering note still rides on stderr (AD-12), keeping stdout pure JSON.
+        ui::note(METERING_NOTE);
         return Ok(());
     }
 
@@ -393,13 +428,17 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // The Metering Source rides the Fleet DETAIL (`kt agent show` + `--json`), which
+    // is where AC-C requires it "visible in Fleet listing detail"; the human `list`
+    // table keeps a compact column set (adding a Metering column here overflows the
+    // 80-col default and truncates cells), surfacing the real Usage token totals.
     let columns = [
         ui::TableColumn::new("Name", 12, 32),
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
         ui::TableColumn::new("Restarts", 8, 10),
         ui::TableColumn::new("Budget/cap", 10, 12),
-        ui::TableColumn::new("Usage", 8, 12),
+        ui::TableColumn::new("Usage (tokens)", 14, 24),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
     let rows: Vec<Vec<ui::TableCell>> = entries
@@ -410,16 +449,17 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 ui::TableCell::plain(entry.kind.clone()),
                 ui::TableCell::status(entry.state.as_str()),
                 ui::TableCell::plain(entry.restart_count.to_string()),
-                // The honest Epic-1 metering seed: a single `—`, never a number.
+                // Budget/cap stays the honest `—` seed (budgets are story 3-2).
                 ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
-                ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+                // Usage is REAL now (story 3-1): the cumulative token totals.
+                ui::TableCell::plain(usage_cell(&entry.usage)),
                 ui::TableCell::muted(entry.agent_home.clone()),
             ]
         })
         .collect();
     ui::print_table("Fleet", &columns, &rows);
-    // One stderr note (AD-12) that budget/usage are Epic-3 seeds, not fabricated.
-    ui::note(METERING_EPIC3_NOTE);
+    // One stderr note (AD-12): usage is real tokens; budget/dollars are later stories.
+    ui::note(METERING_NOTE);
     Ok(())
 }
 
@@ -1342,15 +1382,20 @@ mod tests {
             restart_policy: ktesio_engine::RestartPolicy::OnFailure,
             failed_cause: None,
             budget: None,
-            usage: None,
+            usage: UsageView::new(
+                ktesio_engine::UsageTotals::zero(),
+                ktesio_engine::UsageTotals::zero(),
+            ),
+            metering_source: "self-reported".to_string(),
             agent_home: format!("/x/agents/{name}"),
         }
     }
 
     #[test]
-    fn fleet_json_emits_versioned_document_with_null_seeds() {
+    fn fleet_json_emits_versioned_document_with_budget_seed_and_real_usage() {
         // The `list --json` document is a versioned FleetListing whose per-entry
-        // budget/usage are the honest JSON null seed (never 0). Pure — no engine.
+        // `budget` is the honest JSON null seed (never 0) while `usage` is a real
+        // token-totals object (story 3-1). Pure — no engine.
         let doc = fleet_json(vec![sample_fleet_entry("alpha")]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(
@@ -1360,7 +1405,13 @@ mod tests {
         let entry = &value["instances"][0];
         assert_eq!(entry["name"], serde_json::json!("alpha"));
         assert_eq!(entry["budget"], serde_json::Value::Null);
-        assert_eq!(entry["usage"], serde_json::Value::Null);
+        // usage is a real object with zero token totals (not null).
+        assert!(entry["usage"].is_object(), "{entry}");
+        assert_eq!(
+            entry["usage"]["cumulative_input_tokens"],
+            serde_json::json!(0)
+        );
+        assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
     }
 
     #[test]
@@ -1374,7 +1425,8 @@ mod tests {
     #[test]
     fn show_json_wraps_one_entry_with_the_shared_schema_version() {
         // `show --json` is { schema_version, instance: <FleetEntry> } — the SAME
-        // schema version as list --json (AD-14: one schema), null metering seed.
+        // schema version as list --json (AD-14: one schema). `budget` is the null
+        // seed; `usage` is a real token-totals object (story 3-1).
         let doc = show_json(sample_fleet_entry("web-1")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(
@@ -1383,7 +1435,11 @@ mod tests {
         );
         assert_eq!(value["instance"]["name"], serde_json::json!("web-1"));
         assert_eq!(value["instance"]["budget"], serde_json::Value::Null);
-        assert_eq!(value["instance"]["usage"], serde_json::Value::Null);
+        assert!(value["instance"]["usage"].is_object(), "{value}");
+        assert_eq!(
+            value["instance"]["metering_source"],
+            serde_json::json!("self-reported")
+        );
     }
 
     #[test]

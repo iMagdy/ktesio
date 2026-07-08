@@ -386,10 +386,15 @@ impl Engine {
     /// (ordered by name) plus, per instance, the same runtime status
     /// ([`Engine::instance_status`]) the CLI already surfaces — the restart
     /// count/policy + (for a `failed` instance) the last-known cause — plus the
-    /// honest Epic-1 metering seed (`budget`/`usage` = `None`; metering is Epic
-    /// 3). Reading live persisted state on every call is what makes the listing
-    /// ≤2s fresh (AC6): there is no cache, so any committed transition is
-    /// reflected on the next `fleet()` (a single DB read, far under 2s).
+    /// story-3-1 metering surface: the real Usage-Ledger token totals + the active
+    /// Metering Source (AC-C/AC11), and the still-honest `budget` `None` seed
+    /// (budgets are story 3-2). Reading live persisted state on every call is what
+    /// makes the listing ≤2s fresh (AC6): there is no cache, so any committed
+    /// transition is reflected on the next `fleet()` (a single DB read, far under 2s).
+    ///
+    /// The current-Run token totals come from the supervisor's live Run id (held in
+    /// memory for a running instance), so `fleet()` locks the supervisor too — a
+    /// non-running instance simply has no current Run (current-run totals are zero).
     ///
     /// A per-instance status read-back failure DEGRADES that entry's runtime
     /// fields (count `0`, policy default, no cause) rather than failing the whole
@@ -399,10 +404,11 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
             let instances = registry.list()?;
             let entries = instances
                 .into_iter()
-                .map(|instance| Self::fleet_entry_for(&registry, instance))
+                .map(|instance| Self::fleet_entry_for(&registry, &supervisor, instance))
                 .collect();
             Ok(entries)
         })
@@ -413,8 +419,13 @@ impl Engine {
     /// runtime status through the SAME registry lock (one read pass, no
     /// re-entrancy). A status read-back failure degrades the runtime fields to
     /// their defaults rather than failing the whole Fleet (the 1-6 `list`
-    /// fallback). `budget`/`usage` are the honest Epic-1 `None` seed (Epic 3).
-    fn fleet_entry_for(registry: &Registry, instance: AgentInstance) -> FleetEntry {
+    /// fallback). `budget` is the honest `None` seed (story 3-2); `usage` +
+    /// `metering_source` are real (story 3-1).
+    fn fleet_entry_for(
+        registry: &Registry,
+        supervisor: &Supervisor,
+        instance: AgentInstance,
+    ) -> FleetEntry {
         // Read the write-ahead spawn record for the restart count/policy + cause,
         // exactly as `instance_status` does. A missing record → defaults (count 0,
         // policy default) — this is the normal case for a never-started instance.
@@ -439,6 +450,23 @@ impl Engine {
                 .find(|e| e.new_state == LifecycleState::Failed)
                 .and_then(|e| failed_cause_detail(&e.cause))
         });
+        // Story 3-1 metering surface (AC-C/AC11). The CUMULATIVE token totals come
+        // straight from the Usage Ledger (sum over all Runs); the CURRENT-RUN totals
+        // are scoped to the supervisor's live Run id (zero when not running / no run
+        // id). A read-back failure degrades to zero totals (like the runtime fields),
+        // never failing the whole Fleet. The totals equal the ledger exactly (FR-22).
+        let cumulative = registry.usage_totals(&instance.name).unwrap_or_default();
+        let current_run = supervisor
+            .current_run_id(&instance.name)
+            .and_then(|run_id| registry.run_usage_totals(&instance.name, &run_id).ok())
+            .unwrap_or_default();
+        let usage = crate::domain::UsageView::new(cumulative, current_run);
+        // The active Metering Source is visible in Fleet detail (AC-C), read from the
+        // persisted adapter snapshot. A degraded read falls back to the honest
+        // "unknown" marker rather than fabricating a source.
+        let metering_source = registry
+            .metering_source(&instance.name)
+            .unwrap_or_else(|_| "unknown".to_string());
         FleetEntry {
             name: instance.name,
             kind: instance.kind,
@@ -446,10 +474,13 @@ impl Engine {
             restart_count,
             restart_policy,
             failed_cause,
-            // The honest Epic-1 metering seed: metering is Epic 3 (AD-7), so these
-            // are always `None` (JSON `null`), never `0` and never fabricated.
+            // `budget` stays the honest seed: budgets + enforcement are story 3-2, so
+            // this is always `None` (JSON `null`), never `0` and never fabricated.
             budget: None,
-            usage: None,
+            // `usage` is REAL now (story 3-1): the Usage-Ledger token totals, tokens
+            // only (dollars/headroom are 3-3/3-5). `metering_source` is surfaced too.
+            usage,
+            metering_source,
             agent_home: instance.agent_home,
         }
     }

@@ -1246,11 +1246,13 @@ source = "self-reported"
 }
 
 #[test]
-fn list_json_emits_a_parseable_document_with_null_metering_seeds() {
-    // Story 1-7 (Task 5, AC5/AC9): `kt agent list --json` writes ONE parseable
-    // JSON document to stdout (and NOTHING non-JSON there), carrying a top-level
-    // schema_version + per-instance objects whose budget/usage are the honest
-    // JSON `null` seed (never 0, never fabricated). The Epic-3 note is on stderr.
+fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
+    // Story 1-7 (AC5/AC9) + story 3-1 (AC-C/AC11): `kt agent list --json` writes ONE
+    // parseable JSON document to stdout (and NOTHING non-JSON there), carrying a
+    // top-level schema_version + per-instance objects whose `budget` is the honest
+    // JSON `null` seed (budgets are 3-2) while `usage` is a REAL token-totals object
+    // (zeros for a never-metered instance, not null) and `metering_source` is
+    // surfaced. The metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1278,21 +1280,36 @@ fn list_json_emits_a_parseable_document_with_null_metering_seeds() {
     assert_eq!(entry["kind"], serde_json::json!("mock"));
     assert_eq!(entry["state"], serde_json::json!("registered"));
     assert_eq!(entry["restart_count"], serde_json::json!(0));
-    // The honest Epic-1 metering seed: JSON null, NOT 0, NOT a fabricated number.
+    // budget: the honest JSON null seed, NOT 0, NOT a fabricated number.
     assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
-    assert_eq!(entry["usage"], serde_json::Value::Null, "{entry}");
     assert_ne!(entry["budget"], serde_json::json!(0));
+    // usage: a real object with zero token totals (story 3-1) — NOT null.
+    assert!(
+        entry["usage"].is_object(),
+        "usage must be an object: {entry}"
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_output_tokens"],
+        serde_json::json!(0)
+    );
+    // The active Metering Source is surfaced (AC-C).
+    assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
+    // No dollar figure anywhere (tokens only — AD-8).
+    assert!(entry["usage"].get("cost").is_none(), "{entry}");
     assert!(entry.get("agent_home").is_some());
 
-    // The Epic-3 metering note rides on stderr (never stdout), so stdout stays
-    // valid JSON. stdout must NOT contain the note text.
+    // The metering note rides on stderr (never stdout), so stdout stays valid JSON.
     assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "the Epic-3 note must be on stderr; stderr={}",
+        run.stderr.contains("Usage Ledger"),
+        "the metering note must be on stderr; stderr={}",
         run.stderr
     );
     assert!(
-        !run.stdout.contains("Epic 3"),
+        !run.stdout.contains("Usage Ledger"),
         "stdout must be pure JSON (no note); stdout={}",
         run.stdout
     );
@@ -1325,9 +1342,10 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
 }
 
 #[test]
-fn human_list_shows_the_honest_metering_seed_columns() {
-    // Story 1-7 (Task 5, AC4): the human `list` renders Budget/cap + Usage columns
-    // as the honest `—` seed (never a number), and the Epic-3 note is on stderr.
+fn human_list_shows_the_budget_seed_and_real_usage_columns() {
+    // Story 1-7 (AC4) + story 3-1 (AC-C): the human `list` renders the Budget/cap
+    // column as the honest `—` seed (budgets are 3-2) AND a real Usage (tokens) +
+    // Metering column; the metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1339,27 +1357,27 @@ fn human_list_shows_the_honest_metering_seed_columns() {
 
     let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
-    // The new columns are present (headers) and render the `—` seed (stdout).
+    // The columns are present (headers): Budget/cap (seed) + Usage (real). The
+    // Metering Source rides the Fleet DETAIL (`show` + `--json`), not this compact
+    // human list table, so it is asserted there (AC-C).
     assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
+    // Budget/cap still renders the honest `—` seed.
     assert!(
         run.stdout.contains('—'),
-        "the metering seed cell must render the em dash; stdout={}",
+        "the budget seed cell must render the em dash; stdout={}",
         run.stdout
     );
-    // The Epic-3 note is on stderr (AD-12), never stdout.
-    assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "stderr={}",
-        run.stderr
-    );
+    // The metering note is on stderr (AD-12), never stdout.
+    assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
 #[test]
-fn show_json_surfaces_the_same_entry_shape_with_null_seeds() {
-    // Story 1-7 (Task 5, AC5): `kt agent show <name> --json` writes ONE JSON
-    // document to stdout: { schema_version, instance: <the same FleetEntry
-    // shape> }, budget/usage the honest null seed. The Epic-3 note is on stderr.
+fn show_json_surfaces_the_same_entry_shape_with_budget_seed_and_real_usage() {
+    // Story 1-7 (AC5) + story 3-1: `kt agent show <name> --json` writes ONE JSON
+    // document to stdout: { schema_version, instance: <the same FleetEntry shape> },
+    // `budget` the honest null seed and `usage` a real token-totals object. The
+    // metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1385,20 +1403,29 @@ fn show_json_surfaces_the_same_entry_shape_with_null_seeds() {
     let entry = &doc["instance"];
     assert_eq!(entry["name"], serde_json::json!("alpha"));
     assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
-    assert_eq!(entry["usage"], serde_json::Value::Null, "{entry}");
-    // stdout is pure JSON; the note is on stderr.
-    assert!(!run.stdout.contains("Epic 3"), "stdout={}", run.stdout);
     assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "stderr={}",
-        run.stderr
+        entry["usage"].is_object(),
+        "usage must be an object: {entry}"
     );
+    assert_eq!(
+        entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(0)
+    );
+    assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
+    // stdout is pure JSON; the note is on stderr.
+    assert!(
+        !run.stdout.contains("Usage Ledger"),
+        "stdout={}",
+        run.stdout
+    );
+    assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
 #[test]
-fn human_show_surfaces_the_metering_seed_rows() {
-    // Story 1-7 (Task 5, AC4): human `show` adds Budget/cap + Usage seed rows
-    // (rendered `—`) to the runtime-status block, with the Epic-3 note on stderr.
+fn human_show_surfaces_the_budget_seed_and_real_usage_rows() {
+    // Story 1-7 (AC4) + story 3-1 (AC-C): human `show` renders a Budget/cap seed row
+    // (`—`, budgets are 3-2) plus REAL Usage (tokens) + Metering source rows in the
+    // runtime-status block, with the metering note on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1412,12 +1439,20 @@ fn human_show_surfaces_the_metering_seed_rows() {
     assert!(run.success, "show should exit 0; stderr={}", run.stderr);
     assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
-    assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
+    // The Metering source row + the self-reported value are surfaced (AC-C).
     assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "stderr={}",
-        run.stderr
+        run.stdout.contains("Metering source"),
+        "stdout={}",
+        run.stdout
     );
+    assert!(
+        run.stdout.contains("self-reported"),
+        "stdout={}",
+        run.stdout
+    );
+    // Budget/cap still renders the honest `—` seed.
+    assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
+    assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
 // ---- Story 2-1: `kt agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
@@ -2471,11 +2506,15 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
         !snapshot_path.exists(),
         "an unresolved secret must reject the start before the snapshot is written"
     );
-    // And `agent list` still shows it as `registered` (never `running`/`failed`
-    // from a half-launch).
-    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
-    assert!(
-        list.stdout.contains("registered"),
+    // And `agent list --json` still shows it as `registered` (never
+    // `running`/`failed` from a half-launch). Assert on the JSON `state` field —
+    // deterministic committed state, not the width-dependent human table.
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout)
+        .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
+    let state = doc["instances"][0]["state"].as_str().unwrap_or("");
+    assert_eq!(
+        state, "registered",
         "the instance must stay registered after a rejected start; list=\n{}",
         list.stdout
     );

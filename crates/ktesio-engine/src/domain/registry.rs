@@ -551,6 +551,15 @@ impl Registry {
         Ok((snapshot.kind, manifest_path))
     }
 
+    /// The instance's declared Metering Source as its wire string (story 3-1, AD-7):
+    /// read from the persisted adapter snapshot (`self-reported` / `engine-observed`).
+    /// The supervisor stamps this on every ingested `UsageEvent` during the Run, and
+    /// the Fleet read surfaces it (AC-C). A corrupt/missing snapshot surfaces the same
+    /// [`RegistryError::Io`] as the other snapshot reads.
+    pub(crate) fn metering_source(&self, name: &InstanceName) -> Result<String, RegistryError> {
+        Ok(self.read_adapter_snapshot(name)?.metering_source)
+    }
+
     /// The effective (current-OS) [`SupportLevel`] for `capability` on an
     /// instance (story 1-5, AC5). Reads the persisted [`AdapterSnapshot`]'s FULL
     /// per-OS declaration and projects it onto [`OsId::current`] at READ time (the
@@ -902,9 +911,46 @@ impl Registry {
         self.instance_log_dir(name).join("agent.log")
     }
 
-    /// Count Usage Ledger events for an instance (used to prove empty ledgers).
+    /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;
+    /// story 3-1 populates the table so this returns a real count).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {
         Ok(self.store.count_usage_events(name)?)
+    }
+
+    // ---- Usage Ledger writes + reads (story 3-1, spine AD-6/AD-7) ----
+    //
+    // Thin `pub(crate)` pass-throughs to the store's Usage-Ledger methods (same
+    // pattern as `set_state` → `store.set_state`). The commit choke point in the
+    // supervisor is the SOLE caller of `record_usage_event` (the AD-7 single-writer
+    // invariant); the Fleet read is the sole caller of the total reads.
+
+    /// Append ONE [`UsageEvent`] to the Usage Ledger in its own transaction (AD-6),
+    /// returning whether it was inserted or was a recognized replay (AC-A dedup).
+    /// The supervisor's ingestion choke point is the only caller.
+    pub(crate) fn record_usage_event(
+        &self,
+        event: &crate::domain::UsageEvent,
+    ) -> Result<crate::domain::RecordOutcome, RegistryError> {
+        Ok(self.store.record_usage_event(event)?)
+    }
+
+    /// The CUMULATIVE token totals for an instance (sum over all its Runs) — the
+    /// Fleet-detail `usage` read (AC-C/AC11). An absent instance totals zero.
+    pub(crate) fn usage_totals(
+        &self,
+        name: &InstanceName,
+    ) -> Result<crate::domain::UsageTotals, RegistryError> {
+        Ok(self.store.usage_totals(name)?)
+    }
+
+    /// The PER-RUN token totals for an instance scoped to one Run (AC-B). An absent
+    /// instance / unknown Run totals zero.
+    pub(crate) fn run_usage_totals(
+        &self,
+        name: &InstanceName,
+        run_id: &crate::domain::RunId,
+    ) -> Result<crate::domain::UsageTotals, RegistryError> {
+        Ok(self.store.run_usage_totals(name, run_id)?)
     }
 
     /// Test-only escape hatch to seed an instance in an arbitrary Lifecycle
