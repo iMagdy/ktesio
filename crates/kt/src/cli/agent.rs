@@ -15,9 +15,10 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, BudgetView, Capability, ConfigError, ConfigLayer, EffectiveCapabilities,
-    EffectiveConfig, Engine, EngineError, FleetEntry, FleetListing, RegistryError,
-    RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
+    render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
+    ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
+    FleetEntry, FleetListing, Micros, RegistryError, RemoveDisposition, SupportLevel, UsageView,
+    FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -286,10 +287,17 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&
     let metering_value = entry
         .map(|e| e.metering_source.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    // Budget from the Fleet entry (story 3-2): the token ceiling(s) + remaining +
-    // Breach Action, or the honest `—` absence when no budget is configured (or the
-    // read degraded). Tokens only.
-    let budget_value = budget_cell(entry.and_then(|e| e.budget.as_ref()));
+    // Budget from the Fleet entry (story 3-2 tokens + story 3-3 dollar cap): the
+    // token ceiling(s) + remaining, the dollar Cost Cap + remaining (WHEN a Rate is
+    // configured), and the Breach Action — or the honest `—` absence when nothing is
+    // configured (or the read degraded). The `show` Value column is wide (no
+    // truncation), so the estimate qualifier is labeled INLINE in the cell.
+    let budget_value = budget_cell(entry.and_then(|e| e.budget.as_ref()), DollarLabel::Inline);
+    // Cost from the Fleet entry (story 3-3): the DERIVED cumulative dollar cost,
+    // rendered THROUGH the single currency module + labeled (AD-8), or the honest
+    // inert note when no Rate is configured (AC-B: dollar features inert and SAY SO).
+    let cost_value =
+        cost_row_value(entry.and_then(|e| e.usage.cumulative_dollars.zip(e.usage.estimate_label)));
     let rows = vec![
         vec![
             ui::TableCell::plain("State"),
@@ -303,16 +311,23 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&
             ui::TableCell::plain("Restart count"),
             ui::TableCell::plain(status.restart_count.to_string()),
         ],
-        // Budget is REAL now for TOKENS (story 3-2): the ceiling(s) + remaining +
-        // Breach Action, or `—` when no budget is configured. Dollars stay → 3-3.
+        // Budget is REAL for TOKENS (story 3-2) and DOLLARS (story 3-3, when a Rate
+        // is configured): the ceiling(s) + remaining + Breach Action, or `—`.
         vec![
-            ui::TableCell::plain("Budget (tokens)"),
+            ui::TableCell::plain("Budget"),
             ui::TableCell::plain(budget_value),
         ],
-        // Usage is REAL now (story 3-1): the cumulative token totals (tokens only).
+        // Usage is REAL now (story 3-1): the cumulative token totals (+ dollars when
+        // a Rate is configured, via usage_cell through the currency module).
         vec![
             ui::TableCell::plain("Usage (tokens)"),
             ui::TableCell::plain(usage_value),
+        ],
+        // Cost is REAL for a Rate'd instance (story 3-3): the labeled derived dollar
+        // cost; an honest inert note when no Rate is configured (AC-B).
+        vec![
+            ui::TableCell::plain("Cost (estimated)"),
+            ui::TableCell::plain(cost_value),
         ],
         // The active Metering Source (AC-C).
         vec![
@@ -381,41 +396,106 @@ pub fn remove(
 }
 
 /// The one-line stderr NOTE (AD-12: notices → stderr) about the honest metering
-/// boundary now that stories 3-1/3-2 ship: `usage` shows REAL token totals and
-/// `budget` shows the REAL token ceilings + remaining + Breach Action (or `—`
-/// when un-budgeted), but DOLLAR figures (3-3) are still to come — no dollar
-/// figure is shown (tokens only). Shared by `list` and `show` so both surfaces
-/// state it identically.
+/// boundary now that stories 3-1/3-2/3-3 ship: `usage`/`budget` show REAL token
+/// counts, and — WHEN a Rate is configured — the DERIVED dollar cost + Cost Cap +
+/// remaining, every dollar figure LABELED an estimate (AD-8/FR-23). With no Rate,
+/// dollar features are honestly INERT (no dollar figure — AC-B). Shared by `list`
+/// and `show` so both surfaces state it identically.
 const METERING_NOTE: &str =
     "usage + budget are real TOKEN counts from the Usage Ledger (budget '—' means \
-     no budget configured); dollar figures arrive with a later Epic-3 story (tokens only for now).";
+     no budget configured); dollar figures appear only when a Rate is configured \
+     (cost.rate.input/output) and are labeled estimates — with no Rate, dollar \
+     features are inert.";
 
-/// Render a [`UsageView`]'s CUMULATIVE token totals as a compact human cell, e.g.
-/// `in 120 / out 340` (tokens only — AD-8, no dollars this story). Kept here so
-/// `list` and `show` render usage identically.
+/// The `kt agent list` Budget column HEADER (story 3-3, FR-23/AD-8).
+///
+/// Honestly names BOTH dimensions the column now shows — a token budget AND an
+/// ESTIMATED dollar Cost Cap — and carries the estimate qualifier ("est. $") in the
+/// HEADER. The narrow Budget cell truncates with `…`; because the estimate label
+/// lives here in the header (never in the truncatable cell), truncation can NEVER
+/// strip the mandated estimate qualifier off a real dollar figure and leave a bare,
+/// unlabeled dollar. Replaces the stale "Budget (tokens)" header, which mislabeled a
+/// column that now also renders a dollar cap. (The `show` human view + `--json` are
+/// fully labeled already; this is the `list`-surface fix.)
+const BUDGET_LIST_HEADER: &str = "Budget (tok, est. $)";
+
+/// Render a [`UsageView`]'s CUMULATIVE totals as a compact human cell (story 3-1
+/// tokens + story 3-3 dollars), e.g. `in 120 / out 340` or, with a Rate,
+/// `in 120 / out 340 · $0.30 (estimated)`. The dollar figure is rendered THROUGH
+/// the single currency module ([`render_dollars`], AD-8) and appears ONLY when a
+/// Rate is configured (`cumulative_dollars`/`estimate_label` present); with no Rate
+/// the cell is tokens-only (honest inert dollar view — AC-B). Kept here so `list`
+/// and `show` render usage identically.
 fn usage_cell(usage: &UsageView) -> String {
-    format!(
+    let tokens = format!(
         "in {} / out {}",
         usage.cumulative_input_tokens, usage.cumulative_output_tokens
-    )
+    );
+    match (usage.cumulative_dollars, usage.estimate_label) {
+        (Some(dollars), Some(label)) => format!("{tokens} · {}", render_dollars(dollars, label)),
+        // No Rate ⇒ tokens only (dollar view honestly inert — AC-B).
+        _ => tokens,
+    }
 }
 
-/// Render a [`BudgetView`] as a compact human `budget` cell (story 3-2, AC9):
-/// the configured token ceiling(s) + remaining tokens per scope + the Breach
-/// Action, e.g. `cum 380/500 (pause)` or `run 70/100, cum 600/1000 (stop)`. An
-/// UN-budgeted instance (`None`) renders the honest absence token `—` (never a
-/// fabricated ceiling). TOKENS ONLY — no dollar figure (AD-8). Kept here so `list`
-/// and `show` render the budget identically.
-fn budget_cell(budget: Option<&BudgetView>) -> String {
+/// Where the estimate qualifier (`(estimated)`) for a rendered dollar figure lives
+/// on a given surface (FR-23/AD-8 — every rendered dollar MUST stay labeled).
+///
+/// The `show` "Value" column is WIDE (no truncation), so it carries the label
+/// INLINE in the cell (`… $0.20/$0.50 (estimated) …`). The `list` "Budget" column
+/// is NARROW and TRUNCATES with `…`, which could CHOP an inline `(estimated)` off a
+/// real dollar figure and leave a bare, unlabeled dollar (the FR-23 violation this
+/// fixes). So on `list` the qualifier lives in the COLUMN HEADER ([`BUDGET_LIST_HEADER`])
+/// and the cell renders the dollar value BARE — the label can never be truncated
+/// because it is not in the cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DollarLabel {
+    /// Append `(estimated)` inline in the cell (the wide `show` Value column).
+    Inline,
+    /// Omit the inline label; the qualifier lives in the column HEADER (the narrow,
+    /// truncatable `list` Budget column).
+    InHeader,
+}
+
+/// Render a [`BudgetView`] as a compact human `budget` cell (story 3-2 tokens +
+/// story 3-3 dollars, AC9/AC10): the configured token ceiling(s) + remaining, the
+/// dollar Cost Cap + remaining (WHEN a Rate is configured, rendered THROUGH the
+/// single currency module — AD-8), and the Breach Action. E.g.
+/// `cum 380/500 tok (pause)` or `cum 380/500 tok, cum $0.20/$0.50 (estimated) (pause)`.
+/// An instance with NEITHER a budget nor an enforceable cap (`None`) renders the
+/// honest absence token `—`. A cap with no Rate is inert (no dollar figure — AC-B).
+///
+/// `dollar_label` chooses WHERE the estimate qualifier lives: [`DollarLabel::Inline`]
+/// for the wide `show` Value column (labeled in-cell), [`DollarLabel::InHeader`] for
+/// the narrow, truncatable `list` Budget column (the qualifier is in the header —
+/// [`BUDGET_LIST_HEADER`] — so truncation can never strip it, FR-23). Shared by both
+/// surfaces so tokens + action render identically; only the dollar label placement
+/// differs.
+fn budget_cell(budget: Option<&BudgetView>, dollar_label: DollarLabel) -> String {
     let Some(b) = budget else {
         return FleetEntry::METERING_SEED_CELL.to_string();
     };
     let mut parts: Vec<String> = Vec::new();
     if let (Some(limit), Some(remaining)) = (b.per_run_limit, b.per_run_remaining) {
-        parts.push(format!("run {remaining}/{limit}"));
+        parts.push(format!("run {remaining}/{limit} tok"));
     }
     if let (Some(limit), Some(remaining)) = (b.cumulative_limit, b.cumulative_remaining) {
-        parts.push(format!("cum {remaining}/{limit}"));
+        parts.push(format!("cum {remaining}/{limit} tok"));
+    }
+    // DOLLAR cap/remaining THROUGH the single currency module (AD-8) — present only
+    // when a Rate is configured (the label carries the dimension's honesty).
+    let label = b.estimate_label.unwrap_or_default();
+    if let (Some(cap), Some(remaining)) = (b.per_run_cost_cap, b.per_run_dollars_remaining) {
+        parts.push(format!(
+            "run {}",
+            dollar_cap_cell(remaining, cap, label, dollar_label)
+        ));
+    }
+    if let (Some(cap), Some(remaining)) = (b.cumulative_cost_cap, b.cumulative_dollars_remaining) {
+        parts.push(format!(
+            "cum {}",
+            dollar_cap_cell(remaining, cap, label, dollar_label)
+        ));
     }
     // A budget with an action but somehow no scope (defensive) still shows the
     // action honestly rather than an empty cell.
@@ -423,6 +503,44 @@ fn budget_cell(budget: Option<&BudgetView>) -> String {
         return format!("({})", b.breach_action.as_str());
     }
     format!("{} ({})", parts.join(", "), b.breach_action.as_str())
+}
+
+/// Render a dollar `remaining/cap` pair THROUGH the single currency module (AD-8)
+/// — e.g. `$0.20/$0.50 (estimated)`. The SOLE currency formatting in `kt` routes
+/// through the currency module: the `remaining` value ALWAYS uses the module's
+/// bare-value form ([`render_dollars_bare`]); the `cap` uses [`render_dollars`]
+/// (inline label) or [`render_dollars_bare`] (label in the header) per
+/// `dollar_label`. Either way the `$X.XX` digits ORIGINATE in that one module —
+/// there is NO string-surgery on a labeled string (primary L1). On the
+/// [`DollarLabel::InHeader`] surface the qualifier is carried by the column header
+/// ([`BUDGET_LIST_HEADER`]) instead of the cell, so a truncated cell can never drop
+/// the label.
+fn dollar_cap_cell(
+    remaining: Micros,
+    cap: Micros,
+    label: EstimateLabel,
+    dollar_label: DollarLabel,
+) -> String {
+    let cap_str = match dollar_label {
+        DollarLabel::Inline => render_dollars(cap, label),
+        DollarLabel::InHeader => render_dollars_bare(cap),
+    };
+    format!("{}/{}", render_dollars_bare(remaining), cap_str)
+}
+
+/// The `show` "Cost (estimated)" row value (story 3-3, AC-B): the DERIVED
+/// cumulative dollar cost rendered THROUGH the single currency module + labeled
+/// (AD-8) when a Rate is configured, or the honest INERT note when no Rate exists
+/// (dollar features inert and SAY SO — never a fabricated `$0.00`). `dollars` is
+/// `Some((cost, label))` iff a Rate is configured.
+fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
+    match dollars {
+        Some((cost, label)) => render_dollars(cost, label),
+        None => format!(
+            "{} (no Rate configured — dollar features inert)",
+            FleetEntry::METERING_SEED_CELL
+        ),
+    }
 }
 
 /// `kt agent list [--json]` — render the Fleet (FR-4).
@@ -466,23 +584,33 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // is where AC-C requires it "visible in Fleet listing detail"; the human `list`
     // table keeps a compact column set (adding a Metering column here overflows the
     // 80-col default and truncates cells), surfacing the real Usage token totals.
+    //
+    // The Budget column header is [`BUDGET_LIST_HEADER`] ("Budget (tok, est. $)"):
+    // it honestly names BOTH dimensions (a token budget AND an ESTIMATED dollar Cost
+    // Cap) and — crucially — carries the "est. $" estimate qualifier in the HEADER.
+    // The narrow Budget cell truncates with `…`; putting the qualifier in the header
+    // (not the cell) means truncation can NEVER strip the estimate label off a real
+    // dollar figure (FR-23/AD-8 — every rendered dollar stays labeled). The cell
+    // therefore renders the dollar value BARE (DollarLabel::InHeader).
     let columns = [
         ui::TableColumn::new("Name", 12, 32),
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
         ui::TableColumn::new("Restarts", 8, 10),
-        ui::TableColumn::new("Budget (tokens)", 15, 34),
+        ui::TableColumn::new(BUDGET_LIST_HEADER, 15, 34),
         ui::TableColumn::new("Usage (tokens)", 14, 24),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
     let rows: Vec<Vec<ui::TableCell>> = entries
         .iter()
         .map(|entry| {
-            // Budget is REAL now for TOKENS (story 3-2): ceiling(s) + remaining +
-            // action, or `—` when un-budgeted. A budgeted cell is `plain`, an
+            // Budget is REAL for TOKENS (story 3-2) and DOLLARS (story 3-3): ceiling(s)
+            // + remaining + action, or `—` when un-budgeted. The estimate qualifier for
+            // any dollar figure lives in the column HEADER (DollarLabel::InHeader), so a
+            // truncated cell never drops the label. A budgeted cell is `plain`, an
             // absent one stays `muted` (the honest `—`).
             let budget = entry.budget.as_ref();
-            let budget_text = budget_cell(budget);
+            let budget_text = budget_cell(budget, DollarLabel::InHeader);
             let budget_cell = if budget.is_some() {
                 ui::TableCell::plain(budget_text)
             } else {

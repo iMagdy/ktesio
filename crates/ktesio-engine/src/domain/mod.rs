@@ -11,6 +11,7 @@
 
 mod budget;
 mod config;
+mod cost;
 mod error;
 mod event;
 mod fleet;
@@ -28,14 +29,19 @@ pub use budget::{
     BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,
 };
 pub use config::{
-    is_pass_through, is_secret_ref, pass_through_tail, resolve, resolve_token_budget, secret_name,
-    ConfigError, ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer,
-    BUDGET_BREACH_ACTION_KEY, BUDGET_TOKENS_CUMULATIVE_KEY, BUDGET_TOKENS_PER_RUN_KEY,
-    PASS_THROUGH_PREFIX, SECRET_MASK, SECRET_PREFIX,
+    is_pass_through, is_secret_ref, pass_through_tail, resolve, resolve_cost, resolve_token_budget,
+    secret_name, ConfigError, ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer,
+    BUDGET_BREACH_ACTION_KEY, BUDGET_DOLLARS_CUMULATIVE_KEY, BUDGET_DOLLARS_PER_RUN_KEY,
+    BUDGET_TOKENS_CUMULATIVE_KEY, BUDGET_TOKENS_PER_RUN_KEY, COST_RATE_INPUT_KEY,
+    COST_RATE_OUTPUT_KEY, PASS_THROUGH_PREFIX, SECRET_MASK, SECRET_PREFIX,
+};
+pub use cost::{
+    cost_micros, render_dollars, render_dollars_bare, CostCap, CostEvaluator, EstimateLabel,
+    Micros, Rate, MICROS_PER_DOLLAR,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{
-    BudgetBreachEvent, TransitionCause, TransitionEvent, BUDGET_SCHEMA_VERSION,
+    BreachDimension, BudgetBreachEvent, TransitionCause, TransitionEvent, BUDGET_SCHEMA_VERSION,
     EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
 };
 pub use fleet::{BudgetView, FleetEntry, FleetListing, UsageView};

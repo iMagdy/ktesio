@@ -12,23 +12,27 @@
 //! [`BudgetEvaluator`] itself — a total, pure token comparison that turns
 //! just-committed totals into a decision.
 //!
-//! ## Boundary (what this is NOT — AD-8)
+//! ## Boundary (what this is — the TOKEN dimension)
 //!
-//! TOKENS ONLY. There is NO dollar field, NO `Rate`, NO `EstimateLabel`, NO
-//! headroom rendering — those are 3-3/3-5. A [`TokenBudget`] is token-count
-//! ceilings; the dollar `CostCap` (3-3) reuses THIS evaluator/decision path in
-//! front of a Rate→dollars derivation. The evaluator DECIDES; it never enforces
-//! (no lifecycle, no ledger, no I/O) — the supervisor ACTS on the decision, so the
-//! decision stays trivially unit-testable and cross-OS by construction (retro
-//! AI-37: the bulk of the boundary/scope coverage lives in this file's pure unit
-//! tests).
+//! This module is TOKENS ONLY: a [`TokenBudget`] is token-count ceilings, and the
+//! [`BudgetEvaluator`] is the pure token decision. The DOLLAR dimension (story 3-3)
+//! now lives in the sibling [`super::cost`] module — `Micros`/`Rate`/`CostCap` + a
+//! thin `CostEvaluator` that REUSES THIS module's [`BreachDecision`]/[`BreachScope`]/
+//! [`BreachAction`] verbatim (the decision's `limit`/`observed` are unit-agnostic
+//! `u64`, carrying micro-dollars for a dollar breach). Both evaluators DECIDE; they
+//! never enforce (no lifecycle, no ledger, no I/O) — the supervisor ACTS on the
+//! decision in ONE choke point, so each decision stays trivially unit-testable and
+//! cross-OS by construction (retro AI-37: the bulk of the boundary/scope coverage
+//! lives in the two modules' pure unit tests). `EstimateLabel`, currency rendering,
+//! and dollar headroom are `super::cost`'s (AD-8), not here.
 
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 /// A per-instance Token Budget (spine FR-18) — per-run and cumulative TOKEN
-/// ceilings, and nothing more (AD-8: no dollars/Rate/label this story).
+/// ceilings. The dollar `CostCap` sibling lives in [`super::cost`] (story 3-3);
+/// a [`TokenBudget`] itself carries no dollars/Rate/label (AD-8).
 ///
 /// Both scopes are optional (`u64` to match [`super::usage::UsageTotals`]'s token
 /// type): an UNSET scope (`None`) NEVER breaches — only a configured ceiling is

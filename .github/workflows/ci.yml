@@ -220,6 +220,54 @@ jobs:
             exit 1
           fi
           echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
+      - name: Enforce single currency-formatting module (story 3-3, AD-8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # AD-8: exactly ONE module formats currency. Money becomes a `$X.XX` human
+          # string ONLY in crates/ktesio-engine/src/domain/cost.rs (render_dollars /
+          # render_dollars_bare). Every other module passes Micros + EstimateLabel as
+          # DATA; --json emits integer micros, never a `$` string. This gate FAILS if a
+          # `$`-string-building form appears anywhere else.
+          #
+          # BROADENED alternation (a narrow `\$\{` missed several dollar-string shapes):
+          #   \$ ?\{  — `${...}` AND `$ {...}` (a `$` glued to a format placeholder,
+          #             with or without a space): format!("${x}") / "$ {}"
+          #   \}\$    — `}$` (a placeholder immediately followed by a `$`): "{}$"
+          #   "\$     — a string literal STARTING with `$`: "$", "$0.00", write!(f,"$")
+          #   '\$'    — a bare `$` char literal: '$'
+          pattern='\$ ?\{|\}\$|"\$|'\''\$'\'''
+          # Allowlist (precise, not blanket-by-file): the ONE currency module (the
+          # render home + its unit tests), PLUS the genuinely NON-currency `$` uses the
+          # broadened pattern also matches —
+          #   contains\(.\$  — `.contains('$')` / `.contains("$...` DISCIPLINE READ-checks
+          #                    (they assert a `$` is absent/present on a surface; a read
+          #                    never FORMATS currency, so it cannot hide a regression).
+          #   \$PWD / \$KT_TEST — shell-variable interpolation in a spawned command
+          #                    string (a process backend test), not a dollar figure.
+          # No NEW currency formatting may appear anywhere else in the workspace.
+          allowlist='^crates/ktesio-engine/src/domain/cost\.rs:|contains\(.\$|\$PWD|\$KT_TEST'
+          scan_status=0
+          hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
+          if [ "$scan_status" -ge 2 ]; then
+            echo "::error::grep exited ${scan_status} while scanning for currency formatting."
+            exit "$scan_status"
+          fi
+          violations=''
+          if [ -n "$hits" ]; then
+            filter_status=0
+            violations="$(printf '%s\n' "$hits" | grep -Ev "$allowlist")" || filter_status=$?
+            if [ "$filter_status" -ge 2 ]; then
+              echo "::error::grep exited ${filter_status} while applying the currency allowlist."
+              exit "$filter_status"
+            fi
+          fi
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo "::error::Currency formatting (a \`\$\`-string form: \`\${...}\`, \`\$ {}\`, \`{}\$\`, a \"\$\"-prefixed string, or a '\$' char) is allowed ONLY in crates/ktesio-engine/src/domain/cost.rs (AD-8: one currency module). Pass Micros + EstimateLabel as data and render through render_dollars / render_dollars_bare."
+            exit 1
+          fi
+          echo "Currency gate green: dollar formatting lives only in the one currency module."
 
   semver:
     name: semver

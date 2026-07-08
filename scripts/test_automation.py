@@ -190,6 +190,21 @@ class ReleaseDocsTests(unittest.TestCase):
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/ktesio-engine/src/backends/", ci)
+        # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
+        # It scans for the BROADENED set of dollar-string-building forms (`${`, `$ {`,
+        # `}$`, a `"$`-prefixed string, and a bare `'$'` char) and allowlists the
+        # single currency module (domain/cost.rs) PLUS the precise non-currency `$`
+        # uses the broadened pattern also matches (`.contains('$')` discipline
+        # read-checks; the `$PWD`/`$KT_TEST` shell vars in a backend test). Guard both
+        # the pattern and the allowlist so a regression that scatters currency
+        # formatting is caught — and so the broadening is not silently narrowed back.
+        self.assertIn("Enforce single currency-formatting module", ci)
+        self.assertIn(r"""pattern='\$ ?\{|\}\$|"\$|'\''\$'\''""", ci)
+        self.assertIn(
+            r"allowlist='^crates/ktesio-engine/src/domain/cost\.rs:"
+            r"|contains\(.\$|\$PWD|\$KT_TEST'",
+            ci,
+        )
         # Semver gate: lazy install inside the armed branch, transient skip.
         self.assertIn("cargo +stable install cargo-semver-checks --locked", ci)
         self.assertIn("cargo +stable semver-checks check-release", ci)

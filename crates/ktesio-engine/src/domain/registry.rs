@@ -942,8 +942,9 @@ impl Registry {
     pub(crate) fn record_usage_event(
         &self,
         event: &crate::domain::UsageEvent,
+        rate: Option<crate::domain::Rate>,
     ) -> Result<crate::domain::RecordOutcome, RegistryError> {
-        Ok(self.store.record_usage_event(event)?)
+        Ok(self.store.record_usage_event(event, rate)?)
     }
 
     /// The CUMULATIVE token totals for an instance (sum over all its Runs) — the
@@ -963,6 +964,26 @@ impl Registry {
         run_id: &crate::domain::RunId,
     ) -> Result<crate::domain::UsageTotals, RegistryError> {
         Ok(self.store.run_usage_totals(name, run_id)?)
+    }
+
+    /// The CUMULATIVE derived DOLLAR cost for an instance (story 3-3, AC-A) — each
+    /// row priced at its own persisted Rate (no retro-repricing). An absent instance
+    /// totals `$0`.
+    pub(crate) fn cost_totals(
+        &self,
+        name: &InstanceName,
+    ) -> Result<crate::domain::Micros, RegistryError> {
+        Ok(self.store.cost_totals(name)?)
+    }
+
+    /// The PER-RUN derived DOLLAR cost for an instance scoped to one Run (story
+    /// 3-3). An absent instance / unknown Run totals `$0`.
+    pub(crate) fn run_cost_totals(
+        &self,
+        name: &InstanceName,
+        run_id: &crate::domain::RunId,
+    ) -> Result<crate::domain::Micros, RegistryError> {
+        Ok(self.store.run_cost_totals(name, run_id)?)
     }
 
     /// Test-only escape hatch to seed an instance in an arbitrary Lifecycle

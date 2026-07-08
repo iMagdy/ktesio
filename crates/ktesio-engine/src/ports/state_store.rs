@@ -13,8 +13,8 @@
 //! holds no global state, keeping it facade-friendly for the 1.4 migration.
 
 use crate::domain::{
-    AgentInstance, InstanceName, LifecycleState, RecordOutcome, RestartPolicy, RunId, UsageEvent,
-    UsageTotals,
+    AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome, RestartPolicy, RunId,
+    UsageEvent, UsageTotals,
 };
 
 use super::{ProcessFingerprint, StoreError};
@@ -105,7 +105,18 @@ pub trait StateStore {
     /// This is the SOLE Usage-Ledger writer the engine's commit choke point calls;
     /// no other code path may mutate `usage_events` (the AD-7 single-writer
     /// invariant, which story 3-2's enforcement relies on).
-    fn record_usage_event(&self, event: &UsageEvent) -> Result<RecordOutcome, StoreError>;
+    ///
+    /// `rate` (story 3-3) is the EFFECTIVE per-direction [`Rate`] resolved AT COMMIT,
+    /// persisted onto the row so historical dollars keep the Rate in force when
+    /// consumed (no retroactive repricing — AC-A). `None` = no Rate configured at
+    /// commit → the row contributes $0 to the derived cost (honestly absent — AC-B).
+    /// It is stamped alongside the frozen [`UsageEvent`] token fields WITHOUT
+    /// touching the adapter-facing wire type (AD-6: an engine-side ledger concern).
+    fn record_usage_event(
+        &self,
+        event: &UsageEvent,
+        rate: Option<Rate>,
+    ) -> Result<RecordOutcome, StoreError>;
 
     /// The CUMULATIVE token totals for an instance — the sum of `input_tokens` /
     /// `output_tokens` over ALL its `usage_events` rows (every Run), the AD-6
@@ -121,6 +132,18 @@ pub trait StateStore {
         name: &InstanceName,
         run_id: &RunId,
     ) -> Result<UsageTotals, StoreError>;
+
+    /// The CUMULATIVE derived DOLLAR cost for an instance (story 3-3, AC-A) — the
+    /// sum over ALL its `usage_events` rows of each row's cost priced at THAT ROW'S
+    /// OWN persisted Rate (no retroactive repricing). A row with a NULL rate (no
+    /// Rate at commit, or a pre-v4 row) contributes [`Micros::ZERO`]. An absent
+    /// instance totals [`Micros::ZERO`]. Overflow SATURATES (billing discipline).
+    fn cost_totals(&self, name: &InstanceName) -> Result<Micros, StoreError>;
+
+    /// The PER-RUN derived DOLLAR cost for an instance (story 3-3) — the same
+    /// per-row-priced sum scoped to a single `(instance_id, run_id)`. An absent
+    /// instance / unknown Run totals [`Micros::ZERO`].
+    fn run_cost_totals(&self, name: &InstanceName, run_id: &RunId) -> Result<Micros, StoreError>;
 
     // ---- Write-ahead spawn records (story 1-6, spine AD-5/AD-6) ----
 

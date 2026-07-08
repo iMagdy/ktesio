@@ -7,22 +7,24 @@
 //! than hand-rolling field serialization, so `kt --json` and the future 7-2 Host
 //! event stream share ONE schema (AD-14: "one event schema, two consumers").
 //!
-//! ## Metering fields — usage (3-1) and budget (3-2) are real; dollars → 3-3/3-5
+//! ## Metering fields — usage (3-1), budget (3-2), and DOLLARS (3-3) are real
 //!
 //! Metering is Epic 3 (AD-7). Story 3-1 makes [`FleetEntry::usage`] REAL: a
 //! [`UsageView`] carrying the instance's cumulative (and current-Run) TOKEN totals
-//! from the Usage Ledger — tokens only (AD-8: NO dollars/headroom this story). The
-//! active [`FleetEntry::metering_source`] rides alongside it (AC-C — read from the
-//! persisted adapter snapshot). Story 3-2 makes [`FleetEntry::budget`] REAL for
-//! TOKENS: a [`BudgetView`] carrying the configured per-run + cumulative ceilings,
-//! the Breach Action, and the REMAINING tokens per scope (ceiling − current total).
-//! It stays `Option`-typed: `None` for an instance with NO budget configured (a
-//! truthful ABSENCE — never a fabricated `0` ceiling), so `kt` renders the budget
-//! cell as `—` only when no budget exists. The DOLLAR cap/headroom stay absent
-//! until a Rate exists (3-3/3-5) — a [`BudgetView`] is TOKENS ONLY. Populating
-//! `budget`/`usage` from the old seed to a real view is a backward-additive change
-//! that does not bump [`crate::FLEET_SCHEMA_VERSION`] (a new reader parses every
-//! old document).
+//! from the Usage Ledger. The active [`FleetEntry::metering_source`] rides alongside
+//! it (AC-C — read from the persisted adapter snapshot). Story 3-2 makes
+//! [`FleetEntry::budget`] REAL for TOKENS: a [`BudgetView`] carrying the configured
+//! per-run + cumulative ceilings, the Breach Action, and the REMAINING tokens per
+//! scope. Story 3-3 makes the DOLLAR dimension real WHEN a Rate is configured: the
+//! [`UsageView`] gains the DERIVED cost + [`EstimateLabel`], and the [`BudgetView`]
+//! gains the dollar Cost Cap + dollars-remaining per scope — all as INTEGER MICROS +
+//! the label (NEVER a `$` string on the wire — AD-14; the human render is `kt`'s,
+//! through the one currency module). The dollar fields stay ABSENT for a no-Rate
+//! instance (AC-B: no Rate ⇒ no dollar figure, never a fabricated `$0.00`), and
+//! `budget` stays `Option`-typed (`None` when NEITHER a token budget nor an
+//! enforceable dollar cap exists — a truthful ABSENCE). Populating these fields is a
+//! backward-additive change that does not bump [`crate::FLEET_SCHEMA_VERSION`] (a
+//! new reader parses every old document; the dollar fields default-null/absent).
 //!
 //! ## Boundary (what this is NOT)
 //!
@@ -34,6 +36,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::budget::{BreachAction, TokenBudget};
+use super::cost::{CostCap, EstimateLabel, Micros};
 use super::event::FLEET_SCHEMA_VERSION;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
@@ -69,7 +72,32 @@ pub struct BudgetView {
     /// saturating at 0). `null` when the cumulative scope is unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cumulative_remaining: Option<u64>,
-    /// The configured Breach Action (`pause` / `stop` / `warn`).
+    /// The configured per-run DOLLAR Cost Cap in micro-dollars (story 3-3) —
+    /// present ONLY when a Rate is configured AND the per-run dollar scope is set;
+    /// `null`/absent otherwise (AC-B: a cap with no Rate is inert → no dollar
+    /// figure). NEVER a `$` string (AD-14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_run_cost_cap: Option<Micros>,
+    /// Remaining dollars in the per-run scope (cap − current-Run derived cost,
+    /// saturating at 0 — a breached scope reports `$0`, never negative) in
+    /// micro-dollars (story 3-3). Present under the same condition as
+    /// [`per_run_cost_cap`](Self::per_run_cost_cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_run_dollars_remaining: Option<Micros>,
+    /// The configured cumulative DOLLAR Cost Cap in micro-dollars (story 3-3) —
+    /// present ONLY when a Rate is configured AND the cumulative dollar scope is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_cost_cap: Option<Micros>,
+    /// Remaining dollars in the cumulative scope (cap − cumulative derived cost,
+    /// saturating at 0) in micro-dollars (story 3-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_dollars_remaining: Option<Micros>,
+    /// The estimate label on the dollar cap/remaining figures (story 3-3, AD-8) —
+    /// present ONLY when a Rate is configured; v1 always `estimated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_label: Option<EstimateLabel>,
+    /// The configured Breach Action (`pause` / `stop` / `warn`). Governs BOTH the
+    /// token and the dollar breach (story 3-3: one action).
     pub breach_action: BreachAction,
 }
 
@@ -97,20 +125,85 @@ impl BudgetView {
             cumulative_remaining: budget
                 .cumulative
                 .map(|c| c.saturating_sub(cumulative_total)),
+            per_run_cost_cap: None,
+            per_run_dollars_remaining: None,
+            cumulative_cost_cap: None,
+            cumulative_dollars_remaining: None,
+            estimate_label: None,
+            breach_action: action,
+        })
+    }
+
+    /// Build a combined token + DOLLAR [`BudgetView`] (story 3-3, AC10) — present
+    /// iff a token budget OR a dollar Cost Cap is configured. The token fields come
+    /// from `budget` + the token totals (as [`Self::from_budget`]); the DOLLAR
+    /// fields come from `cost_cap` + the DERIVED costs, present ONLY when
+    /// `has_rate` (a cap with no Rate is inert — AC-B: no dollar figure surfaced).
+    /// Remaining is `cap.saturating_remaining(cost)` per scope (a breached scope →
+    /// `$0`, never negative). Returns `None` when NEITHER a token budget nor an
+    /// enforceable dollar cap exists (an honest absent budget — never a fabricated
+    /// ceiling).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_budget_and_cost(
+        budget: &TokenBudget,
+        cost_cap: &CostCap,
+        action: BreachAction,
+        current_run_total: u64,
+        cumulative_total: u64,
+        has_rate: bool,
+        current_run_cost: Micros,
+        cumulative_cost: Micros,
+        label: EstimateLabel,
+    ) -> Option<Self> {
+        // The dollar dimension is surfaced ONLY when a Rate exists AND a cap scope is
+        // set (AC-B inert otherwise: no Rate ⇒ no dollar figure at all).
+        let dollar_active = has_rate && cost_cap.is_set();
+        // Present iff SOMETHING is configured (a token budget OR an enforceable cap).
+        if !budget.is_set() && !dollar_active {
+            return None;
+        }
+        Some(Self {
+            per_run_limit: budget.per_run,
+            per_run_remaining: budget.per_run.map(|c| c.saturating_sub(current_run_total)),
+            cumulative_limit: budget.cumulative,
+            cumulative_remaining: budget
+                .cumulative
+                .map(|c| c.saturating_sub(cumulative_total)),
+            per_run_cost_cap: dollar_active.then_some(cost_cap.per_run).flatten(),
+            per_run_dollars_remaining: dollar_active
+                .then(|| {
+                    cost_cap
+                        .per_run
+                        .map(|c| c.saturating_remaining(current_run_cost))
+                })
+                .flatten(),
+            cumulative_cost_cap: dollar_active.then_some(cost_cap.cumulative).flatten(),
+            cumulative_dollars_remaining: dollar_active
+                .then(|| {
+                    cost_cap
+                        .cumulative
+                        .map(|c| c.saturating_remaining(cumulative_cost))
+                })
+                .flatten(),
+            // The label rides only when the dollar dimension is active.
+            estimate_label: dollar_active.then_some(label),
             breach_action: action,
         })
     }
 }
 
-/// The per-instance Usage Ledger totals surfaced in Fleet detail (story 3-1,
-/// AC-C/AC11) — TOKENS ONLY (AD-8).
+/// The per-instance Usage Ledger totals surfaced in Fleet detail (story 3-1
+/// tokens + story 3-3 dollars, AC-C/AC11/AC10).
 ///
 /// Carries the CUMULATIVE token totals (summed over every Run) and the
 /// CURRENT-RUN totals (the active `starting`→terminal span, or zero when the
-/// instance is not currently running). NO dollars, NO headroom, NO budget — those
-/// are 3-2/3-3/3-5; the honest boundary is "tokens now, money later". The
-/// Fleet-detail totals equal the Usage Ledger exactly (the FR-22 discipline
-/// seeded here for the read story 3-5). snake_case on the wire (AD-14).
+/// instance is not currently running). Story 3-3 adds the DERIVED DOLLAR cost
+/// (cumulative + current-run, integer micros) + the [`EstimateLabel`] — present
+/// ONLY when a Rate is configured, `None`/absent otherwise (AC-B honest absence:
+/// no Rate ⇒ NO dollar figure, never a fabricated `$0.00`). The dollar cost equals
+/// the Usage-Ledger-derived cost exactly (each row priced at its own persisted
+/// Rate — FR-22). The wire carries INTEGER MICROS + the label, NEVER a `$` string
+/// (AD-14). snake_case on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageView {
     /// Cumulative input (prompt) tokens over all of the instance's Runs.
@@ -121,18 +214,51 @@ pub struct UsageView {
     pub current_run_input_tokens: u64,
     /// Output tokens for the CURRENT Run (0 when the instance is not running).
     pub current_run_output_tokens: u64,
+    /// The DERIVED cumulative dollar cost in micro-dollars (story 3-3) — present
+    /// ONLY when a Rate is configured; `null`/absent otherwise (AC-B: no Rate ⇒ no
+    /// dollar figure). Equals the ledger-derived cost exactly (FR-22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_dollars: Option<Micros>,
+    /// The DERIVED current-Run dollar cost in micro-dollars (story 3-3) — present
+    /// ONLY when a Rate is configured; `null`/absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_dollars: Option<Micros>,
+    /// The estimate label on the dollar figures (story 3-3, AD-8) — present ONLY
+    /// when a Rate is configured; v1 always `estimated`. NEVER a `$` string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_label: Option<EstimateLabel>,
 }
 
 impl UsageView {
-    /// Build a [`UsageView`] from the cumulative + current-run [`UsageTotals`] the
-    /// Fleet read summed from the ledger.
+    /// Build a TOKENS-ONLY [`UsageView`] from the cumulative + current-run
+    /// [`UsageTotals`] the Fleet read summed from the ledger (the dollar fields
+    /// absent — the no-Rate case, AC-B). Story 3-3's [`Self::with_dollars`] adds the
+    /// derived cost when a Rate is present.
     pub fn new(cumulative: UsageTotals, current_run: UsageTotals) -> Self {
         Self {
             cumulative_input_tokens: cumulative.input_tokens,
             cumulative_output_tokens: cumulative.output_tokens,
             current_run_input_tokens: current_run.input_tokens,
             current_run_output_tokens: current_run.output_tokens,
+            cumulative_dollars: None,
+            current_run_dollars: None,
+            estimate_label: None,
         }
+    }
+
+    /// Attach the DERIVED dollar cost + label to a [`UsageView`] (story 3-3) — the
+    /// Rate-present case. The costs are the ledger-derived micros (each row priced
+    /// at its own persisted Rate — no retro-repricing); the label is v1 `estimated`.
+    pub fn with_dollars(
+        mut self,
+        cumulative_dollars: Micros,
+        current_run_dollars: Micros,
+        label: EstimateLabel,
+    ) -> Self {
+        self.cumulative_dollars = Some(cumulative_dollars);
+        self.current_run_dollars = Some(current_run_dollars);
+        self.estimate_label = Some(label);
+        self
     }
 
     /// The cumulative total tokens (input + output over all Runs), saturating.
@@ -454,5 +580,142 @@ mod tests {
     fn metering_seed_cell_is_the_em_dash_token() {
         // The human cell token is `—` (consistent between list + show).
         assert_eq!(FleetEntry::METERING_SEED_CELL, "—");
+    }
+
+    // ---- Story 3-3: dollar fields on the views (AC-B/AC10) ----
+
+    #[test]
+    fn usage_view_with_dollars_carries_labeled_integer_micros() {
+        // A Rate'd instance: the derived cost rides as integer micros + the label,
+        // NEVER a `$` string, NEVER a float.
+        let usage = UsageView::new(
+            UsageTotals {
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+            },
+            UsageTotals::zero(),
+        )
+        .with_dollars(Micros(18_000_000), Micros(0), EstimateLabel::Estimated);
+        let value: serde_json::Value = serde_json::to_value(usage).unwrap();
+        assert_eq!(value["cumulative_dollars"], serde_json::json!(18_000_000));
+        assert_eq!(value["current_run_dollars"], serde_json::json!(0));
+        assert_eq!(value["estimate_label"], serde_json::json!("estimated"));
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(!json.contains('$'), "no `$` string on the wire: {json}");
+        let back: UsageView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn usage_view_without_a_rate_omits_the_dollar_fields() {
+        // AC-B: no Rate ⇒ no dollar figure at all (the fields are absent, not `$0`).
+        let usage = UsageView::new(UsageTotals::zero(), UsageTotals::zero());
+        let value: serde_json::Value = serde_json::to_value(usage).unwrap();
+        assert!(value.get("cumulative_dollars").is_none(), "{value}");
+        assert!(value.get("current_run_dollars").is_none(), "{value}");
+        assert!(value.get("estimate_label").is_none(), "{value}");
+    }
+
+    #[test]
+    fn budget_view_with_a_rate_carries_the_dollar_cap_and_remaining() {
+        // AC10: a Rate'd instance with a dollar cap surfaces the cap + remaining
+        // (saturating) in integer micros + the label. Cap $0.50, spent $0.30 → $0.20
+        // remaining.
+        let v = BudgetView::from_budget_and_cost(
+            &TokenBudget::none(),
+            &CostCap {
+                per_run: None,
+                cumulative: Some(Micros(500_000)),
+            },
+            BreachAction::Pause,
+            0,
+            0,
+            true, // has_rate
+            Micros(0),
+            Micros(300_000),
+            EstimateLabel::Estimated,
+        )
+        .expect("a dollar cap makes the view present even with no token budget");
+        assert_eq!(v.cumulative_cost_cap, Some(Micros(500_000)));
+        assert_eq!(v.cumulative_dollars_remaining, Some(Micros(200_000)));
+        assert_eq!(v.estimate_label, Some(EstimateLabel::Estimated));
+        let value: serde_json::Value = serde_json::to_value(v).unwrap();
+        assert_eq!(value["cumulative_cost_cap"], serde_json::json!(500_000));
+        assert_eq!(
+            value["cumulative_dollars_remaining"],
+            serde_json::json!(200_000)
+        );
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains('$'), "no `$` string on the wire: {json}");
+    }
+
+    #[test]
+    fn budget_view_dollar_remaining_saturates_at_zero_when_breached() {
+        // A breached dollar scope reports $0 remaining, never negative.
+        let v = BudgetView::from_budget_and_cost(
+            &TokenBudget::none(),
+            &CostCap {
+                per_run: None,
+                cumulative: Some(Micros(500_000)),
+            },
+            BreachAction::Pause,
+            0,
+            0,
+            true,
+            Micros(0),
+            Micros(800_000), // spent past the cap
+            EstimateLabel::Estimated,
+        )
+        .unwrap();
+        assert_eq!(v.cumulative_dollars_remaining, Some(Micros(0)));
+    }
+
+    #[test]
+    fn budget_view_cost_cap_with_no_rate_is_inert_no_dollar_fields() {
+        // AC-B: a Cost Cap set WITHOUT a Rate is inert — the view carries NO dollar
+        // cap/remaining (has_rate = false), and with no token budget either the view
+        // is None (an honest absent budget, never a fabricated dollar ceiling).
+        let v = BudgetView::from_budget_and_cost(
+            &TokenBudget::none(),
+            &CostCap {
+                per_run: None,
+                cumulative: Some(Micros(500_000)),
+            },
+            BreachAction::Pause,
+            0,
+            0,
+            false, // NO rate
+            Micros(0),
+            Micros(0),
+            EstimateLabel::Estimated,
+        );
+        assert!(
+            v.is_none(),
+            "a cap with no Rate and no token budget is an honest absent budget"
+        );
+
+        // With a token budget present but no Rate, the view IS present but its dollar
+        // fields stay absent (inert).
+        let v = BudgetView::from_budget_and_cost(
+            &TokenBudget {
+                per_run: None,
+                cumulative: Some(100),
+            },
+            &CostCap {
+                per_run: None,
+                cumulative: Some(Micros(500_000)),
+            },
+            BreachAction::Pause,
+            0,
+            50,
+            false, // NO rate
+            Micros(0),
+            Micros(0),
+            EstimateLabel::Estimated,
+        )
+        .unwrap();
+        assert_eq!(v.cumulative_limit, Some(100));
+        assert_eq!(v.cumulative_cost_cap, None, "no Rate ⇒ dollar cap inert");
+        assert_eq!(v.estimate_label, None);
     }
 }

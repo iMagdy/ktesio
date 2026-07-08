@@ -457,29 +457,68 @@ impl Engine {
         // id). A read-back failure degrades to zero totals (like the runtime fields),
         // never failing the whole Fleet. The totals equal the ledger exactly (FR-22).
         let cumulative = registry.usage_totals(&instance.name).unwrap_or_default();
-        let current_run = supervisor
-            .current_run_id(&instance.name)
-            .and_then(|run_id| registry.run_usage_totals(&instance.name, &run_id).ok())
+        let current_run_id = supervisor.current_run_id(&instance.name);
+        let current_run = current_run_id
+            .as_ref()
+            .and_then(|run_id| registry.run_usage_totals(&instance.name, run_id).ok())
             .unwrap_or_default();
-        let usage = crate::domain::UsageView::new(cumulative, current_run);
-        // Story 3-2 budget surface (AC9): the CURRENT resolved Token Budget +
-        // Breach Action + remaining tokens per scope, TOKENS ONLY (dollars stay
-        // absent → 3-3). Read through the SAME live config resolve the evaluator
-        // uses (so the Fleet view matches what enforcement sees). A degraded config
-        // read falls back to no budget (honest absence), never failing the Fleet.
-        // Remaining is computed from the SAME ledger totals `usage` reports, so it
-        // equals the Usage Ledger exactly (FR-22). An instance with no budget
-        // configured surfaces an honest absent budget (never a fabricated ceiling).
+        // Story 3-3 dollar surface: resolve the CURRENT Rate/cap + action ONCE
+        // through the SAME live config resolve enforcement uses (so the Fleet view
+        // matches what enforcement sees). A degraded read → no Rate / no budget
+        // (honest absence), never failing the Fleet.
+        let (rate, cost_cap, action) = registry
+            .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
+            .ok()
+            .map(|effective| {
+                let (_token_budget, action) = crate::domain::resolve_token_budget(&effective);
+                let (rate, cost_cap, _cost_action) = crate::domain::resolve_cost(&effective);
+                (rate, cost_cap, action)
+            })
+            .unwrap_or_else(|| (None, crate::domain::CostCap::none(), Default::default()));
+        // The DERIVED dollar cost, present ONLY when a Rate is configured (AC-B: no
+        // Rate ⇒ NO dollar figure, never a fabricated `$0.00`). Each row is priced at
+        // its own persisted Rate (no retro-repricing), so these equal the ledger
+        // exactly (FR-22). v1 the estimate label is always `estimated`.
+        let (cumulative_cost, current_run_cost) = if rate.is_some() {
+            let cum = registry.cost_totals(&instance.name).unwrap_or_default();
+            let run = current_run_id
+                .as_ref()
+                .and_then(|run_id| registry.run_cost_totals(&instance.name, run_id).ok())
+                .unwrap_or_default();
+            (cum, run)
+        } else {
+            (crate::domain::Micros::ZERO, crate::domain::Micros::ZERO)
+        };
+        let label = crate::domain::EstimateLabel::Estimated;
+        let usage = {
+            let base = crate::domain::UsageView::new(cumulative, current_run);
+            if rate.is_some() {
+                base.with_dollars(cumulative_cost, current_run_cost, label)
+            } else {
+                base
+            }
+        };
+        // Story 3-2 budget surface + story 3-3 dollar cap surface (AC9/AC10): the
+        // CURRENT resolved Token Budget + Cost Cap + Breach Action + remaining per
+        // scope. TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are present
+        // ONLY when a Rate exists (a cap with no Rate is inert — AC-B). An instance
+        // with NEITHER a budget nor an enforceable cap surfaces an honest absent
+        // budget (never a fabricated ceiling).
         let budget = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
             .ok()
             .and_then(|effective| {
-                let (token_budget, action) = crate::domain::resolve_token_budget(&effective);
-                crate::domain::BudgetView::from_budget(
+                let (token_budget, _action) = crate::domain::resolve_token_budget(&effective);
+                crate::domain::BudgetView::from_budget_and_cost(
                     &token_budget,
+                    &cost_cap,
                     action,
                     current_run.total_tokens(),
                     cumulative.total_tokens(),
+                    rate.is_some(),
+                    current_run_cost,
+                    cumulative_cost,
+                    label,
                 )
             });
         // The active Metering Source is visible in Fleet detail (AC-C), read from the

@@ -9,7 +9,7 @@ mod helpers;
 
 use std::path::Path;
 
-use helpers::{run_kt_agent, TestContext};
+use helpers::{run_kt_agent, run_kt_agent_with_env, TestContext};
 
 /// Path to the SQLite state DB the engine creates under a state base.
 fn state_db(state_dir: &Path) -> std::path::PathBuf {
@@ -1357,8 +1357,9 @@ fn human_list_shows_the_budget_column_and_real_usage_columns() {
 
     let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
-    // The columns are present (headers): Budget (tokens) + Usage (real). The
-    // header may truncate on a narrow terminal, so match a stable prefix.
+    // The columns are present (headers): a Budget column (story 3-3 renamed it from
+    // "Budget (tokens)" to "Budget (tok, est. $)") + Usage (real). The header may
+    // truncate on a narrow terminal, so match a stable prefix.
     assert!(run.stdout.contains("Budget"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
     // An un-budgeted instance's budget cell renders the honest `—` absence.
@@ -1453,6 +1454,350 @@ fn human_show_surfaces_the_budget_row_and_real_usage_rows() {
     // The un-budgeted budget row renders the honest `—` absence.
     assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
     assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
+}
+
+// ---- Story 3-3: dollar cost + Cost Cap rendering (AC-B/AC10 — AD-8) ----
+
+#[test]
+fn config_set_rejects_a_malformed_rate_value_with_a_diagnostic() {
+    // AC11: a malformed Rate dollar value is rejected at WRITE time (never silently
+    // defaulted; a bad value must not crash). The write fails with a diagnostic and
+    // the config is unchanged.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let bad = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "cost.rate.input",
+            "three-dollars",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !bad.success,
+        "a malformed Rate must be rejected; stdout={}",
+        bad.stdout
+    );
+    assert!(
+        bad.stderr.contains("cost.rate.input"),
+        "the diagnostic must name the key; stderr={}",
+        bad.stderr
+    );
+    // Sub-micro precision is likewise rejected.
+    let submicro = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.dollars.cumulative",
+            "5.0000001",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !submicro.success,
+        "sub-micro precision must be rejected; stdout={}",
+        submicro.stdout
+    );
+}
+
+#[test]
+fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
+    // AC10/AC-B: a Rate'd + capped instance surfaces the DOLLAR cost + cap in
+    // `list --json` as INTEGER MICROS + the estimate label (NO `$` string on the
+    // wire — AD-14), and in the human table THROUGH the single currency module
+    // (a `$X.XX (estimated)` cell — AD-8). Even with zero usage, a Rate'd instance
+    // shows `$0.00 (estimated)` (an honest labeled zero, distinct from the no-Rate
+    // inert absence).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Both directions → a supplied Rate; a cumulative dollar cap.
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.input",
+            "3.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.output",
+            "15.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "budget.dollars.cumulative",
+            "5.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // --json: integer micros + label, NO `$` string.
+    let json = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        json.success,
+        "list --json should exit 0; stderr={}",
+        json.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", json.stdout));
+    let entry = &doc["instances"][0];
+    // The cumulative cost cap is $5.00 = 5_000_000 micros (an integer, not a string).
+    assert_eq!(
+        entry["budget"]["cumulative_cost_cap"],
+        serde_json::json!(5_000_000),
+        "the cap must be integer micros: {entry}"
+    );
+    // A Rate'd instance surfaces the derived cost ($0.00 at zero usage) + the label.
+    assert_eq!(
+        entry["usage"]["cumulative_dollars"],
+        serde_json::json!(0),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["usage"]["estimate_label"],
+        serde_json::json!("estimated"),
+        "{entry}"
+    );
+    // NO pre-formatted `$` string anywhere in the JSON document (AD-14).
+    assert!(
+        !json.stdout.contains('$'),
+        "no `$` string on the wire; stdout={}",
+        json.stdout
+    );
+
+    // Human table: the dollar cap cell rendered THROUGH the currency module shows a
+    // `$` figure. (The narrow `list` Budget column may TRUNCATE the trailing
+    // `(estimated)` label; the untruncated `show` surface asserts the label — see
+    // `show_of_a_rated_instance_surfaces_a_labeled_cost_row`.)
+    let human = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(human.success, "list should exit 0; stderr={}", human.stderr);
+    assert!(
+        human.stdout.contains('$'),
+        "the human dollar cell must render a `$` figure; stdout={}",
+        human.stdout
+    );
+}
+
+#[test]
+fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
+    // FR-23/AD-8 (primary review L1): the human `list` Budget column is NARROW and
+    // truncates its cell with `…`. Rendering the estimate qualifier INLINE in the
+    // cell (`… $0.50 (estimated) …`) would let truncation CHOP `(estimated)` and
+    // leave a human staring at a bare, UNLABELED dollar. The fix moves the qualifier
+    // OUT of the cell and into the COLUMN HEADER ("est. $"): the cell renders the
+    // dollar value BARE (via render_dollars_bare), so there is no inline estimate
+    // label in the cell to mangle, and the header carries the label instead.
+    //
+    // COLUMNS=110 is chosen so the Budget header + cell BOTH render in full while the
+    // other columns (Usage / Agent Home) truncate — the truncation pressure is real,
+    // yet the Budget column is the one under test and is fully observable.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A supplied Rate (both directions) + a cumulative dollar cap → the Budget cell
+    // renders a `$` cost-cap figure.
+    for (key, value) in [
+        ("cost.rate.input", "3.00"),
+        ("cost.rate.output", "15.00"),
+        ("budget.dollars.cumulative", "5.00"),
+    ] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let human = run_kt_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "110")],
+    );
+    assert!(human.success, "list should exit 0; stderr={}", human.stderr);
+
+    // (1) The estimate qualifier lives in the HEADER ("est. $") — the stable home of
+    // the dollar label on this truncatable surface (FR-23).
+    assert!(
+        human.stdout.contains("est. $"),
+        "the Budget header must carry the estimate qualifier 'est. $'; stdout=\n{}",
+        human.stdout
+    );
+    // (2) The header is NOT the stale "Budget (tokens)" mislabel — the column now
+    // also renders an ESTIMATED dollar Cost Cap, so "(tokens)" would misdescribe it.
+    assert!(
+        !human.stdout.contains("Budget (tokens)"),
+        "the header must not be the stale 'Budget (tokens)' mislabel; stdout=\n{}",
+        human.stdout
+    );
+    // (3) The Budget cell renders BARE dollar figures whose only trailing
+    // parenthetical is the Breach Action `(pause)` — NEVER an inline `(estimated)`
+    // (which truncation could mangle into `(esti…` glued to a dollar). The exact
+    // `cum $5.00/$5.00 (pause)` cell is proof: the `$` cap + remaining are bare, the
+    // estimate label is not in the cell at all, so no mangled label can appear here.
+    assert!(
+        human.stdout.contains("cum $5.00/$5.00 (pause)"),
+        "the Budget cell must render bare dollars + only the breach action (no inline \
+         estimate label to truncate); stdout=\n{}",
+        human.stdout
+    );
+
+    // (4) Belt-and-suspenders: the estimate qualifier is ALSO carried by the
+    // always-present, never-truncated stderr metering note ("labeled estimates"),
+    // which covers every rendered dollar on the surface regardless of terminal width.
+    assert!(
+        human.stderr.contains("labeled estimates"),
+        "the stderr metering note must state dollar figures are labeled estimates; \
+         stderr=\n{}",
+        human.stderr
+    );
+}
+
+#[test]
+fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
+    // AC10: human `show` of a Rate'd instance renders a `Cost (estimated)` row with
+    // a labeled dollar figure THROUGH the currency module.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.input",
+            "3.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.output",
+            "15.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A cumulative dollar cap too, so the Budget row renders a dollar Cost Cap pair.
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "budget.dollars.cumulative",
+            "5.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let show = run_kt_agent(&["agent", "show", "priced"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("Cost (estimated)"),
+        "show must render a Cost row; stdout={}",
+        show.stdout
+    );
+    assert!(
+        show.stdout.contains("$0.00 (estimated)"),
+        "the Cost row must show a labeled dollar figure; stdout={}",
+        show.stdout
+    );
+    // The `show` Value column is WIDE (no truncation), so its Budget row labels the
+    // dollar Cost Cap INLINE (DollarLabel::Inline) — the full `remaining/cap (estimated)`
+    // pair. At zero usage the remaining equals the $5.00 cap, so the pair is
+    // `$5.00/$5.00 (estimated)`. This is the un-truncated companion to the `list`
+    // truncation test, where the same label instead lives in the column header.
+    assert!(
+        show.stdout.contains("$5.00/$5.00 (estimated)"),
+        "the `show` Budget row must render the inline-labeled dollar cap pair; \
+         stdout={}",
+        show.stdout
+    );
+}
+
+#[test]
+fn show_of_a_no_rate_instance_says_dollar_features_are_inert() {
+    // AC-B: with NO Rate, dollar features are INERT and SAY SO — the human `show`
+    // Cost row is an honest "no Rate configured — dollar features inert" note, never
+    // a fabricated `$0.00`. Token features (the Budget/Usage rows) still render.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "norate", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let show = run_kt_agent(&["agent", "show", "norate"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("dollar features inert"),
+        "with no Rate, the Cost row must say dollar features are inert; stdout={}",
+        show.stdout
+    );
+    // No fabricated dollar figure for a no-Rate instance.
+    assert!(
+        !show.stdout.contains("$0.00"),
+        "a no-Rate instance must NOT fabricate a $0.00 cost; stdout={}",
+        show.stdout
+    );
+    // Token features still work: the Usage row is present.
+    assert!(show.stdout.contains("Usage"), "stdout={}", show.stdout);
 }
 
 // ---- Story 2-1: `kt agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
@@ -2621,10 +2966,12 @@ fn an_unbudgeted_instance_shows_the_honest_absent_budget() {
         list.stdout
     );
 
-    // The human table shows the `—` absence in the budget cell.
+    // The human show shows the `—` absence in the budget cell. (Story 3-3 renamed
+    // the `show` row "Budget (tokens)" → "Budget" since it now covers tokens AND the
+    // dollar Cost Cap.)
     let human = run_kt_agent(&["agent", "show", "bare"], &ctx.project_dir, state_dir);
     assert!(
-        human.stdout.contains("Budget (tokens)") && human.stdout.contains('—'),
+        human.stdout.contains("Budget") && human.stdout.contains('—'),
         "human show must render the honest absent budget; stdout=\n{}",
         human.stdout
     );

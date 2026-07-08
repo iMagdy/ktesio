@@ -55,6 +55,7 @@ use thiserror::Error;
 use toml::Value;
 
 use super::budget::{BreachAction, TokenBudget};
+use super::cost::{CostCap, Micros, Rate, MICROS_PER_DOLLAR};
 
 /// The engine-namespace config key for the PER-RUN token ceiling (story 3-2,
 /// AD-9). A validated key (NOT `agent.*` pass-through): its value parses as a
@@ -69,8 +70,33 @@ pub const BUDGET_TOKENS_CUMULATIVE_KEY: &str = "budget.tokens.cumulative";
 /// The engine-namespace config key for the Breach Action (story 3-2, AC-C). A
 /// validated key; its value parses as a [`BreachAction`] (`pause`/`stop`/`warn`)
 /// at write time. Absent → [`BreachAction::default`] (`pause`, the ratified
-/// default).
+/// default). Story 3-3: the SAME key governs a DOLLAR breach too (one action for
+/// both token and dollar breaches — see [`resolve_cost`]).
 pub const BUDGET_BREACH_ACTION_KEY: &str = "budget.breach_action";
+
+/// The engine-namespace config key for the per-direction INPUT Rate (story 3-3,
+/// FR-20). A validated key; its value is a DOLLAR STRING (e.g. `"3.00"`) parsed to
+/// micro-dollars-per-1M-tokens at WRITE time (rejecting a non-numeric or sub-micro
+/// value — see [`validate_cost_value`]). Absent → no input Rate; because BOTH
+/// directions are required for a Rate to be "supplied", an absent input direction
+/// makes the whole Rate inert (AC-B).
+pub const COST_RATE_INPUT_KEY: &str = "cost.rate.input";
+
+/// The engine-namespace config key for the per-direction OUTPUT Rate (story 3-3,
+/// FR-20). A dollar-string leaf parsed to micros at write time, exactly like
+/// [`COST_RATE_INPUT_KEY`]. Absent → the Rate is inert (both directions required).
+pub const COST_RATE_OUTPUT_KEY: &str = "cost.rate.output";
+
+/// The engine-namespace config key for the PER-RUN dollar Cost Cap (story 3-3,
+/// FR-21). A dollar-string leaf parsed to micros at write time. Absent → the
+/// per-run dollar scope is unset (never breaches). A cap set with no Rate is inert
+/// (AC-B).
+pub const BUDGET_DOLLARS_PER_RUN_KEY: &str = "budget.dollars.per_run";
+
+/// The engine-namespace config key for the CUMULATIVE dollar Cost Cap (story 3-3,
+/// FR-21). A dollar-string leaf parsed to micros at write time. Absent → the
+/// cumulative dollar scope is unset.
+pub const BUDGET_DOLLARS_CUMULATIVE_KEY: &str = "budget.dollars.cumulative";
 
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
@@ -502,11 +528,22 @@ fn merge_table_into(
 /// [`BUDGET_BREACH_ACTION_KEY`]) — validated keys whose VALUES are additionally
 /// type-checked by [`validate_write`] (a budget number must parse as `u64`, the
 /// breach action as [`BreachAction`]); they are NOT `agent.*` pass-through.
+///
+/// Story 3-3 (AD-8/AD-9) ADDS the four engine-namespace dollar keys
+/// ([`COST_RATE_INPUT_KEY`], [`COST_RATE_OUTPUT_KEY`], [`BUDGET_DOLLARS_PER_RUN_KEY`],
+/// [`BUDGET_DOLLARS_CUMULATIVE_KEY`]) — validated keys whose VALUES are dollar
+/// strings parsed to micros + type-checked by [`validate_write`] (a malformed
+/// dollar value or one with sub-micro precision is rejected at write time, never
+/// silently defaulted); they are NOT `agent.*` pass-through.
 const KNOWN_KEYS: &[&str] = &[
     "model",
     BUDGET_TOKENS_PER_RUN_KEY,
     BUDGET_TOKENS_CUMULATIVE_KEY,
     BUDGET_BREACH_ACTION_KEY,
+    COST_RATE_INPUT_KEY,
+    COST_RATE_OUTPUT_KEY,
+    BUDGET_DOLLARS_PER_RUN_KEY,
+    BUDGET_DOLLARS_CUMULATIVE_KEY,
 ];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
@@ -607,10 +644,11 @@ pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
         });
     }
     if is_known_key(key) {
-        // The story-3-2 budget keys additionally TYPE-CHECK their value at write
-        // time (AC-C — never silently defaulted). `model` (and any future value-
-        // free known key) skips this.
+        // The story-3-2 budget keys + the story-3-3 dollar keys additionally
+        // TYPE-CHECK their value at write time (never silently defaulted). `model`
+        // (and any future value-free known key) skips this.
         validate_budget_value(key, value)?;
+        validate_cost_value(key, value)?;
         return Ok(());
     }
     if is_pass_through(key) {
@@ -650,6 +688,117 @@ fn validate_budget_value(key: &str, value: &str) -> Result<(), ConfigError> {
             }),
         _ => Ok(()),
     }
+}
+
+/// Type-check the VALUE of a story-3-3 dollar key at write time (AC-A/AC-B/AC11).
+/// The Rate directions (`cost.rate.*`) and the dollar cap scopes
+/// (`budget.dollars.*`) are all DOLLAR STRINGS parsed to micro-dollars: a malformed
+/// value (non-numeric, negative, or sub-micro precision) is rejected BEFORE any
+/// persistence with a clear diagnostic (never silently defaulted — the honesty
+/// rule; a bad value must not crash ingestion, so we gate it at write). A non-cost
+/// key is a no-op.
+fn validate_cost_value(key: &str, value: &str) -> Result<(), ConfigError> {
+    match key {
+        COST_RATE_INPUT_KEY
+        | COST_RATE_OUTPUT_KEY
+        | BUDGET_DOLLARS_PER_RUN_KEY
+        | BUDGET_DOLLARS_CUMULATIVE_KEY => {
+            parse_dollars_to_micros(value)
+                .map(|_| ())
+                .map_err(|reason| ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    reason,
+                })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Parse a DOLLAR STRING (e.g. `"3.00"`, `"0"`, `"15"`, `"0.000003"`) into
+/// integer micro-dollars (story 3-3 — the money-parse crux, AC11). PURE + total.
+///
+/// Recorded decision (the config leaf is a decimal-dollar STRING parsed to micros,
+/// NOT a raw micros integer — the operator writes `"3.00"`, not `3000000`): a
+/// human-facing Rate is a dollar figure. Rules (rejected → `Err(reason)`, never a
+/// silent default):
+///
+/// * At most ONE `.`; a leading/trailing sign is NOT accepted (a Rate/cap is
+///   non-negative — a `-` is rejected).
+/// * The fractional part is at most 6 digits (the micro-dollar quantum). MORE than
+///   6 fractional digits is SUB-MICRO precision and is REJECTED (a clear
+///   diagnostic) rather than silently truncated — the story's "reject a value with
+///   sub-micro precision".
+/// * The integer and fractional parts must be ASCII digits (an empty integer part,
+///   as in `".5"`, is treated as `0`; an empty fractional part, as in `"3."`, is
+///   treated as `0`). A non-digit (`"abc"`, `"3.0x"`) is rejected.
+/// * The whole-dollar magnitude must fit in the micro-dollar `i64` domain (a
+///   value above ~9.2e12 dollars overflows and is rejected — implausible for a
+///   real Rate/cap, so the ceiling loses nothing real).
+pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("expected a dollar amount like \"3.00\", got an empty value".to_string());
+    }
+    // No sign: a Rate/cap is non-negative.
+    if trimmed.starts_with('-') || trimmed.starts_with('+') {
+        return Err(format!(
+            "'{trimmed}' is not a valid dollar amount (a Rate/cap must be non-negative, no sign)"
+        ));
+    }
+    let mut parts = trimmed.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next();
+    // A second '.' would remain in frac_part; reject a multi-dot value.
+    if let Some(frac) = frac_part {
+        if frac.contains('.') {
+            return Err(format!(
+                "'{trimmed}' is not a valid dollar amount (more than one decimal point)"
+            ));
+        }
+    }
+    // Integer dollars: an empty int part (".5") is 0.
+    let dollars: u64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse::<u64>().map_err(|_| {
+            format!(
+                "'{trimmed}' is not a valid dollar amount (the whole-dollar part is not a number)"
+            )
+        })?
+    };
+    // Fractional micros: pad/reject to exactly 6 digits (the micro quantum).
+    let frac_micros: u64 = match frac_part {
+        None | Some("") => 0,
+        Some(frac) => {
+            if !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "'{trimmed}' is not a valid dollar amount (the fractional part is not a number)"
+                ));
+            }
+            if frac.len() > 6 {
+                return Err(format!(
+                    "'{trimmed}' has sub-micro-dollar precision (more than 6 decimal places); \
+                     the finest supported unit is one micro-dollar ($0.000001)"
+                ));
+            }
+            // Right-pad to 6 digits so "3" fractional means 300_000 micros, "000003"
+            // means 3 micros.
+            let padded = format!("{frac:0<6}");
+            padded.parse::<u64>().map_err(|_| {
+                format!("'{trimmed}' is not a valid dollar amount (the fractional part is not a number)")
+            })?
+        }
+    };
+    // dollars × 1e6 + frac_micros, in i64, rejecting an overflow (implausible Rate).
+    let micros = (dollars as i128)
+        .checked_mul(MICROS_PER_DOLLAR as i128)
+        .and_then(|d| d.checked_add(frac_micros as i128))
+        .filter(|m| *m <= i64::MAX as i128)
+        .ok_or_else(|| {
+            format!("'{trimmed}' is too large to represent as micro-dollars (max ~$9.2 trillion)")
+        })?;
+    Ok(Micros(micros as i64))
 }
 
 /// Resolve the current [`TokenBudget`] + [`BreachAction`] from an already-resolved
@@ -700,6 +849,77 @@ fn budget_u64(effective: &EffectiveConfig, key: &str) -> Option<u64> {
         Value::String(s) => s.trim().parse::<u64>().ok(),
         _ => None,
     }
+}
+
+/// Resolve the current [`Rate`] (per-direction, if BOTH set) + [`CostCap`] +
+/// [`BreachAction`] from an already-resolved [`EffectiveConfig`] (story 3-3,
+/// AC-A/AC-B/AC-C/AC11 — the LIVE read the dollar enforcement calls on EACH
+/// ingestion, mirroring [`resolve_token_budget`]).
+///
+/// A read of the CURRENT resolved config (NOT a start-time snapshot): a Rate/cap
+/// changed while `running` is reflected on the very next `UsageEvent` (AC-A "a Rate
+/// change re-prices FUTURE consumption only"; AC-B "changeable while running")
+/// because the supervisor re-resolves + re-reads here each time. The Rate REQUIRES
+/// BOTH directions to be "supplied" (Key design decision 2): a half-configured Rate
+/// (only input, or only output) resolves to `None` — inert, treated as no-Rate
+/// (AC-B), avoiding a silently-half-priced ledger. Absent cap scopes → `None`
+/// (never breach); the SAME `budget.breach_action` key governs a dollar breach
+/// (one action for both dimensions).
+///
+/// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
+/// somehow present but MALFORMED (slipped past write-validation via a hand-edited
+/// `config.toml`) is treated as ABSENT for that direction/scope rather than
+/// erroring — the honest degrade is "no Rate / no ceiling", never a panic
+/// mid-ingestion. [`validate_write`] is the primary gate; this read is defensive.
+pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, BreachAction) {
+    // Both directions required for a "supplied" Rate (AC6/AC-B). A missing or
+    // malformed direction → no Rate (inert).
+    let input = cost_micros_leaf(effective, COST_RATE_INPUT_KEY);
+    let output = cost_micros_leaf(effective, COST_RATE_OUTPUT_KEY);
+    let rate = match (input, output) {
+        (Some(i), Some(o)) => Some(Rate::new(micros_to_u64(i), micros_to_u64(o))),
+        _ => None,
+    };
+    let cap = CostCap {
+        per_run: cost_micros_leaf(effective, BUDGET_DOLLARS_PER_RUN_KEY),
+        cumulative: cost_micros_leaf(effective, BUDGET_DOLLARS_CUMULATIVE_KEY),
+    };
+    // The SAME breach-action key governs dollar breaches too (story 3-3): resolve it
+    // exactly as `resolve_token_budget` does (absent → the ratified `pause` default).
+    let action = effective
+        .value(BUDGET_BREACH_ACTION_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<BreachAction>().ok())
+        .unwrap_or_default();
+    (rate, cap, action)
+}
+
+/// Read a dollar-string leaf into [`Micros`], coercing the TOML value (story 3-3,
+/// the defensive resolve). Accepts a TOML string (the `set` path stores the dollar
+/// string verbatim) parsed via [`parse_dollars_to_micros`], or a bare TOML integer
+/// interpreted as WHOLE DOLLARS (a hand-edited `budget.dollars.cumulative = 5`
+/// resolves to $5). A malformed / negative value → `None` (absent — the defensive
+/// degrade). A `secret:`-classified string is not a dollar value → `None`.
+fn cost_micros_leaf(effective: &EffectiveConfig, key: &str) -> Option<Micros> {
+    let value = effective.value(key)?;
+    match value {
+        // The `set` path stores the dollar string; parse it to micros.
+        Value::String(s) if !is_secret_ref(s) => parse_dollars_to_micros(s).ok(),
+        // A hand-edited bare integer means whole dollars (defensive convenience).
+        Value::Integer(i) => u64::try_from(*i)
+            .ok()
+            .and_then(|d| (d as i128).checked_mul(MICROS_PER_DOLLAR as i128))
+            .filter(|m| *m <= i64::MAX as i128)
+            .map(|m| Micros(m as i64)),
+        _ => None,
+    }
+}
+
+/// The non-negative micro count of a [`Micros`] as `u64` for the [`Rate`] fields
+/// (which are `u64` micros-per-1M). A cost value is non-negative; a defensive
+/// negative clamps to 0.
+fn micros_to_u64(m: Micros) -> u64 {
+    u64::try_from(m.get()).unwrap_or(0)
 }
 
 /// Whether a dotted key has any EMPTY segment (a leading/trailing/doubled dot, or
@@ -1383,7 +1603,8 @@ mod tests {
         // sole known key.
         assert!(!is_known_key("restart.policy"));
         assert!(validate_write("restart.policy", "never").is_err());
-        // `model` plus the three story-3-2 Token-Budget keys are the known set.
+        // `model` plus the three story-3-2 Token-Budget keys plus the four story-3-3
+        // dollar keys (Rate ×2 + Cost Cap ×2) are the known set.
         assert_eq!(
             KNOWN_KEYS,
             &[
@@ -1391,6 +1612,10 @@ mod tests {
                 "budget.tokens.per_run",
                 "budget.tokens.cumulative",
                 "budget.breach_action",
+                "cost.rate.input",
+                "cost.rate.output",
+                "budget.dollars.per_run",
+                "budget.dollars.cumulative",
             ]
         );
     }
@@ -1704,5 +1929,187 @@ mod tests {
             "[budget.tokens]\nper_run = \"250\"\n",
         ));
         assert_eq!(resolve_token_budget(&eff).0.per_run, Some(250));
+    }
+
+    // ---- Story 3-3: dollar-string → micros parse (AC11) ----
+
+    #[test]
+    fn parse_dollars_accepts_common_forms() {
+        assert_eq!(parse_dollars_to_micros("3.00").unwrap(), Micros(3_000_000));
+        assert_eq!(parse_dollars_to_micros("3").unwrap(), Micros(3_000_000));
+        assert_eq!(parse_dollars_to_micros("15").unwrap(), Micros(15_000_000));
+        assert_eq!(parse_dollars_to_micros("0").unwrap(), Micros(0));
+        assert_eq!(parse_dollars_to_micros("0.00").unwrap(), Micros(0));
+        // Sub-cent but at/above the micro quantum: $0.000003 = 3 micros ($3/1M).
+        assert_eq!(parse_dollars_to_micros("0.000003").unwrap(), Micros(3));
+        // Partial fractional digits right-pad: "0.3" = $0.30 = 300_000 micros.
+        assert_eq!(parse_dollars_to_micros("0.3").unwrap(), Micros(300_000));
+        // Leading-dot integer defaults to 0: ".5" = $0.50.
+        assert_eq!(parse_dollars_to_micros(".5").unwrap(), Micros(500_000));
+        // Trailing-dot fractional defaults to 0: "3." = $3.00.
+        assert_eq!(parse_dollars_to_micros("3.").unwrap(), Micros(3_000_000));
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            parse_dollars_to_micros("  3.00  ").unwrap(),
+            Micros(3_000_000)
+        );
+    }
+
+    #[test]
+    fn parse_dollars_rejects_sub_micro_precision() {
+        // MORE than 6 fractional digits is sub-micro precision — REJECTED (a clear
+        // diagnostic), never silently truncated.
+        let err = parse_dollars_to_micros("3.0000001").unwrap_err();
+        assert!(err.contains("sub-micro"), "{err}");
+        assert!(err.contains("0.000001"), "{err}");
+        // Exactly 6 digits is fine (the quantum).
+        assert!(parse_dollars_to_micros("3.000001").is_ok());
+    }
+
+    #[test]
+    fn parse_dollars_rejects_non_numeric_and_signed_and_multi_dot() {
+        assert!(parse_dollars_to_micros("abc").is_err());
+        assert!(parse_dollars_to_micros("3.0x").is_err());
+        assert!(parse_dollars_to_micros("").is_err());
+        // A Rate/cap is non-negative — a sign is rejected.
+        assert!(parse_dollars_to_micros("-3.00").is_err());
+        assert!(parse_dollars_to_micros("+3.00").is_err());
+        // More than one decimal point.
+        assert!(parse_dollars_to_micros("3.0.0").is_err());
+        // An implausibly huge value overflows the micro domain and is rejected.
+        assert!(parse_dollars_to_micros("100000000000000").is_err());
+    }
+
+    // ---- Story 3-3: validate_write on the dollar keys (AC-A/AC11) ----
+
+    #[test]
+    fn validate_write_accepts_valid_dollar_keys() {
+        assert!(validate_write(COST_RATE_INPUT_KEY, "3.00").is_ok());
+        assert!(validate_write(COST_RATE_OUTPUT_KEY, "15.00").is_ok());
+        assert!(validate_write(BUDGET_DOLLARS_PER_RUN_KEY, "5").is_ok());
+        assert!(validate_write(BUDGET_DOLLARS_CUMULATIVE_KEY, "50.00").is_ok());
+    }
+
+    #[test]
+    fn validate_write_rejects_a_malformed_dollar_value_with_a_diagnostic() {
+        // AC11: a malformed Rate/cap dollar value is rejected at WRITE time (never
+        // silently defaulted; a bad value must not crash ingestion). It is an
+        // InvalidValue (the KEY is known — its VALUE is wrong), naming key + value.
+        let err = validate_write(COST_RATE_INPUT_KEY, "three dollars").unwrap_err();
+        match err {
+            ConfigError::InvalidValue { key, value, reason } => {
+                assert_eq!(key, COST_RATE_INPUT_KEY);
+                assert_eq!(value, "three dollars");
+                assert!(!reason.is_empty(), "a remediation reason is present");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        // Sub-micro precision on a cap is likewise rejected.
+        assert!(matches!(
+            validate_write(BUDGET_DOLLARS_CUMULATIVE_KEY, "5.0000001"),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+    }
+
+    // ---- Story 3-3: resolve_cost (AC-A/AC-B/AC-C/AC11) ----
+
+    #[test]
+    fn resolve_cost_requires_both_rate_directions_else_inert() {
+        // Both directions present → a real Rate.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\noutput = \"15.00\"\n",
+        ));
+        let (rate, _cap, _action) = resolve_cost(&eff);
+        assert_eq!(
+            rate,
+            Some(Rate::new(3_000_000, 15_000_000)),
+            "both directions set → the Rate is supplied"
+        );
+
+        // Only input set → inert (no Rate), avoiding a silently-half-priced ledger.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\n",
+        ));
+        assert_eq!(resolve_cost(&eff).0, None, "a half-Rate is inert (AC-B)");
+
+        // Only output set → inert.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(resolve_cost(&eff).0, None);
+    }
+
+    #[test]
+    fn resolve_cost_reads_the_dollar_cap_scopes_and_action() {
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"1.00\"\noutput = \"1.00\"\n\
+             [budget.dollars]\nper_run = \"5.00\"\ncumulative = \"50.00\"\n\
+             [budget]\nbreach_action = \"stop\"\n",
+        ));
+        let (rate, cap, action) = resolve_cost(&eff);
+        assert_eq!(rate, Some(Rate::new(1_000_000, 1_000_000)));
+        assert_eq!(cap.per_run, Some(Micros(5_000_000)));
+        assert_eq!(cap.cumulative, Some(Micros(50_000_000)));
+        // The SAME breach-action key governs the dollar breach.
+        assert_eq!(action, BreachAction::Stop);
+    }
+
+    #[test]
+    fn resolve_cost_absent_yields_no_rate_no_cap_default_action() {
+        // AC-B: nothing configured → no Rate, no cap, the ratified `pause` default.
+        let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
+        let (rate, cap, action) = resolve_cost(&eff);
+        assert_eq!(rate, None);
+        assert!(!cap.is_set());
+        assert_eq!(action, BreachAction::Pause);
+    }
+
+    #[test]
+    fn resolve_cost_degrades_a_malformed_value_to_absent_never_panics() {
+        // AD-12 defensive read: a hand-edited malformed value resolves to absent for
+        // that direction/scope rather than erroring. Malformed input → no Rate.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"garbage\"\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(resolve_cost(&eff).0, None, "a malformed direction → inert");
+    }
+
+    #[test]
+    fn resolve_cost_accepts_a_bare_integer_leaf_as_whole_dollars() {
+        // A hand-edited bare integer means whole dollars (defensive convenience):
+        // `cumulative = 5` → $5.00 = 5_000_000 micros.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.dollars]\ncumulative = 5\n",
+        ));
+        assert_eq!(resolve_cost(&eff).1.cumulative, Some(Micros(5_000_000)));
+    }
+
+    #[test]
+    fn resolve_cost_reflects_a_live_rate_change_no_caching() {
+        // AC-A/AC-B: a Rate changed in config is reflected on the next resolve (a
+        // live read, no caching) — the mechanism behind "re-prices future only".
+        let eff1 = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&eff1).0,
+            Some(Rate::new(3_000_000, 15_000_000))
+        );
+        // A fresh resolve of a CHANGED config sees the new Rate immediately.
+        let eff2 = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"6.00\"\noutput = \"30.00\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&eff2).0,
+            Some(Rate::new(6_000_000, 30_000_000))
+        );
     }
 }

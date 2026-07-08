@@ -10,9 +10,14 @@
 //!
 //! ## Scope boundary (story 3-1 is CAPTURE → LEDGER)
 //!
-//! A [`UsageEvent`] is TOKENS ONLY (AD-8: no currency this story). There is NO
-//! dollar field, NO `EstimateLabel`, NO budget/headroom — those are 3-3/3-2/3-5.
-//! The `metering_source` rides as its wire string (the
+//! A [`UsageEvent`] is TOKENS ONLY (AD-8: no currency ON THE ADAPTER-FACING WIRE
+//! TYPE). There is NO dollar field, NO `EstimateLabel`, NO budget/headroom on the
+//! event itself — those stay engine-side. Story 3-3 DERIVES dollars from these
+//! token counts (via [`super::cost::cost_micros`]) and persists the effective
+//! `Rate` per ledger ROW as an engine-side column (NOT on this frozen wire type —
+//! AD-6, no retro-repricing); the derived cost + `EstimateLabel` surface in the
+//! Fleet view ([`super::fleet::UsageView`]), never on the `UsageEvent` wire. The
+//! `metering_source` rides as its wire string (the
 //! [`ktesio_adapter_api::MeteringSource`] kebab-case form) so the row is
 //! self-describing without a cross-crate enum dependency in the ledger.
 

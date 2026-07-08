@@ -55,8 +55,9 @@ use crate::time::now_rfc3339;
 
 use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
 use super::config::{self, ConfigLayer};
+use super::cost::{CostEvaluator, EstimateLabel, Micros};
 use super::error::EngineError;
-use super::event::{BudgetBreachEvent, TransitionCause, TransitionEvent};
+use super::event::{BreachDimension, BudgetBreachEvent, TransitionCause, TransitionEvent};
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
@@ -198,20 +199,26 @@ struct Supervised {
     /// cursor. Advanced past each block the drain reads, so lines are ingested at
     /// most once from the capture (the DB dedup is the second, authoritative guard).
     usage_cursor: u64,
-    /// The per-Run breach LATCH (story 3-2 idempotence fix): the set of
-    /// [`BreachScope`]s that have ALREADY fired a breach for THIS Run. Enforcement
-    /// (`enforce_budget`) runs on EVERY committed usage event, but a breach must
-    /// fire **at most once per scope per Run** — otherwise every post-crossing event
-    /// re-records a `BudgetBreachEvent` and re-fires the action (unbounded duplicate
-    /// records for `warn`; redundant records for `pause`/`stop`). A scope is inserted
-    /// here the first time it trips; a subsequent event whose scope is already latched
-    /// short-circuits BOTH the record and the action. The per-run and cumulative
-    /// scopes latch INDEPENDENTLY (a persistently-over-cumulative agent fires ≤1
-    /// cumulative breach; a per-run breach fires once for this Run). The latch lives
-    /// on `Supervised`, so it RESETS automatically when a new Run starts — a fresh
-    /// `Supervised` (built at `starting`, where the `run_id` is freshly minted) begins
-    /// with an empty latch, giving the intended "at most one breach per scope per Run".
-    breached_scopes: std::collections::HashSet<BreachScope>,
+    /// The per-Run breach LATCH (story 3-2 idempotence fix; story 3-3 keyed by
+    /// dimension): the set of `(dimension, scope)` pairs that have ALREADY fired a
+    /// breach for THIS Run. Enforcement (`enforce_budget`) runs on EVERY committed
+    /// usage event, but a breach must fire **at most once per (dimension, scope) per
+    /// Run** — otherwise every post-crossing event re-records a `BudgetBreachEvent`
+    /// and re-fires the action (unbounded duplicate records for `warn`; redundant
+    /// records for `pause`/`stop`). A pair is inserted the first time it trips; a
+    /// subsequent event whose pair is already latched short-circuits BOTH the record
+    /// and the action.
+    ///
+    /// STORY 3-3 — DIMENSION KEY: the latch key is `(BreachDimension, BreachScope)`
+    /// so a TOKEN breach and a DOLLAR breach of the SAME scope latch INDEPENDENTLY —
+    /// each fires once per Run (a run can legitimately trip both its token ceiling
+    /// and its dollar cap; the action is identical, so both fire once each). The
+    /// per-run and cumulative scopes still latch independently within each dimension.
+    /// The latch lives on `Supervised`, so it RESETS automatically when a new Run
+    /// starts — a fresh `Supervised` (built at `starting`, where the `run_id` is
+    /// freshly minted) begins empty, giving "at most one breach per (dimension,
+    /// scope) per Run".
+    breached_scopes: std::collections::HashSet<(BreachDimension, BreachScope)>,
 }
 
 /// The lifecycle supervisor: owns running process handles + drives transitions.
@@ -1410,7 +1417,16 @@ impl Supervisor {
             metering_source,
             now_rfc3339(),
         );
-        match registry.record_usage_event(&event) {
+        // Story 3-3 — NO-RETROACTIVE-REPRICING: resolve the EFFECTIVE Rate at COMMIT
+        // (a live config read) and PERSIST it onto this row, so historical dollars
+        // keep the Rate in force when consumed. A later Rate change re-prices FUTURE
+        // events only (each row is priced at its own stored Rate on read). A degraded
+        // config read / absent-or-half Rate → `None` (the row contributes $0; AC-B).
+        let rate = registry
+            .effective_config(name, ConfigLayer::empty())
+            .ok()
+            .and_then(|eff| config::resolve_cost(&eff).0);
+        match registry.record_usage_event(&event, rate) {
             // A fresh row: build the AD-14 usage-update wire struct (frozen now; 7-2
             // delivers it), THEN run the AD-7 enforcement stage on the just-committed
             // totals — synchronously, in this same commit path.
@@ -1430,30 +1446,35 @@ impl Supervisor {
         }
     }
 
-    /// The AD-7 ENFORCEMENT stage (story 3-2), run INSIDE [`Self::ingest_usage`]
-    /// right after a fresh commit — the SOLE place a budget is evaluated + a Breach
-    /// Action fired.
+    /// The AD-7 ENFORCEMENT stage (story 3-2 tokens + story 3-3 dollars), run INSIDE
+    /// [`Self::ingest_usage`] right after a fresh commit — the SOLE place a budget or
+    /// Cost Cap is evaluated + a Breach Action fired.
     ///
-    /// Reads the CURRENT resolved budget + action (live, AC-B), reads the committed
-    /// per-run + cumulative totals, evaluates purely, and on a breach records the
-    /// event FIRST then executes the action. Every step is best-effort to the RUN:
-    /// a failed config read / totals read / lifecycle op is a diagnostic, never a
-    /// crash (AD-12). A no-budget instance resolves to [`TokenBudget::none`] and the
-    /// evaluator returns `WithinBudget` — so the common (un-budgeted) path is a
-    /// cheap config read + a pure comparison and nothing else.
+    /// Reads the CURRENT resolved budget/Rate/cap + action (live, AC-B), reads the
+    /// committed per-run + cumulative totals, evaluates purely (TOKENS then DOLLARS,
+    /// in the SAME choke point), and on a breach records the event FIRST then
+    /// executes the action. Every step is best-effort to the RUN: a failed config
+    /// read / totals read / lifecycle op is a diagnostic, never a crash (AD-12). A
+    /// no-budget + no-cap instance evaluates to `WithinBudget` for both — so the
+    /// common path is a cheap config read + two pure comparisons and nothing else.
     ///
-    /// **Idempotence — at most one breach event per scope per Run (story 3-2 fix):**
-    /// this runs on EVERY committed usage event, so once totals cross a ceiling every
-    /// subsequent event would re-evaluate to the SAME breach. To keep the guardrail
-    /// honest we consult the per-Run breach LATCH ([`Supervised::breached_scopes`]):
-    /// a scope that has ALREADY fired this Run short-circuits BOTH the
-    /// [`Self::record_breach`] and the action (the re-transition would no-op via
-    /// `InvalidTransition` anyway, but the DURABLE breach record would still spam —
-    /// unbounded for `warn`). The per-run and cumulative scopes latch INDEPENDENTLY,
-    /// each still EVALUATED every event; only the SECOND+ trip of an already-latched
-    /// scope is suppressed. The latch resets when a new Run starts (a fresh
-    /// `Supervised` at `starting`), so a persistently-over-cumulative agent fires ≤1
-    /// cumulative breach per Run and a per-run breach fires once per Run.
+    /// **STORY 3-3 — the DOLLAR evaluation folds in HERE (AD-7, no new path):** after
+    /// the token evaluation, IF a [`Rate`](super::cost::Rate) is present AND the
+    /// [`CostCap`](super::cost::CostCap) `is_set()`, derive the per-run + cumulative
+    /// COST (each row priced at its own persisted Rate — no retro-repricing) and run
+    /// the pure [`CostEvaluator`]. NO Rate ⇒ dollar enforcement is SKIPPED entirely
+    /// (AC-B inert — a `CostCap` with no Rate cannot be enforced). Both dimensions
+    /// reuse the SAME record-first-then-act path + the SAME per-Run latch, keyed by
+    /// `(dimension, scope)` so a token breach and a dollar breach of the same scope
+    /// each fire ONCE per Run (both can fire on the same event; the action is
+    /// identical).
+    ///
+    /// **Idempotence — at most one breach per (dimension, scope) per Run:** this runs
+    /// on EVERY committed usage event, so once a total crosses a ceiling every
+    /// subsequent event would re-evaluate to the SAME breach. The per-Run breach
+    /// LATCH ([`Supervised::breached_scopes`], keyed by `(dimension, scope)`)
+    /// short-circuits BOTH the [`Self::record_breach`] and the action for an
+    /// already-fired pair; the latch resets when a new Run starts.
     fn enforce_budget(
         &mut self,
         registry: &Registry,
@@ -1461,94 +1482,163 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
     ) {
-        // (1) LIVE budget read (AC-B "changes apply immediately"): resolve the
-        // CURRENT effective config each ingestion, NOT a start-time snapshot. A
-        // malformed on-disk layer degrades to "no budget" (best-effort — never a
-        // crash mid-ingestion).
+        // (1) LIVE config read (AC-B "changes apply immediately"): resolve the
+        // CURRENT effective config ONCE, for BOTH the token budget and the dollar
+        // Rate/cap. A malformed on-disk layer degrades to "no budget / no Rate"
+        // (best-effort — never a crash mid-ingestion).
         let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
             return;
         };
-        let (budget, action) = config::resolve_token_budget(&effective);
-        // Skip the totals reads entirely when no ceiling is configured (the common
-        // case): the evaluator would return WithinBudget regardless.
-        if !budget.is_set() {
+        let (budget, token_action) = config::resolve_token_budget(&effective);
+        let (rate, cost_cap, cost_action) = config::resolve_cost(&effective);
+
+        // Whether each dimension is ARMED: a token budget is armed when a ceiling is
+        // set; the dollar cap is armed ONLY when BOTH a Rate is present AND a cap
+        // scope is set (AC-B: a cap with no Rate is inert). If NEITHER is armed, skip
+        // the totals reads entirely (the common un-governed path).
+        let token_armed = budget.is_set();
+        let dollar_armed = rate.is_some() && cost_cap.is_set();
+        if !token_armed && !dollar_armed {
             return;
         }
 
-        // (2) The just-committed totals (3-1's reads): per-run scoped to THIS Run,
-        // cumulative over all Runs. A read error degrades to zero (best-effort).
-        let run_total = registry
-            .run_usage_totals(name, run_id)
-            .map(|t| t.total_tokens())
-            .unwrap_or(0);
-        let cumulative_total = registry
-            .usage_totals(name)
-            .map(|t| t.total_tokens())
-            .unwrap_or(0);
+        // (2) TOKEN dimension (story 3-2): the just-committed token totals + the pure
+        // evaluator. Reuses the record-first-then-act helper with the tokens dimension.
+        if token_armed {
+            let run_total = registry
+                .run_usage_totals(name, run_id)
+                .map(|t| t.total_tokens())
+                .unwrap_or(0);
+            let cumulative_total = registry
+                .usage_totals(name)
+                .map(|t| t.total_tokens())
+                .unwrap_or(0);
+            let decision =
+                BudgetEvaluator::evaluate(run_total, cumulative_total, &budget, token_action);
+            if let BreachDecision::Breached {
+                scope,
+                action,
+                limit,
+                observed,
+            } = decision
+            {
+                let cause = TransitionCause::budget_exceeded(scope, limit, observed);
+                self.apply_breach(
+                    registry,
+                    name,
+                    run_id,
+                    BreachDimension::Tokens,
+                    scope,
+                    action,
+                    cause,
+                    metering_source,
+                    // The token breach event carries token counts (no dollar fields).
+                    |registry, sup, run_id, scope, action, src| {
+                        sup.record_token_breach(
+                            registry, name, run_id, scope, limit, observed, action, src,
+                        );
+                    },
+                );
+            }
+        }
 
-        // (3) Pure decision (the ≥ threshold, per-run-before-cumulative).
-        let BreachDecision::Breached {
-            scope,
-            action,
-            limit,
-            observed,
-        } = BudgetEvaluator::evaluate(run_total, cumulative_total, &budget, action)
-        else {
-            return;
-        };
+        // (3) DOLLAR dimension (story 3-3): derive the per-run + cumulative COST from
+        // the ledger (each row priced at its own persisted Rate — no retro-repricing),
+        // then the pure CostEvaluator. Only when a Rate is present AND the cap is set
+        // (AC-B inert otherwise). v1 the estimate label is always `estimated`.
+        if dollar_armed {
+            let run_cost = registry
+                .run_cost_totals(name, run_id)
+                .unwrap_or(Micros::ZERO);
+            let cumulative_cost = registry.cost_totals(name).unwrap_or(Micros::ZERO);
+            let decision =
+                CostEvaluator::evaluate(run_cost, cumulative_cost, &cost_cap, cost_action);
+            if let BreachDecision::Breached {
+                scope,
+                action,
+                limit,
+                observed,
+            } = decision
+            {
+                let label = EstimateLabel::Estimated;
+                let cause = TransitionCause::cost_cap_exceeded(
+                    scope,
+                    Micros(limit as i64),
+                    Micros(observed as i64),
+                    label,
+                );
+                self.apply_breach(
+                    registry,
+                    name,
+                    run_id,
+                    BreachDimension::Dollars,
+                    scope,
+                    action,
+                    cause,
+                    metering_source,
+                    // The dollar breach event carries integer micros + the label.
+                    |registry, sup, run_id, scope, action, src| {
+                        sup.record_cost_breach(
+                            registry,
+                            name,
+                            run_id,
+                            scope,
+                            Micros(limit as i64),
+                            Micros(observed as i64),
+                            label,
+                            action,
+                            src,
+                        );
+                    },
+                );
+            }
+        }
+    }
 
-        // (3b) IDEMPOTENCE LATCH (story 3-2): a breach fires AT MOST ONCE per scope
-        // per Run. If THIS scope has already fired for the current Run, short-circuit
-        // — skip BOTH the durable record and the action (otherwise every post-crossing
-        // event re-records the same breach: unbounded for `warn`, redundant for
-        // pause/stop even though their re-transition no-ops). Otherwise mark the scope
-        // latched now, then record + act exactly once. The latch lives on the
-        // per-instance `Supervised`, so it is scoped to the CURRENT Run and resets
-        // when a new Run starts (a fresh `Supervised` at `starting`). A missing entry
-        // (the instance is not currently supervised — e.g. a race with stop) declines
-        // to enforce: there is nothing to latch or act on.
+    /// Apply ONE breach decision for a given `dimension` (story 3-3 shared path):
+    /// consult the per-Run `(dimension, scope)` latch, and if this pair has NOT yet
+    /// fired this Run, RECORD the breach (via `record`, the dimension-specific event
+    /// writer) FIRST/INDEPENDENTLY and THEN execute the action via Epic-1's lifecycle
+    /// (AD-15 — a REASON, not a new edge). A pair already latched short-circuits both.
+    /// A missing `Supervised` (not currently supervised — a race with stop) declines
+    /// to enforce. All best-effort: a lifecycle error is a diagnostic, never a crash.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_breach(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        dimension: BreachDimension,
+        scope: BreachScope,
+        action: BreachAction,
+        cause: TransitionCause,
+        metering_source: &str,
+        record: impl FnOnce(&Registry, &Self, &RunId, BreachScope, BreachAction, &str),
+    ) {
+        // IDEMPOTENCE LATCH (story 3-2/3-3): fire at most once per (dimension, scope)
+        // per Run. Insert the pair; if it was already present, short-circuit.
         match self.running.get_mut(name) {
             Some(supervised) => {
-                if !supervised.breached_scopes.insert(scope) {
-                    // Already fired for this scope this Run — nothing new to do.
+                if !supervised.breached_scopes.insert((dimension, scope)) {
                     return;
                 }
             }
             None => return,
         }
-
-        // (4a) RECORD THE BREACH FIRST/INDEPENDENTLY (AC7 / FR-21): a durable breach
-        // event, recorded BEFORE the lifecycle side-effect, so a pause that is
-        // best-effort/unsupported/failing never loses the record. Best-effort write
-        // (a log hiccup must not crash ingestion — but it is the primary record).
-        self.record_breach(
-            registry,
-            name,
-            run_id,
-            scope,
-            limit,
-            observed,
-            action,
-            metering_source,
-        );
-
-        // (4b) EXECUTE THE ACTION via Epic-1's EXISTING lifecycle (AD-15 — a new
-        // CAUSE, not a new edge). The breach is already recorded; a lifecycle error
-        // here is a best-effort diagnostic, never a supervisor crash.
-        let cause = TransitionCause::budget_exceeded(scope, limit, observed);
+        // RECORD THE BREACH FIRST (AC7/AC10 / FR-21 "always recorded regardless of
+        // action"), BEFORE the lifecycle side-effect, so a best-effort/unsupported/
+        // failing pause never loses the record.
+        record(registry, self, run_id, scope, action, metering_source);
+        // EXECUTE THE ACTION via Epic-1's EXISTING lifecycle. The breach is already
+        // recorded; a lifecycle error here is a best-effort diagnostic, never a crash.
         match action {
             BreachAction::Warn => {
-                // No lifecycle transition — the breach event (4a) is the whole
-                // guardrail. The agent keeps running.
+                // No lifecycle transition — the breach event is the whole guardrail.
             }
             BreachAction::Pause => {
                 self.enforce_pause(registry, name, cause);
             }
             BreachAction::Stop => {
-                // Drive running → stopping → stopped (story 1-4). The BudgetExceeded
-                // cause is carried by tagging the resulting stop (best-effort: if the
-                // stop path records its own cause we still have the breach event +
-                // the pre-stop cause marker below).
                 self.enforce_stop(registry, name, cause);
             }
         }
@@ -1597,21 +1687,12 @@ impl Supervisor {
         }
     }
 
-    /// Record the ALWAYS-recorded [`BudgetBreachEvent`] to the durable per-instance
-    /// breach log (story 3-2, AC7 / FR-21 "always recorded regardless of action").
-    /// Recorded for EVERY action (including `warn`) and BEFORE the lifecycle
-    /// side-effect, so the breach is never lost.
-    ///
-    /// Non-fatal but NOT swallowed: this is the PRIMARY durable record of the breach
-    /// (FR-21), so a write failure (disk full / IO / perms) must not vanish silently
-    /// while the action still fires — that would lose the mandated record with no
-    /// diagnostic. We keep enforcement acting (the write failure is NOT made fatal),
-    /// but SURFACE the error on the engine-log stderr breadcrumb (mirroring how
-    /// `enforce_pause`/`enforce_stop` log their best-effort diagnostics), so a lost
-    /// breach record is visible to an operator. Both the dir-create and the append
-    /// failure are surfaced.
+    /// Record a TOKEN [`BudgetBreachEvent`] (story 3-2, AC7) — the token-dimension
+    /// event writer passed to [`Self::apply_breach`]. Builds the token breach struct
+    /// (token `limit`/`observed`, no dollar fields) and persists it via
+    /// [`Self::persist_breach_event`].
     #[allow(clippy::too_many_arguments)]
-    fn record_breach(
+    fn record_token_breach(
         &self,
         registry: &Registry,
         name: &InstanceName,
@@ -1632,6 +1713,60 @@ impl Supervisor {
             metering_source,
             now_rfc3339(),
         );
+        self.persist_breach_event(registry, name, &event);
+    }
+
+    /// Record a DOLLAR [`BudgetBreachEvent`] (story 3-3, AC10) — the dollar-dimension
+    /// event writer passed to [`Self::apply_breach`]. Builds the dollar breach struct
+    /// (integer-micro `dollar_limit`/`dollar_observed` + the [`EstimateLabel`]) and
+    /// persists it via [`Self::persist_breach_event`]. NO `$` string, NO `f64` — the
+    /// wire carries integer micros + the label (AD-14).
+    #[allow(clippy::too_many_arguments)]
+    fn record_cost_breach(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        scope: BreachScope,
+        limit_micros: Micros,
+        observed_micros: Micros,
+        label: EstimateLabel,
+        action: BreachAction,
+        metering_source: &str,
+    ) {
+        let event = BudgetBreachEvent::new_cost(
+            name.as_str(),
+            run_id.as_str(),
+            scope,
+            limit_micros,
+            observed_micros,
+            label,
+            action,
+            metering_source,
+            now_rfc3339(),
+        );
+        self.persist_breach_event(registry, name, &event);
+    }
+
+    /// Persist a built [`BudgetBreachEvent`] to the durable per-instance breach log
+    /// (story 3-2 shared path, AC7 / FR-21 "always recorded regardless of action").
+    /// Recorded for EVERY action (including `warn`) and BEFORE the lifecycle
+    /// side-effect, so the breach is never lost.
+    ///
+    /// Non-fatal but NOT swallowed: this is the PRIMARY durable record of the breach
+    /// (FR-21), so a write failure (disk full / IO / perms) must not vanish silently
+    /// while the action still fires — that would lose the mandated record with no
+    /// diagnostic. We keep enforcement acting (the write failure is NOT made fatal),
+    /// but SURFACE the error on the engine-log stderr breadcrumb (mirroring how
+    /// `enforce_pause`/`enforce_stop` log their best-effort diagnostics), so a lost
+    /// breach record is visible to an operator. Both the dir-create and the append
+    /// failure are surfaced.
+    fn persist_breach_event(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        event: &BudgetBreachEvent,
+    ) {
         let path = registry.instance_breach_log_path(name);
         // Ensure the log dir exists (a never-transitioned instance may lack it) —
         // non-fatal, mirroring `ensure_log_dir`, but a failure is surfaced (below) if
@@ -1652,7 +1787,7 @@ impl Supervisor {
         // Surface (do NOT swallow) an append failure: the breach record is the FR-21
         // mandated durable artifact; a lost record with no diagnostic is the bug. Log
         // and move on — enforcement still acts.
-        if let Err(e) = append_breach_event(&path, &event) {
+        if let Err(e) = append_breach_event(&path, event) {
             self.log_enforcement_diagnostic(
                 registry,
                 name,
@@ -2873,7 +3008,7 @@ mod tests {
         let sup = Supervisor::with_backoff(fast_backoff());
         // Must not panic — both the dir-create and the append failures are logged
         // (surfaced) and enforcement continues rather than crashing.
-        sup.record_breach(
+        sup.record_token_breach(
             &registry,
             &name,
             &RunId::mint(),

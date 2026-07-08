@@ -125,13 +125,30 @@ pub struct KtRun {
 /// Returns the full [`KtRun`] regardless of exit status.
 #[allow(dead_code)]
 pub fn run_kt_agent(args: &[&str], working_dir: &Path, state_dir: &Path) -> KtRun {
-    let output = Command::new(env!("CARGO_BIN_EXE_kt"))
+    run_kt_agent_with_env(args, working_dir, state_dir, &[])
+}
+
+/// Like [`run_kt_agent`], but with EXTRA environment variables layered on (e.g.
+/// `COLUMNS` to force a narrow terminal so the table renderer truncates cells — the
+/// FR-23 `list`-surface truncation test needs a deterministic width, independent of
+/// the runner's real terminal size).
+#[allow(dead_code)]
+pub fn run_kt_agent_with_env(
+    args: &[&str],
+    working_dir: &Path,
+    state_dir: &Path,
+    extra_env: &[(&str, &str)],
+) -> KtRun {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt"));
+    command
         .args(args)
         .current_dir(working_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
-        .env("KTESIO_STATE_DIR", state_dir)
-        .output()
-        .expect("Failed to execute kt");
+        .env("KTESIO_STATE_DIR", state_dir);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("Failed to execute kt");
 
     KtRun {
         success: output.status.success(),
