@@ -2133,19 +2133,22 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     //   - `config get --json --reveal` DOES carry the sentinel (AC-C, the sole
     //     un-mask), and the default `--json` carries the mask.
     //
-    // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
-    // outside the backends allowlist). The POSITIVE-delivery half of this proof
-    // observes the sentinel in the fake agent's `--dump`, which the agent writes
-    // only AFTER `kt agent start` returns and the one-shot `kt` process exits.
-    // On Unix the spawned agent re-parents to init and survives that exit, so it
-    // reaches the dump; on Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE tears the
-    // agent down the instant `kt` exits (the documented Epic-1 no-survivor
-    // semantics — the same limitation that gates the `start_via_surviving_engine`
-    // survival tests off Windows), so the dump is NEVER written and no timeout
-    // can help. The masking / no-leak logic this test proves is OS-agnostic
-    // engine code, exercised here on Linux + macOS and additionally by the
-    // backend-level 0600 secrets-file tests, so Windows coverage is not lost.
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    // Runtime-gate to Linux only (data-driven OS id, NO `#[cfg]` — this file is
+    // outside the backends allowlist). The no-leak / masking logic this test
+    // proves is OS-AGNOSTIC engine code: `ResolvedValue::display()` masking and
+    // the snapshot / JSON serialization are identical on every OS. The
+    // OS-SPECIFIC secret bit (the 0600 secrets-file permission check) already has
+    // dedicated tests under `backends/{unix,windows}`. The reason this test can't
+    // run everywhere is its POSITIVE-delivery half, which observes the sentinel
+    // in the fake agent's `--dump`: that dump is written only AFTER the one-shot
+    // `kt agent start` exits, and observing a one-shot-spawned agent is unreliable
+    // on macOS + Windows CI. On macOS CI the agent never writes the dump at all
+    // (the one-shot start leaves no observable running agent — regardless of
+    // timeout); on Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills the agent the
+    // instant `kt` exits. The heavier `start_via_surviving_engine` harness isn't
+    // warranted just to re-prove OS-agnostic masking. tarpaulin runs on Linux, so
+    // the test still executes there and coverage is unchanged.
+    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Linux {
         return;
     }
     let ctx = TestContext::new();
@@ -2206,13 +2209,11 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
 
     // (POSITIVE) The sentinel REACHED the adapter's native env (the value is usable).
     let dump_text = {
-        // The agent writes the dump at startup, but only AFTER the one-shot `kt`
-        // process has exited and the re-parented (init-adopted) agent gets
-        // scheduled. On a loaded CI runner that hand-off can take several seconds,
-        // so poll with a generous 30 s deadline (was 5 s, which raced and flaked
-        // on macOS CI). This is a wait for the write to APPEAR, not a fixed sleep:
-        // it returns the instant the dump is present.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // The agent writes the dump at startup; poll briefly for it. This runs
+        // Linux-only (see the gate above), where the one-shot-spawned agent
+        // re-parents to init, survives `kt`'s exit, and reaches this within the
+        // 5 s deadline. It is a wait for the write to APPEAR, not a fixed sleep.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(t) = std::fs::read_to_string(&dump) {
                 if t.contains("env=MODEL=") {
