@@ -2132,6 +2132,22 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     //     (logs + event payloads included) — the MASK appears instead (AC-A/AC-B);
     //   - `config get --json --reveal` DOES carry the sentinel (AC-C, the sole
     //     un-mask), and the default `--json` carries the mask.
+    //
+    // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
+    // outside the backends allowlist). The POSITIVE-delivery half of this proof
+    // observes the sentinel in the fake agent's `--dump`, which the agent writes
+    // only AFTER `kt agent start` returns and the one-shot `kt` process exits.
+    // On Unix the spawned agent re-parents to init and survives that exit, so it
+    // reaches the dump; on Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE tears the
+    // agent down the instant `kt` exits (the documented Epic-1 no-survivor
+    // semantics — the same limitation that gates the `start_via_surviving_engine`
+    // survival tests off Windows), so the dump is NEVER written and no timeout
+    // can help. The masking / no-leak logic this test proves is OS-agnostic
+    // engine code, exercised here on Linux + macOS and additionally by the
+    // backend-level 0600 secrets-file tests, so Windows coverage is not lost.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -2190,8 +2206,13 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
 
     // (POSITIVE) The sentinel REACHED the adapter's native env (the value is usable).
     let dump_text = {
-        // The agent writes the dump at startup; poll briefly for it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // The agent writes the dump at startup, but only AFTER the one-shot `kt`
+        // process has exited and the re-parented (init-adopted) agent gets
+        // scheduled. On a loaded CI runner that hand-off can take several seconds,
+        // so poll with a generous 30 s deadline (was 5 s, which raced and flaked
+        // on macOS CI). This is a wait for the write to APPEAR, not a fixed sleep:
+        // it returns the instant the dump is present.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Ok(t) = std::fs::read_to_string(&dump) {
                 if t.contains("env=MODEL=") {
