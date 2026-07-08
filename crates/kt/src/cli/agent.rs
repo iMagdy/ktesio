@@ -15,16 +15,17 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, Capability, EffectiveCapabilities, Engine, EngineError, FleetEntry, FleetListing,
-    RegistryError, RemoveDisposition, SupportLevel, FLEET_SCHEMA_VERSION,
+    AdapterRef, Capability, ConfigError, ConfigLayer, EffectiveCapabilities, EffectiveConfig,
+    Engine, EngineError, FleetEntry, FleetListing, RegistryError, RemoveDisposition, SupportLevel,
+    FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentDuplicateName, AgentInvalidName, AgentInvalidTransition,
-    AgentIo, AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound,
-    AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound,
-    AgentRunningRequiresForce, AgentStore, AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInvalidName,
+    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+    AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource,
+    AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -572,6 +573,363 @@ fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &st
     }
 }
 
+/// `kt agent config set <name> <key> <value>` — write one key to the Agent
+/// Instance config layer (story 2-1, AC-B/AC10, AD-12).
+///
+/// Validated at WRITE time by the engine: a known unified key or an `agent.*`
+/// pass-through key is accepted and persisted to the instance `config.toml`
+/// through path authority; an unknown key OUTSIDE `agent.*` is REJECTED before
+/// anything is written (the on-disk config is byte-unchanged) and a miette
+/// diagnostic naming the offending key + the nearest valid key goes to STDERR
+/// with a non-zero exit. On success `ui::success` confirms to stdout. The value
+/// is stored verbatim — a `secret:NAME` REFERENCE is what is persisted here
+/// (story 2-4 resolves + masks it at start/read, FR-14; this write neither
+/// resolves nor echoes a secret).
+pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    match engine.blocking().set_config(name, key, value) {
+        Ok(()) => {
+            ui::success(format!(
+                "Set {} = {} on Agent Instance {} (instance layer)",
+                key,
+                value,
+                ui::skill_name(name)
+            ));
+            Ok(())
+        }
+        Err(err) => Err(map_config_error(err)),
+    }
+}
+
+/// `kt agent config get <name> [<key>] [--json]` — read the EFFECTIVE (resolved)
+/// config WITH per-value provenance (story 2-1 read + story 2-3 provenance,
+/// AC10/AC-A/AC3/AC4, AD-12/AD-9).
+///
+/// With `<key>`, prints that key's effective VALUE to stdout (a not-set key is a
+/// diagnostic on stderr + non-zero exit); `--json` emits that one leaf as
+/// `{ key, value, source, unvalidated }`. Without a key, prints the whole
+/// effective config as a Key/Value/Validated/**Source** table to stdout, or (with
+/// `--json`) a single versioned document to stdout and nothing else there. Each
+/// value NAMES its source layer (`engine-default` / `kind-default` / `instance` /
+/// `invocation-override`), read from the [`ktesio_engine::SourceLayer`] tag the
+/// engine records per leaf (AD-2: `kt` never re-derives it). Deep-resolved via the
+/// engine (engine defaults < kind defaults < instance < invocation overrides); a
+/// key set at the instance layer overrides the same key at a lower layer, every
+/// time (FR-11). No invocation overrides are supplied here (a plain read).
+///
+/// Output discipline (AD-12): result → stdout; `--json` is pure JSON on stdout,
+/// with any note on stderr. The 2-1/2-2 "provenance arrives in Epic 2.3" stderr
+/// note is RETIRED here (Decision 3) — the "Source" column now IS the provenance,
+/// so a residual deferral note would be false.
+///
+/// SECRETS (story 2-4, AC-C/AC11): `secret:NAME` values are MASKED by default (the
+/// engine's [`ResolvedValue::display`] masks them — `kt` renders whatever the
+/// engine hands it, AD-2). `--reveal` (`reveal == true`) is the SOLE un-mask: it
+/// asks the engine to re-resolve the secret leaves LIVE and overlays their
+/// cleartext into BOTH the human table and `--json` (Assumption 11 — symmetric). A
+/// reveal resolution failure is a stderr diagnostic (mapped from
+/// [`ConfigError::SecretReveal`]), never a crash; `--reveal` NEVER touches the
+/// snapshot/logs/events.
+pub fn config_get(
+    name: &str,
+    key: Option<&str>,
+    json: bool,
+    reveal: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let blocking = engine.blocking();
+    let effective = blocking
+        .effective_config(name, ConfigLayer::empty())
+        .map_err(map_config_error)?;
+
+    // With --reveal, ask the ENGINE for the resolved cleartext of the secret leaves
+    // (kt never resolves secrets itself, AD-2). A live-resolution failure surfaces
+    // as a stderr diagnostic (never a crash). Without --reveal, an empty overlay
+    // leaves every secret masked via the engine's display().
+    let revealed = if reveal {
+        blocking
+            .reveal_secrets(name, ConfigLayer::empty())
+            .map_err(map_config_error)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    match key {
+        Some(key) => {
+            // A syntactically fine key that has no effective value (unset at every
+            // layer) is the honest not-found diagnostic (stderr, non-zero exit) —
+            // in BOTH human and --json mode (stdout stays clean of a partial doc).
+            if effective.get(key).is_none() {
+                return Err(AgentUnknownConfigKey {
+                    message: format!(
+                        "Agent Instance '{name}' has no effective value for config key '{key}'. \
+                         List the effective config with: kt agent config get {name}"
+                    ),
+                }
+                .into());
+            }
+            if json {
+                // Emit just that one leaf as the same per-leaf object shape.
+                let document = config_json(&effective, Some(key), &revealed)?;
+                println!("{document}");
+            } else {
+                // Command result to stdout: the effective value (revealed cleartext
+                // for a secret leaf under --reveal, else the masked display).
+                println!("{}", leaf_display(&effective, key, &revealed));
+            }
+            Ok(())
+        }
+        None => {
+            if json {
+                // AC4/AD-12: the whole result is ONE JSON document to stdout.
+                let document = config_json(&effective, None, &revealed)?;
+                println!("{document}");
+            } else {
+                render_effective_config(name, &effective, &revealed);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The display string for one leaf, honoring a `--reveal` overlay (story 2-4). If
+/// `revealed` holds this key (a secret leaf under `--reveal`), its CLEARTEXT is
+/// shown; otherwise the engine's masked/plain `value_display` is used. The overlay
+/// only ever contains secret leaves the engine resolved, so a non-secret key is
+/// always the plain display.
+fn leaf_display(
+    effective: &EffectiveConfig,
+    key: &str,
+    revealed: &std::collections::BTreeMap<String, String>,
+) -> String {
+    match revealed.get(key) {
+        Some(cleartext) => cleartext.clone(),
+        None => effective.value_display(key).unwrap_or_default(),
+    }
+}
+
+/// The `kt agent config get --json` document (story 2-3, AC4 / AD-12).
+///
+/// A versioned wrapper — its own `schema_version` (this surface had NO prior
+/// `--json`; recorded Decision 4) — carrying each resolved leaf as
+/// `{ key, value, source, unvalidated }`: `value` is the rendered display string
+/// (the ONE display path shared with the human table + the persisted snapshot, so
+/// story 2-4 masks a `secret:` value at this single choke point — AC8), OVERLAID
+/// with the engine-resolved cleartext for a secret leaf when `--reveal` is passed
+/// (AC-C — the sole un-mask of machine-readable output); `source` is the kebab-case
+/// [`ktesio_engine::SourceLayer`] wire label; `unvalidated` is the story-2-2
+/// pass-through marker (derived via the engine accessor, AD-2). When `only` is
+/// `Some(key)` the document carries just that one leaf (the single-key
+/// `config get <name> <key> --json` form).
+///
+/// Presentation-only: the engine owns the domain types; this wraps the rendered
+/// leaves for the `config get` surface.
+const CONFIG_GET_SCHEMA_VERSION: u32 = 1;
+
+/// One leaf in the `config get --json` document (story 2-3).
+#[derive(Serialize)]
+struct ConfigLeaf {
+    /// The dotted leaf key.
+    key: String,
+    /// The rendered winning value (via the single display path — AC8).
+    value: String,
+    /// The winning source layer's kebab-case label (AC4).
+    source: String,
+    /// Whether the leaf skipped known-key validation (`agent.*` — story 2-2).
+    unvalidated: bool,
+}
+
+/// The versioned `config get --json` document (story 2-3, AC4).
+#[derive(Serialize)]
+struct ConfigDocument {
+    /// The config-get document schema version ([`CONFIG_GET_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// The resolved leaves (all, or just the single requested key).
+    entries: Vec<ConfigLeaf>,
+}
+
+/// Serialize the effective config into the pretty `config get --json` document
+/// (a versioned [`ConfigDocument`]). Pure (no engine, no I/O) so it is
+/// unit-testable in-process; the CLI just prints the returned string to stdout.
+/// `only` selects a single leaf (the single-key form) or `None` for the whole
+/// config. Every value renders via the engine's ONE display path
+/// ([`ktesio_engine::EffectiveConfig::value_display`]) and every source via the
+/// engine's [`ktesio_engine::EffectiveConfig::source_label`] accessor — `kt` never
+/// re-derives either (AD-2). A serialize failure (not reachable for these plain
+/// serde structs) becomes an [`AgentIo`] diagnostic, never a panic.
+fn config_json(
+    effective: &EffectiveConfig,
+    only: Option<&str>,
+    revealed: &std::collections::BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let entries: Vec<ConfigLeaf> = effective
+        .iter()
+        .filter(|(key, _)| only.is_none_or(|k| k == key.as_str()))
+        .map(|(key, resolved)| ConfigLeaf {
+            key: key.clone(),
+            // The engine renders the value (the ONE display path — AC8), which
+            // MASKS a secret by default, so `kt` needs no `toml` dep and cannot leak
+            // (AD-2/AD-10). `--reveal` overlays the engine-resolved cleartext for a
+            // secret leaf (AC-C) — the SOLE way machine-readable output carries an
+            // unmasked secret; a non-secret leaf is never in the overlay.
+            value: match revealed.get(key.as_str()) {
+                Some(cleartext) => cleartext.clone(),
+                None => resolved.display(),
+            },
+            // The source layer is READ from the engine tag, never re-derived.
+            source: resolved.source.as_str().to_string(),
+            unvalidated: effective.is_unvalidated(key),
+        })
+        .collect();
+    let document = ConfigDocument {
+        schema_version: CONFIG_GET_SCHEMA_VERSION,
+        entries,
+    };
+    serde_json::to_string_pretty(&document).map_err(|e| serialize_error("effective config", e))
+}
+
+/// The per-row marker (story 2-2, AC-B/AC7) shown in the `config get` table's
+/// "Validated" column for a leaf that skipped known-key validation — i.e. a leaf
+/// under the `agent.*` pass-through namespace. A validated (known) key shows the
+/// affirmative marker. The marker is DERIVED from the pass-through prefix via the
+/// engine's [`EffectiveConfig::is_unvalidated`] accessor (so `kt` owns no config
+/// internals — AD-2), NOT from a new persisted field; the full per-value source
+/// layer stays Epic 2.3.
+const UNVALIDATED_MARKER: &str = "unvalidated";
+/// The affirmative counterpart shown for a validated (known) key.
+const VALIDATED_MARKER: &str = "validated";
+
+/// Render the whole effective config as a table (result → stdout, AD-12). VALUES,
+/// the story-2-2 "Validated" marker column, and the story-2-3 **"Source"** column
+/// naming each value's winning layer (FR-13). A leaf under `agent.*` is marked
+/// **unvalidated** (it bypassed known-key validation, AC-B/AC7); a known key is
+/// marked validated. The "Source" column shows the winning [`ktesio_engine::SourceLayer`]
+/// label (`engine-default` / `kind-default` / `instance` / `invocation-override`),
+/// read per leaf from the engine's `source` tag (AD-2: `kt` never re-derives it).
+/// An empty effective config prints a plain info line rather than an empty table.
+///
+/// `revealed` (story 2-4, AC-C) overlays the engine-resolved cleartext for a secret
+/// leaf under `--reveal`; without it (empty map) every `secret:` value stays masked
+/// via the engine's `display()`.
+fn render_effective_config(
+    name: &str,
+    effective: &EffectiveConfig,
+    revealed: &std::collections::BTreeMap<String, String>,
+) {
+    let title = format!("Effective config for {name}");
+    if effective.is_empty() {
+        ui::info(format!("{title}: no config keys set"));
+        return;
+    }
+    let columns = [
+        ui::TableColumn::new("Key", 12, 40),
+        ui::TableColumn::new("Value", 12, 48),
+        ui::TableColumn::new("Validated", 9, 12),
+        ui::TableColumn::new("Source", 12, 20),
+    ];
+    let rows: Vec<Vec<ui::TableCell>> = effective
+        .iter()
+        .map(|(key, resolved)| {
+            // The marker is derived from the `agent.*` pass-through prefix via the
+            // engine accessor (AD-2: `kt` never re-implements the boundary). A
+            // pass-through leaf is "unvalidated"; a known key is "validated".
+            let marker = if effective.is_unvalidated(key) {
+                ui::TableCell::muted(UNVALIDATED_MARKER)
+            } else {
+                ui::TableCell::plain(VALIDATED_MARKER)
+            };
+            // The engine renders the value (no `toml::Value` in `kt` — AD-2),
+            // masking a secret by default; --reveal overlays the resolved cleartext.
+            let value = match revealed.get(key.as_str()) {
+                Some(cleartext) => cleartext.clone(),
+                None => resolved.display(),
+            };
+            vec![
+                ui::TableCell::skill(key.clone()),
+                ui::TableCell::plain(value),
+                marker,
+                // The source layer is READ from the engine tag (story 2-3, FR-13);
+                // `kt` never re-derives it (AD-2).
+                ui::TableCell::muted(resolved.source.as_str()),
+            ]
+        })
+        .collect();
+    ui::print_table(&title, &columns, &rows);
+}
+
+/// Translate a [`ConfigError`] (story 2-1) into a `miette` diagnostic with a
+/// remediation hint (NFR-1). The unknown-key class (AC-B) carries the offending
+/// key + the nearest-key suggestion the engine computed; the shared name/store
+/// classes reuse the existing agent diagnostics for a consistent surface;
+/// malformed-layer names the layer + path (AC8).
+fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
+    match err {
+        // AC-B: an unknown key outside `agent.*` — the engine already computed the
+        // nearest valid key (or "no close match"); surface the whole message
+        // (which names the key + the suggestion) with a pass-through remediation.
+        ConfigError::UnknownKey { .. } => AgentUnknownConfigKey {
+            message: format!(
+                "{err}. Set a known unified key, or use the agent.* pass-through namespace for \
+                 agent-native extras (e.g. kt agent config set <name> agent.<key> <value>)."
+            ),
+        }
+        .into(),
+        // Patch #3: a write that would nest a child under an existing scalar is
+        // rejected (nothing persisted) — the message names the conflicting
+        // ancestor; add the remediation.
+        ConfigError::WriteShapeConflict { .. } => AgentConfig {
+            message: format!(
+                "{err}. Nothing was changed. Unset or rename the conflicting key first, then \
+                 set the nested key."
+            ),
+        }
+        .into(),
+        ConfigError::InvalidName { name, reason } => AgentInvalidName {
+            message: format!(
+                "Invalid Agent Instance name '{name}': {reason}. Names must match \
+                 ^[a-z0-9][a-z0-9_-]*$ (lowercase letters, digits, '_' or '-', not starting \
+                 with '_' or '-')."
+            ),
+        }
+        .into(),
+        ConfigError::NotFound { name } => AgentNotFound {
+            message: format!(
+                "No Agent Instance named '{name}' is registered. List the Fleet with: kt agent list"
+            ),
+        }
+        .into(),
+        ConfigError::MalformedLayer {
+            layer,
+            path,
+            detail,
+        } => AgentConfig {
+            message: format!(
+                "The {layer} config layer at '{path}' could not be read/parsed: {detail}. \
+                 Fix the TOML (or restore the file) and try again."
+            ),
+        }
+        .into(),
+        ConfigError::Store { name, detail } => AgentStore {
+            message: format!(
+                "State store error for Agent Instance '{name}': {detail}. The state database may \
+                 be inaccessible."
+            ),
+        }
+        .into(),
+        // Story 2-4 (AC-C/AC11): `--reveal` re-resolved a secret and it failed
+        // (unset env var, ill-permissioned/absent secrets file). A read-surface
+        // DIAGNOSTIC (stderr, non-zero exit) — the detail names the NAME + the
+        // resolvers tried + a remediation, never a value.
+        ConfigError::SecretReveal { detail } => AgentConfig {
+            message: format!(
+                "{detail}. Set the environment variable, or add it to the engine secrets file \
+                 (chmod 600), then try --reveal again."
+            ),
+        }
+        .into(),
+    }
+}
+
 /// Open the engine using the default (or env-overridden) state dir.
 ///
 /// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
@@ -624,6 +982,16 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' was removed from the Fleet, but its Agent Home at \
                  '{path}' could not be deleted: {detail}. Remove the directory manually."
+            ),
+        }
+        .into(),
+        // Story 2-3: the effective-config snapshot could not be written (AD-9/AD-6).
+        // Surfaced through the lifecycle path as EngineError::Snapshot; this arm
+        // keeps the RegistryError mapper exhaustive with a matching diagnostic.
+        RegistryError::SnapshotWrite { name, path, detail } => AgentIo {
+            message: format!(
+                "Could not write the effective-config snapshot for '{name}' at '{path}': {detail}. \
+                 Check directory permissions and available disk space, then start it again."
             ),
         }
         .into(),
@@ -752,6 +1120,29 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 2-3: the effective-config snapshot could not be written at start
+        // (AD-9/AD-6). It lands before the `starting` transition, so the instance
+        // stays in its prior state; name the snapshot path + a disk/permissions
+        // remediation (NFR-1).
+        EngineError::Snapshot { name, path, detail } => AgentIo {
+            message: format!(
+                "Could not write the effective-config snapshot for '{name}' at '{path}': {detail}. \
+                 Check directory permissions and available disk space, then start it again."
+            ),
+        }
+        .into(),
+        // Story 2-4 (AC-A/AC9): a `secret:NAME` reference could not be resolved at
+        // start (unset env var, ill-permissioned/absent secrets file). Resolution
+        // runs before the `starting` transition, so the instance stays in its prior
+        // state; the detail names the NAME + resolvers + a remediation, never a
+        // value (NFR-6).
+        EngineError::Secret { name, detail } => AgentConfig {
+            message: format!(
+                "Agent Instance '{name}' could not start: {detail}. Nothing was changed; set the \
+                 secret and start it again."
+            ),
+        }
+        .into(),
         EngineError::Backend { name, source } => AgentIo {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
         }
@@ -766,6 +1157,13 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the in-process engine-driver tests that mutate the shared
+    /// `KTESIO_STATE_DIR` process env var (`config_get_*` + `list_and_show_*`), so
+    /// they never race each other under the multi-threaded test runner (one test
+    /// clearing the var mid-run would break another's `open_engine`). A poisoned
+    /// lock is fine — the guard is only for env-var mutual exclusion.
+    static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn disposition_from_flags_resolves_each_combination() {
@@ -1005,8 +1403,11 @@ mod tests {
         // KTESIO_STATE_DIR; set it, seed one instance via the engine, then drive
         // each surface. They print to stdout (test noise, harmless) and must all
         // return Ok — proving the full CLI read path, not just the pure helpers.
+        // Hold the shared env lock so this and the config_get driver test never
+        // race on the process-global KTESIO_STATE_DIR.
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
-        // SAFETY: single-threaded test; set the state dir the CLI resolves.
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK; set the state dir the CLI resolves.
         unsafe {
             std::env::set_var("KTESIO_STATE_DIR", tmp.path());
         }
@@ -1028,6 +1429,184 @@ mod tests {
         list(false).unwrap();
         unsafe {
             std::env::remove_var("KTESIO_STATE_DIR");
+        }
+    }
+
+    /// Build a small effective config in-process for the config_json unit tests
+    /// (a known key from the instance layer + an agent.* pass-through leaf from a
+    /// weaker layer), reusing the engine's public resolver.
+    fn sample_effective() -> EffectiveConfig {
+        use ktesio_engine::{resolve, SourceLayer};
+        let layers = [
+            ConfigLayer::parse(
+                SourceLayer::EngineDefault,
+                "<e>",
+                "agent = { legacy = \"on\" }\n",
+            )
+            .unwrap(),
+            ConfigLayer::empty(),
+            ConfigLayer::parse(SourceLayer::Instance, "<i>", "model = \"gpt-4\"\n").unwrap(),
+            ConfigLayer::empty(),
+        ];
+        resolve(layers)
+    }
+
+    #[test]
+    fn config_json_emits_versioned_document_with_source_and_unvalidated_per_leaf() {
+        // Story 2-3 (AC4): the pure serializer emits a versioned document with
+        // { key, value, source, unvalidated } per leaf. The known `model` key is
+        // instance-sourced + validated; the agent.* leaf is engine-sourced +
+        // unvalidated. Values render via the ONE display path (bare strings).
+        let eff = sample_effective();
+        let doc = config_json(&eff, None, &std::collections::BTreeMap::new()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(value["schema_version"], serde_json::json!(1));
+        let entries = value["entries"].as_array().unwrap();
+
+        let model = entries.iter().find(|e| e["key"] == "model").unwrap();
+        assert_eq!(model["value"], serde_json::json!("gpt-4"));
+        assert_eq!(model["source"], serde_json::json!("instance"));
+        assert_eq!(model["unvalidated"], serde_json::json!(false));
+
+        let legacy = entries.iter().find(|e| e["key"] == "agent.legacy").unwrap();
+        assert_eq!(legacy["value"], serde_json::json!("on"));
+        assert_eq!(legacy["source"], serde_json::json!("engine-default"));
+        assert_eq!(legacy["unvalidated"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn config_json_single_key_emits_just_that_leaf() {
+        // The single-key `config get <name> <key> --json` form emits exactly one
+        // leaf, sourced + rendered identically to the whole-config form.
+        let eff = sample_effective();
+        let doc = config_json(&eff, Some("model"), &std::collections::BTreeMap::new()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["key"], serde_json::json!("model"));
+        assert_eq!(entries[0]["source"], serde_json::json!("instance"));
+    }
+
+    #[test]
+    fn config_json_value_matches_the_human_display_form() {
+        // AC8: the --json value and the human value both render via the ONE display
+        // path — a non-string scalar renders in the same inline form in both.
+        use ktesio_engine::{resolve, SourceLayer};
+        let eff = resolve([
+            ConfigLayer::empty(),
+            ConfigLayer::empty(),
+            ConfigLayer::parse(SourceLayer::Instance, "<i>", "n = 42\narr = [1, 2]\n").unwrap(),
+            ConfigLayer::empty(),
+        ]);
+        let doc = config_json(&eff, None, &std::collections::BTreeMap::new()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        let n = entries.iter().find(|e| e["key"] == "n").unwrap();
+        // Same inline rendering as effective.value_display / the human table.
+        assert_eq!(
+            n["value"],
+            serde_json::json!(eff.value_display("n").unwrap())
+        );
+        let arr = entries.iter().find(|e| e["key"] == "arr").unwrap();
+        assert_eq!(
+            arr["value"],
+            serde_json::json!(eff.value_display("arr").unwrap())
+        );
+    }
+
+    #[test]
+    fn config_get_drives_the_engine_in_process_human_and_json() {
+        // Cover the config_get() success paths in-process (human + --json, whole +
+        // single-key) against a real temp state dir, mirroring the list/show cover
+        // test. Prints to stdout (harmless test noise) and must all return Ok.
+        // Hold the shared env lock: this test mutates KTESIO_STATE_DIR, which other
+        // in-process engine-driver tests also touch.
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK; set the state dir the CLI resolves.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+        }
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            let blocking = engine.blocking();
+            blocking.register("demo", "mock").unwrap();
+            blocking.set_config("demo", "model", "gpt-4").unwrap();
+            blocking.set_config("demo", "agent.flag", "on").unwrap();
+        }
+        // Whole-config: human + JSON. Single-key: human + JSON.
+        config_get("demo", None, false, false).unwrap();
+        config_get("demo", None, true, false).unwrap();
+        config_get("demo", Some("model"), false, false).unwrap();
+        config_get("demo", Some("model"), true, false).unwrap();
+        // A not-set key is a non-zero (Err) diagnostic in both modes.
+        assert!(config_get("demo", Some("missing"), false, false).is_err());
+        assert!(config_get("demo", Some("missing"), true, false).is_err());
+        unsafe {
+            std::env::remove_var("KTESIO_STATE_DIR");
+        }
+    }
+
+    #[test]
+    fn config_get_reveal_overlays_resolved_cleartext_in_process() {
+        // Story 2-4 (AC-C): cover the `--reveal` paths in-process — the reveal
+        // overlay (`leaf_display`, `config_json` + `render_effective_config` with a
+        // non-empty overlay) and the `leaf_display` fallback. Sets a secret env var
+        // so the engine resolves it. Holds the shared env lock (mutates
+        // KTESIO_STATE_DIR + the secret env var).
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sentinel = "s3cr3t-inproc-reveal";
+        let secret_key = "KTESIO_INPROC_REVEAL_KEY";
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+            std::env::set_var(secret_key, sentinel);
+        }
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            let blocking = engine.blocking();
+            blocking.register("sec", "mock").unwrap();
+            blocking
+                .set_config("sec", "model", &format!("secret:{secret_key}"))
+                .unwrap();
+            blocking
+                .set_config("sec", "agent.plain", "visible")
+                .unwrap();
+
+            // reveal_secrets returns the resolved cleartext for the secret leaf only.
+            let revealed = blocking
+                .reveal_secrets("sec", ktesio_engine::ConfigLayer::empty())
+                .unwrap();
+            assert_eq!(revealed.get("model").map(String::as_str), Some(sentinel));
+            assert!(!revealed.contains_key("agent.plain"), "only secret leaves");
+        }
+        // The reveal render paths run without error (whole + single-key, human +
+        // JSON), and the default (masked) paths too.
+        config_get("sec", None, true, true).unwrap(); // --json --reveal (whole)
+        config_get("sec", None, false, true).unwrap(); // human --reveal (whole)
+        config_get("sec", Some("model"), true, true).unwrap(); // single-key reveal
+        config_get("sec", Some("model"), false, true).unwrap(); // single-key human reveal
+        config_get("sec", None, true, false).unwrap(); // default masked --json
+
+        // leaf_display: revealed overlay wins; absent key falls back to display().
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let eff = engine
+            .blocking()
+            .effective_config("sec", ktesio_engine::ConfigLayer::empty())
+            .unwrap();
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert("model".to_string(), sentinel.to_string());
+        assert_eq!(leaf_display(&eff, "model", &overlay), sentinel);
+        // A non-overlaid secret leaf falls back to the masked display().
+        assert_eq!(
+            leaf_display(&eff, "model", &std::collections::BTreeMap::new()),
+            ktesio_engine::SECRET_MASK
+        );
+
+        unsafe {
+            std::env::remove_var("KTESIO_STATE_DIR");
+            std::env::remove_var(secret_key);
         }
     }
 

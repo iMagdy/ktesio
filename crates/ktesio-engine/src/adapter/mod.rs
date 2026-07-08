@@ -36,10 +36,15 @@ mod builtin;
 use std::path::{Path, PathBuf};
 
 use ktesio_adapter_api::{
-    CapabilityDeclaration, EffectiveCapabilities, Manifest, ManifestError, MeteringSource, OsId,
+    CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, Manifest,
+    ManifestError, MeteringSource, OsId,
 };
 
+use crate::domain::{pass_through_tail, EffectiveConfig};
+
 use thiserror::Error;
+
+pub use builtin::native_config_mapping;
 
 /// The canonical `adapter.toml` filename inside a manifest-adapter directory.
 pub const MANIFEST_FILE: &str = "adapter.toml";
@@ -208,6 +213,23 @@ pub enum LaunchResolveError {
         /// The native kind.
         kind: String,
     },
+
+    /// The adapter's config mapping (story 2-2, FR-12) is invalid — a malformed
+    /// rule, or a `File` target whose `path` is absolute or escapes the Agent
+    /// Home. Applied symmetrically to BOTH kinds ([`resolve_config_mapping`]): a
+    /// manifest mapping is validated at registration, but re-checked here; a
+    /// NATIVE (code-declared) mapping is validated here too, so a native `File`
+    /// target can never escape the home (AD-6 — symmetric trust). Names the
+    /// offending unified key + why.
+    #[error("adapter '{adapter}' has an invalid config mapping for key '{key}': {detail}")]
+    InvalidConfigMapping {
+        /// The adapter kind/identity whose mapping is invalid.
+        adapter: String,
+        /// The offending unified key.
+        key: String,
+        /// Why the rule is invalid.
+        detail: String,
+    },
 }
 
 /// Resolve the `start` launch for an adapter, given its persisted snapshot
@@ -252,6 +274,287 @@ pub fn resolve_start_launch(
         exec: start.exec.clone(),
         args: start.args.clone(),
         env: start.env.clone(),
+    })
+}
+
+/// Why applying the adapter's config mapping to a launch failed (story 2-2). The
+/// only failure is rendering a FILE target into the Agent Home — env/flag targets
+/// are pure in-memory mutations of the launch that cannot fail. The supervisor
+/// maps this into its launch error surface (never a panic).
+///
+/// ATOMICITY (accurate guarantee): the mapping is applied BEFORE the `starting`
+/// transition, so a file-render failure REJECTS the start and the instance stays
+/// in its PRIOR state (registered/stopped/failed) — the start STATE is atomic
+/// (all mapping failures reject before any state change). It is NOT a
+/// whole-filesystem atomic write: multi-file apply is not atomic across files, so
+/// a failure on a LATER file can leave an EARLIER file already rendered in the
+/// Agent Home (a harmless stale artifact the next successful start overwrites). An
+/// atomic temp-then-rename per rendered file is a deferred follow-up (same family
+/// as the existing non-atomic-write item).
+#[derive(Debug, Error)]
+pub enum ConfigApplyError {
+    /// A FILE-target config file could not be rendered/written into the Agent
+    /// Home. Names the unified key, the target path, and the underlying detail.
+    #[error(
+        "could not render config key '{key}' into the file '{path}' in the Agent Home: {detail}"
+    )]
+    FileRender {
+        /// The unified key whose file target failed.
+        key: String,
+        /// The target path (relative to the Agent Home).
+        path: String,
+        /// The underlying I/O or serialization detail.
+        detail: String,
+    },
+}
+
+/// Resolve the adapter's unified→native config [`ConfigMapping`] for a start
+/// (story 2-2, AC3): a MANIFEST adapter's mapping comes from its parsed `[config]`
+/// section; a NATIVE adapter's from the builtin table's code-declared mapping.
+/// Both yield the same uniform [`ConfigMapping`] the start seam applies (AD-3
+/// "two kinds, one trait"). A manifest that cannot be re-read/parsed surfaces the
+/// same [`LaunchResolveError::ManifestUnreadable`] as [`resolve_start_launch`]
+/// (the launch already re-read it, but this stays defensive + symmetric). An
+/// unknown native kind yields an EMPTY mapping (delivers nothing) rather than an
+/// error — the launch resolution already rejected an unknown/native-only kind.
+pub fn resolve_config_mapping(
+    kind: &str,
+    manifest_path: Option<&Path>,
+) -> Result<ConfigMapping, LaunchResolveError> {
+    let mapping = match manifest_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                LaunchResolveError::ManifestUnreadable {
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                }
+            })?;
+            let manifest = Manifest::from_toml_str(&text).map_err(|e| {
+                LaunchResolveError::ManifestUnreadable {
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                }
+            })?;
+            manifest.config_mapping()
+        }
+        // A native adapter's mapping is code-declared; an unknown kind → empty.
+        None => native_config_mapping(kind).unwrap_or_default(),
+    };
+    // Validate the mapping SYMMETRICALLY for both kinds (AD-6 — symmetric trust):
+    // a manifest mapping is validated at registration, but re-checked here; a
+    // NATIVE code-declared mapping is validated here too, so a native `File`
+    // target can never be absolute or escape the Agent Home. A malformed rule
+    // rejects the start (a bad rule is an adapter authoring bug).
+    if let Err((key, detail)) = mapping.validate() {
+        return Err(LaunchResolveError::InvalidConfigMapping {
+            adapter: kind.to_string(),
+            key,
+            detail,
+        });
+    }
+    Ok(mapping)
+}
+
+/// APPLY the adapter's config mapping to a [`StartLaunch`], from the resolved
+/// [`EffectiveConfig`] (story 2-2 — the heart of AC-A/AC4/AC5/AC6). Runs at start,
+/// after the launch's exec/args/env are read from the `[lifecycle.start]`
+/// template and BEFORE the `SpawnSpec` is built, so the spawned process already
+/// reflects the mapped native config.
+///
+/// For every resolved leaf (`dotted key → value`), in the effective config's
+/// deterministic sorted order:
+/// * a leaf under the `agent.*` PASS-THROUGH namespace is delivered VERBATIM
+///   (AC6): the key-tail after `agent.` + the value, with NO known-key mapping
+///   lookup and NO rewriting. The recorded delivery convention (Decision 5): a
+///   pass-through key maps to an ENV var named by its verbatim key-tail
+///   (`agent.FOO=bar` → env `FOO=bar`), the value as-is;
+/// * any other leaf is a documented KNOWN key: if the adapter's `mapping` declares
+///   a rule for it, the value lands in that rule's native target — **env** →
+///   inserted into [`StartLaunch::env`]; **flag** → appended to
+///   [`StartLaunch::args`] as two tokens (`--model` `gpt-4`); **file** →
+///   rendered into a native TOML file in the Agent `home` (the engine is the sole
+///   writer — path authority). A documented key with NO rule is a no-op
+///   (Decision 6 — not every adapter maps every unified key).
+///
+/// PURE for env/flag (in-memory mutation); FILE targets are the only side effect
+/// (a write into `home`), and a bad/unwritable target is a typed
+/// [`ConfigApplyError::FileRender`] the supervisor lands as a launch failure. The
+/// resolved-config → launch transform is deterministic (sorted iteration + a
+/// per-file merge keyed by the native key), so the same inputs always yield the
+/// same launch + files.
+///
+/// SECRET DELIVERY (story 2-4, AC9 — display and delivery DIVERGE). `secrets` maps
+/// a dotted leaf key → the RESOLVED cleartext
+/// [`SecretString`](crate::domain::SecretString) the supervisor resolved at start
+/// (env → the 0600 file) for each `secret:NAME` leaf. For a secret-classified leaf,
+/// the value placed into the native mechanism is `secrets[key].expose_secret()` —
+/// the REAL key the agent needs — NOT `resolved.display()` (which now MASKS a
+/// secret) and NOT the `secret:NAME` reference. Non-secret leaves keep
+/// `resolved.display()`. This is the crux: the SAME leaf renders masked in
+/// `config get`/the snapshot/logs while delivering cleartext into the adapter's
+/// PRIVATE native config (the rendered file the agent reads holds cleartext by
+/// necessity — an accepted FR-2/NFR-6 boundary, the Agent Home is
+/// filesystem-isolated, not a sandbox). A secret leaf whose key is absent from
+/// `secrets` (should not happen — the supervisor resolves every secret leaf before
+/// calling this) falls back to the MASKED `display()` — fail-CLOSED, never a leak.
+pub fn apply_config_mapping(
+    launch: &mut StartLaunch,
+    mapping: &ConfigMapping,
+    effective: &EffectiveConfig,
+    secrets: &std::collections::BTreeMap<String, crate::domain::SecretString>,
+    home: &Path,
+) -> Result<(), ConfigApplyError> {
+    // Accumulate FILE-target writes keyed by target path, so multiple keys
+    // mapping into the SAME file merge into one rendered document (deterministic:
+    // the effective config iterates sorted, and each file's keys are set into a
+    // sorted TOML table). Rendered + written once at the end.
+    let mut files: std::collections::BTreeMap<String, FileDoc> = std::collections::BTreeMap::new();
+
+    for (dotted_key, resolved) in effective.iter() {
+        // Secret delivery (AC9): a secret-classified leaf delivers the RESOLVED
+        // CLEARTEXT (from the SecretString), never the mask. A non-secret leaf uses
+        // the plain display(); a secret leaf missing from `secrets` fails CLOSED to
+        // the masked display() (never a leak). This is the ONE place cleartext is
+        // exposed for delivery — display() everywhere else stays masked.
+        let value = match secrets.get(dotted_key) {
+            Some(secret) => secret.expose_secret().to_string(),
+            None => resolved.display(),
+        };
+        if let Some(tail) = pass_through_tail(dotted_key) {
+            // AC6: pass-through delivered VERBATIM into the native mechanism (the
+            // recorded convention: an env var named by the verbatim key-tail).
+            // NO known-key mapping lookup, NO rewriting of the tail or value.
+            launch.env.insert(tail.to_string(), value);
+            continue;
+        }
+        // A documented known key: apply the adapter's rule if it declares one.
+        let Some(target) = mapping.target(dotted_key) else {
+            // Decision 6: a documented key the adapter does not map is a no-op.
+            continue;
+        };
+        match target {
+            ConfigTarget::Env { env } => {
+                launch.env.insert(env.clone(), value);
+            }
+            ConfigTarget::Flag { .. } => {
+                // A secret mapped to a `flag` target lands its CLEARTEXT here as a
+                // command-line argument. This is a STRICTER exposure than the env /
+                // rendered-file boundaries: argv is world-readable CROSS-USER via
+                // `ps` / `/proc/<pid>/cmdline`, whereas those live in the
+                // filesystem-isolated Agent Home. It is an accepted boundary
+                // (documented in docs/architecture.md Secrets / AD-10) — the agent
+                // needs a usable key and Ktesio's own surfaces stay masked — but
+                // operators should prefer `env`/`file` targets for secret-carrying
+                // keys.
+                // TODO(follow-up): surface a one-time operator warning when a
+                // `secret:` leaf resolves into a `flag` target. Deferred: the `start`
+                // seam has no existing engine→CLI note channel that reaches this
+                // fact without new cross-boundary machinery (unlike pause's
+                // best-effort re-read, which reuses `effective_capabilities`).
+                if let Some([flag, val]) = target.render_flag_args(&value) {
+                    launch.args.push(flag);
+                    launch.args.push(val);
+                }
+            }
+            ConfigTarget::File(file_target) => {
+                let placement = &file_target.file;
+                files
+                    .entry(placement.path.clone())
+                    .or_default()
+                    .set(&placement.key, value);
+            }
+        }
+    }
+
+    // Render + write each accumulated file into the Agent Home (sole writer,
+    // AD-6). The path was validated RELATIVE at manifest-load time; a native
+    // mapping is trusted (code-declared). Join defensively onto the home.
+    for (rel_path, doc) in files {
+        write_config_file(home, &rel_path, &doc)?;
+    }
+    Ok(())
+}
+
+/// An in-progress native config FILE document being assembled by
+/// [`apply_config_mapping`] (a set of dotted native keys → string values). Kept a
+/// small newtype so the per-file merge is explicit + testable; serialized to TOML
+/// once, deterministically (a [`std::collections::BTreeMap`] sorts its keys).
+#[derive(Debug, Default)]
+struct FileDoc {
+    entries: std::collections::BTreeMap<String, String>,
+}
+
+impl FileDoc {
+    /// Set a dotted native key to `value` (last write wins — the effective config
+    /// yields one value per unified key, so a collision only arises if two unified
+    /// keys map to the SAME file+native-key, which is an adapter authoring choice).
+    fn set(&mut self, key: &str, value: String) {
+        self.entries.insert(key.to_string(), value);
+    }
+
+    /// Render to a TOML document string: each dotted native key set as a nested
+    /// TOML value (`llm.model = "gpt-4"` → `[llm]\nmodel = "gpt-4"`). Reuses the
+    /// same dotted-set discipline the instance-config writer uses, so a native key
+    /// path lands in the right nested table.
+    fn to_toml_string(&self) -> Result<String, String> {
+        let mut table = toml::value::Table::new();
+        for (key, value) in &self.entries {
+            set_dotted_string(&mut table, key, value.clone());
+        }
+        toml::to_string_pretty(&table).map_err(|e| e.to_string())
+    }
+}
+
+/// Set a DOTTED native key (`a.b.c`) into a TOML table as a string value,
+/// creating intermediate tables. A collision where an intermediate is already a
+/// non-table value overwrites it with a table (the rendered native file is
+/// engine-authored from the mapping, not user input — there is no existing scalar
+/// to preserve, unlike the instance-config write path which fails closed).
+fn set_dotted_string(table: &mut toml::value::Table, dotted_key: &str, value: String) {
+    let mut segments = dotted_key.split('.').peekable();
+    let mut current = table;
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            current.insert(segment.to_string(), toml::Value::String(value));
+            return;
+        }
+        let entry = current
+            .entry(segment.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        if !entry.is_table() {
+            *entry = toml::Value::Table(toml::value::Table::new());
+        }
+        current = entry
+            .as_table_mut()
+            .expect("intermediate ensured to be a table");
+    }
+}
+
+/// Render `doc` into the file at `rel_path` inside the Agent `home` (the engine is
+/// the sole writer — AD-6). Creates parent directories under the home as needed. A
+/// write/serialize failure is a typed [`ConfigApplyError::FileRender`] naming the
+/// key path + detail (never a panic). `rel_path` was validated relative at
+/// manifest load; joining it onto `home` therefore stays inside the home.
+fn write_config_file(home: &Path, rel_path: &str, doc: &FileDoc) -> Result<(), ConfigApplyError> {
+    let body = doc
+        .to_toml_string()
+        .map_err(|detail| ConfigApplyError::FileRender {
+            key: rel_path.to_string(),
+            path: rel_path.to_string(),
+            detail,
+        })?;
+    let full = home.join(rel_path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ConfigApplyError::FileRender {
+            key: rel_path.to_string(),
+            path: rel_path.to_string(),
+            detail: e.to_string(),
+        })?;
+    }
+    std::fs::write(&full, body).map_err(|e| ConfigApplyError::FileRender {
+        key: rel_path.to_string(),
+        path: rel_path.to_string(),
+        detail: e.to_string(),
     })
 }
 
@@ -652,5 +955,405 @@ source = "self-reported"
             manifest_path: None,
         };
         assert!(enforce_registration_invariants(&resolved).is_ok());
+    }
+
+    // ---- Story 2-2: apply_config_mapping (the resolved-config → launch transform) ----
+
+    use crate::domain::{ConfigLayer, EffectiveConfig, SourceLayer};
+
+    /// Build an [`EffectiveConfig`] from a single instance-layer TOML body (the
+    /// other three layers empty) — the resolved input `apply_config_mapping`
+    /// consumes.
+    fn effective_from_instance(body: &str) -> EffectiveConfig {
+        let layers = [
+            ConfigLayer::empty(),
+            ConfigLayer::empty(),
+            ConfigLayer::parse(SourceLayer::Instance, "<test>", body).unwrap(),
+            ConfigLayer::empty(),
+        ];
+        crate::domain::resolve(layers)
+    }
+
+    /// An empty launch (exec only) to apply a mapping onto.
+    fn empty_launch() -> StartLaunch {
+        StartLaunch {
+            exec: "the-agent".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The empty resolved-secrets map — no leaf is a secret (the story-2-2
+    /// mapping-mechanics tests carry no `secret:` values). Story 2-4 added the
+    /// `secrets` parameter to `apply_config_mapping`; these tests pass an empty map.
+    fn no_secrets() -> std::collections::BTreeMap<String, crate::domain::SecretString> {
+        std::collections::BTreeMap::new()
+    }
+
+    #[test]
+    fn apply_maps_model_to_env_target() {
+        // AC-A / AC4 (env): a `model` value lands in the declared env var.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::env("MODEL"));
+        let effective = effective_from_instance("model = \"gpt-4\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(launch.env.get("MODEL").map(String::as_str), Some("gpt-4"));
+        assert!(launch.args.is_empty());
+    }
+
+    #[test]
+    fn apply_maps_model_to_flag_target_as_two_args() {
+        // AC-A / AC4 (flag): a `model` value appends `--model gpt-4` to the args.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::flag("--model"));
+        let effective = effective_from_instance("model = \"gpt-4\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(
+            launch.args,
+            vec!["--model".to_string(), "gpt-4".to_string()]
+        );
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn apply_maps_model_to_file_target_rendered_into_home() {
+        // AC-A / AC4 (file): a `model` value renders into a native TOML file in the
+        // Agent Home, at the declared native key path.
+        let mapping = ConfigMapping::new().with(
+            "model",
+            ConfigTarget::file("config/agent.toml", "llm.model"),
+        );
+        let effective = effective_from_instance("model = \"gpt-4\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        // The launch env/args are untouched (the value went into the file).
+        assert!(launch.env.is_empty());
+        assert!(launch.args.is_empty());
+        // The rendered file exists at the declared path with the native key set.
+        let rendered = tmp.path().join("config/agent.toml");
+        assert!(rendered.is_file(), "file target must render into the home");
+        let text = std::fs::read_to_string(&rendered).unwrap();
+        let parsed: toml::Table = text.parse().unwrap();
+        assert_eq!(
+            parsed["llm"]["model"].as_str(),
+            Some("gpt-4"),
+            "native key path set; got {text}"
+        );
+    }
+
+    #[test]
+    fn apply_delivers_agent_pass_through_verbatim_to_env() {
+        // AC6: an `agent.*` leaf is delivered VERBATIM (the key-tail after `agent.`
+        // + the value) into the native mechanism — NO known-key lookup, NO
+        // rewriting. The recorded convention delivers it to an env var named by the
+        // verbatim tail.
+        let mapping = ConfigMapping::new(); // no known-key rules at all
+        let effective = effective_from_instance("[agent]\nCUSTOM_FLAG = \"verbatim\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(
+            launch.env.get("CUSTOM_FLAG").map(String::as_str),
+            Some("verbatim"),
+            "pass-through delivered verbatim by key-tail"
+        );
+    }
+
+    #[test]
+    fn apply_delivers_resolved_cleartext_for_a_secret_leaf_not_the_mask() {
+        // Story 2-4 AC9 (delivery diverges from display): a `secret:NAME` leaf whose
+        // resolved cleartext is in the `secrets` map delivers the REAL value into
+        // the native env target, NOT the mask and NOT the reference. This is the
+        // crux — `display()` would mask this same leaf.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::env("MODEL"));
+        let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        // The supervisor would resolve `secret:MODEL_KEY` → this cleartext.
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "model".to_string(),
+            crate::domain::SecretString::new("sk-real-key-123"),
+        );
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &secrets, tmp.path()).unwrap();
+        // The adapter's native env holds the CLEARTEXT (usable key), not the mask.
+        assert_eq!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some("sk-real-key-123"),
+            "a secret leaf must deliver resolved cleartext to the adapter"
+        );
+        // Sanity: the masked display of the same leaf is NOT what was delivered.
+        assert_ne!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some(ktesio_adapter_api::OsId::current().as_str()), // arbitrary non-equal
+        );
+        assert_ne!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some("secret:MODEL_KEY")
+        );
+    }
+
+    #[test]
+    fn apply_delivers_resolved_cleartext_for_a_secret_leaf_into_a_flag_arg() {
+        // Story 2-4 AC9 + the flag/argv boundary (documented in the Flag arm and
+        // docs/architecture.md Secrets): a `secret:NAME` leaf mapped to a FLAG target
+        // delivers its resolved CLEARTEXT as an argv token, NOT the mask and NOT the
+        // reference. This is the STRICTER exposure the docs call out (argv is
+        // cross-user readable via `ps`/`/proc/<pid>/cmdline`), so it is proven
+        // explicitly alongside the env path.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::flag("--model"));
+        let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "model".to_string(),
+            crate::domain::SecretString::new("sk-real-key-123"),
+        );
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &secrets, tmp.path()).unwrap();
+        // The flag value token carries the CLEARTEXT (what the child sees in argv).
+        assert_eq!(
+            launch.args,
+            vec!["--model".to_string(), "sk-real-key-123".to_string()],
+            "a secret leaf mapped to a flag must deliver resolved cleartext into argv"
+        );
+        // Sanity: neither the mask nor the raw reference reaches argv.
+        assert!(
+            !launch.args.iter().any(|a| a == "secret:MODEL_KEY"),
+            "the raw reference must not reach argv"
+        );
+        assert!(
+            !launch.args.iter().any(|a| a == crate::domain::SECRET_MASK),
+            "the mask must not reach argv (delivery diverges from display)"
+        );
+    }
+
+    #[test]
+    fn apply_secret_leaf_missing_from_map_fails_closed_to_the_mask() {
+        // Defense-in-depth: if a secret leaf is (unexpectedly) absent from the
+        // `secrets` map, the placement falls back to the MASKED display() — never
+        // the cleartext, never the raw reference. Fail-closed: a bug in resolution
+        // yields a broken-but-safe agent config, not a leak.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::env("MODEL"));
+        let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty secrets map (the leaf is secret but unresolved in the map).
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some(ktesio_engine_secret_mask()),
+            "a secret leaf missing from the map must fail closed to the mask, not leak"
+        );
+    }
+
+    /// The config-layer secret mask token (re-exported), for the fail-closed test.
+    fn ktesio_engine_secret_mask() -> &'static str {
+        crate::domain::SECRET_MASK
+    }
+
+    #[test]
+    fn apply_unmapped_documented_key_is_a_noop() {
+        // Decision 6 / AC5: a documented key the adapter declares NO rule for is
+        // delivered nowhere — the launch is untouched.
+        let mapping = ConfigMapping::new(); // model has no rule
+        let effective = effective_from_instance("model = \"gpt-4\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert!(launch.env.is_empty(), "unmapped key must not land anywhere");
+        assert!(launch.args.is_empty());
+        assert!(!tmp.path().join("config").exists(), "no file rendered");
+    }
+
+    #[test]
+    fn apply_is_deterministic_and_empty_config_is_a_noop() {
+        // An empty effective config leaves the launch untouched; and the transform
+        // is deterministic (same inputs → same launch), reinforcing the pure-ish
+        // start seam.
+        let mapping = ConfigMapping::new()
+            .with("model", ConfigTarget::flag("--model"))
+            .with("agent.a", ConfigTarget::env("IGNORED")); // pass-through ignores the rule
+        let empty = EffectiveConfig::default();
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &empty, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(launch, empty_launch(), "empty config is a no-op");
+
+        // Determinism: two applies of the same non-empty config yield equal launches.
+        let effective = effective_from_instance("model = \"m\"\n[agent]\nx = \"y\"\n");
+        let mut a = empty_launch();
+        let mut b = empty_launch();
+        apply_config_mapping(&mut a, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        apply_config_mapping(&mut b, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        assert_eq!(a, b);
+        // model flag present; the agent.* leaf delivered verbatim by its tail (NOT
+        // via the env rule keyed at "agent.a").
+        assert_eq!(a.args, vec!["--model".to_string(), "m".to_string()]);
+        assert_eq!(a.env.get("x").map(String::as_str), Some("y"));
+        assert!(
+            !a.env.contains_key("IGNORED"),
+            "pass-through bypasses the rule"
+        );
+    }
+
+    #[test]
+    fn resolve_config_mapping_reads_manifest_config_section() {
+        // A manifest adapter's mapping comes from its parsed [config] section.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[config.model]
+flag = "--model"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let mapping = resolve_config_mapping("demo", Some(&path)).unwrap();
+        assert_eq!(
+            mapping.target("model").unwrap().render_flag_args("x"),
+            Some(["--model".to_string(), "x".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolve_config_mapping_native_reads_the_builtin_table() {
+        // A native adapter's mapping comes from the builtin code-declared table:
+        // the mock declares `model` → env `MODEL`.
+        let mapping = resolve_config_mapping("mock", None).unwrap();
+        assert_eq!(mapping.target("model").unwrap().env_var(), Some("MODEL"));
+        // An unknown native kind → an empty mapping (delivers nothing), not an err.
+        assert!(resolve_config_mapping("nope", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_config_mapping_rejects_an_escaping_file_target_symmetric() {
+        // Fix #2 / AD-6 (symmetric trust): `resolve_config_mapping` VALIDATES the
+        // mapping for BOTH kinds. A `[config.model]` File target whose path escapes
+        // the Agent Home is rejected at start with InvalidConfigMapping — even
+        // though this arm parses the manifest with `from_toml_str` (not the
+        // registration-time `validate`), so a post-registration manifest edit that
+        // slips a bad path past registration is still caught before it can steer a
+        // write outside the home. The same `mapping.validate()` gate covers a
+        // native code-declared File target (a native adapter carries no manifest to
+        // re-validate at registration, so this start-time check is its ONLY guard).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[config.model]
+file = { path = "../escape.toml", key = "k" }
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_config_mapping("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidConfigMapping {
+                adapter,
+                key,
+                detail,
+            } => {
+                assert_eq!(adapter, "demo");
+                assert_eq!(key, "model");
+                assert!(detail.contains("RELATIVE"), "{detail}");
+            }
+            other => panic!("expected InvalidConfigMapping, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_config_mapping_unreadable_manifest_is_reported() {
+        // A manifest path that does not exist → ManifestUnreadable (defensive: the
+        // launch resolver re-read it first, but this stays symmetric).
+        let missing = std::path::Path::new("/no/such/adapter.toml");
+        let err = resolve_config_mapping("demo", Some(missing)).unwrap_err();
+        assert!(
+            matches!(err, LaunchResolveError::ManifestUnreadable { .. }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_config_mapping_malformed_manifest_is_unreadable() {
+        // A manifest that fails to PARSE surfaces as ManifestUnreadable.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(tmp.path(), "not = = valid toml");
+        let err = resolve_config_mapping("demo", Some(&path)).unwrap_err();
+        assert!(matches!(err, LaunchResolveError::ManifestUnreadable { .. }));
+    }
+
+    #[test]
+    fn apply_file_target_render_failure_is_a_typed_error() {
+        // ConfigApplyError::FileRender: a file target whose PARENT path is blocked
+        // (a regular file sits where a directory must be) fails the write with a
+        // typed error naming the key/path — never a panic (the start then rejects
+        // before the `starting` transition, so the instance state is unchanged).
+        let mapping =
+            ConfigMapping::new().with("model", ConfigTarget::file("blocked/agent.toml", "k"));
+        let effective = effective_from_instance("model = \"gpt-4\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        // Put a regular FILE at `blocked` so create_dir_all(blocked) fails.
+        std::fs::write(tmp.path().join("blocked"), b"not a dir").unwrap();
+        let err =
+            apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path())
+                .unwrap_err();
+        match err {
+            ConfigApplyError::FileRender { key, path, .. } => {
+                assert_eq!(key, "blocked/agent.toml");
+                assert_eq!(path, "blocked/agent.toml");
+            }
+        }
+        // The error message names the key + path (defensive Display coverage).
+        let msg = apply_config_mapping(
+            &mut empty_launch(),
+            &mapping,
+            &effective,
+            &no_secrets(),
+            tmp.path(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("blocked/agent.toml"), "{msg}");
+        assert!(msg.contains("Agent Home"), "{msg}");
+    }
+
+    #[test]
+    fn apply_two_file_keys_where_a_prefix_collides_overwrites_to_a_table() {
+        // set_dotted_string's collision branch: two native keys into the SAME file
+        // where one is a prefix of the other (`a` then `a.b`). The engine-authored
+        // file has no scalar to preserve, so the prefix is overwritten with a table
+        // (unlike the instance-config write path, which fails closed). Deterministic
+        // sorted iteration means `a` is set first, then `a.b` masks it.
+        let mapping = ConfigMapping::new()
+            .with("model", ConfigTarget::file("f.toml", "a"))
+            .with("temperature", ConfigTarget::file("f.toml", "a.b"));
+        let effective = effective_from_instance("model = \"m\"\ntemperature = \"t\"\n");
+        let mut launch = empty_launch();
+        let tmp = tempfile::tempdir().unwrap();
+        apply_config_mapping(&mut launch, &mapping, &effective, &no_secrets(), tmp.path()).unwrap();
+        let rendered = tmp.path().join("f.toml");
+        let parsed: toml::Table = std::fs::read_to_string(&rendered).unwrap().parse().unwrap();
+        // `a` became a table with `b = "t"`; the scalar `a = "m"` was masked.
+        assert_eq!(
+            parsed["a"]["b"].as_str(),
+            Some("t"),
+            "prefix overwritten to a table"
+        );
     }
 }

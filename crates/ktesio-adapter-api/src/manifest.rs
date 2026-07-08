@@ -30,6 +30,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::capability::CapabilityDeclaration;
+use crate::config::ConfigMapping;
 use crate::metering::MeteringSource;
 
 /// The parsed `adapter.toml` (spine AD-3 manifest schema).
@@ -53,6 +54,11 @@ pub struct Manifest {
     pub metering: Option<Metering>,
     /// Interaction wiring (channel). Optional this story (defaults documented).
     pub interaction: Option<Interaction>,
+    /// The unified→native config MAPPING (story 2-2, FR-12). OPTIONAL: an adapter
+    /// that maps no unified keys omits it entirely (an empty mapping is valid and
+    /// common). Each `[config.<key>]` sub-table declares one native mechanism
+    /// (`env`/`flag`/`file`). Validated by [`Manifest::validate`] when present.
+    pub config: Option<ConfigMapping>,
 }
 
 /// The `[adapter]` identity block.
@@ -263,6 +269,23 @@ impl Manifest {
             return Err(ManifestError::missing("`[metering]` section"));
         }
 
+        // [config] mapping (story 2-2, FR-12), IF present. Absent is valid (an
+        // adapter that maps no unified keys — the common case). A present-but-
+        // malformed rule (an empty native token, or a `file.path` that is
+        // absolute / escapes the Agent Home) is an InvalidField naming the
+        // `[config.<key>]` sub-section. A rule that names an unknown/ambiguous
+        // native mechanism never reaches here — `#[serde(untagged)]` fails to
+        // match a variant at PARSE time (surfaced as a section error by
+        // `from_toml_str`), like every other typed field.
+        if let Some(mapping) = &self.config {
+            if let Err((key, detail)) = mapping.validate() {
+                return Err(ManifestError::InvalidField {
+                    field: format!("`[config.{key}]` mapping in the `[config]` section"),
+                    detail,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -285,6 +308,16 @@ impl Manifest {
     /// The adapter kind declared in `[adapter]` (present after validation).
     pub fn adapter_kind(&self) -> Option<&str> {
         self.adapter.as_ref().map(|a| a.kind.as_str())
+    }
+
+    /// The declared unified→native config [`ConfigMapping`] (story 2-2, FR-12).
+    ///
+    /// Returns the parsed `[config]` mapping, or an EMPTY mapping when the section
+    /// is absent — so the engine's start seam treats "no `[config]`" as "maps no
+    /// unified keys" (a no-op) uniformly with a native adapter that declares no
+    /// mapping. Mirrors [`Self::capability_declaration`]'s empty-when-absent shape.
+    pub fn config_mapping(&self) -> ConfigMapping {
+        self.config.clone().unwrap_or_default()
     }
 }
 
@@ -587,6 +620,86 @@ channel = "stdio"
         assert!(m.capability_declaration().is_empty());
         assert_eq!(m.metering_source(), None);
         assert_eq!(m.adapter_kind(), None);
+        // Story 2-2: an absent `[config]` yields an EMPTY mapping (a no-op), not
+        // an error.
+        assert!(m.config_mapping().is_empty());
         assert!(m.validate().is_err());
+    }
+
+    // ---- Story 2-2: the optional `[config]` mapping section (FR-12) ----
+
+    #[test]
+    fn absent_config_section_validates_with_an_empty_mapping() {
+        // The common case: a valid manifest with NO `[config]` section is valid,
+        // and `config_mapping()` returns an empty mapping (delivers nothing).
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.config.is_none());
+        assert!(m.config_mapping().is_empty());
+    }
+
+    #[test]
+    fn config_section_with_each_target_parses_validates_and_reads_back() {
+        // AC3: a manifest can declare, per documented unified key, its native
+        // target (env / flag / file). All three parse, validate, and read back
+        // through the accessor.
+        let toml = format!(
+            "{VALID}\n\
+             [config.model]\nenv = \"MODEL\"\n\n\
+             [config.temperature]\nflag = \"--temp\"\n\n\
+             [config.seed]\nfile = {{ path = \"config/agent.toml\", key = \"llm.seed\" }}\n"
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+
+        let mapping = m.config_mapping();
+        assert_eq!(mapping.len(), 3);
+        assert_eq!(mapping.target("model").unwrap().env_var(), Some("MODEL"));
+        assert_eq!(
+            mapping
+                .target("temperature")
+                .unwrap()
+                .render_flag_args("0.7"),
+            Some(["--temp".to_string(), "0.7".to_string()])
+        );
+        let placement = mapping.target("seed").unwrap().file_placement().unwrap();
+        assert_eq!(placement.path, "config/agent.toml");
+        assert_eq!(placement.key, "llm.seed");
+    }
+
+    #[test]
+    fn malformed_config_rule_is_rejected_naming_the_config_subsection() {
+        // A present-but-malformed rule (an empty env var name) is an InvalidField
+        // naming the `[config.<key>]` sub-section.
+        let toml = format!("{VALID}\n[config.model]\nenv = \"\"\n");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("[config.model]")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn config_file_path_escaping_the_home_is_rejected() {
+        // A `file.path` that escapes the Agent Home is rejected (the engine is the
+        // sole writer inside the home — AD-6).
+        let toml = format!(
+            "{VALID}\n[config.model]\nfile = {{ path = \"../escape.toml\", key = \"k\" }}\n"
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("[config.model]"), "got {err}");
+        assert!(err.to_string().contains("RELATIVE"), "got {err}");
+    }
+
+    #[test]
+    fn config_rule_with_no_native_mechanism_fails_to_parse_deny_unknown() {
+        // A `[config.<key>]` sub-table naming no known mechanism fails at PARSE
+        // (untagged variant match), surfaced as a Toml error — like every other
+        // typo the manifest's deny_unknown_fields style catches.
+        let toml = format!("{VALID}\n[config.model]\nbogus = \"x\"\n");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
     }
 }

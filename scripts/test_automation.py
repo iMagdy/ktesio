@@ -147,11 +147,16 @@ class ReleaseDocsTests(unittest.TestCase):
             "|| cargo +stable install cargo-tarpaulin --locked",
             ci,
         )
-        # The instrumented run is serialised and given swap headroom: instrumented +
-        # parallel + subprocess-spawning tests overflowed the 7 GB runner's RAM and
-        # it "lost communication" (an OOM that drops the job with no log, AI-23).
+        # The instrumented run is serialised, given swap headroom, has `/` disk
+        # reclaimed, and builds with line-tables-only debuginfo — the OOM ("runner
+        # lost communication", AI-23) came from RAM+disk pressure of the instrumented
+        # build (coverage counters + full debuginfo + subprocess-spawning tests), not
+        # the engine. CARGO_PROFILE_DEV_DEBUG=1 leaves coverage unchanged (llvm needs
+        # only line tables); the SDK cleanup frees ~30 GB on `/` where target/ lives.
         self.assertIn('RUST_TEST_THREADS: "1"', ci)
+        self.assertIn('CARGO_PROFILE_DEV_DEBUG: "1"', ci)
         self.assertIn("swapon /mnt/covswap", ci)
+        self.assertIn("rm -rf /usr/share/dotnet", ci)
 
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the

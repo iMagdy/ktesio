@@ -95,6 +95,21 @@ pub enum RegistryError {
         rollback_error: String,
     },
 
+    /// The effective-config snapshot could not be written to the Agent Home at
+    /// start (story 2-3, AD-9/AD-6). Names the instance + the snapshot path so the
+    /// diagnostic can point at it (NFR-1). Distinct from [`RegistryError::Io`] so
+    /// `kt` can phrase the "could not write the effective-config snapshot" case
+    /// precisely; the start rejects cleanly on this error (no state change).
+    #[error("could not write the effective-config snapshot for Agent Instance '{name}' at {path}: {detail}")]
+    SnapshotWrite {
+        /// The instance the snapshot is for.
+        name: String,
+        /// The snapshot path that could not be written.
+        path: String,
+        /// The underlying serialize / I/O detail.
+        detail: String,
+    },
+
     /// A native adapter `kind` was requested that no builtin provides (story
     /// 1.3). Carries the unrecognized kind so `kt` can suggest alternatives.
     #[error("unknown adapter kind '{kind}'")]
@@ -224,6 +239,37 @@ pub enum EngineError {
         /// The instance whose adapter failed to resolve.
         name: String,
         /// Why resolution failed.
+        detail: String,
+    },
+
+    /// The effective-config snapshot could not be written to the Agent Home at
+    /// start (story 2-3, AD-9/AD-6). The snapshot is a promised AD-9 artifact, so
+    /// a write failure FAILS the start cleanly (it lands before the `starting`
+    /// transition, so the instance stays in its prior state — no spurious change).
+    /// Names the instance + the snapshot path (NFR-1).
+    #[error("could not write the effective-config snapshot for Agent Instance '{name}' at {path}: {detail}")]
+    Snapshot {
+        /// The instance the snapshot is for.
+        name: String,
+        /// The snapshot path that could not be written.
+        path: String,
+        /// The underlying serialize / I/O detail.
+        detail: String,
+    },
+
+    /// A `secret:NAME` config reference could not be RESOLVED at start (story 2-4,
+    /// spine AD-10, FR-14). The resolution runs BEFORE the config mapping + the
+    /// `starting` transition, so a failure FAILS the start cleanly — the instance
+    /// stays in its prior state, NO half-launch (mirroring the snapshot-write
+    /// failure). `detail` carries the underlying [`crate::ports::SecretError`]
+    /// message, which names the `NAME` + the resolvers tried (or the `chmod 600`
+    /// remediation) but NEVER a resolved secret VALUE (NFR-6). Names the instance.
+    #[error("could not resolve a secret for Agent Instance '{name}': {detail}")]
+    Secret {
+        /// The instance whose secret failed to resolve.
+        name: String,
+        /// The underlying secret-resolution detail (names the NAME + resolvers +
+        /// remediation, never a value).
         detail: String,
     },
 

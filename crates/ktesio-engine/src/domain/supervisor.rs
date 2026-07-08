@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use ktesio_adapter_api::{Capability, OsId, SupportLevel};
 
-use crate::adapter::{self, LaunchResolveError};
+use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
 use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnRecord, SpawnSpec};
 use crate::time::now_rfc3339;
@@ -192,8 +192,60 @@ impl Supervisor {
         let (kind, manifest_path) = registry
             .adapter_launch_facts(&name)
             .map_err(registry_to_engine)?;
-        let launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
+        let mut launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
+        // (story 2-2, FR-12) — still before any persisted state change, so a
+        // config/mapping failure rejects the start cleanly (no spurious state
+        // change, no half-launched process). Resolve the instance's effective
+        // config (2-1's four-layer fold; empty invocation overrides for a plain
+        // start — the parameter is threaded so a future `start --set k=v` supplies
+        // it without an API change), the adapter's declared mapping (manifest
+        // `[config]` or the native code-declared table), then apply: known keys
+        // land in their declared native target (env → launch.env; flag →
+        // launch.args; file → a rendered file in the Agent Home), and `agent.*`
+        // pass-through leaves are delivered VERBATIM (AC6). The Agent Home already
+        // exists (created at registration); file targets render into it here.
+        let home = registry.agent_home(&name);
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .map_err(|e| config_to_engine(&name, e))?;
+        let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+        // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
+        // the mapping application (story 2-4, spine AD-10, AC-A/AC9). This is where
+        // display and delivery DIVERGE: `effective`'s `display()`-based surfaces
+        // (the snapshot at (2c), `config get`) stay MASKED, but the resolved
+        // cleartext flows into `apply_config_mapping` so the ADAPTER gets a usable
+        // key. Resolution (env → the 0600 secrets file) runs here, still before any
+        // persisted state change, so an unresolved/ill-permissioned secret REJECTS
+        // the start cleanly (no half-launch, mirroring the config-apply + snapshot
+        // failures) — a typed `EngineError::Secret` that NEVER echoes a value.
+        let secrets = registry
+            .resolve_secrets(&effective)
+            .map_err(|e| secret_to_engine(&name, e))?;
+        adapter::apply_config_mapping(&mut launch, &mapping, &effective, &secrets, &home)
+            .map_err(|e| config_apply_to_engine(&name, e))?;
+
+        // (2c) Persist the effective-config snapshot into the Agent Home (story
+        // 2-3, spine AD-9 "start resolves to an EffectiveConfig snapshot persisted
+        // in the Agent Home, every value tagged with its source layer" + AD-6
+        // "effective-config snapshots are files inside the Agent Home"). The
+        // resolved `effective` is already in hand from (2b); write it HERE, right
+        // after the mapping application and BEFORE the `starting` transition below,
+        // so a snapshot-write failure rejects the start cleanly (NO state change —
+        // exactly mirroring how the config-apply failure at (2b) rejects before the
+        // transition). The snapshot is a PROMISED AD-9 artifact (a Host/debugging
+        // record of "what will apply on next start"), not a best-effort nicety, so
+        // its failure is a typed start error. Because RESTART also flows through
+        // this path (story 1-6), the snapshot is refreshed on restart too (AC7:
+        // OVERWRITTEN every successful start/restart, never a stale resolution). It
+        // is NOT written at registration (there is no "effective at start" until a
+        // start happens) and NOT deleted at stop.
+        registry
+            .write_effective_config_snapshot(&name, &effective)
+            .map_err(snapshot_to_engine)?;
 
         // Read the per-instance Restart Policy so the write-ahead record carries
         // it (AD-15 per-instance configurable). Read once, before any side effect.
@@ -201,7 +253,6 @@ impl Supervisor {
             .effective_restart_policy(&name)
             .map_err(registry_to_engine)?;
 
-        let home = registry.agent_home(&name);
         // The spawned agent's stdout/stderr go to a SEPARATE agent.log, never the
         // engine's JSON-Lines transition-event log (instance.log) — otherwise the
         // agent's plain-text output would corrupt the structured event log.
@@ -1025,10 +1076,65 @@ fn launch_to_engine(name: &InstanceName, err: LaunchResolveError) -> EngineError
     }
 }
 
+/// Map a config-resolution failure (story 2-2) encountered while mapping the
+/// resolved unified config into the launch into the lifecycle [`EngineError`]. A
+/// malformed config layer / missing instance surfaces as an unresolved-adapter
+/// launch failure (the config could not be mapped into the launch), naming the
+/// instance + detail; the start rejects BEFORE any state change (mirrors a bad
+/// manifest).
+fn config_to_engine(name: &InstanceName, err: crate::domain::ConfigError) -> EngineError {
+    EngineError::AdapterUnresolved {
+        name: name.as_str().to_string(),
+        detail: err.to_string(),
+    }
+}
+
+/// Map a config-mapping APPLICATION failure (story 2-2) — a FILE target that
+/// could not be rendered into the Agent Home — into the lifecycle [`EngineError`].
+/// Surfaces as an unresolved-adapter launch failure naming the instance + detail;
+/// the start rejects before any state change (the file write happens before the
+/// `starting` transition), so a bad file target never leaves a spurious state.
+fn config_apply_to_engine(name: &InstanceName, err: ConfigApplyError) -> EngineError {
+    EngineError::AdapterUnresolved {
+        name: name.as_str().to_string(),
+        detail: err.to_string(),
+    }
+}
+
+/// Map an effective-config SNAPSHOT-write failure (story 2-3) into the lifecycle
+/// [`EngineError`]. The snapshot write lands BEFORE the `starting` transition, so
+/// a failure here rejects the start with no state change. A
+/// [`RegistryError::SnapshotWrite`] already carries the instance + snapshot path +
+/// detail; map it to the dedicated [`EngineError::Snapshot`] naming the same, so
+/// `kt` renders a precise "could not write the effective-config snapshot"
+/// diagnostic with a permissions/disk remediation (NFR-1). Any other registry
+/// error (not expected from this call) falls back to the shared registry mapper.
+fn snapshot_to_engine(err: super::error::RegistryError) -> EngineError {
+    match err {
+        super::error::RegistryError::SnapshotWrite { name, path, detail } => {
+            EngineError::Snapshot { name, path, detail }
+        }
+        other => registry_to_engine(other),
+    }
+}
+
+/// Map a SECRET-resolution failure (story 2-4) into the lifecycle [`EngineError`].
+/// The resolution runs BEFORE the config mapping + the `starting` transition, so a
+/// failure here rejects the start with no state change (mirroring
+/// [`snapshot_to_engine`]). The [`SecretError`] message names the `NAME` + the
+/// resolvers tried (or the `chmod 600` remediation) but NEVER a resolved value, so
+/// mapping it into [`EngineError::Secret`]'s `detail` cannot leak a secret (AC-B).
+fn secret_to_engine(name: &InstanceName, err: crate::ports::SecretError) -> EngineError {
+    EngineError::Secret {
+        name: name.as_str().to_string(),
+        detail: err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::AdapterRef;
+    use crate::adapter::{AdapterRef, StartLaunch};
     use crate::domain::RestartPolicy;
     use std::time::Instant;
 
@@ -1070,6 +1176,64 @@ mod tests {
         (state, manifest, registry)
     }
 
+    /// Story 2-2: write a `fake_agent` manifest with `args` PLUS a `[config]`
+    /// mapping section (`config_toml` is the section body, e.g.
+    /// `"[config.model]\nflag = \"--model\"\n"`). Used by the manifest end-to-end
+    /// mapping proofs.
+    fn write_fake_manifest_with_config(dir: &Path, kind: &str, args: &[&str], config_toml: &str) {
+        let bin = ktesio_conformance::fake_agent_bin();
+        let args_toml = args
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "contract_version = \"0.1.0\"\n\n\
+             [adapter]\nkind = \"{kind}\"\n\n\
+             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"self-reported\"\n\n\
+             {config_toml}",
+            exec = bin.to_string_lossy(),
+        );
+        std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    }
+
+    /// Register a `fake_agent`-backed instance carrying a `[config]` mapping.
+    /// Returns the (state dir, manifest dir, registry).
+    fn setup_fake_with_config(
+        name: &str,
+        args: &[&str],
+        config_toml: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_fake_manifest_with_config(manifest.path(), name, args, config_toml);
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry
+            .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+            .unwrap();
+        (state, manifest, registry)
+    }
+
+    /// Poll for a `--dump` file to appear (the spawned `fake_agent` writes it at
+    /// startup) and return its contents, bounded — avoids racing the spawn.
+    fn wait_for_dump(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dump file never appeared at {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Poll until `poll_once` reports the crash (returns its plans), bounded.
     fn wait_for_crash(sup: &mut Supervisor, registry: &Registry) -> Vec<RestartPlan> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1096,6 +1260,427 @@ mod tests {
             .lookup(&InstanceName::new(name).unwrap())
             .unwrap()
             .state
+    }
+
+    // ---- Story 2-2: unified→native config mapping proven at start (AC-A/AC-B) ----
+
+    #[test]
+    fn mock_native_start_maps_model_to_the_declared_env_target() {
+        // AC-A + AC8 (the MOCK/native proof). The builtin `mock` is INERT (no live
+        // process — NativeHasNoLaunch), so a `mock` start cannot spawn to observe.
+        // Per the recorded inert-mock strategy (Decision 8), we assert on the
+        // MAPPED launch the mapping application PRODUCES: register a mock, set the
+        // documented `model` key (2-1), then resolve the mock's code-declared
+        // mapping + the effective config and apply — the mock's declared native
+        // target (env `MODEL`) must carry the value. This is exactly the transform
+        // the start seam runs; a launchable native agent is a manifest adapter.
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry.register("mck", "mock").unwrap();
+        let name = InstanceName::new("mck").unwrap();
+        registry.set_config(&name, "model", "gpt-4").unwrap();
+
+        // Resolve exactly as start_inner would for a native adapter.
+        let (kind, manifest_path) = registry.adapter_launch_facts(&name).unwrap();
+        assert_eq!(kind, "mock");
+        assert!(manifest_path.is_none(), "mock is native (no manifest)");
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref()).unwrap();
+        // The mock declares `model` → env `MODEL`.
+        assert_eq!(mapping.target("model").unwrap().env_var(), Some("MODEL"));
+
+        // Apply onto a bare launch (the mock has no [lifecycle.start] template;
+        // this is the launch shape the mapping would produce).
+        let mut launch = StartLaunch {
+            exec: "mock".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        };
+        adapter::apply_config_mapping(
+            &mut launch,
+            &mapping,
+            &effective,
+            &std::collections::BTreeMap::new(),
+            &registry.agent_home(&name),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.env.get("MODEL").map(String::as_str),
+            Some("gpt-4"),
+            "the documented model key must land in the mock's declared env target"
+        );
+    }
+
+    #[test]
+    fn manifest_start_maps_model_to_the_declared_flag_target_live() {
+        // Linux-only (RUNTIME gate, not cfg): the delivery logic proven here —
+        // unified config → native env/flag/file mapping — is OS-agnostic engine
+        // code, identical on every OS. Only the `_live` spawn+observe scaffolding
+        // (spawn the real `fake_agent`, poll its `--dump` file) is fragile on
+        // macOS/Windows CI (spawn latency, `.exe` naming). It is covered on Linux
+        // here, and Epic 1's process/backend tests already prove the OS-specific
+        // spawn works on all three OSes. Tarpaulin runs on Linux, so gating these
+        // to Linux leaves coverage unchanged.
+        if OsId::current() != OsId::Linux {
+            return;
+        }
+        // AC-A + AC8 (the MANIFEST proof, live). A `fake_agent` manifest declares
+        // `[config.model]` → flag `--model`; set model, start the REAL process
+        // with `--dump`, and assert the mapped flag landed in the spawned
+        // process's argv (observed via the dump file — no stdout race).
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("argv.txt");
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "flg",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+            "[config.model]\nflag = \"--model\"\n",
+        );
+        let name = InstanceName::new("flg").unwrap();
+        registry.set_config(&name, "model", "gpt-4o").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "flg").unwrap();
+        assert_eq!(state_of(&registry, "flg"), LifecycleState::Running);
+
+        // The spawned fake_agent dumped its argv; the mapped flag + value are there.
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == "arg=--model"),
+            "the mapped --model flag must reach the process argv; dump=\n{dumped}"
+        );
+        assert!(
+            dumped.lines().any(|l| l == "arg=gpt-4o"),
+            "the mapped model VALUE must reach the process argv; dump=\n{dumped}"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "flg", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn secret_leaf_delivers_cleartext_to_the_adapter_but_masks_snapshot_and_events() {
+        // Linux-only: see manifest_start_maps_model_to_the_declared_flag_target_live
+        // — OS-agnostic delivery, fragile _live spawn on macOS/Windows CI.
+        if OsId::current() != OsId::Linux {
+            return;
+        }
+        // Story 2-4 (AC-A/AC9 delivery + AC-B no-leak, engine level). A
+        // `model = secret:NAME` leaf resolves (env resolver) to a sentinel; the
+        // spawned agent's argv carries the CLEARTEXT (usable), while the persisted
+        // snapshot AND every transition event carry the MASK, never the sentinel.
+        // Uses a UNIQUE env-var name to avoid racing sibling in-process tests.
+        const SENTINEL: &str = "s3cr3t-engine-sentinel-abc";
+        let env_key = "KTESIO_SUP_SECRET_TEST_KEY";
+        let prev = std::env::var_os(env_key);
+        std::env::set_var(env_key, SENTINEL);
+
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("argv.txt");
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "sekeng",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+            "[config.model]\nflag = \"--model\"\n",
+        );
+        let name = InstanceName::new("sekeng").unwrap();
+        registry
+            .set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "sekeng").unwrap();
+        assert_eq!(state_of(&registry, "sekeng"), LifecycleState::Running);
+
+        // (POSITIVE) the spawned process argv carries the resolved CLEARTEXT.
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == format!("arg={SENTINEL}")),
+            "the resolved secret cleartext must reach the process argv; dump=\n{dumped}"
+        );
+
+        // (NO-LEAK) the persisted snapshot masks the secret.
+        let snapshot = std::fs::read_to_string(registry.paths().effective_config_snapshot(&name))
+            .expect("snapshot written");
+        assert!(
+            !snapshot.contains(SENTINEL),
+            "the snapshot leaked the secret:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("secret:****"),
+            "snapshot must mask; {snapshot}"
+        );
+
+        // (NO-LEAK) no transition event payload carries the sentinel (AD-14).
+        let events = Supervisor::read_events(&registry, "sekeng").unwrap();
+        let events_json = serde_json::to_string(&events).unwrap();
+        assert!(
+            !events_json.contains(SENTINEL),
+            "a transition event leaked the secret:\n{events_json}"
+        );
+
+        // Teardown + restore env.
+        let _ = sup.stop(&registry, "sekeng", Some(Duration::from_millis(200)));
+        match prev {
+            Some(v) => std::env::set_var(env_key, v),
+            None => std::env::remove_var(env_key),
+        }
+    }
+
+    #[test]
+    fn unresolved_secret_rejects_start_before_any_state_change() {
+        // Story 2-4 (AC5/AC9, engine level): a `secret:NAME` unresolved by env AND
+        // the (absent) secrets file rejects the start with a typed EngineError::Secret
+        // that NEVER echoes a value, leaving the instance in its PRIOR state and NO
+        // snapshot written. The env var is deliberately unset.
+        let env_key = "KTESIO_SUP_DEFINITELY_UNSET_SECRET_KEY_XYZ";
+        std::env::remove_var(env_key);
+        let (_state, _manifest, registry) = setup_fake("noresolve_eng", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("noresolve_eng").unwrap();
+        registry
+            .set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+        let prior = state_of(&registry, "noresolve_eng");
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start(&registry, "noresolve_eng").unwrap_err();
+        match &err {
+            EngineError::Secret { name: n, detail } => {
+                assert_eq!(n, "noresolve_eng");
+                // Names the NAME + resolvers, NEVER a value.
+                assert!(detail.contains(env_key), "detail must name NAME; {detail}");
+            }
+            other => panic!("expected EngineError::Secret, got {other:?}"),
+        }
+        // Prior state preserved; no snapshot written (rejected before both).
+        assert_eq!(state_of(&registry, "noresolve_eng"), prior);
+        assert!(
+            !registry.paths().effective_config_snapshot(&name).exists(),
+            "an unresolved secret must reject before the snapshot write"
+        );
+    }
+
+    #[test]
+    fn manifest_start_maps_model_to_the_declared_file_target_live() {
+        // AC-A + AC4 (the MANIFEST FILE proof, live). A `fake_agent` manifest
+        // declares `[config.model]` → a file target; set model, start, and assert
+        // the engine RENDERED the native config file into the Agent Home at the
+        // declared native key (the engine is the sole writer — path authority).
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "fil",
+            &["--linger-ms", "600000"],
+            "[config.model]\nfile = { path = \"config/agent.toml\", key = \"llm.model\" }\n",
+        );
+        let name = InstanceName::new("fil").unwrap();
+        registry.set_config(&name, "model", "claude-opus").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "fil").unwrap();
+        assert_eq!(state_of(&registry, "fil"), LifecycleState::Running);
+
+        // The engine rendered the native config file into the Agent Home.
+        let rendered = registry.agent_home(&name).join("config/agent.toml");
+        assert!(
+            rendered.is_file(),
+            "the file target must render into the home"
+        );
+        let parsed: toml::Table = std::fs::read_to_string(&rendered).unwrap().parse().unwrap();
+        assert_eq!(
+            parsed["llm"]["model"].as_str(),
+            Some("claude-opus"),
+            "the documented model key must land at the declared native key path"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "fil", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn manifest_start_delivers_agent_pass_through_verbatim_live() {
+        // Linux-only: see manifest_start_maps_model_to_the_declared_flag_target_live
+        // — OS-agnostic delivery, fragile _live spawn on macOS/Windows CI.
+        if OsId::current() != OsId::Linux {
+            return;
+        }
+        // AC-B (the `agent.*` verbatim proof, live). Set an `agent.*` pass-through
+        // key, start the REAL fake_agent with `--dump`, and assert the value was
+        // delivered VERBATIM into the native mechanism (an env var named by the
+        // verbatim key-tail) — no rewriting, no known-key mapping.
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("env.txt");
+        // No [config] mapping at all — pass-through does not need one (AC6).
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "pth",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+            "",
+        );
+        let name = InstanceName::new("pth").unwrap();
+        registry
+            .set_config(&name, "agent.CUSTOM_TOKEN", "verbatim-xyz")
+            .unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "pth").unwrap();
+        assert_eq!(state_of(&registry, "pth"), LifecycleState::Running);
+
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == "env=CUSTOM_TOKEN=verbatim-xyz"),
+            "the agent.* value must be delivered verbatim into the native env; dump=\n{dumped}"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "pth", Some(Duration::from_millis(200)));
+    }
+
+    // ---- Story 2-3: the persisted effective-config snapshot at start (AC5/AC6/AC7) ----
+
+    /// Parse the persisted effective-config snapshot for `name` and return the
+    /// entry map (key → (rendered value, source label)). Panics if the file is
+    /// missing/unparseable (the test wants it present).
+    fn read_snapshot_entries(
+        registry: &Registry,
+        name: &str,
+    ) -> std::collections::BTreeMap<String, (String, String)> {
+        let path = registry
+            .paths()
+            .effective_config_snapshot(&InstanceName::new(name).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["key"].as_str().unwrap().to_string(),
+                    (
+                        e["value"].as_str().unwrap().to_string(),
+                        e["source"].as_str().unwrap().to_string(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn start_writes_the_effective_config_snapshot_tagged_with_source() {
+        // AC5 (AD-9/AD-6): starting an instance writes the effective-config
+        // snapshot FILE into the Agent Home at EnginePaths::effective_config_snapshot,
+        // and it parses + carries model=<v> tagged `instance`. Register a live
+        // fake_agent, set model, start it, assert the snapshot.
+        let (_state, _manifest, registry) = setup_fake("snp", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("snp").unwrap();
+        registry.set_config(&name, "model", "gpt-4o").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "snp").unwrap();
+        assert_eq!(state_of(&registry, "snp"), LifecycleState::Running);
+
+        let path = registry.paths().effective_config_snapshot(&name);
+        assert!(path.is_file(), "the snapshot must exist at {path:?}");
+        let entries = read_snapshot_entries(&registry, "snp");
+        assert_eq!(
+            entries.get("model"),
+            Some(&("gpt-4o".to_string(), "instance".to_string())),
+            "model must be present tagged `instance`; entries={entries:?}"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "snp", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn restart_via_start_inner_overwrites_the_snapshot_with_the_new_value() {
+        // AC7: the snapshot is OVERWRITTEN on every start — a re-start (which flows
+        // through the SAME start_inner seam, story 1-6) refreshes it with the newly
+        // resolved value, never a stale earlier resolution. Start, stop, change the
+        // value, start again; the snapshot reflects the LATEST value.
+        let (_state, _manifest, registry) = setup_fake("rsn", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("rsn").unwrap();
+        registry.set_config(&name, "model", "first").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "rsn").unwrap();
+        assert_eq!(
+            read_snapshot_entries(&registry, "rsn").get("model"),
+            Some(&("first".to_string(), "instance".to_string()))
+        );
+        sup.stop(&registry, "rsn", Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Change the value and start again (stopped → starting → running via
+        // start_inner). The snapshot must be overwritten with the new value.
+        registry.set_config(&name, "model", "second").unwrap();
+        sup.start(&registry, "rsn").unwrap();
+        assert_eq!(state_of(&registry, "rsn"), LifecycleState::Running);
+        assert_eq!(
+            read_snapshot_entries(&registry, "rsn").get("model"),
+            Some(&("second".to_string(), "instance".to_string())),
+            "the snapshot must reflect the latest resolved value after re-start (AC7)"
+        );
+        // Teardown.
+        let _ = sup.stop(&registry, "rsn", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn snapshot_write_failure_rejects_the_start_before_the_starting_transition() {
+        // AC6: a snapshot-write failure rejects the start with NO state change (the
+        // write lands before the `starting` transition). Force the write to fail by
+        // making the snapshot path a DIRECTORY, then assert start errors and the
+        // instance stays in its prior state (`registered`), with NO agent spawned.
+        let (_state, _manifest, registry) = setup_fake("bad", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("bad").unwrap();
+        registry.set_config(&name, "model", "gpt-4").unwrap();
+        // A directory where the snapshot file must be → std::fs::write fails.
+        let snap_path = registry.paths().effective_config_snapshot(&name);
+        std::fs::create_dir(&snap_path).unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start(&registry, "bad").unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Snapshot { name, .. } if name == "bad"),
+            "expected a typed Snapshot error, got {err:?}"
+        );
+        // The instance stayed in its prior state — the start was rejected cleanly
+        // BEFORE the `starting` transition (no spurious state change, AC6).
+        assert_eq!(state_of(&registry, "bad"), LifecycleState::Registered);
+    }
+
+    #[test]
+    fn snapshot_to_engine_maps_snapshot_write_and_falls_back_for_others() {
+        // Unit-cover the snapshot error mapper: a SnapshotWrite maps to the
+        // dedicated EngineError::Snapshot naming the instance + path; any other
+        // registry error falls back to the shared registry mapper (NotFound here).
+        let mapped = snapshot_to_engine(crate::domain::RegistryError::SnapshotWrite {
+            name: "demo".into(),
+            path: "/x/agents/demo/effective-config.json".into(),
+            detail: "disk full".into(),
+        });
+        match mapped {
+            EngineError::Snapshot { name, path, detail } => {
+                assert_eq!(name, "demo");
+                assert!(path.ends_with("effective-config.json"), "path={path}");
+                assert_eq!(detail, "disk full");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        // Fallback: a non-snapshot registry error goes through registry_to_engine.
+        let fallback = snapshot_to_engine(crate::domain::RegistryError::NotFound {
+            name: "demo".into(),
+        });
+        assert!(matches!(fallback, EngineError::NotFound { name } if name == "demo"));
     }
 
     #[test]
@@ -1434,6 +2019,75 @@ mod tests {
             }
             other => panic!("expected AdapterUnresolved, got {other}"),
         }
+    }
+
+    #[test]
+    fn config_to_engine_and_config_apply_to_engine_wrap_as_adapter_unresolved() {
+        // Story 2-2: a config-resolution failure and a config-apply (file-render)
+        // failure both surface as an unresolved-adapter launch failure naming the
+        // instance + preserving the detail, so `start` rejects cleanly.
+        let name = InstanceName::new("svc").unwrap();
+        let cfg_err = config_to_engine(
+            &name,
+            crate::domain::ConfigError::NotFound { name: "svc".into() },
+        );
+        match cfg_err {
+            EngineError::AdapterUnresolved { name, detail } => {
+                assert_eq!(name, "svc");
+                assert!(detail.contains("svc"), "detail preserved: {detail}");
+            }
+            other => panic!("expected AdapterUnresolved, got {other}"),
+        }
+        let apply_err = config_apply_to_engine(
+            &name,
+            ConfigApplyError::FileRender {
+                key: "config/agent.toml".into(),
+                path: "config/agent.toml".into(),
+                detail: "disk full".into(),
+            },
+        );
+        match apply_err {
+            EngineError::AdapterUnresolved { name, detail } => {
+                assert_eq!(name, "svc");
+                assert!(detail.contains("config/agent.toml"), "{detail}");
+                assert!(detail.contains("disk full"), "{detail}");
+            }
+            other => panic!("expected AdapterUnresolved, got {other}"),
+        }
+    }
+
+    #[test]
+    fn start_with_an_unwritable_file_target_rejects_before_any_state_change() {
+        // Story 2-2 end-to-end error path (accurate atomicity, Fix #5): a manifest
+        // `[config.model]` FILE target whose parent path is blocked (a regular file
+        // sits where the config directory must be in the Agent Home) fails the
+        // config-mapping application at start. Because the mapping is applied BEFORE
+        // the `starting` transition, the start REJECTS (AdapterUnresolved) and the
+        // instance stays in its PRIOR state (`registered`) — it does NOT land
+        // `failed`, and never reaches `running`. Exercises the start_inner
+        // config-apply error branch + config_apply_to_engine.
+        let (_state, _manifest, registry) = setup_fake_with_config(
+            "badfile",
+            &["--linger-ms", "600000"],
+            "[config.model]\nfile = { path = \"blocked/agent.toml\", key = \"k\" }\n",
+        );
+        let name = InstanceName::new("badfile").unwrap();
+        registry.set_config(&name, "model", "gpt-4").unwrap();
+        // Block the file target's parent: put a regular FILE at <home>/blocked so
+        // create_dir_all(<home>/blocked) fails when rendering blocked/agent.toml.
+        let home = registry.agent_home(&name);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("blocked"), b"not a dir").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start(&registry, "badfile").unwrap_err();
+        assert!(
+            matches!(err, EngineError::AdapterUnresolved { .. }),
+            "a bad file target must fail the start; got {err}"
+        );
+        // Never reached running (the failure was before the starting transition, so
+        // the instance stays registered).
+        assert_eq!(state_of(&registry, "badfile"), LifecycleState::Registered);
     }
 
     #[test]

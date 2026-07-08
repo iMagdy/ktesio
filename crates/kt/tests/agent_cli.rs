@@ -1419,3 +1419,1064 @@ fn human_show_surfaces_the_metering_seed_rows() {
         run.stderr
     );
 }
+
+// ---- Story 2-1: `kt agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
+
+#[test]
+fn config_set_then_get_shows_the_value_on_stdout() {
+    // AC10/AC-A end-to-end: set a known key, then `config get <name> <key>`
+    // prints the effective value to stdout (bare, no quotes) and exits 0.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let set = run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(set.success, "set should exit 0; stderr={}", set.stderr);
+    assert!(set.stdout.contains("Set"), "stdout={}", set.stdout);
+
+    // Single-key get: the bare value on stdout.
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "model"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "gpt-4"),
+        "stdout should print the bare value; stdout={}",
+        get.stdout
+    );
+
+    // Whole-config get: a Key/Value table on stdout, provenance note on stderr.
+    let get_all = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get_all.success,
+        "get-all should exit 0; stderr={}",
+        get_all.stderr
+    );
+    assert!(
+        get_all.stdout.contains("model"),
+        "stdout should list the key; stdout={}",
+        get_all.stdout
+    );
+    // Story 2-3: the stale "provenance arrives in Epic 2.3" deferral note is
+    // RETIRED (the Source column now IS the provenance) — it must appear NOWHERE.
+    assert!(
+        !get_all.stderr.contains("Epic 2.3") && !get_all.stdout.contains("Epic 2.3"),
+        "the stale Epic 2.3 deferral note must be gone; stdout={} stderr={}",
+        get_all.stdout,
+        get_all.stderr
+    );
+    // The provenance now rides on STDOUT as a "Source" column (result → stdout).
+    assert!(
+        get_all.stdout.contains("Source") && get_all.stdout.contains("instance"),
+        "config get must show a Source column with the instance layer; stdout={}",
+        get_all.stdout
+    );
+}
+
+#[test]
+fn config_get_effective_is_empty_before_any_set() {
+    // AC-C / review decision #1: engine + kind defaults ship EMPTY in 2-1, so
+    // before any `set` the effective config has no keys — `config get` exits 0
+    // and prints the "no config keys set" info line (never a fabricated default).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    assert!(
+        get.stdout.contains("no config keys set"),
+        "empty effective config should say so; stdout={}",
+        get.stdout
+    );
+    // The seeded identity key `name` is NOT surfaced (patch #4).
+    assert!(
+        !get.stdout.contains("name"),
+        "identity key must not appear; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_set_instance_value_is_read_back() {
+    // AC-A/AC10: a key set at the INSTANCE layer is read back by `config get`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "claude-opus"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "model"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "claude-opus"),
+        "instance value should read back; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_set_child_under_scalar_fails_closed() {
+    // Review patch #3 end-to-end: nesting a child under an existing scalar is
+    // rejected (non-zero exit) naming the conflict; nothing persisted.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.a", "v1"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let config_path = state_dir.join("agents").join("demo").join("config.toml");
+    let before = std::fs::read(&config_path).unwrap();
+
+    let run = run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.a.b", "v2"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "shape conflict must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("agent.a"),
+        "stderr should name the conflicting ancestor; stderr={}",
+        run.stderr
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        before,
+        "failed write must leave config byte-unchanged"
+    );
+}
+
+#[test]
+fn config_set_unknown_key_is_rejected_with_suggestion_and_config_unchanged() {
+    // AC-B: an unknown key outside `agent.*` is rejected (non-zero exit), the
+    // suggestion is on stderr, and the on-disk config.toml is byte-unchanged.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let config_path = state_dir.join("agents").join("demo").join("config.toml");
+    let before = std::fs::read(&config_path).expect("read config before");
+
+    // `modle` is a near-miss for the known key `model`.
+    let run = run_kt_agent(
+        &["agent", "config", "set", "demo", "modle", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "unknown key must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("modle"),
+        "stderr should name the offending key; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("model"),
+        "stderr should suggest the nearest key; stderr={}",
+        run.stderr
+    );
+
+    // AC-B atomicity: nothing persisted — config byte-unchanged.
+    let after = std::fs::read(&config_path).expect("read config after");
+    assert_eq!(before, after, "rejected write must not touch config.toml");
+}
+
+#[test]
+fn config_set_agent_pass_through_key_round_trips_verbatim() {
+    // AC7: an `agent.*` key writes successfully and round-trips verbatim.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let set = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "agent.custom_flag",
+            "verbatim-value",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "agent.* set should exit 0; stderr={}",
+        set.stderr
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "agent.custom_flag"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "verbatim-value"),
+        "pass-through key must round-trip verbatim; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_get_unknown_instance_exits_nonzero() {
+    // A `get` on an unregistered instance is the uniform not-found diagnostic on
+    // stderr with a non-zero exit.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "config", "get", "ghost"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "get on a ghost must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("ghost"),
+        "stderr should name the missing instance; stderr={}",
+        run.stderr
+    );
+}
+
+// ---- Story 2-2: the `agent.*`-unvalidated marker in `config get` (AC-B/AC7) ----
+
+#[test]
+fn config_get_marks_agent_pass_through_leaf_unvalidated_and_known_key_validated() {
+    // AC-B / AC7 at the CLI: `config get <name>` renders a "Validated" marker per
+    // row — an `agent.*` leaf is marked `unvalidated` (it bypassed known-key
+    // validation), while a KNOWN key (`model`) is marked `validated`. The marker
+    // rides on STDOUT (part of the result table, AD-12). Story 2-3 ADDS the
+    // "Source" column beside it and RETIRES the stale Epic 2.3 note.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A known key (validated) and an agent.* pass-through key (unvalidated).
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.custom_flag", "on"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    // The Validated column header is present, and the unvalidated marker appears
+    // for the agent.* leaf (result → stdout).
+    assert!(
+        get.stdout.contains("Validated"),
+        "config get must have a Validated column; stdout={}",
+        get.stdout
+    );
+    assert!(
+        get.stdout.contains("unvalidated"),
+        "the agent.* leaf must be marked unvalidated; stdout={}",
+        get.stdout
+    );
+    // Both keys are listed.
+    assert!(get.stdout.contains("model"), "stdout={}", get.stdout);
+    assert!(
+        get.stdout.contains("agent.custom_flag"),
+        "stdout={}",
+        get.stdout
+    );
+    // Story 2-3: the "Source" column now sits beside "Validated" on STDOUT, and
+    // the stale Epic 2.3 deferral note is gone from both streams.
+    assert!(
+        get.stdout.contains("Source"),
+        "config get must show a Source column beside Validated; stdout={}",
+        get.stdout
+    );
+    assert!(
+        !get.stderr.contains("Epic 2.3") && !get.stdout.contains("Epic 2.3"),
+        "the stale Epic 2.3 deferral note must be gone; stdout={} stderr={}",
+        get.stdout,
+        get.stderr
+    );
+}
+
+#[test]
+fn config_get_known_key_only_shows_no_unvalidated_marker() {
+    // AC-B companion: with ONLY a known key set (no agent.* leaf), `config get`
+    // shows the value marked `validated` and NO `unvalidated` marker anywhere —
+    // the marker is present only for pass-through leaves.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    // No `unvalidated` marker anywhere (the only key is a known one).
+    assert!(
+        !get.stdout.contains("unvalidated"),
+        "a known-key-only config must show NO unvalidated marker; stdout={}",
+        get.stdout
+    );
+    // The affirmative `validated` marker IS present — checked unambiguously (not
+    // via a bare `contains("validated")`, which is a substring of "unvalidated").
+    // Since no `unvalidated` occurs (asserted above), stripping it is a no-op here;
+    // the check stays correct even if the two ever co-occur in some future row.
+    assert!(
+        get.stdout.replace("unvalidated", "").contains("validated"),
+        "the known key must be marked validated (standalone token); stdout={}",
+        get.stdout
+    );
+}
+
+// ---- Story 2-3: per-value SOURCE-LAYER rendering (human + --json) (AC-A/AC3/AC4) ----
+
+#[test]
+fn config_get_human_shows_source_column_with_the_winning_layer() {
+    // AC3 (the FR-13 heart): `config get <name>` gains a "Source" column naming
+    // each leaf's winning layer. A key set at the instance layer shows source
+    // `instance`; the column rides on STDOUT (result), and the stale Epic 2.3
+    // deferral note is gone.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    // The Source column header + the `instance` label for the set key (STDOUT).
+    assert!(
+        get.stdout.contains("Source"),
+        "config get must have a Source column; stdout={}",
+        get.stdout
+    );
+    assert!(
+        get.stdout.contains("instance"),
+        "the instance-layer key must show source `instance`; stdout={}",
+        get.stdout
+    );
+    // The stale deferral note is retired from both streams.
+    assert!(
+        !get.stdout.contains("Epic 2.3") && !get.stderr.contains("Epic 2.3"),
+        "the stale Epic 2.3 note must be gone; stdout={} stderr={}",
+        get.stdout,
+        get.stderr
+    );
+}
+
+#[test]
+fn config_get_json_emits_source_per_leaf_on_stdout() {
+    // AC4 + AD-12: `config get <name> --json` writes ONE parseable JSON document
+    // to stdout — a versioned doc whose per-leaf objects carry { key, value,
+    // source, unvalidated }. A known key set at the instance layer is
+    // instance-sourced + validated; an agent.* leaf is unvalidated.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.custom_flag", "on"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.success,
+        "config get --json should exit 0; stderr={}",
+        get.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&get.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be pure JSON: {e}; stdout={}", get.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let entries = doc["entries"].as_array().unwrap();
+
+    let model = entries.iter().find(|e| e["key"] == "model").unwrap();
+    assert_eq!(model["value"], serde_json::json!("gpt-4"));
+    assert_eq!(model["source"], serde_json::json!("instance"));
+    assert_eq!(model["unvalidated"], serde_json::json!(false));
+
+    let flag = entries
+        .iter()
+        .find(|e| e["key"] == "agent.custom_flag")
+        .unwrap();
+    assert_eq!(flag["source"], serde_json::json!("instance"));
+    assert_eq!(flag["unvalidated"], serde_json::json!(true));
+    // Nothing but JSON on stdout (no note leaked there).
+    assert!(
+        !get.stdout.contains("Epic 2.3"),
+        "stdout must stay pure JSON; stdout={}",
+        get.stdout
+    );
+}
+
+#[test]
+fn config_get_single_key_json_emits_just_that_leaf() {
+    // AC4: the single-key `config get <name> <key> --json` form emits exactly one
+    // leaf with its value + source, matching the human single-key value.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "demo", "model", "claude-opus"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "model", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(get.success, "get should exit 0; stderr={}", get.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&get.stdout)
+        .unwrap_or_else(|e| panic!("stdout must be pure JSON: {e}; stdout={}", get.stdout));
+    let entries = doc["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "single-key --json emits one leaf; {doc}");
+    assert_eq!(entries[0]["key"], serde_json::json!("model"));
+    assert_eq!(entries[0]["value"], serde_json::json!("claude-opus"));
+    assert_eq!(entries[0]["source"], serde_json::json!("instance"));
+}
+
+#[test]
+fn config_get_persists_effective_config_snapshot_at_start() {
+    // AC5 end-to-end through the CLI: starting an instance writes the
+    // effective-config snapshot (effective-config.json) into the Agent Home,
+    // carrying model=<v> tagged `instance`. Uses a live `fake_agent` manifest (the
+    // builtin `mock` is inert — its start rejects before the snapshot write), and
+    // reads the Agent Home path from `register`'s stdout (path authority — kt
+    // never constructs it). The started process is cleaned up on this CLI exit
+    // (kill-on-drop), so no separate stop is needed.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "snapcli",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register should exit 0; stderr={}", reg.stderr);
+    // The registered Agent Home path is the stdout result line (an absolute path).
+    let home = reg
+        .stdout
+        .lines()
+        .find(|l| l.contains("agents") && l.contains("snapcli"))
+        .unwrap_or_else(|| {
+            panic!(
+                "register stdout should name the home; stdout={}",
+                reg.stdout
+            )
+        })
+        .trim()
+        .to_string();
+
+    run_kt_agent(
+        &["agent", "config", "set", "snapcli", "model", "gpt-4o"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let start = run_kt_agent(&["agent", "start", "snapcli"], &ctx.project_dir, state_dir);
+    assert!(
+        start.success,
+        "start should exit 0; stderr={}",
+        start.stderr
+    );
+
+    // The snapshot exists in the Agent Home and carries the resolved value +
+    // provenance (written before the `starting` transition).
+    let snapshot_path = std::path::Path::new(&home).join("effective-config.json");
+    assert!(
+        snapshot_path.is_file(),
+        "the effective-config snapshot must exist at {snapshot_path:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let model = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "model")
+        .unwrap();
+    assert_eq!(model["value"], serde_json::json!("gpt-4o"));
+    assert_eq!(model["source"], serde_json::json!("instance"));
+}
+
+// ============================================================================
+// Story 2-4: SECRETS — the no-leak guarantee (FR-14, NFR-6, AD-10).
+//
+// The sentinel cleartext used across the matrix. If it ever appears in a
+// no-leak surface (engine/instance log, event payload, config get --json, the
+// snapshot), the guarantee is broken. It DOES appear in the adapter's native
+// mechanism (the --dump file) and under `config get --reveal`.
+// ============================================================================
+
+const SECRET_SENTINEL: &str = "s3cr3t-sentinel-VALUE-xyz";
+
+/// A `kt` run with ONE extra environment variable set on the child (so the env
+/// SecretResolver can resolve `secret:NAME` at start). Mirrors `run_kt_agent` but
+/// adds `env(key, value)`; the child `kt` process inherits it, and the engine it
+/// spawns reads it via `std::env::var`. Local to the secret tests (the shared
+/// helper does not need a general env knob).
+fn run_kt_agent_env(
+    args: &[&str],
+    working_dir: &Path,
+    state_dir: &Path,
+    env_key: &str,
+    env_val: &str,
+) -> (bool, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(args)
+        .current_dir(working_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .env(env_key, env_val)
+        .output()
+        .expect("Failed to execute kt");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Write a `fake_agent` manifest that (a) dumps its received argv + env to
+/// `dump_path` at startup (`--dump`, the config-mapping observation point) and (b)
+/// maps the unified `model` key into the native env var `MODEL` (`[config.model]
+/// env = "MODEL"`). So a `model = "secret:NAME"` leaf, once resolved, lands in the
+/// child's `MODEL` env — captured in the dump as `env=MODEL=<cleartext>`.
+fn fake_agent_manifest_secret_env(dir: &Path, dump_path: &Path) -> std::path::PathBuf {
+    let m = dir.join("fake-agent-secret-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fake"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000", "--dump", {dump:?}]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config.model]
+env = "MODEL"
+"#,
+        exec = bin.to_string_lossy(),
+        dump = dump_path.to_string_lossy(),
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+/// Recursively collect the text of every file under `dir` into one string (for the
+/// no-leak sweep of an Agent Home / logs directory). Missing/binary files are
+/// skipped. Also returns each scanned path so a failure names WHERE a leak was.
+fn read_tree_text(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(read_tree_text(&path));
+        } else if let Ok(text) = std::fs::read_to_string(&path) {
+            out.push((path, text));
+        }
+    }
+    out
+}
+
+#[test]
+fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
+    // THE no-leak matrix (AC-B, the security heart of FR-14/NFR-6), end-to-end
+    // through the real `kt` binary:
+    //   - a `secret:MODEL_KEY` leaf resolves (env resolver) to a sentinel cleartext;
+    //   - the sentinel REACHES the adapter's native mechanism (env=MODEL=<sentinel>
+    //     in the --dump file) — the value is USABLE (AC9 delivery);
+    //   - the sentinel appears in NONE of: the persisted effective-config snapshot,
+    //     `config get --json`, the human `config get`, or ANY file in the Agent Home
+    //     (logs + event payloads included) — the MASK appears instead (AC-A/AC-B);
+    //   - `config get --json --reveal` DOES carry the sentinel (AC-C, the sole
+    //     un-mask), and the default `--json` carries the mask.
+    //
+    // Runtime-gate to Linux only (data-driven OS id, NO `#[cfg]` — this file is
+    // outside the backends allowlist). The no-leak / masking logic this test
+    // proves is OS-AGNOSTIC engine code: `ResolvedValue::display()` masking and
+    // the snapshot / JSON serialization are identical on every OS. The
+    // OS-SPECIFIC secret bit (the 0600 secrets-file permission check) already has
+    // dedicated tests under `backends/{unix,windows}`. The reason this test can't
+    // run everywhere is its POSITIVE-delivery half, which observes the sentinel
+    // in the fake agent's `--dump`: that dump is written only AFTER the one-shot
+    // `kt agent start` exits, and observing a one-shot-spawned agent is unreliable
+    // on macOS + Windows CI. On macOS CI the agent never writes the dump at all
+    // (the one-shot start leaves no observable running agent — regardless of
+    // timeout); on Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills the agent the
+    // instant `kt` exits. The heavier `start_via_surviving_engine` harness isn't
+    // warranted just to re-prove OS-agnostic masking. tarpaulin runs on Linux, so
+    // the test still executes there and coverage is unchanged.
+    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Linux {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    // The dump file the agent writes its received env into (outside the state dir,
+    // so the no-leak Agent-Home sweep does not scan the intended-cleartext dump).
+    let dump = ctx.project_dir.join("agent-received.dump");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+
+    // Register + set `model = secret:MODEL_KEY` (the reference is what is stored).
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "sek",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register failed; stderr={}", reg.stderr);
+    let home = reg
+        .stdout
+        .lines()
+        .find(|l| l.contains("agents") && l.contains("sek"))
+        .expect("register stdout names the home")
+        .trim()
+        .to_string();
+    let set = run_kt_agent(
+        &["agent", "config", "set", "sek", "model", "secret:MODEL_KEY"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(set.success, "set failed; stderr={}", set.stderr);
+
+    // Start with MODEL_KEY set in the environment → the env resolver resolves the
+    // secret to the sentinel, which apply_config_mapping delivers into env MODEL.
+    let (ok, out, err) = run_kt_agent_env(
+        &["agent", "start", "sek"],
+        &ctx.project_dir,
+        state_dir,
+        "MODEL_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(ok, "start should succeed; stdout={out} stderr={err}");
+    // Neither start's stdout nor stderr may carry the sentinel.
+    assert!(
+        !out.contains(SECRET_SENTINEL),
+        "start stdout leaked the secret"
+    );
+    assert!(
+        !err.contains(SECRET_SENTINEL),
+        "start stderr leaked the secret"
+    );
+
+    // (POSITIVE) The sentinel REACHED the adapter's native env (the value is usable).
+    let dump_text = {
+        // The agent writes the dump at startup; poll briefly for it. This runs
+        // Linux-only (see the gate above), where the one-shot-spawned agent
+        // re-parents to init, survives `kt`'s exit, and reaches this within the
+        // 5 s deadline. It is a wait for the write to APPEAR, not a fixed sleep.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&dump) {
+                if t.contains("env=MODEL=") {
+                    break t;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent never wrote its dump at {dump:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    assert!(
+        dump_text.contains(&format!("env=MODEL={SECRET_SENTINEL}")),
+        "the resolved cleartext must reach the adapter's native env; dump=\n{dump_text}"
+    );
+
+    // (NO-LEAK) The persisted snapshot masks the secret (never the sentinel).
+    let snapshot_path = std::path::Path::new(&home).join("effective-config.json");
+    let snapshot = std::fs::read_to_string(&snapshot_path).unwrap();
+    assert!(
+        !snapshot.contains(SECRET_SENTINEL),
+        "the effective-config snapshot leaked the secret:\n{snapshot}"
+    );
+    assert!(
+        snapshot.contains("secret:****"),
+        "the snapshot must carry the mask; snapshot=\n{snapshot}"
+    );
+
+    // (NO-LEAK) Every file in the Agent Home — logs + event payloads included —
+    // is free of the sentinel. This is the log + event-payload half of AC-B.
+    for (path, text) in read_tree_text(std::path::Path::new(&home)) {
+        assert!(
+            !text.contains(SECRET_SENTINEL),
+            "the secret leaked into an Agent Home file: {path:?}\n{text}"
+        );
+    }
+
+    // (NO-LEAK) `config get --json` (default, no --reveal) masks the secret.
+    let get_json = run_kt_agent(
+        &["agent", "config", "get", "sek", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get_json.success,
+        "get --json failed; stderr={}",
+        get_json.stderr
+    );
+    assert!(
+        !get_json.stdout.contains(SECRET_SENTINEL),
+        "config get --json leaked the secret by default:\n{}",
+        get_json.stdout
+    );
+    assert!(
+        get_json.stdout.contains("secret:****"),
+        "config get --json must mask by default:\n{}",
+        get_json.stdout
+    );
+
+    // (NO-LEAK) The human `config get` table masks too (same display path).
+    let get_human = run_kt_agent(
+        &["agent", "config", "get", "sek"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !get_human.stdout.contains(SECRET_SENTINEL),
+        "the human config get leaked the secret:\n{}",
+        get_human.stdout
+    );
+
+    // (REVEAL) `config get --json --reveal` re-resolves LIVE and DOES carry the
+    // sentinel — the sole un-mask (AC-C). Needs MODEL_KEY in the env for the read.
+    let (rok, rout, rerr) = run_kt_agent_env(
+        &["agent", "config", "get", "sek", "--json", "--reveal"],
+        &ctx.project_dir,
+        state_dir,
+        "MODEL_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(rok, "get --reveal failed; stderr={rerr}");
+    let doc: serde_json::Value = serde_json::from_str(&rout)
+        .unwrap_or_else(|e| panic!("--reveal --json must be pure JSON: {e}; out={rout}"));
+    let model = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "model")
+        .expect("the model leaf is present");
+    assert_eq!(
+        model["value"],
+        serde_json::json!(SECRET_SENTINEL),
+        "--reveal must emit the unmasked cleartext; doc={doc}"
+    );
+}
+
+#[test]
+fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
+    // AC-C single-key form: `config get <name> <key> --json [--reveal]`. Default
+    // masks that one leaf; --reveal shows just its cleartext. A --reveal on a
+    // NON-secret leaf is a harmless no-op (the plain value).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let dump = ctx.project_dir.join("agent.dump");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "one",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register failed; stderr={}", reg.stderr);
+    // A secret leaf (agent.token) + a plain leaf (agent.mode).
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "one",
+            "agent.token",
+            "secret:TOKEN_KEY",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "config", "set", "one", "agent.mode", "fast"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // Default single-key --json masks the secret leaf.
+    let masked = run_kt_agent(
+        &["agent", "config", "get", "one", "agent.token", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(masked.success, "get failed; stderr={}", masked.stderr);
+    let d: serde_json::Value = serde_json::from_str(&masked.stdout).unwrap();
+    assert_eq!(d["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(d["entries"][0]["value"], serde_json::json!("secret:****"));
+
+    // --reveal on the single secret leaf shows only its cleartext.
+    let (rok, rout, _e) = run_kt_agent_env(
+        &[
+            "agent",
+            "config",
+            "get",
+            "one",
+            "agent.token",
+            "--json",
+            "--reveal",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        "TOKEN_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(rok, "reveal single-key failed");
+    let d: serde_json::Value = serde_json::from_str(&rout).unwrap();
+    assert_eq!(d["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(d["entries"][0]["value"], serde_json::json!(SECRET_SENTINEL));
+
+    // --reveal on a NON-secret leaf is a harmless no-op: the plain value.
+    let (pok, pout, _e) = run_kt_agent_env(
+        &[
+            "agent",
+            "config",
+            "get",
+            "one",
+            "agent.mode",
+            "--json",
+            "--reveal",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        "TOKEN_KEY",
+        SECRET_SENTINEL,
+    );
+    assert!(pok, "reveal on non-secret failed");
+    let d: serde_json::Value = serde_json::from_str(&pout).unwrap();
+    assert_eq!(d["entries"][0]["value"], serde_json::json!("fast"));
+}
+
+#[test]
+fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
+    // AC5/AC9: a `secret:NAME` that resolves in NEITHER env nor the (absent)
+    // secrets file REJECTS the start — non-zero exit, a stderr diagnostic naming the
+    // NAME (never a value), and the instance stays in its PRIOR state (the snapshot
+    // is not even written). The env var is deliberately NOT set.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let dump = ctx.project_dir.join("agent.dump");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "noresolve",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register failed; stderr={}", reg.stderr);
+    let home = reg
+        .stdout
+        .lines()
+        .find(|l| l.contains("agents") && l.contains("noresolve"))
+        .expect("register stdout names the home")
+        .trim()
+        .to_string();
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "noresolve",
+            "model",
+            "secret:DEFINITELY_UNSET_KEY_XYZ",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // Start WITHOUT the env var → unresolved → non-zero, diagnostic names the NAME.
+    let start = run_kt_agent(
+        &["agent", "start", "noresolve"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!start.success, "start must fail on an unresolved secret");
+    assert!(
+        start.stderr.contains("DEFINITELY_UNSET_KEY_XYZ"),
+        "the diagnostic must name the secret NAME; stderr={}",
+        start.stderr
+    );
+    // The instance stayed in its prior state: the snapshot was never written (the
+    // resolution failure rejects before the snapshot write + the `starting`
+    // transition).
+    let snapshot_path = std::path::Path::new(&home).join("effective-config.json");
+    assert!(
+        !snapshot_path.exists(),
+        "an unresolved secret must reject the start before the snapshot is written"
+    );
+    // And `agent list` still shows it as `registered` (never `running`/`failed`
+    // from a half-launch).
+    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(
+        list.stdout.contains("registered"),
+        "the instance must stay registered after a rejected start; list=\n{}",
+        list.stdout
+    );
+}

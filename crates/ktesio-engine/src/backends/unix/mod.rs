@@ -38,7 +38,8 @@ use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::{setsid, Pid};
 
 use crate::ports::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
+    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec,
+    StopOutcome,
 };
 
 /// How often the graceful-stop wait polls for the process to exit.
@@ -519,6 +520,34 @@ fn signal_group(pgid: Pid, signal: Signal) -> Result<(), BackendError> {
     }
 }
 
+/// Check that the engine secrets file at `path` is owner-only (mode `0600`),
+/// story 2-4 AC6 (spine AD-10/AD-4 — the OS-specific permission INSPECTION, which
+/// MUST live under `backends/`, the sole allowlisted `#[cfg]` home).
+///
+/// On Unix this READS the file's mode bits via
+/// [`std::os::unix::fs::PermissionsExt`] and REFUSES a group/other-accessible file
+/// (a world-/group-readable secrets file defeats "safe by construction"): a typed
+/// [`SecretError::FilePermissions`] with a `chmod 600` remediation. The RULE
+/// (`mode & 0o077 == 0`) + the error construction live in the OS-agnostic
+/// [`crate::ports`] ([`crate::ports::mode_is_owner_only`] /
+/// [`crate::ports::file_permissions_error`]) so they are unit-testable without a
+/// real file; this function only supplies the mode-bit READ (the OS-specific part).
+/// The caller (the file resolver) has already confirmed the file exists; a stat
+/// failure surfaces as [`SecretError::FileUnreadable`].
+pub fn check_secrets_file_permissions(path: &std::path::Path) -> Result<(), SecretError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).map_err(|e| SecretError::FileUnreadable {
+        path: path.to_string_lossy().into_owned(),
+        detail: e.to_string(),
+    })?;
+    let mode = metadata.permissions().mode();
+    if crate::ports::mode_is_owner_only(mode) {
+        Ok(())
+    } else {
+        Err(crate::ports::file_permissions_error(path, mode))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +882,39 @@ mod tests {
         // Use a pgid extremely unlikely to exist.
         let result = signal_group(Pid::from_raw(2_000_000_000), Signal::SIGTERM);
         assert!(result.is_ok(), "missing group must be Ok, got {result:?}");
+    }
+
+    #[test]
+    fn check_secrets_file_permissions_refuses_group_readable_and_accepts_0600() {
+        // Story 2-4 AC6 (Unix): a 0644 (group/other-readable) secrets file is
+        // REFUSED with a typed FilePermissions error + chmod remediation; a 0600
+        // (owner-only) file passes. This is the real enforcement of AD-10's "mode
+        // 0600". Lives in the backend test module (the allowlisted OS-cfg home), so
+        // reading Unix mode bits here needs no cfg elsewhere.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.toml");
+        std::fs::write(&path, "OPENAI_KEY = \"x\"\n").unwrap();
+
+        // 0644 → refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = check_secrets_file_permissions(&path).unwrap_err();
+        match &err {
+            crate::ports::SecretError::FilePermissions { path: p, detail } => {
+                assert!(p.contains("secrets.toml"), "{p}");
+                assert!(detail.contains("group/other"), "{detail}");
+            }
+            other => panic!("expected FilePermissions, got {other:?}"),
+        }
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+
+        // 0600 → accepted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_secrets_file_permissions(&path).is_ok());
+
+        // 0400 (read-only owner) is also owner-only → accepted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(check_secrets_file_permissions(&path).is_ok());
     }
 
     /// Whether a pid is still alive (Unix): `kill(pid, 0)` succeeds while it

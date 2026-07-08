@@ -43,11 +43,31 @@ pub const STATE_DIR_ENV: &str = "KTESIO_STATE_DIR";
 /// File name of the SQLite state store inside the state base. `[ASSUMPTION]`
 pub const STATE_DB_FILE: &str = "state.db";
 
+/// File name of the engine SECRETS store inside the state base (story 2-4, spine
+/// AD-10 "the engine secrets file, mode 0600"). A state-dir-level file (NOT
+/// per-Agent-Home — it is the engine's SHARED secret store, resolving every
+/// instance's `secret:NAME` references), beside [`STATE_DB_FILE`]. `[ASSUMPTION]`
+/// recorded (Assumption 5): TOML `NAME = "value"` (reuses the engine's `toml`
+/// dep), at `<state base>/secrets.toml`, expected mode `0600` (owner-only —
+/// enforced on Unix by the backend permission check, AD-4). It is NOT a SQLite
+/// blob (AD-6): secrets are files under path authority, never a DB column.
+pub const SECRETS_FILE: &str = "secrets.toml";
+
 /// Directory (under the state base) that holds all Agent Homes. `[ASSUMPTION]`
 pub const AGENTS_DIR: &str = "agents";
 
 /// File name of the per-instance config file inside an Agent Home. `[ASSUMPTION]`
 pub const INSTANCE_CONFIG_FILE: &str = "config.toml";
+
+/// File name of the persisted effective-config snapshot inside an Agent Home
+/// (story 2-3, spine AD-9 "the effective-config snapshot persisted in the Agent
+/// Home" + AD-6 "effective-config snapshots are files inside the Agent Home").
+/// Written at START (the resolved four-layer config + per-value provenance),
+/// OVERWRITTEN every start/restart. `[ASSUMPTION]` recorded (Decision 5): JSON,
+/// mirroring the `adapter.json` snapshot convention — OS-portable, serializes the
+/// provenance tags cleanly, and kept DISTINCT from the editable `config.toml`
+/// (this file is engine-owned, read-only-to-humans, never hand-edited).
+pub const EFFECTIVE_CONFIG_SNAPSHOT_FILE: &str = "effective-config.json";
 
 /// Computes engine-owned paths from a resolved state-dir base.
 ///
@@ -122,6 +142,16 @@ impl EnginePaths {
         self.state_base.join(STATE_DB_FILE)
     }
 
+    /// Absolute path to the engine secrets file (story 2-4, AD-10) — the
+    /// state-dir-level TOML `NAME = "value"` store the 0600-file
+    /// [`crate::ports::SecretResolver`] reads. Mirrors [`state_db`](Self::state_db);
+    /// the engine is the SOLE path authority (AD-6). The file is optional (a
+    /// missing secrets file is not an error — env may resolve every reference);
+    /// only its PRESENCE triggers the permission check + lookup.
+    pub fn secrets_file(&self) -> PathBuf {
+        self.state_base.join(SECRETS_FILE)
+    }
+
     /// Directory holding all Agent Homes.
     pub fn agents_dir(&self) -> PathBuf {
         self.state_base.join(AGENTS_DIR)
@@ -138,6 +168,14 @@ impl EnginePaths {
     /// Absolute path to an Agent Home's instance config file.
     pub fn instance_config(&self, name: &InstanceName) -> PathBuf {
         self.agent_home(name).join(INSTANCE_CONFIG_FILE)
+    }
+
+    /// Absolute path to an Agent Home's persisted effective-config snapshot
+    /// (story 2-3, AD-9/AD-6). The engine is the SOLE writer (path authority);
+    /// `kt`/Hosts/adapters read it back but never construct the path. Mirrors
+    /// [`instance_config`](Self::instance_config), rooted at the same Agent Home.
+    pub fn effective_config_snapshot(&self, name: &InstanceName) -> PathBuf {
+        self.agent_home(name).join(EFFECTIVE_CONFIG_SNAPSHOT_FILE)
     }
 }
 
@@ -157,6 +195,9 @@ mod tests {
         assert_eq!(paths.state_base(), tmp.path());
         assert_eq!(paths.state_db(), tmp.path().join("state.db"));
         assert_eq!(paths.agents_dir(), tmp.path().join("agents"));
+        // Story 2-4: the engine secrets file is a state-dir-level file beside the
+        // state DB (NOT per-Agent-Home), named secrets.toml.
+        assert_eq!(paths.secrets_file(), tmp.path().join("secrets.toml"));
     }
 
     #[test]
@@ -170,6 +211,12 @@ mod tests {
         assert!(b.ends_with("agents/beta"));
         // Config file lives inside the home.
         assert_eq!(paths.instance_config(&name("alpha")), a.join("config.toml"));
+        // Story 2-3: the effective-config snapshot also lives inside the home,
+        // as effective-config.json, distinct from the editable config.toml.
+        assert_eq!(
+            paths.effective_config_snapshot(&name("alpha")),
+            a.join("effective-config.json")
+        );
     }
 
     #[test]

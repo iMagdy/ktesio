@@ -238,3 +238,17 @@ pub struct AgentLaunchFailed {
 pub struct AgentCapabilityUnsupported {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::unknown_config_key))]
+pub struct AgentUnknownConfigKey {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::config))]
+pub struct AgentConfig {
+    pub message: String,
+}

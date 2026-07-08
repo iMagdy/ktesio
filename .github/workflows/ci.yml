@@ -357,28 +357,38 @@ jobs:
         # cache hit the binary is already on PATH, so the `command -v` guard skips
         # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
-      - name: Add swap headroom for the instrumented run
-        # The instrumented build + test run is far more memory-hungry than the
-        # normal `test` job: coverage counters, full debuginfo, and the fleet/
-        # adoption tests each spawning several instrumented child processes. On a
-        # 7 GB hosted runner that peaked over RAM and the runner "lost communication"
-        # — an OOM kill, which drops the whole job with no log (AI-23). A large swap
-        # file on the roomy /mnt temp disk lets a spike page instead of OOM-ing.
+      - name: Reclaim disk + add swap for the instrumented run
+        # The instrumented build is far heavier than the normal `test` job (coverage
+        # counters + the fleet/adoption tests each spawning several instrumented
+        # children), and the runner "lost communication" ~49 min in — an OOM that
+        # drops the job with no log (AI-23). Two pressures, addressed together:
+        #   * DISK — the instrumented target + profraw sit on `/` (~14 GB free); an
+        #     earlier swap file on /mnt did NOT relieve `/`. Free the big unused
+        #     preinstalled SDKs (~30 GB) so the instrumented target has room.
+        #   * RAM — an 8 GB swap file on the roomy /mnt temp disk lets a spike page
+        #     instead of OOM-ing. (CARGO_PROFILE_DEV_DEBUG=1 below also shrinks the
+        #     instrumented binaries, cutting both RAM and `/` disk — coverage same.)
         run: |
           set -euo pipefail
+          echo "before:"; df -h / /mnt; free -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo fallocate -l 8G /mnt/covswap
           sudo chmod 600 /mnt/covswap
           sudo mkswap /mnt/covswap
           sudo swapon /mnt/covswap
-          free -h
+          echo "after:"; df -h / /mnt; free -h
       - name: Enforce coverage
         # --engine llvm: parity with the local gate (see docs/testing.md).
         # --skip-clean: reuse the cached instrumented target. --timeout 180: raise
         # the per-test cap from tarpaulin's 60 s default. --verbose: log progress.
-        # RUST_TEST_THREADS=1: run the instrumented tests SERIALLY so only one
-        # subprocess-spawning test's process tree is resident at once — the main
-        # lever against the OOM (the normal test job parallelises freely, but
-        # instrumented + parallel + subprocess-spawning overflowed 7 GB of RAM).
+        # Env, all aimed at the OOM (AI-23):
+        #   RUST_TEST_THREADS=1 — instrumented tests run SERIALLY (one subprocess-
+        #     spawning test's process tree resident at a time).
+        #   CARGO_PROFILE_DEV_DEBUG=1 — line-tables-only debuginfo instead of full:
+        #     smaller instrumented binaries (less RAM) and a smaller target on `/`
+        #     (less disk). Verified locally to leave coverage unchanged at 95.20% —
+        #     llvm line-mapping needs only line tables, not full debuginfo.
         env:
           RUST_TEST_THREADS: "1"
+          CARGO_PROFILE_DEV_DEBUG: "1"
         run: cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose --workspace --fail-under 95

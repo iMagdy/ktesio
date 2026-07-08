@@ -24,12 +24,18 @@
 //! constructs and inspects it.
 
 use ktesio_adapter_api::{
-    AdapterError, AgentAdapter, Capability, CapabilityDeclaration, MeteringSource, OsId,
-    SupportLevel,
+    AdapterError, AgentAdapter, Capability, CapabilityDeclaration, ConfigMapping, ConfigTarget,
+    MeteringSource, OsId, SupportLevel,
 };
 
 /// The kind string the mock adapter registers under.
 pub const MOCK_KIND: &str = "mock";
+
+/// The mock's code-declared config-mapping target for the documented `model` key
+/// (story 2-2): the ENV var `MODEL`. MUST match the shipping engine builtin's
+/// [`MOCK_MODEL_ENV_VAR`] — the cross-boundary parity test in the engine guards
+/// the two fixtures against drift.
+pub const MOCK_MODEL_ENV_VAR: &str = "MODEL";
 
 /// A native [`AgentAdapter`] fixture with a per-OS Capability Declaration.
 ///
@@ -95,6 +101,14 @@ impl AgentAdapter for MockAdapter {
 
     fn metering_source(&self) -> MeteringSource {
         MeteringSource::SelfReported
+    }
+
+    /// The code-declared unified→native config mapping (story 2-2): `model` → the
+    /// ENV var [`MOCK_MODEL_ENV_VAR`]. Mirrors the shipping engine `BuiltinMock`
+    /// so this fixture stays a faithful stand-in (the engine's cross-boundary
+    /// parity test guards the two against drift).
+    fn config_mapping(&self) -> ConfigMapping {
+        ConfigMapping::new().with("model", ConfigTarget::env(MOCK_MODEL_ENV_VAR))
     }
 
     // Lifecycle ops intentionally use the trait's default (unavailable) bodies:
@@ -228,6 +242,19 @@ mod tests {
         assert_eq!(mock.metering_source(), MeteringSource::SelfReported);
         assert!(!mock.capabilities().is_empty());
         assert_eq!(mock.capabilities().len(), 2);
+    }
+
+    #[test]
+    fn mock_declares_the_model_env_config_mapping() {
+        // Story 2-2: the fixture mirrors the shipping builtin's `model` → env
+        // `MODEL` mapping (the engine parity test guards the two against drift).
+        let mock = MockAdapter::new();
+        let mapping = mock.config_mapping();
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(
+            mapping.target("model").unwrap().env_var(),
+            Some(MOCK_MODEL_ENV_VAR)
+        );
     }
 
     #[test]

@@ -136,7 +136,17 @@ Details:
   one instance's effective capabilities and runtime status. Both list and show
   accept --json for a machine-readable document (budget/cap and Usage Ledger
   columns are honest Epic-3 seeds until metering lands: '—' in the table, null in
-  JSON). Removing a running instance requires --force.
+  JSON). config set writes a key to the Agent Instance layer (validated at write
+  time — an unknown key outside the agent.* pass-through namespace is rejected
+  with the nearest valid key suggested, and nothing is persisted); config get
+  prints the effective (resolved) config, where a key set at the instance layer
+  overrides the same key at the kind/engine-default layer, every time (FR-11);
+  each value names its source layer (a Source column, or a source field with
+  --json), and starting an instance persists an effective-config snapshot in the
+  Agent Home. A secret:NAME value is resolved from the environment or the engine
+  secrets file at start and delivered to the agent, but is MASKED in config get,
+  the snapshot, logs, and events (FR-14); config get --reveal is the sole way to
+  print it unmasked. Removing a running instance requires --force.
 
 Examples:
   kt agent register demo --kind mock
@@ -148,6 +158,12 @@ Examples:
   kt agent show demo
   kt agent list
   kt agent list --json
+  kt agent config set demo model gpt-4
+  kt agent config set demo agent.api_key secret:OPENAI_KEY
+  kt agent config get demo
+  kt agent config get demo model
+  kt agent config get demo --json
+  kt agent config get demo --reveal
   kt agent remove demo --delete";
 
 #[derive(Parser)]
@@ -370,6 +386,42 @@ enum AgentCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Get or set an Agent Instance's unified config (layered, FR-11)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set a config key on the Agent Instance layer (validated at write time)
+    Set {
+        /// Name of the Agent Instance
+        name: String,
+        /// Config key (a known unified key, or an `agent.*` pass-through key)
+        key: String,
+        /// Value to set (stored verbatim; a `secret:NAME` reference is resolved +
+        /// masked at start/read, FR-14 — the reference is what is stored here)
+        value: String,
+    },
+    /// Get an Agent Instance's effective (resolved) config value(s) with per-value source
+    Get {
+        /// Name of the Agent Instance
+        name: String,
+        /// Optional config key; omitted prints the whole effective config
+        key: Option<String>,
+        /// Emit the effective config (value + source layer per leaf) as JSON (FR-13)
+        #[arg(long)]
+        json: bool,
+        /// Reveal secret values unmasked (the SOLE explicit acknowledgment; FR-14).
+        /// Without it, `secret:` values are masked in both the table and --json.
+        /// Never un-masks the persisted snapshot, logs, or events. Re-resolves
+        /// secrets LIVE (env, then the secrets file) at read time, so a revealed
+        /// value may differ from what a running instance resolved at its start.
+        #[arg(long)]
+        reveal: bool,
+    },
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -461,6 +513,17 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Resume { name } => cli::agent::resume(&name),
             AgentCommands::List { json } => cli::agent::list(json),
             AgentCommands::Show { name, json } => cli::agent::show(&name, json),
+            AgentCommands::Config { command } => match command {
+                ConfigCommands::Set { name, key, value } => {
+                    cli::agent::config_set(&name, &key, &value)
+                }
+                ConfigCommands::Get {
+                    name,
+                    key,
+                    json,
+                    reveal,
+                } => cli::agent::config_get(&name, key.as_deref(), json, reveal),
+            },
         },
         None => {
             Cli::command().print_help()?;
@@ -514,6 +577,31 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "resume"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
+    }
+
+    #[test]
+    fn test_agent_config_parse() {
+        // Story 2-1: `config set <name> <key> <value>` and
+        // `config get <name> [key]` parse (a nested subcommand).
+        assert!(
+            Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model", "gpt-4"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model"]).is_ok());
+        // Story 2-3: `config get` accepts `--json` (whole config or single key).
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model", "--json"])
+                .is_ok()
+        );
+        // set requires all three positional args.
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model"]).is_err());
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo"]).is_err());
+        // get requires at least a name.
+        assert!(Cli::try_parse_from(["kt", "agent", "config", "get"]).is_err());
+        // config requires a subcommand.
+        assert!(Cli::try_parse_from(["kt", "agent", "config"]).is_err());
     }
 
     #[test]
