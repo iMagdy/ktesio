@@ -53,6 +53,11 @@ pub mod adapter;
 mod backends;
 pub mod domain;
 mod engine;
+// Engine-observed metering (AD-7 / FR-19), story 3-4: the loopback forward
+// listener + the OpenAI `usage` parse. Engine-INTERNAL (AD-2 — `kt` never sees
+// the listener); the supervisor drives it. Portable — NO OS cfg (in core, not
+// `backends/`; the OS-cfg gate stays green).
+mod metering;
 pub mod paths;
 pub mod ports;
 mod store;

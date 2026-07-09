@@ -73,6 +73,17 @@
 //!   exit immediately. The process dies with a half-line in the log, so ONLY the
 //!   engine's TERMINAL drain-on-reap can rescue it — the H1 under-count proof (a
 //!   mid-run drain, which stops at the last newline, would strand it forever).
+//! * `--observed-calls <N>` (story 3-4)  ENGINE-OBSERVED mode: after announcing
+//!   readiness, make `<N>` OpenAI-compatible completion requests to the `base_url`
+//!   the engine INJECTED into this process's environment (`OPENAI_BASE_URL` — the
+//!   env var an `engine-observed` manifest maps `metering.base_url` onto). Each is a
+//!   minimal `POST <base_url>/v1/chat/completions`; the engine's loopback forward
+//!   listener relays it to a test upstream stub and skims the `usage` out of the
+//!   response into the ledger. This is the `engine-observed` half of FR-19: the
+//!   agent reports NOTHING itself — the engine OBSERVES its model traffic. A tiny
+//!   pure-`std` HTTP/1.1 client (a raw `TcpStream` — NO dependency, NO OS-cfg) makes
+//!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
+//!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -119,6 +130,18 @@ struct Opts {
     /// past the batch), so the TERMINAL drain-on-reap must consume the newline-less
     /// tail or that event is stranded and lost.
     final_usage_no_newline: bool,
+    /// ENGINE-OBSERVED mode (story 3-4): after announcing readiness, make `<N>`
+    /// OpenAI-compatible completion requests to the `base_url` the engine injected
+    /// into this process's environment (read from `OPENAI_BASE_URL` — the env var an
+    /// `engine-observed` manifest maps `metering.base_url` onto). Each POST goes to
+    /// `<base_url>/v1/chat/completions`; the engine's loopback listener forwards it
+    /// to the test upstream stub and skims the `usage` out of the response. `0` =
+    /// no observed calls (the default; existing self-reported tests unaffected).
+    observed_calls: u64,
+    /// The `Authorization: Bearer <value>` the observed calls carry (story 3-4
+    /// no-leak test): a sentinel API key the proxy must relay UPSTREAM faithfully but
+    /// leak into NONE of ktesio's surfaces. `None` = no auth header sent.
+    observed_auth: Option<String>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -159,6 +182,8 @@ fn parse() -> Opts {
     let mut usage_input_tokens = None;
     let mut usage_output_tokens = None;
     let mut final_usage_no_newline = false;
+    let mut observed_calls = 0;
+    let mut observed_auth = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -184,6 +209,16 @@ fn parse() -> Opts {
                 }
             }
             "--final-usage-no-newline" => final_usage_no_newline = true,
+            "--observed-calls" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    observed_calls = n;
+                }
+            }
+            "--observed-auth" => {
+                if let Some(v) = args.next() {
+                    observed_auth = Some(v);
+                }
+            }
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -234,6 +269,8 @@ fn parse() -> Opts {
         usage_input_tokens,
         usage_output_tokens,
         final_usage_no_newline,
+        observed_calls,
+        observed_auth,
     }
 }
 
@@ -304,6 +341,36 @@ fn main() {
         let _ = writeln!(stdout, "{}", usage_line(0, input_tokens, output_tokens));
         let _ = stdout.flush();
     }
+
+    // Story 3-4 (ENGINE-OBSERVED): make `observed_calls` OpenAI-compatible completion
+    // requests to the injected `base_url` (read from OPENAI_BASE_URL — the env var the
+    // engine-observed manifest maps `metering.base_url` onto). The engine's loopback
+    // forward listener relays each to the upstream stub and skims `usage` into the
+    // ledger. Readiness-gated (AFTER the ready line) + count-bounded, so the test waits
+    // for the KNOWN committed observed-row count, not a wall clock. Pure `std` HTTP.
+    if opts.observed_calls > 0 {
+        // The base_url the engine injected. Absent → nothing to call (a
+        // misconfiguration the test would catch as zero committed rows); announce it
+        // to stderr as a diagnostic and skip (never crash).
+        match std::env::var("OPENAI_BASE_URL") {
+            Ok(base_url) if !base_url.trim().is_empty() => {
+                for _ in 0..opts.observed_calls {
+                    // Best-effort per call: a transport hiccup is skipped (the test
+                    // asserts on committed rows, not on this loop). A small pause lets
+                    // the ~250ms reaper drain the observed queue between calls.
+                    let _ = post_completion(base_url.trim(), opts.observed_auth.as_deref());
+                    sleep(Duration::from_millis(20));
+                }
+            }
+            _ => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fake_agent: --observed-calls set but OPENAI_BASE_URL is unset/empty"
+                );
+            }
+        }
+    }
+
     // Story 3-1 (H1): a Run's FINAL usage line, flushed WITHOUT a trailing newline,
     // must not be stranded when the process exits. First stay alive PAST the engine's
     // ~300ms startup readiness window (so `start` confirms `running` — an immediate
@@ -373,6 +440,66 @@ fn write_marker(path: &Option<PathBuf>, phase: &str) {
             format!("fake_agent {phase} pid={}\n", std::process::id()),
         );
     }
+}
+
+/// Make ONE minimal OpenAI-compatible completion POST to `<base_url>/v1/chat/completions`
+/// (story 3-4 engine-observed mode). Pure `std` HTTP/1.1 over a raw `TcpStream` — NO
+/// dependency, NO OS-cfg. Sends a tiny JSON body, reads (and discards) the response.
+/// Best-effort: any error is returned to the caller which skips it (the test asserts
+/// on committed ledger rows, not on this call succeeding byte-for-byte). The `base_url`
+/// is `http://127.0.0.1:<port>` (the engine's loopback listener); we parse the
+/// host:port out of it, connect, and speak the minimal HTTP/1.1 a proxy relays.
+#[cfg(not(tarpaulin_include))]
+fn post_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    // Parse `http://<host>:<port>` → the `host:port` authority (v1 the injected URL
+    // is always http loopback with an explicit port). Strip the scheme + any path.
+    let authority = base_url
+        .strip_prefix("http://")
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty authority",
+        ));
+    }
+
+    let body = br#"{"model":"gpt-observed","messages":[{"role":"user","content":"hi"}]}"#;
+    // An optional `Authorization: Bearer <key>` header (the no-leak sentinel): the
+    // proxy must relay it UPSTREAM faithfully but leak it into none of ktesio's
+    // surfaces. Included verbatim in the request head when set.
+    let auth_header = match auth {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    // A minimal, correct HTTP/1.1 request: the path the OpenAI client uses, Host, a
+    // JSON content-type, an explicit content-length, and Connection: close so the
+    // upstream/proxy closes the socket after one response (simplest read loop).
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         {auth_header}\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        len = body.len(),
+    );
+
+    let mut stream = TcpStream::connect(authority)?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    // Read the whole response and discard it (the engine skims `usage` on its side;
+    // the agent just needs a faithful response, which we do not inspect here).
+    let mut sink = Vec::new();
+    let _ = stream.read_to_end(&mut sink);
+    Ok(())
 }
 
 /// Best-effort write of the received argv + environment to the `--dump` file

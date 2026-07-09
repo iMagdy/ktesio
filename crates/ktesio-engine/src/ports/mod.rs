@@ -7,9 +7,12 @@
 //! resolution, AD-10 — env + the 0600 secrets file; OS-keychain stays a deferred
 //! resolver behind the same port), and, from story 3-1, [`UsageSource`] (the AD-7
 //! metering INGESTION seam — the self-reported channel that yields usage from a
-//! running instance; the `engine-observed` loopback listener is a deferred impl
-//! behind the same port, story 3-4). The remaining port (`MemoryBacking`) arrives
-//! with the story that needs it (entity-timing) — no speculative port trees.
+//! running instance). Story 3-4 landed the SECOND source, [`ObservedUsageSource`]
+//! (`engine-observed`): it is fed by the loopback forward listener
+//! (`crate::metering`) and, being event-driven rather than a log-tail drainer,
+//! mints its [`ParsedUsage`] directly while yielding the SAME shape into the SAME
+//! commit choke point. The remaining port (`MemoryBacking`) arrives with the story
+//! that needs it (entity-timing) — no speculative port trees.
 
 mod process_backend;
 mod secret_resolver;
@@ -25,8 +28,8 @@ pub use secret_resolver::{
 };
 pub use state_store::{SpawnRecord, StateStore};
 pub use usage_source::{
-    assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line, ParsedUsage,
-    SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
+    assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line,
+    ObservedUsageSource, ParsedUsage, SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
 };
 
 use thiserror::Error;

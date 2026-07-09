@@ -98,6 +98,33 @@ pub const BUDGET_DOLLARS_PER_RUN_KEY: &str = "budget.dollars.per_run";
 /// cumulative dollar scope is unset.
 pub const BUDGET_DOLLARS_CUMULATIVE_KEY: &str = "budget.dollars.cumulative";
 
+/// The engine-namespace config key for the ENGINE-OBSERVED upstream provider base
+/// URL (story 3-4, FR-19/AD-7). The OPERATOR sets it to the agent's REAL
+/// OpenAI-compatible provider endpoint (e.g. `"http://127.0.0.1:1234"` for a local
+/// gateway); the engine's loopback forward listener FORWARDS observed traffic
+/// there. Absent → an `engine-observed` instance cannot start its listener (a
+/// typed start error naming this key), since there is nowhere to forward. v1 is
+/// HTTP-only (an `https://` upstream is a documented deferral). ENGINE-INTERNAL
+/// config — it does NOT touch the Adapter Contract surface (no `CONTRACT_VERSION`
+/// bump), exactly like the budget/cost keys.
+pub const METERING_UPSTREAM_BASE_URL_KEY: &str = "metering.upstream_base_url";
+
+/// The RESERVED engine-namespace config key the engine INJECTS the loopback
+/// listener address into at start (story 3-4, AC6). The engine writes
+/// `http://127.0.0.1:<port>` here as an INVOCATION-OVERRIDE leaf at `starting` for
+/// an `engine-observed` instance, and the adapter's EXISTING `[config]` mapping
+/// (story 2-2) delivers it into the agent's native mechanism — the adapter
+/// declares e.g. `[config."metering.base_url"] env = "OPENAI_BASE_URL"`, pointing
+/// the agent's OpenAI-compatible `base_url` at the listener (FR-19 "the Adapter
+/// routes the Agent's model traffic through an Engine-provided interception
+/// point"). A KNOWN key so a mapping can target it, but the OPERATOR does NOT set
+/// it — the address is ephemeral (known only at spawn) and ENGINE-computed (the
+/// engine is the sole authority on the listen address, AC-B). Reusing the existing
+/// config-mapping means NO new contract surface (no `CONTRACT_VERSION` bump). A
+/// hand-set value in a lower layer is harmless — the engine's start-time override
+/// always wins (the invocation layer is strongest).
+pub const METERING_BASE_URL_KEY: &str = "metering.base_url";
+
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
 /// delivered verbatim (the mapping into an agent's native mechanism is 2-2,
@@ -544,6 +571,12 @@ const KNOWN_KEYS: &[&str] = &[
     COST_RATE_OUTPUT_KEY,
     BUDGET_DOLLARS_PER_RUN_KEY,
     BUDGET_DOLLARS_CUMULATIVE_KEY,
+    // Story 3-4 (engine-observed metering): the operator-set real-upstream URL, and
+    // the engine-injected loopback base_url the adapter's mapping delivers. Both are
+    // engine-namespace keys (NOT `agent.*` pass-through); neither touches the Adapter
+    // Contract surface (no CONTRACT_VERSION bump).
+    METERING_UPSTREAM_BASE_URL_KEY,
+    METERING_BASE_URL_KEY,
 ];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
@@ -892,6 +925,21 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
         .and_then(|s| s.trim().parse::<BreachAction>().ok())
         .unwrap_or_default();
     (rate, cap, action)
+}
+
+/// Resolve the ENGINE-OBSERVED upstream provider base URL from an already-resolved
+/// [`EffectiveConfig`] (story 3-4, AC6) — the operator's real OpenAI-compatible
+/// endpoint the loopback listener forwards to. Returns the trimmed string value of
+/// [`METERING_UPSTREAM_BASE_URL_KEY`], or `None` when unset / not a string /
+/// empty. A secret-classified value is NOT a URL → `None` (defensive; the URL is
+/// not a secret). The listener validates it is a usable `http://…` URL at start
+/// (v1 HTTP-only); this only reads the leaf.
+pub fn resolve_upstream_base_url(effective: &EffectiveConfig) -> Option<String> {
+    let value = effective.value(METERING_UPSTREAM_BASE_URL_KEY)?;
+    match value {
+        Value::String(s) if !is_secret_ref(s) && !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    }
 }
 
 /// Read a dollar-string leaf into [`Micros`], coercing the TOML value (story 3-3,
@@ -1603,8 +1651,10 @@ mod tests {
         // sole known key.
         assert!(!is_known_key("restart.policy"));
         assert!(validate_write("restart.policy", "never").is_err());
-        // `model` plus the three story-3-2 Token-Budget keys plus the four story-3-3
-        // dollar keys (Rate ×2 + Cost Cap ×2) are the known set.
+        // `model` + the three story-3-2 Token-Budget keys + the four story-3-3 dollar
+        // keys (Rate ×2 + Cost Cap ×2) + the two story-3-4 engine-observed metering
+        // keys (the operator-set upstream URL + the engine-injected loopback base_url)
+        // are the known set.
         assert_eq!(
             KNOWN_KEYS,
             &[
@@ -1616,8 +1666,15 @@ mod tests {
                 "cost.rate.output",
                 "budget.dollars.per_run",
                 "budget.dollars.cumulative",
+                "metering.upstream_base_url",
+                "metering.base_url",
             ]
         );
+        // Story 3-4: both metering keys are known (a mapping can target them) and
+        // accepted as ordinary string writes (no special value type-check).
+        assert!(is_known_key("metering.upstream_base_url"));
+        assert!(is_known_key("metering.base_url"));
+        assert!(validate_write("metering.upstream_base_url", "http://127.0.0.1:1234").is_ok());
     }
 
     #[test]
@@ -2056,6 +2113,36 @@ mod tests {
         assert_eq!(cap.cumulative, Some(Micros(50_000_000)));
         // The SAME breach-action key governs the dollar breach.
         assert_eq!(action, BreachAction::Stop);
+    }
+
+    #[test]
+    fn resolve_upstream_base_url_reads_the_operator_key_or_none() {
+        // Story 3-4 (AC6): the operator's real provider endpoint is read from
+        // `metering.upstream_base_url` (trimmed); absent / empty / secret → None.
+        let set = resolve(one_layer(
+            SourceLayer::Instance,
+            "[metering]\nupstream_base_url = \"  http://127.0.0.1:1234  \"\n",
+        ));
+        assert_eq!(
+            resolve_upstream_base_url(&set).as_deref(),
+            Some("http://127.0.0.1:1234"),
+            "trimmed operator upstream"
+        );
+        // Absent → None (an engine-observed start then fails fast with a clear error).
+        let absent = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
+        assert_eq!(resolve_upstream_base_url(&absent), None);
+        // A secret-classified value is NOT a URL → None (defensive).
+        let secret = resolve(one_layer(
+            SourceLayer::Instance,
+            "[metering]\nupstream_base_url = \"secret:UPSTREAM\"\n",
+        ));
+        assert_eq!(resolve_upstream_base_url(&secret), None);
+        // An empty string → None.
+        let empty = resolve(one_layer(
+            SourceLayer::Instance,
+            "[metering]\nupstream_base_url = \"   \"\n",
+        ));
+        assert_eq!(resolve_upstream_base_url(&empty), None);
     }
 
     #[test]

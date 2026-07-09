@@ -47,9 +47,10 @@ use ktesio_adapter_api::{Capability, OsId, SupportLevel};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
+use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
-    assemble_usage_event, BackendError, ParsedUsage, ProcessBackend, ProcessStatus,
-    SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+    assemble_usage_event, BackendError, ObservedUsageSource, ParsedUsage, ProcessBackend,
+    ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
 };
 use crate::time::now_rfc3339;
 
@@ -219,6 +220,19 @@ struct Supervised {
     /// freshly minted) begins empty, giving "at most one breach per (dimension,
     /// scope) per Run".
     breached_scopes: std::collections::HashSet<(BreachDimension, BreachScope)>,
+    /// The per-instance loopback forward listener for an `engine-observed` instance
+    /// (story 3-4), or `None` for a `self-reported` instance (whose start path is
+    /// UNCHANGED). Held for the Run; DROPPED at the terminal transition (which
+    /// aborts its accept-loop task — teardown bounded to the Run, no orphan
+    /// listeners, NFR-1). A restart opens a NEW listener under the new Run.
+    observed_listener: Option<ObservedListener>,
+    /// The `engine-observed` source (story 3-4): the per-Run monotonic `sequence`
+    /// minter for observed completions (the agent supplies no ordinal). Fresh per
+    /// Run (built here with the freshly-minted `run_id`), so the ordinal resets per
+    /// Run — preserving the `UNIQUE(instance_id, run_id, sequence)` dedup invariant.
+    /// Present only for an `engine-observed` instance (a `self-reported` instance
+    /// leaves it `None` and drives the log-tail `drain_usage_for` instead).
+    observed_source: Option<ObservedUsageSource>,
 }
 
 /// The lifecycle supervisor: owns running process handles + drives transitions.
@@ -234,24 +248,57 @@ pub struct Supervisor {
     running: HashMap<InstanceName, Supervised>,
     usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
+    /// The engine's tokio runtime handle (story 3-4), used to SPAWN the loopback
+    /// forward listener's accept loop for an `engine-observed` instance. The
+    /// supervisor's sync start path runs on the blocking pool, so it cannot use
+    /// `Handle::current`; the engine threads its handle in via
+    /// [`Supervisor::with_runtime`]. `None` (the [`Supervisor::new`]/
+    /// [`Supervisor::with_backoff`] default) means "no runtime to spawn a
+    /// listener" — an `engine-observed` start then fails fast with a clear error
+    /// (only the sync unit tests, which never start an observed instance, use the
+    /// handle-less constructors).
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Supervisor {
     /// Construct an empty supervisor with the current OS's process backend and
     /// the PRODUCTION backoff schedule (1s base, ×2, 60s cap — spine AD-15).
+    ///
+    /// NO runtime handle (story 3-4) — so this cannot start an `engine-observed`
+    /// listener. Production uses [`Supervisor::with_runtime`] (the engine threads
+    /// its runtime handle in); this handle-less form remains for the sync unit
+    /// tests that only exercise self-reported / lifecycle paths.
     pub fn new() -> Self {
         Self {
             backend: backends::current(),
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
+            runtime: None,
+        }
+    }
+
+    /// Construct an empty supervisor with the PRODUCTION backoff schedule AND the
+    /// engine's tokio runtime handle (story 3-4) — the production constructor the
+    /// engine uses. The handle lets an `engine-observed` start SPAWN its loopback
+    /// forward listener's accept loop on the engine runtime (the supervisor's sync
+    /// start path runs on the blocking pool, so `Handle::current` is unavailable;
+    /// a `Handle` spawns onto its runtime from any thread).
+    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            backend: backends::current(),
+            running: HashMap::new(),
+            usage_source: SelfReportedUsageSource::new(),
+            backoff: BackoffSchedule::production(),
+            runtime: Some(runtime),
         }
     }
 
     /// Construct an empty supervisor with a custom backoff schedule (TEST
     /// injection, so the crash-loop / backoff legs run in milliseconds without
     /// weakening the production constants). Production always uses
-    /// [`Supervisor::new`].
+    /// [`Supervisor::with_runtime`]. NO runtime handle — the lib tests using this
+    /// never start an `engine-observed` instance.
     #[cfg(test)]
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
@@ -259,6 +306,7 @@ impl Supervisor {
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff,
+            runtime: None,
         }
     }
 
@@ -344,6 +392,33 @@ impl Supervisor {
             .map_err(|e| config_to_engine(&name, e))?;
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-observed) ENGINE-OBSERVED metering (story 3-4, AC-A/AC6): for an
+        // `engine-observed` instance, START the loopback forward listener HERE
+        // (before the mapping application + the `starting` transition, so a listener
+        // failure rejects the start cleanly with NO state change — mirroring the
+        // secret/snapshot failures), then INJECT its loopback `http://127.0.0.1:<port>`
+        // address as a `metering.base_url` INVOCATION-OVERRIDE so the adapter's
+        // EXISTING config-mapping (2-2) delivers it into the agent's native mechanism
+        // (e.g. env `OPENAI_BASE_URL`). The address is ENGINE-computed (the engine is
+        // the sole authority — AC-B); the adapter merely receives it. A `self-reported`
+        // instance leaves `observed_listener` None and its start path UNCHANGED. The
+        // held listener is moved into `Supervised` on success; on any later start
+        // failure its `Drop` aborts the accept-loop task (RAII teardown, no leak).
+        let observed_listener =
+            self.start_observed_listener(&name, &metering_source, &effective)?;
+        // The effective config the MAPPING applies: for an observed instance it
+        // carries the engine-injected loopback base_url as an override (so the mapping
+        // delivers it); otherwise it is the plain operator config. The SNAPSHOT (2c)
+        // below stays on the plain `effective` (the operator config), so the ephemeral
+        // loopback URL is NOT persisted as "what applied" — honest provenance.
+        let mapping_effective = match observed_listener.as_ref() {
+            Some(listener) => registry
+                .effective_config(&name, base_url_override(listener.base_url()))
+                .map_err(|e| config_to_engine(&name, e))?,
+            None => effective.clone(),
+        };
+
         // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
         // the mapping application (story 2-4, spine AD-10, AC-A/AC9). This is where
         // display and delivery DIVERGE: `effective`'s `display()`-based surfaces
@@ -354,9 +429,9 @@ impl Supervisor {
         // the start cleanly (no half-launch, mirroring the config-apply + snapshot
         // failures) — a typed `EngineError::Secret` that NEVER echoes a value.
         let secrets = registry
-            .resolve_secrets(&effective)
+            .resolve_secrets(&mapping_effective)
             .map_err(|e| secret_to_engine(&name, e))?;
-        adapter::apply_config_mapping(&mut launch, &mapping, &effective, &secrets, &home)
+        adapter::apply_config_mapping(&mut launch, &mapping, &mapping_effective, &secrets, &home)
             .map_err(|e| config_apply_to_engine(&name, e))?;
 
         // (2c) Persist the effective-config snapshot into the Agent Home (story
@@ -484,6 +559,14 @@ impl Supervisor {
         // bleed in the previous Run's usage. The ingestion cursor was anchored at the
         // pre-spawn log length (above), so this Run ingests all of its own output.
         let run_id = RunId::mint();
+        // Story 3-4: an `engine-observed` instance holds its listener + a fresh
+        // per-Run observed `sequence` minter (built here with the just-minted
+        // run_id, so the ordinal resets per Run — the AD-7 Run boundary + the dedup
+        // invariant). A `self-reported` instance leaves both `None` (its log-tail
+        // drain is unchanged).
+        let observed_source = observed_listener
+            .as_ref()
+            .map(|_| ObservedUsageSource::new());
         self.running.insert(
             name.clone(),
             Supervised {
@@ -497,6 +580,8 @@ impl Supervisor {
                 // that stops and starts again gets a new Run + a clean latch, so it
                 // can fire one cumulative breach in the new Run too.
                 breached_scopes: std::collections::HashSet::new(),
+                observed_listener,
+                observed_source,
             },
         );
 
@@ -605,6 +690,11 @@ impl Supervisor {
         // end-of-log rather than stranded (H1). Best-effort — a drain hiccup never
         // blocks the stop.
         self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // Drain any final ENGINE-OBSERVED usage still queued before the listener is
+        // torn down (story 3-4): a completion the proxy parsed just before the stop
+        // must land, not be lost when the `Supervised` (and its listener) is dropped
+        // below. Best-effort, mirroring the self-reported terminal drain.
+        self.drain_observed_for(registry, &name);
 
         // Ask the backend to stop the process (group/job). If we have no handle
         // for it (the row says running but this engine holds no handle AND orphan
@@ -892,6 +982,13 @@ impl Supervisor {
         // agent-output log into the Usage Ledger while an instance is `running`.
         // Best-effort per instance; a drain hiccup never blocks crash detection.
         self.drain_usage_all(registry);
+        // Then INGEST engine-observed usage (story 3-4): drain each observed
+        // instance's listener queue (the counts the loopback proxy parsed out of the
+        // agent's model traffic) into the SAME `ingest_usage` choke point, minting
+        // the per-Run `sequence`. This reaper cadence (~250ms) lands observed usage
+        // well within the AD-7/FR-19 flush bound (≤5s) of call completion. Best-
+        // effort per instance, exactly like the self-reported drain.
+        self.drain_observed_all(registry);
 
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
@@ -914,6 +1011,11 @@ impl Supervisor {
             // TERMINAL drain — the process is dead, so consume a final newline-less
             // usage line to end-of-log instead of stranding it (H1).
             self.drain_usage_for(registry, &name, DrainMode::Terminal);
+            // Drain any final ENGINE-OBSERVED usage still queued before the crashed
+            // instance's listener is torn down (story 3-4): a completion parsed just
+            // before the crash must land, not be lost when the `Supervised` is
+            // removed below. Best-effort, mirroring the self-reported terminal drain.
+            self.drain_observed_for(registry, &name);
 
             // Read the store state: only an instance the store still shows
             // running/paused is an UNREQUESTED crash. A `stopping` (operator
@@ -1123,6 +1225,25 @@ impl Supervisor {
                             // run_id died with the crashed engine), so its breach latch
                             // starts empty too (story 3-2).
                             breached_scopes: std::collections::HashSet::new(),
+                            // ENGINE-OBSERVED across a crash/adoption (story 3-4,
+                            // tracked follow-up — NOT just a metering gap): the pre-crash
+                            // listener died with the crashed engine, but the already-
+                            // running agent's `base_url` STILL points at that now-DEAD
+                            // loopback port. So the adopted agent's MODEL TRAFFIC ITSELF
+                            // breaks — its completion calls hit the dead port and fail
+                            // with a connection-refused error (not merely un-metered).
+                            // This fails LOUD (a transport error the agent surfaces),
+                            // never a corrupt/silent-wrong output. We cannot rebind the
+                            // old port to a fresh listener here (the agent chose no port;
+                            // the OS did), so we leave it un-observed with no listener;
+                            // RECOVERY is an operator stop→start, which relaunches the
+                            // agent pointed at a fresh listener. The full fix (re-launch
+                            // an adopted observed instance / a stable per-instance listener
+                            // port / the Epic-7 daemon owning the listener) is a tracked
+                            // follow-up, not done here. A self-reported instance's
+                            // log-tail drain is unaffected (it needs no listener).
+                            observed_listener: None,
+                            observed_source: None,
                         },
                     );
                     adopted += 1;
@@ -1247,6 +1368,67 @@ impl Supervisor {
         }
     }
 
+    /// Start the loopback forward listener for an `engine-observed` instance
+    /// (story 3-4, AC-A/AC-B/AC6), or return `Ok(None)` for a `self-reported`
+    /// instance (whose start path is UNCHANGED). Runs at `starting`, BEFORE any
+    /// persisted state change, so a failure rejects the start cleanly.
+    ///
+    /// For an `engine-observed` instance it: (1) resolves the operator-configured
+    /// real upstream provider URL (`metering.upstream_base_url`) from `effective`;
+    /// (2) requires the engine runtime handle (the listener's accept loop runs on
+    /// it) — absent → a clear error (only the handle-less unit-test supervisor lacks
+    /// it, and it never starts an observed instance); (3) binds `127.0.0.1:0`
+    /// (loopback ONLY — AC-B) and spawns the accept loop. Every failure maps to a
+    /// TRAFFIC-FREE [`EngineError::ObservedMetering`] (no body/header/key — 2-4
+    /// no-leak). The returned [`ObservedListener`] is moved into `Supervised`; its
+    /// `base_url` is what the caller injects via the config-mapping (AC6).
+    fn start_observed_listener(
+        &self,
+        name: &InstanceName,
+        metering_source: &str,
+        effective: &crate::domain::EffectiveConfig,
+    ) -> Result<Option<ObservedListener>, EngineError> {
+        // Only an `engine-observed` instance runs a listener. `self-reported`
+        // (and any other) leaves it None — its start path is byte-unchanged.
+        if metering_source != "engine-observed" {
+            return Ok(None);
+        }
+        // The operator MUST configure the real upstream provider URL (there is
+        // nowhere to forward otherwise). Absent → a clear start error naming the key.
+        let upstream = config::resolve_upstream_base_url(effective).ok_or_else(|| {
+            EngineError::ObservedMetering {
+                name: name.as_str().to_string(),
+                detail: format!(
+                    "no upstream provider URL configured; set `{}` to the agent's real \
+                     OpenAI-compatible endpoint",
+                    crate::domain::METERING_UPSTREAM_BASE_URL_KEY
+                ),
+            }
+        })?;
+        // The listener's accept loop runs on the engine runtime; the sync start path
+        // (on the blocking pool) cannot use `Handle::current`, so the engine threads
+        // its handle in (`with_runtime`). A handle-less supervisor cannot observe.
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| EngineError::ObservedMetering {
+                name: name.as_str().to_string(),
+                detail: "the engine has no runtime handle to run the loopback listener \
+                     (engine-observed metering requires the async engine)"
+                    .to_string(),
+            })?;
+        // Bind loopback + spawn. A ListenerError is TRAFFIC-FREE by construction
+        // (bind/upstream-shape only — never a body/header/key), so mapping it into
+        // the detail cannot leak a secret (2-4 rigor).
+        let listener = ObservedListener::start(runtime, upstream).map_err(|e: ListenerError| {
+            EngineError::ObservedMetering {
+                name: name.as_str().to_string(),
+                detail: e.to_string(),
+            }
+        })?;
+        Ok(Some(listener))
+    }
+
     /// Watch a freshly spawned process for [`READINESS_WINDOW`]. Returns
     /// `Some(exit_code)` if the process died within the window (a launch failure,
     /// AC2 — the inner `Option<i32>` is the OS exit code, `None` if killed by a
@@ -1367,6 +1549,72 @@ impl Supervisor {
                     self.ingest_usage(registry, name, &run_id, &metering_source, &usage);
                 }
             }
+        }
+    }
+
+    /// Drain ENGINE-OBSERVED usage from EVERY currently-running observed instance
+    /// (story 3-4 — the reaper cadence, parallel to [`Self::drain_usage_all`]).
+    /// Best-effort per instance — one instance's drain never blocks another's or
+    /// crash detection. A `self-reported` instance (no observed listener) is a
+    /// no-op here (it rides the log-tail drain instead).
+    fn drain_observed_all(&mut self, registry: &Registry) {
+        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.drain_observed_for(registry, &name);
+        }
+    }
+
+    /// Drain one instance's OBSERVED usage queue (the counts the loopback listener
+    /// parsed out of the agent's model traffic) into the SAME [`Self::ingest_usage`]
+    /// choke point (story 3-4), minting the per-Run `sequence` for each.
+    ///
+    /// The listener task PUSHES each parsed `(input, output)` pair; this reaper pass
+    /// DRAINS the queue (event-driven, NOT the log-tail path — observed usage does
+    /// NOT ride the agent-output log, AD-12 contrast), the [`ObservedUsageSource`]
+    /// mints the engine-side `sequence` (the agent supplies none), and each becomes
+    /// a `ParsedUsage` fed to `ingest_usage` under the instance's CURRENT Run id +
+    /// `engine-observed` source. NO new ledger writer, NO new enforcement path — the
+    /// SAME choke point stamps + records + enforces (so 3-2 budgets + 3-3 caps apply
+    /// unchanged). A `self-reported` instance (no `observed_source`/`observed_listener`)
+    /// is a no-op. Best-effort: a lock hiccup skips this pass, never a crash.
+    fn drain_observed_for(&mut self, registry: &Registry, name: &InstanceName) {
+        // Read the Run context + drain the queue under the instance's held state.
+        // Collect the pushed counts + mint the per-Run sequence for each FIRST (a
+        // short critical section), then ingest OUTSIDE the borrow so `ingest_usage`
+        // can take `&mut self`.
+        let (run_id, metering_source, minted) = match self.running.get(name) {
+            Some(s) => {
+                // Only an observed instance has both a listener (its queue) + a source
+                // (the sequence minter). A self-reported instance skips (no-op).
+                let (Some(listener), Some(source)) =
+                    (s.observed_listener.as_ref(), s.observed_source.as_ref())
+                else {
+                    return;
+                };
+                let queue = listener.queue();
+                // Drain the queue: take every pushed pair (the lock is held only for
+                // the swap). A poisoned/failed lock is a best-effort skip.
+                let drained: Vec<(u64, u64)> = match queue.lock() {
+                    Ok(mut q) => q.drain(..).collect(),
+                    Err(_) => return,
+                };
+                if drained.is_empty() {
+                    return;
+                }
+                // Mint the per-Run ParsedUsage for each observed completion (the
+                // engine stamps `sequence`; the agent supplies none).
+                let minted: Vec<ParsedUsage> = drained
+                    .into_iter()
+                    .map(|(input, output)| source.mint(input, output))
+                    .collect();
+                (s.run_id.clone(), s.metering_source.clone(), minted)
+            }
+            None => return,
+        };
+        // Ingest each observed event through the SAME single choke point (stamps the
+        // Run id + `engine-observed` source + timestamp, records, and enforces).
+        for usage in &minted {
+            self.ingest_usage(registry, name, &run_id, &metering_source, usage);
         }
     }
 
@@ -1836,6 +2084,28 @@ impl Default for Supervisor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build the INVOCATION-OVERRIDE config layer that injects the engine-observed
+/// loopback `base_url` into the mapping (story 3-4, AC6). The engine writes the
+/// listener's `http://127.0.0.1:<port>` at the reserved
+/// [`METERING_BASE_URL_KEY`](crate::domain::METERING_BASE_URL_KEY) so the
+/// adapter's EXISTING config-mapping (2-2) delivers it into the agent's native
+/// mechanism. Because it is the INVOCATION layer (the strongest — AD-9), it always
+/// wins over any hand-set lower-layer value; and because the mapping reads it as an
+/// ordinary string leaf, NO new contract surface is introduced (no
+/// `CONTRACT_VERSION` bump). Pure — builds a one-key TOML table.
+fn base_url_override(base_url: &str) -> ConfigLayer {
+    let mut table = toml::value::Table::new();
+    // A DOTTED key (`metering.base_url`) is a nested table in TOML; build the nested
+    // shape so `resolve` flattens it to the dotted leaf the mapping targets.
+    let mut metering = toml::value::Table::new();
+    metering.insert(
+        "base_url".to_string(),
+        toml::Value::String(base_url.to_string()),
+    );
+    table.insert("metering".to_string(), toml::Value::Table(metering));
+    ConfigLayer::from_table(table)
 }
 
 /// Append one transition event as a single JSON line to the instance log.
@@ -3108,6 +3378,109 @@ mod tests {
         assert_eq!(
             plan_drain(bytes, 4, DrainMode::Terminal),
             DrainPlan::Nothing
+        );
+    }
+
+    // ---- Story 3-4: engine-observed base_url injection + source selection ----
+
+    #[test]
+    fn base_url_override_builds_the_reserved_metering_leaf() {
+        // AC6: the engine injects the loopback URL at the reserved `metering.base_url`
+        // key as an INVOCATION override, so the adapter's config-mapping delivers it.
+        let layer = base_url_override("http://127.0.0.1:54321");
+        let resolved = crate::domain::resolve([
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            layer,
+        ]);
+        assert_eq!(
+            resolved
+                .value_display(crate::domain::METERING_BASE_URL_KEY)
+                .as_deref(),
+            Some("http://127.0.0.1:54321"),
+            "the loopback URL lands at the reserved metering.base_url leaf"
+        );
+    }
+
+    #[test]
+    fn self_reported_start_observed_listener_is_a_no_op() {
+        // Source selection: a `self-reported` instance's start path is UNCHANGED —
+        // start_observed_listener returns Ok(None), NO listener (even with an upstream
+        // configured, which a self-reported instance ignores).
+        let (_state, _manifest, registry) = setup_fake("selfrep_obs", &["--linger-ms", "1000"]);
+        let name = InstanceName::new("selfrep_obs").unwrap();
+        registry
+            .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
+            .unwrap();
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let sup = Supervisor::with_backoff(fast_backoff());
+        // self-reported (the fake manifest declares self-reported) → Ok(None).
+        let result = sup
+            .start_observed_listener(&name, "self-reported", &effective)
+            .expect("self-reported is a no-op, not an error");
+        assert!(
+            result.is_none(),
+            "a self-reported instance runs no listener"
+        );
+    }
+
+    #[test]
+    fn engine_observed_without_upstream_rejects_with_a_clear_error() {
+        // AC-A: an `engine-observed` instance with NO configured upstream URL rejects
+        // start_observed_listener with a traffic-free ObservedMetering error naming the
+        // key (nothing to forward to). Uses the handle-less test supervisor, but the
+        // upstream check fails FIRST (before the runtime-handle check), so the error
+        // names the missing config key.
+        let (_state, _manifest, registry) = setup_fake("obs_noup", &["--linger-ms", "1000"]);
+        let name = InstanceName::new("obs_noup").unwrap();
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let sup = Supervisor::with_backoff(fast_backoff());
+        let err = match sup.start_observed_listener(&name, "engine-observed", &effective) {
+            Err(e) => e,
+            Ok(_) => panic!("an engine-observed instance with no upstream must reject"),
+        };
+        match err {
+            EngineError::ObservedMetering { name: n, detail } => {
+                assert_eq!(n, "obs_noup");
+                assert!(
+                    detail.contains("metering.upstream_base_url"),
+                    "detail names the missing key: {detail}"
+                );
+            }
+            other => panic!("expected ObservedMetering, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_observed_without_runtime_handle_rejects_cleanly() {
+        // With an upstream configured but NO engine runtime handle (the handle-less
+        // test supervisor), an engine-observed start rejects with a clear, traffic-free
+        // error rather than panicking — the async engine is required to observe.
+        let (_state, _manifest, registry) = setup_fake("obs_nort", &["--linger-ms", "1000"]);
+        let name = InstanceName::new("obs_nort").unwrap();
+        registry
+            .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
+            .unwrap();
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let sup = Supervisor::with_backoff(fast_backoff()); // no runtime handle
+        let err = match sup.start_observed_listener(&name, "engine-observed", &effective) {
+            Err(e) => e,
+            Ok(_) => panic!("no runtime handle must reject an engine-observed start"),
+        };
+        assert!(
+            matches!(err, EngineError::ObservedMetering { .. }),
+            "expected ObservedMetering, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("runtime"),
+            "names the cause: {err}"
         );
     }
 }

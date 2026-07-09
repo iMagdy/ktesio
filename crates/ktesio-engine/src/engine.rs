@@ -154,7 +154,12 @@ impl Engine {
         })?;
         let inner = Arc::new(EngineInner {
             registry: Mutex::new(registry),
-            supervisor: Mutex::new(Supervisor::new()),
+            // Story 3-4: thread the engine runtime handle into the supervisor so an
+            // `engine-observed` start can spawn its loopback forward listener's
+            // accept loop on this runtime (the sync start path runs on the blocking
+            // pool, where `Handle::current` is unavailable). A `Handle` spawns onto
+            // its runtime from any thread, so this is sound.
+            supervisor: Mutex::new(Supervisor::with_runtime(rt.handle().clone())),
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the

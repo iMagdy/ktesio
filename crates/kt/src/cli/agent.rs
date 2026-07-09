@@ -1362,6 +1362,17 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 3-4 (AC-A): the engine-observed loopback forward listener could not
+        // start (no configured upstream URL, a non-http upstream, or a bind failure).
+        // It starts before the `starting` transition, so the instance stays in its
+        // prior state; the detail is traffic-free (never a body/header/key — NFR-6).
+        EngineError::ObservedMetering { name, detail } => AgentConfig {
+            message: format!(
+                "Agent Instance '{name}' could not start engine-observed metering: {detail}. \
+                 Nothing was changed; fix the metering configuration and start it again."
+            ),
+        }
+        .into(),
         EngineError::Backend { name, source } => AgentIo {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
         }
