@@ -7,7 +7,7 @@
 //! than hand-rolling field serialization, so `kt --json` and the future 7-2 Host
 //! event stream share ONE schema (AD-14: "one event schema, two consumers").
 //!
-//! ## Metering fields — usage (3-1), budget (3-2), and DOLLARS (3-3) are real
+//! ## Metering fields — usage (3-1), budget (3-2), DOLLARS (3-3), Fleet totals (3-5)
 //!
 //! Metering is Epic 3 (AD-7). Story 3-1 makes [`FleetEntry::usage`] REAL: a
 //! [`UsageView`] carrying the instance's cumulative (and current-Run) TOKEN totals
@@ -23,8 +23,18 @@
 //! instance (AC-B: no Rate ⇒ no dollar figure, never a fabricated `$0.00`), and
 //! `budget` stays `Option`-typed (`None` when NEITHER a token budget nor an
 //! enforceable dollar cap exists — a truthful ABSENCE). Populating these fields is a
-//! backward-additive change that does not bump [`crate::FLEET_SCHEMA_VERSION`] (a
-//! new reader parses every old document; the dollar fields default-null/absent).
+//! backward-additive change.
+//!
+//! Story 3-5 adds the Fleet-WIDE read: [`FleetTotals`] aggregates the per-instance
+//! rows into total tokens (input/output over every instance, every Run) + a total
+//! derived dollar figure, computed by the PURE [`FleetTotals::from_entries`] over the
+//! already-composed [`FleetEntry`] rows (no second ledger query — AD-2/AD-6). It rides
+//! on the [`FleetListing`] document (`totals`), and [`FleetListing::new`] computes it
+//! internally so the document is always self-consistent (the total is DERIVED from the
+//! rows it carries). Because the document GAINS a first-class aggregate that `--json`
+//! consumers + the future 7-2 Host stream negotiate on, [`crate::FLEET_SCHEMA_VERSION`]
+//! bumps 1 → 2 (ADDITIVE: a new reader parses every old v1 document, no field is
+//! renamed/removed; a v1 consumer that ignores `totals` still parses `instances`).
 //!
 //! ## Boundary (what this is NOT)
 //!
@@ -43,8 +53,9 @@ use super::name::InstanceName;
 use super::restart::RestartPolicy;
 use super::usage::UsageTotals;
 
-/// The per-instance TOKEN budget/status surfaced in Fleet detail (story 3-2, AC9)
-/// — TOKENS ONLY (AD-8: NO dollar cap, NO dollar headroom → 3-3/3-5).
+/// The per-instance budget/status surfaced in Fleet detail — TOKEN ceilings
+/// (story 3-2, AC9) PLUS the DOLLAR Cost Cap + dollars-remaining when a Rate is
+/// configured (story 3-3, AD-8; absent otherwise).
 ///
 /// Present iff a budget is CONFIGURED (at least one scope set); an un-budgeted
 /// instance carries `None` in [`FleetEntry::budget`] (a truthful absence, never a
@@ -273,11 +284,13 @@ impl UsageView {
 ///
 /// Composes the registry identity (`name`, `kind`, `agent_home`), the live
 /// runtime status (`state`, `restart_count`, `restart_policy`), and the REAL
-/// metering view: `usage` (token totals, real since story 3-1) and `budget` (the
-/// configured TOKEN ceilings + Breach Action, real for tokens since 3-2; `null`
-/// only when NO budget is configured). The dollar cap/headroom stay absent until a
-/// Rate exists (3-3/3-5). Field names are snake_case so the `--json` document is
-/// stable and re-parseable.
+/// metering view: `usage` (token totals real since story 3-1, plus the derived
+/// dollar cost when a Rate exists since 3-3) and `budget` (the configured TOKEN
+/// ceilings + Breach Action real since 3-2, plus the dollar Cost Cap + headroom
+/// when a Rate exists since 3-3; `null` only when NO budget is configured). The
+/// dollar fields stay a typed absence when no Rate exists (AC-B). Field names are
+/// snake_case so the `--json` document is stable and re-parseable. The Fleet-WIDE
+/// sum across these rows is [`FleetTotals`] (story 3-5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetEntry {
     /// Fleet-unique instance name (serializes as a plain string).
@@ -296,8 +309,9 @@ pub struct FleetEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_cause: Option<String>,
     /// Token budget / status (story 3-2, AC9) — the configured per-run + cumulative
-    /// ceilings, the Breach Action, and the REMAINING tokens per scope, TOKENS ONLY
-    /// (AD-8: dollar cap/headroom stay absent → 3-3/3-5). `None` (JSON `null`) for an
+    /// ceilings, the Breach Action, and the REMAINING tokens per scope, PLUS the
+    /// dollar Cost Cap + dollars-remaining when a Rate is configured (story 3-3,
+    /// AD-8; absent otherwise). `None` (JSON `null`) for an
     /// instance with NO budget configured — a truthful absence, never a fabricated
     /// `0` ceiling. The remaining values equal the Usage Ledger exactly (FR-22).
     /// ALWAYS PRESENT on the wire (rendered as `null` when absent), preserving the
@@ -308,7 +322,8 @@ pub struct FleetEntry {
     /// never-metered instance shows an honest all-ZERO [`UsageView`] (a truthful
     /// zero — the ledger genuinely holds zero tokens for it), distinct from the
     /// Epic-1 `budget` `null` "does not exist yet". The totals equal the ledger
-    /// exactly (the FR-22 discipline). Dollars/headroom stay absent until 3-3/3-5.
+    /// exactly (the FR-22 discipline). The derived dollar cost rides here when a Rate
+    /// is configured (story 3-3), absent otherwise (AC-B).
     pub usage: UsageView,
     /// The active Metering Source wire string (`self-reported` / `engine-observed`),
     /// visible in Fleet detail (AC-C). Read from the persisted adapter snapshot.
@@ -326,26 +341,206 @@ impl FleetEntry {
     pub const METERING_SEED_CELL: &'static str = "—";
 }
 
-/// The `kt agent list --json` document (story 1-7, AD-14).
+/// The Fleet-WIDE usage + cost aggregate (story 3-5, FR-22 — the greenfield).
 ///
-/// A versioned wrapper carrying [`FLEET_SCHEMA_VERSION`] plus the per-instance
-/// [`FleetEntry`] rows, so `--json` consumers (and the future 7-2 Host stream)
-/// negotiate on the version and never see an unversioned document. An empty Fleet
-/// serializes with an empty `instances` array (valid JSON — AC9).
+/// Sums the already-composed per-instance [`FleetEntry`] rows into a single honest
+/// total: cumulative input/output tokens across EVERY instance (every Run), and the
+/// summed DERIVED dollar cost across only the instances that HAVE a Rate. It is
+/// computed PURELY by [`FleetTotals::from_entries`] over the `Vec<FleetEntry>` the
+/// Fleet read already built (no second ledger query — AD-2/AD-6), using the SAME
+/// saturating integer discipline the per-instance totals use ([`u64`] saturating add
+/// for tokens; [`Micros::saturating_add`] for dollars), so no aggregate can wrap or
+/// touch a float.
+///
+/// ## The honesty rules (the crux — AD-8 / FR-23 / SM-C3)
+///
+/// A naive `sum()` would be dishonest three ways this type prevents:
+///
+/// 1. **Label the estimate.** v1 EVERY derived dollar is `estimated` (3-3), so any
+///    non-empty dollar total carries [`EstimateLabel::Estimated`]. There is NO path
+///    to a `reconciled` Fleet total in v1 (the arm is an unreachable forward seam
+///    until reconciliation ingestion ships). Mixing metering sources
+///    (`self-reported` + `engine-observed`) does not change this — both are
+///    estimates; the per-instance `metering_source` stays visible in the rows the
+///    total summarizes, so a reader sees the mix (AC7) without the aggregate
+///    enumerating per-source subtotals.
+/// 2. **Zero-not-absent — count the honest zero, never fabricate/omit.** EVERY entry
+///    contributes its real token total (a never-metered instance's genuine `0` is
+///    COUNTED — the ledger truly holds zero for it, 3-1's truthful zero — never
+///    skipped); a no-Rate instance contributes `0` dollars but is NOT claimed to have
+///    cost `$0.00` (its dollar cost is UNKNOWN, not zero).
+/// 3. **Say so when partial.** If a metered instance has NO Rate, its real token
+///    consumption has an unknown dollar cost the aggregate CANNOT include — so a
+///    non-`None` [`total_dollars`](Self::total_dollars) is then a LOWER BOUND, flagged
+///    [`dollars_partial`](Self::dollars_partial). It is NEVER presented as the exact
+///    Fleet cost (SM-C3 — honesty outranks precision).
+///
+/// The dollar shape encodes all three: `total_dollars` is `None` when NO instance has
+/// a Rate (nothing to estimate); `Some(sum)` with `estimate_label = Some(Estimated)`
+/// when at least one does; and `dollars_partial = true` additionally when SOME but not
+/// all metered instances have Rates. Integer micros + the label on the wire (snake_case,
+/// NO `f64`, NO `$` string — AD-14); the human render routes through the ONE currency
+/// module ([`render_dollars`](super::cost::render_dollars)/[`render_dollars_bare`](super::cost::render_dollars_bare)).
+///
+/// The Fleet total is CUMULATIVE only — there is no cross-instance per-Run scope (a
+/// "per-run" total is meaningful per-instance, where each instance is in its own Run,
+/// not across instances that are each in different Runs). Recorded decision (AC3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetTotals {
+    /// Cumulative input (prompt) tokens summed over EVERY instance, every Run
+    /// (saturating). Always present — a never-metered instance contributes a
+    /// truthful `0` (zero-not-absent, AC4).
+    pub total_input_tokens: u64,
+    /// Cumulative output (completion) tokens summed over EVERY instance, every Run
+    /// (saturating). Always present (zero-not-absent, AC4).
+    pub total_output_tokens: u64,
+    /// The summed DERIVED dollar cost across only the instances that HAVE a Rate, in
+    /// micro-dollars (saturating). `None` when NO instance has a Rate (nothing to
+    /// estimate — an honest absence, never a fabricated `$0.00`); `Some(sum)` when at
+    /// least one does. When `Some` and [`dollars_partial`](Self::dollars_partial) is
+    /// `true`, this is a LOWER BOUND (some metered instances are unpriced). NEVER a
+    /// `$` string on the wire (AD-14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_dollars: Option<Micros>,
+    /// `true` when the dollar total OMITS a metered-but-unpriced instance's real (but
+    /// un-derivable) consumption — i.e. SOME but not all metered instances have Rates.
+    /// Signals that [`total_dollars`](Self::total_dollars) is a lower bound, not the
+    /// exact Fleet cost (AC5, SM-C3). `false` when the total is complete (all metered
+    /// instances have Rates) OR when there is nothing to estimate (`total_dollars` is
+    /// `None`).
+    pub dollars_partial: bool,
+    /// How many instances are metered-but-unpriced — the ones with real usage tokens
+    /// (`> 0`) but NO derived dollar cost (no Rate), i.e. exactly the instances whose
+    /// missing cost makes [`dollars_partial`](Self::dollars_partial) `true`. Lets the
+    /// human footer name the count ("N instances unpriced") so the reader knows the
+    /// basis of the lower bound (AC7); `0` whenever `dollars_partial` is `false`. An
+    /// ADDITIVE v2 field (serializes as a plain integer, never a `$` string — AD-14);
+    /// a v1/older consumer that ignores it still parses the rest.
+    #[serde(default)]
+    pub unpriced_count: usize,
+    /// The estimate label on [`total_dollars`](Self::total_dollars) (AD-8) — present
+    /// (`Some`) iff a dollar was summed; v1 always [`EstimateLabel::Estimated`].
+    /// `None` when `total_dollars` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate_label: Option<EstimateLabel>,
+}
+
+impl FleetTotals {
+    /// The PURE Fleet-wide aggregate (story 3-5, AC-A/AC3/AC4/AC5) — sum the
+    /// already-composed per-instance rows with the honesty rules. NO engine, NO I/O:
+    /// unit-testable in isolation and cross-OS by construction.
+    ///
+    /// Tokens: sum `usage.cumulative_input_tokens`/`cumulative_output_tokens`
+    /// (saturating) over ALL entries — every entry counts, including a never-metered
+    /// instance's honest `0` (zero-not-absent, AC4). Dollars: sum
+    /// `usage.cumulative_dollars` (via [`Micros::saturating_add`]) over ONLY the
+    /// entries that carry one (a Rate is configured); an entry with no Rate contributes
+    /// `0` dollars but marks the total PARTIAL rather than being counted as `$0.00`
+    /// (AC5). The label is `Some(Estimated)` iff any dollar was summed (v1 — AC5);
+    /// `total_dollars` is `None` when NO instance has a Rate (nothing to estimate).
+    pub fn from_entries(entries: &[FleetEntry]) -> Self {
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        // The running dollar sum + whether ANY instance contributed a dollar figure
+        // (had a Rate) + how many METERED instances lacked one (each → partial, and the
+        // count is what the human footer names).
+        let mut dollar_sum = Micros::ZERO;
+        let mut any_rate = false;
+        let mut unpriced_count: usize = 0;
+
+        for entry in entries {
+            let usage = &entry.usage;
+            // Tokens ALWAYS count (zero-not-absent — a never-metered instance's real 0
+            // is in the sum, never skipped).
+            total_input_tokens = total_input_tokens.saturating_add(usage.cumulative_input_tokens);
+            total_output_tokens =
+                total_output_tokens.saturating_add(usage.cumulative_output_tokens);
+            // Dollars: sum ONLY where a derived cost exists (a Rate is configured).
+            match usage.cumulative_dollars {
+                Some(cost) => {
+                    any_rate = true;
+                    dollar_sum = dollar_sum.saturating_add(cost);
+                }
+                None => {
+                    // A metered instance with NO Rate has real tokens but an UNKNOWN
+                    // dollar cost the aggregate cannot include — its presence makes the
+                    // dollar total a lower bound (partial), NOT a fabricated $0.00. An
+                    // instance with zero tokens either way contributes nothing to hide,
+                    // so only a metered-but-unpriced instance is counted toward the
+                    // partial-ness (and the footer's "N unpriced" note).
+                    if usage.cumulative_total_tokens() > 0 {
+                        unpriced_count += 1;
+                    }
+                }
+            }
+        }
+
+        // The dollar total is present iff SOMETHING was priced (a Rate existed). With
+        // nothing priced there is nothing to estimate → an honest absence (`None`),
+        // never a $0.00 that would imply zero cost.
+        let (total_dollars, estimate_label) = if any_rate {
+            (Some(dollar_sum), Some(EstimateLabel::Estimated))
+        } else {
+            (None, None)
+        };
+        // Partial ONLY when we DID price some dollars but a metered instance was left
+        // unpriced (a lower bound that must say so). With no dollar total at all there
+        // is no lower bound to qualify — so the reported count stays `0` in lockstep
+        // with `dollars_partial == false` (no lower bound ⇒ nothing to name).
+        let dollars_partial = any_rate && unpriced_count > 0;
+        let unpriced_count = if dollars_partial { unpriced_count } else { 0 };
+
+        Self {
+            total_input_tokens,
+            total_output_tokens,
+            total_dollars,
+            dollars_partial,
+            unpriced_count,
+            estimate_label,
+        }
+    }
+
+    /// The combined total tokens (input + output across the whole Fleet), saturating.
+    pub fn total_tokens(&self) -> u64 {
+        self.total_input_tokens
+            .saturating_add(self.total_output_tokens)
+    }
+}
+
+/// The `kt agent list --json` document (story 1-7, AD-14; the Fleet-WIDE aggregate
+/// story 3-5).
+///
+/// A versioned wrapper carrying [`FLEET_SCHEMA_VERSION`], the per-instance
+/// [`FleetEntry`] rows, and the Fleet-wide [`FleetTotals`] aggregate, so `--json`
+/// consumers (and the future 7-2 Host stream) negotiate on the version and never see
+/// an unversioned document. An empty Fleet serializes with an empty `instances` array
+/// + an all-zero / `None`-dollars `totals` (valid JSON — AC9).
+///
+/// The `totals` is DERIVED from `instances` inside [`FleetListing::new`], so the
+/// document is always self-consistent (the aggregate equals
+/// [`FleetTotals::from_entries`] over the rows it carries — never passed
+/// independently, never able to drift from the rows).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetListing {
     /// The Fleet document schema version ([`FLEET_SCHEMA_VERSION`]).
     pub schema_version: u32,
+    /// The Fleet-WIDE usage + cost aggregate over `instances` (story 3-5), computed
+    /// in [`FleetListing::new`] so it stays consistent with the rows.
+    pub totals: FleetTotals,
     /// Every Agent Instance in the Fleet, ordered by name.
     pub instances: Vec<FleetEntry>,
 }
 
 impl FleetListing {
     /// Build a listing document from the composed entries, stamping the current
-    /// [`FLEET_SCHEMA_VERSION`].
+    /// [`FLEET_SCHEMA_VERSION`] and computing the Fleet-wide [`FleetTotals`] PURELY
+    /// from those entries (self-consistent — the total is derived from the rows, one
+    /// read pass, no second ledger query — AD-2/AD-6).
     pub fn new(instances: Vec<FleetEntry>) -> Self {
+        let totals = FleetTotals::from_entries(&instances);
         Self {
             schema_version: FLEET_SCHEMA_VERSION,
+            totals,
             instances,
         }
     }
@@ -562,18 +757,338 @@ mod tests {
             serde_json::json!(FLEET_SCHEMA_VERSION)
         );
         assert_eq!(value["instances"].as_array().unwrap().len(), 2);
+        // Story 3-5: the document also carries a top-level `totals` object.
+        assert!(value["totals"].is_object(), "totals present: {value}");
     }
 
     #[test]
-    fn empty_listing_serializes_with_an_empty_array() {
-        // AC9: an empty Fleet is still valid JSON — an empty `instances` array.
+    fn fleet_schema_version_is_2_after_the_3_5_additive_bump() {
+        // Story 3-5 bumped the Fleet document version 1 → 2 (additive: `totals`
+        // gained). Guard the value so the bump is deliberate + recorded.
+        assert_eq!(FLEET_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn empty_listing_serializes_with_an_empty_array_and_zero_totals() {
+        // AC9: an empty Fleet is still valid JSON — an empty `instances` array + an
+        // all-zero / absent-dollars `totals` (nothing to estimate).
         let listing = FleetListing::new(vec![]);
         let value: serde_json::Value = serde_json::to_value(&listing).unwrap();
         assert_eq!(value["instances"], serde_json::json!([]));
+        assert_eq!(value["totals"]["total_input_tokens"], serde_json::json!(0));
+        assert_eq!(value["totals"]["total_output_tokens"], serde_json::json!(0));
+        // No dollars to estimate → the field is absent (skip_serializing_if), not $0.
+        assert!(
+            value["totals"].get("total_dollars").is_none(),
+            "empty Fleet has no dollar total: {value}"
+        );
+        assert_eq!(value["totals"]["dollars_partial"], serde_json::json!(false));
         // And it re-parses.
         let json = serde_json::to_string(&listing).unwrap();
         let back: FleetListing = serde_json::from_str(&json).unwrap();
         assert_eq!(back, listing);
+    }
+
+    #[test]
+    fn listing_totals_equal_from_entries_over_its_rows() {
+        // The document is SELF-CONSISTENT: `new(instances)` computes `totals` as
+        // exactly `FleetTotals::from_entries(&instances)` — the aggregate is DERIVED
+        // from the rows it carries, never passed independently (Key design decision 4).
+        let entries = vec![
+            metered_entry("a", 100, 250, Some(Micros(300_000))),
+            metered_entry("b", 40, 60, None),
+        ];
+        let listing = FleetListing::new(entries.clone());
+        assert_eq!(listing.totals, FleetTotals::from_entries(&entries));
+    }
+
+    // ---- Story 3-5: FleetTotals — the pure Fleet-wide aggregate + honesty rules ----
+
+    /// A metered [`FleetEntry`] with the given cumulative token totals and, when
+    /// `dollars` is `Some`, a derived cost + `estimated` label (a Rate is configured).
+    /// `None` dollars = a no-Rate instance (the dollar figure honestly absent).
+    fn metered_entry(name: &str, input: u64, output: u64, dollars: Option<Micros>) -> FleetEntry {
+        let mut entry = sample_entry(name);
+        let base = UsageView::new(
+            UsageTotals {
+                input_tokens: input,
+                output_tokens: output,
+            },
+            UsageTotals::zero(),
+        );
+        entry.usage = match dollars {
+            Some(cost) => base.with_dollars(cost, Micros::ZERO, EstimateLabel::Estimated),
+            None => base,
+        };
+        entry
+    }
+
+    #[test]
+    fn totals_of_an_empty_fleet_are_zero_and_dollars_absent() {
+        // Empty Fleet → all-zero tokens, no dollar total (nothing to estimate), no
+        // label, not partial.
+        let totals = FleetTotals::from_entries(&[]);
+        assert_eq!(totals.total_input_tokens, 0);
+        assert_eq!(totals.total_output_tokens, 0);
+        assert_eq!(totals.total_tokens(), 0);
+        assert_eq!(totals.total_dollars, None);
+        assert_eq!(totals.estimate_label, None);
+        assert!(!totals.dollars_partial);
+        assert_eq!(totals, FleetTotals::default());
+    }
+
+    #[test]
+    fn totals_of_one_rated_instance_equal_that_instance_labeled_estimated() {
+        // Fleet of one (Rate'd) → the aggregate equals that instance's totals, and the
+        // dollar total is labeled `estimated`, not partial.
+        let entries = vec![metered_entry(
+            "solo",
+            1_000_000,
+            2_000_000,
+            Some(Micros(45_000_000)),
+        )];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.total_input_tokens, 1_000_000);
+        assert_eq!(t.total_output_tokens, 2_000_000);
+        assert_eq!(t.total_dollars, Some(Micros(45_000_000)));
+        assert_eq!(t.estimate_label, Some(EstimateLabel::Estimated));
+        assert!(!t.dollars_partial, "a single Rate'd instance is complete");
+    }
+
+    #[test]
+    fn totals_of_one_no_rate_instance_have_tokens_but_absent_dollars() {
+        // Fleet of one (no Rate) → tokens equal that instance's tokens; dollars are
+        // honestly absent (None) — never a fabricated $0.00 for an unpriced instance.
+        let entries = vec![metered_entry("solo", 500, 700, None)];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.total_input_tokens, 500);
+        assert_eq!(t.total_output_tokens, 700);
+        assert_eq!(t.total_dollars, None, "no Rate ⇒ nothing to estimate");
+        assert_eq!(t.estimate_label, None);
+        // A lone unpriced instance is not "partial" — there is no dollar total to
+        // qualify as a lower bound (partial only applies once SOMETHING is priced).
+        assert!(!t.dollars_partial);
+    }
+
+    #[test]
+    fn totals_of_a_mixed_fleet_sum_all_tokens_but_only_rated_dollars_and_flag_partial() {
+        // THE honesty crux (AC4/AC5): a mixed Fleet — one Rate'd + accrued, one
+        // metered-but-no-Rate, one never-metered. Tokens sum ALL THREE (zero-not-
+        // absent); dollars sum ONLY the Rate'd one; the total is a labeled LOWER BOUND
+        // flagged `dollars_partial` because a metered instance had no Rate.
+        let entries = vec![
+            metered_entry("rated", 1_000_000, 1_000_000, Some(Micros(18_000_000))),
+            metered_entry("unpriced", 500, 250, None), // metered, NO Rate
+            metered_entry("idle", 0, 0, None),         // never metered (honest zero)
+        ];
+        let t = FleetTotals::from_entries(&entries);
+        // Tokens sum all three (the idle instance's 0 is COUNTED, the unpriced one's
+        // real tokens are COUNTED).
+        assert_eq!(t.total_input_tokens, 1_000_000 + 500);
+        assert_eq!(t.total_output_tokens, 1_000_000 + 250);
+        // Dollars sum ONLY the Rate'd instance.
+        assert_eq!(t.total_dollars, Some(Micros(18_000_000)));
+        assert_eq!(t.estimate_label, Some(EstimateLabel::Estimated));
+        // ...and the total is a LOWER BOUND — a metered instance ("unpriced") was left
+        // out of the dollar sum, so it says so (SM-C3), and the count names exactly the
+        // one metered-but-unpriced instance (the never-metered "idle" is NOT counted).
+        assert!(
+            t.dollars_partial,
+            "a metered-but-unpriced instance makes the dollar total partial"
+        );
+        assert_eq!(
+            t.unpriced_count, 1,
+            "only the metered-but-unpriced instance is counted (not the idle 0)"
+        );
+    }
+
+    #[test]
+    fn unpriced_count_names_every_metered_but_unpriced_instance_and_ignores_the_rest() {
+        // The count is EXACTLY the instances that make the total partial: metered
+        // (tokens > 0) AND no Rate. A Rate'd instance, a Rate'd-$0 instance, and a
+        // never-metered no-Rate instance all contribute 0 to the count; only the two
+        // metered-no-Rate instances are named.
+        let entries = vec![
+            metered_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_entry("rated0", 0, 0, Some(Micros::ZERO)),
+            metered_entry("idle", 0, 0, None), // never metered — not counted
+            metered_entry("unpriced-a", 500, 0, None),
+            metered_entry("unpriced-b", 0, 250, None),
+        ];
+        let t = FleetTotals::from_entries(&entries);
+        assert!(t.dollars_partial);
+        assert_eq!(t.unpriced_count, 2, "exactly the two metered-no-Rate rows");
+    }
+
+    #[test]
+    fn unpriced_count_is_zero_when_the_total_is_not_partial() {
+        // No lower bound to qualify ⇒ the count reads 0, in lockstep with
+        // `dollars_partial == false`. Covers: all-priced, a lone no-Rate instance (no
+        // dollar total at all), and an empty Fleet.
+        let all_priced = FleetTotals::from_entries(&[
+            metered_entry("a", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_entry("b", 0, 1_000_000, Some(Micros(15_000_000))),
+        ]);
+        assert!(!all_priced.dollars_partial);
+        assert_eq!(all_priced.unpriced_count, 0, "complete total names nothing");
+
+        // A metered no-Rate instance with NO priced instance anywhere: `total_dollars`
+        // is None, so there is no lower bound to qualify — the count stays 0 even though
+        // an instance is unpriced (nothing was priced to be a lower bound of).
+        let no_rate_at_all = FleetTotals::from_entries(&[metered_entry("solo", 500, 700, None)]);
+        assert!(!no_rate_at_all.dollars_partial);
+        assert_eq!(no_rate_at_all.unpriced_count, 0);
+
+        assert_eq!(FleetTotals::from_entries(&[]).unpriced_count, 0);
+    }
+
+    #[test]
+    fn totals_of_all_rated_instances_sum_dollars_and_are_not_partial() {
+        // All metered instances have Rates → dollars sum all, the total is complete
+        // (not partial), labeled `estimated`.
+        let entries = vec![
+            metered_entry("a", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_entry("b", 0, 1_000_000, Some(Micros(15_000_000))),
+        ];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.total_input_tokens, 1_000_000);
+        assert_eq!(t.total_output_tokens, 1_000_000);
+        assert_eq!(t.total_dollars, Some(Micros(18_000_000)));
+        assert!(
+            !t.dollars_partial,
+            "all metered instances priced ⇒ complete"
+        );
+        assert_eq!(t.estimate_label, Some(EstimateLabel::Estimated));
+    }
+
+    #[test]
+    fn a_rated_zero_usage_instance_is_counted_and_not_partial() {
+        // A Rate'd instance with zero usage contributes a genuine $0 to the sum (an
+        // honest labeled zero — it HAS a Rate, the cost is truly $0), and does NOT flag
+        // partial. Distinct from a no-Rate instance (unknown cost).
+        let entries = vec![
+            metered_entry("rated0", 0, 0, Some(Micros::ZERO)),
+            metered_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+        ];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.total_dollars, Some(Micros(3_000_000)), "0 + 3_000_000");
+        assert!(
+            !t.dollars_partial,
+            "a Rate'd $0 instance is priced, not unpriced — no partial flag"
+        );
+    }
+
+    #[test]
+    fn zero_not_absent_every_instance_is_counted_in_the_token_sum() {
+        // Zero-not-absent (AC4): N instances contribute N token contributions — a
+        // never-metered instance's `0` is present in the sum, never skipped. Ten
+        // idle instances + one metered: the token total is exactly the metered one's,
+        // and adding the zeros does not change it (proving they were summed, not
+        // dropped, and did not fabricate anything).
+        let mut entries: Vec<FleetEntry> = (0..10)
+            .map(|i| metered_entry(&format!("idle{i}"), 0, 0, None))
+            .collect();
+        entries.push(metered_entry("busy", 123, 456, None));
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.total_input_tokens, 123);
+        assert_eq!(t.total_output_tokens, 456);
+        // The count of entries and the token total are mutually consistent — no
+        // instance was silently dropped (11 summed, all-zero contributions included).
+        assert_eq!(entries.len(), 11);
+    }
+
+    #[test]
+    fn token_sums_saturate_and_never_wrap() {
+        // Saturation (AC3): many large instances must SATURATE at u64::MAX, never wrap
+        // to a small number. Two instances each near u64::MAX.
+        let entries = vec![
+            metered_entry("big1", u64::MAX, u64::MAX, None),
+            metered_entry("big2", u64::MAX, u64::MAX, None),
+        ];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.total_input_tokens, u64::MAX, "saturates, never wraps");
+        assert_eq!(t.total_output_tokens, u64::MAX);
+        assert_eq!(t.total_tokens(), u64::MAX, "combined also saturates");
+    }
+
+    #[test]
+    fn dollar_sum_saturates_and_never_wraps() {
+        // Saturation (AC3): the Micros dollar sum saturates at i64::MAX rather than
+        // wrapping negative (a runaway Fleet cost must not un-breach any reader).
+        let entries = vec![
+            metered_entry("big1", 1, 0, Some(Micros(i64::MAX))),
+            metered_entry("big2", 1, 0, Some(Micros(i64::MAX))),
+        ];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(
+            t.total_dollars,
+            Some(Micros(i64::MAX)),
+            "saturates, no wrap"
+        );
+        assert!(
+            t.total_dollars.unwrap().get() > 0,
+            "a runaway dollar total stays positive"
+        );
+    }
+
+    #[test]
+    fn the_fleet_dollar_label_is_always_estimated_when_present_never_reconciled() {
+        // v1 the Fleet dollar total, when present, is ALWAYS `estimated` — there is no
+        // code path to a `reconciled` Fleet total (the arm is an unreachable forward
+        // seam). Any Rate'd Fleet proves it.
+        let entries = vec![metered_entry("a", 10, 20, Some(Micros(30)))];
+        let t = FleetTotals::from_entries(&entries);
+        assert_eq!(t.estimate_label, Some(EstimateLabel::Estimated));
+        assert_ne!(t.estimate_label, Some(EstimateLabel::Reconciled));
+    }
+
+    #[test]
+    fn fleet_totals_serialize_as_integer_micros_and_a_label_never_a_dollar_string() {
+        // AD-14/AC-B: the aggregate rides the wire as integer micros + a snake/kebab
+        // label string, snake_case fields, NEVER a `$` string and NEVER a float.
+        let t = FleetTotals::from_entries(&[metered_entry(
+            "a",
+            1_000_000,
+            2_000_000,
+            Some(Micros(45_000_000)),
+        )]);
+        let value: serde_json::Value = serde_json::to_value(t).unwrap();
+        assert_eq!(value["total_input_tokens"], serde_json::json!(1_000_000));
+        assert_eq!(value["total_output_tokens"], serde_json::json!(2_000_000));
+        assert_eq!(value["total_dollars"], serde_json::json!(45_000_000));
+        assert!(
+            value["total_dollars"].is_i64() || value["total_dollars"].is_u64(),
+            "dollars are an integer: {value}"
+        );
+        assert_eq!(value["estimate_label"], serde_json::json!("estimated"));
+        assert_eq!(value["dollars_partial"], serde_json::json!(false));
+        // The unpriced count rides as a plain integer (0 for a complete total), NOT a
+        // `$` string (AD-14).
+        assert_eq!(value["unpriced_count"], serde_json::json!(0));
+        assert!(value["unpriced_count"].is_u64(), "an integer: {value}");
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains('$'), "no `$` string on the wire: {json}");
+        // Round-trips.
+        let back: FleetTotals = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn a_partial_fleet_total_serializes_the_partial_flag_as_data() {
+        // AC5: the partial-ness rides as DATA on the wire so a --json consumer knows
+        // the dollar total is a lower bound.
+        let entries = vec![
+            metered_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_entry("unpriced", 500, 0, None),
+        ];
+        let value: serde_json::Value =
+            serde_json::to_value(FleetTotals::from_entries(&entries)).unwrap();
+        assert_eq!(value["dollars_partial"], serde_json::json!(true));
+        assert_eq!(value["total_dollars"], serde_json::json!(3_000_000));
+        assert_eq!(value["estimate_label"], serde_json::json!("estimated"));
+        // The count of unpriced instances rides as DATA too (a plain integer), so a
+        // --json consumer can render the same "N unpriced" the human footer does.
+        assert_eq!(value["unpriced_count"], serde_json::json!(1));
     }
 
     #[test]

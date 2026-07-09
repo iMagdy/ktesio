@@ -57,11 +57,20 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 /// shape must not force a version bump on the other). It rides on the
 /// [`crate::FleetListing`] wrapper (for `list`) and each `show --json` object.
 ///
-/// Bumped only on an INCOMPATIBLE change to the Fleet document shape. Adding a
-/// field (e.g. populating the Epic-3 `budget`/`usage` from `null` to a real
-/// type) is backward-ADDITIVE and does NOT bump the version — a new reader
-/// parses every old document and no field is renamed or removed.
-pub const FLEET_SCHEMA_VERSION: u32 = 1;
+/// Bumped only on a change to the Fleet document shape that consumers negotiate on.
+/// POPULATING an existing field from `null` to a real type (e.g. the Epic-3
+/// `budget`/`usage`) is transparently backward-additive and did NOT bump it. Story
+/// 3-5 bumps it **1 → 2**: the `list --json` document GAINS a first-class top-level
+/// `totals` object (the Fleet-WIDE [`crate::FleetTotals`] aggregate) that consumers
+/// and the future 7-2 Host stream will want to negotiate on. The change is ADDITIVE
+/// — a v2 reader parses every v1 document (no field is renamed or removed), and a v1
+/// consumer that ignores the new `totals` still parses `instances` — but the bump is
+/// the honest signal that a new first-class field exists, matching the 1-7/3-1/3-3
+/// discipline of treating the Fleet document version as the `--json` contract. (The
+/// `show --json` document carries this same version but does NOT gain `totals`: a
+/// single instance has no Fleet total — its own `usage` IS its total.) A future
+/// INCOMPATIBLE change (renaming/removing a field) would bump it again.
+pub const FLEET_SCHEMA_VERSION: u32 = 2;
 
 /// The schema version stamped on every emitted [`BudgetBreachEvent`] (story 3-2,
 /// AD-14).

@@ -392,11 +392,21 @@ impl Engine {
     /// ([`Engine::instance_status`]) the CLI already surfaces — the restart
     /// count/policy + (for a `failed` instance) the last-known cause — plus the
     /// story-3-1 metering surface: the real Usage-Ledger token totals + the active
-    /// Metering Source (AC-C/AC11), and the story-3-2 real TOKEN `budget` (the
-    /// configured ceilings + Breach Action + remaining, or an honest absent budget
-    /// when none is configured; dollars stay → 3-3). Reading live persisted state on every call is what
-    /// makes the listing ≤2s fresh (AC6): there is no cache, so any committed
+    /// Metering Source (AC-C/AC11), the story-3-2 real TOKEN `budget` (the configured
+    /// ceilings + Breach Action + remaining, or an honest absent budget when none is
+    /// configured), and — when a Rate is configured — the story-3-3 derived dollar
+    /// cost + Cost Cap + dollars-remaining. Reading live persisted state on every call
+    /// is what makes the listing ≤2s fresh (AC6): there is no cache, so any committed
     /// transition is reflected on the next `fleet()` (a single DB read, far under 2s).
+    ///
+    /// This returns the per-instance rows; the Fleet-WIDE aggregate
+    /// ([`FleetTotals`](crate::domain::FleetTotals), story 3-5) is computed PURELY from
+    /// these rows by [`FleetListing::new`](crate::domain::FleetListing::new) — one read
+    /// pass, no second ledger query. Recorded surface decision (AC-A/AD-2): the
+    /// aggregation RULE lives in the engine `domain`
+    /// ([`FleetTotals::from_entries`](crate::domain::FleetTotals::from_entries)), and
+    /// the CLI triggers it over these engine-provided rows via `FleetListing::new`, so
+    /// `kt` stays a thin renderer that never sums the ledger or derives dollars itself.
     ///
     /// The current-Run token totals come from the supervisor's live Run id (held in
     /// memory for a running instance), so `fleet()` locks the supervisor too — a
@@ -539,13 +549,16 @@ impl Engine {
             restart_count,
             restart_policy,
             failed_cause,
-            // `budget` is REAL now for TOKENS (story 3-2): the configured ceilings +
-            // Breach Action + remaining tokens per scope, or `None` when no budget is
-            // configured (an honest absence, never a fabricated `0`). Dollars stay
-            // absent → 3-3/3-5.
+            // `budget` is REAL for TOKENS (story 3-2): the configured ceilings +
+            // Breach Action + remaining tokens per scope, PLUS the dollar Cost Cap +
+            // dollars-remaining when a Rate is configured (story 3-3); or `None` when no
+            // budget is configured (an honest absence, never a fabricated `0`).
             budget,
-            // `usage` is REAL (story 3-1): the Usage-Ledger token totals, tokens only
-            // (dollars/headroom are 3-3/3-5). `metering_source` is surfaced too.
+            // `usage` is REAL: the Usage-Ledger token totals (story 3-1) + the derived
+            // dollar cost when a Rate is configured (story 3-3). `metering_source` is
+            // surfaced too. The Fleet-WIDE sum across these rows is `FleetTotals`
+            // (story 3-5), composed by the CLI via `FleetListing::new` (AD-2 — the
+            // aggregation rule is engine-domain; `kt` triggers it over these rows).
             usage,
             metering_source,
             agent_home: instance.agent_home,

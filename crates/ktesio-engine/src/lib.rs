@@ -71,9 +71,9 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     is_pass_through, render_dollars, render_dollars_bare, resolve, AgentInstance, BreachAction,
     BreachDimension, BreachScope, BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap,
-    EffectiveConfig, EngineError, EstimateLabel, FleetEntry, FleetListing, InstanceName,
-    LifecycleCommand, LifecycleError, LifecycleState, Micros, NameError, Rate, Registry,
-    RegistryError, RemoveDisposition, ResolvedValue, RestartPolicy, RunId, SourceLayer,
+    EffectiveConfig, EngineError, EstimateLabel, FleetEntry, FleetListing, FleetTotals,
+    InstanceName, LifecycleCommand, LifecycleError, LifecycleState, Micros, NameError, Rate,
+    Registry, RegistryError, RemoveDisposition, ResolvedValue, RestartPolicy, RunId, SourceLayer,
     TokenBudget, TransitionCause, TransitionEvent, UsageEvent, UsageTotals, UsageUpdateEvent,
     UsageView, BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
     MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,

@@ -17,8 +17,8 @@ use std::time::Duration;
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, Micros, RegistryError, RemoveDisposition, SupportLevel, UsageView,
-    FLEET_SCHEMA_VERSION,
+    FleetEntry, FleetListing, FleetTotals, Micros, RegistryError, RemoveDisposition, SupportLevel,
+    UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -176,14 +176,15 @@ impl ShowDocument {
     }
 }
 
-/// Serialize the Fleet entries into the pretty `list --json` document (a
-/// versioned [`FleetListing`]). Pure (no engine, no I/O) so it is unit-testable
-/// in-process; the CLI just prints the returned string to stdout. A serialize
-/// failure (not reachable for these plain serde structs) becomes an [`AgentIo`]
-/// diagnostic rather than a panic.
-fn fleet_json(entries: Vec<FleetEntry>) -> Result<String, Box<dyn std::error::Error>> {
-    let listing = FleetListing::new(entries);
-    serde_json::to_string_pretty(&listing).map_err(|e| serialize_error("Fleet", e))
+/// Serialize the composed [`FleetListing`] into the pretty `list --json` document (a
+/// versioned wrapper carrying the rows AND the Fleet-WIDE `totals`, story 3-5). Pure
+/// (no engine, no I/O) so it is unit-testable in-process; the CLI just prints the
+/// returned string to stdout. The listing is composed by the caller
+/// ([`FleetListing::new`], which computes the aggregate from the rows), so this stays
+/// a thin serialize. A serialize failure (not reachable for these plain serde structs)
+/// becomes an [`AgentIo`] diagnostic rather than a panic.
+fn fleet_json(listing: &FleetListing) -> Result<String, Box<dyn std::error::Error>> {
+    serde_json::to_string_pretty(listing).map_err(|e| serialize_error("Fleet", e))
 }
 
 /// Serialize one entry into the pretty `show --json` document (a versioned
@@ -282,7 +283,7 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&
     // Usage + Metering Source from the Fleet entry (story 3-1); a degraded read
     // falls back to zero usage / "unknown" source so `show` never fails on it.
     let usage_value = entry
-        .map(|e| usage_cell(&e.usage))
+        .map(|e| usage_cell_show(&e.usage))
         .unwrap_or_else(|| "in 0 / out 0".to_string());
     let metering_value = entry
         .map(|e| e.metering_source.clone())
@@ -425,7 +426,10 @@ const BUDGET_LIST_HEADER: &str = "Budget (tok, est. $)";
 /// the single currency module ([`render_dollars`], AD-8) and appears ONLY when a
 /// Rate is configured (`cumulative_dollars`/`estimate_label` present); with no Rate
 /// the cell is tokens-only (honest inert dollar view — AC-B). Kept here so `list`
-/// and `show` render usage identically.
+/// and `show` render the cumulative scope identically. The narrow `list` column shows
+/// the CUMULATIVE scope only; the wide `show` Value column additionally surfaces the
+/// current-Run scope via [`usage_cell_show`] (AC8 — tokens by BOTH scopes are legible
+/// where the column can hold them; `--json` carries both on every surface).
 fn usage_cell(usage: &UsageView) -> String {
     let tokens = format!(
         "in {} / out {}",
@@ -435,6 +439,28 @@ fn usage_cell(usage: &UsageView) -> String {
         (Some(dollars), Some(label)) => format!("{tokens} · {}", render_dollars(dollars, label)),
         // No Rate ⇒ tokens only (dollar view honestly inert — AC-B).
         _ => tokens,
+    }
+}
+
+/// The `show` "Usage (tokens)" cell (story 3-5, AC8 — tokens BY SCOPE on the wide
+/// detail surface). Renders the CUMULATIVE scope (via [`usage_cell`], including the
+/// labeled dollar cost when a Rate exists) AND — when the instance has a current Run
+/// with usage — the CURRENT-RUN token scope, so BOTH scopes the AC names are legible
+/// in human `show` detail (the `--json` `FleetEntry` already carries all four token
+/// fields). A non-running / zero-current-run instance shows only the cumulative scope
+/// (the current-Run scope is an honest absence, not a fabricated `run: in 0 / out 0`).
+fn usage_cell_show(usage: &UsageView) -> String {
+    let cumulative = usage_cell(usage);
+    let run_total = usage
+        .current_run_input_tokens
+        .saturating_add(usage.current_run_output_tokens);
+    if run_total > 0 {
+        format!(
+            "cumulative {cumulative}; this run: in {} / out {}",
+            usage.current_run_input_tokens, usage.current_run_output_tokens
+        )
+    } else {
+        cumulative
     }
 }
 
@@ -543,6 +569,61 @@ fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
     }
 }
 
+/// Render the Fleet-WIDE total footer for the human `kt agent list` (story 3-5,
+/// AC-A/AC-B/AC5/AC7 — FR-22/FR-23). Summarizes the [`FleetTotals`] the engine
+/// composed over the rows: total input/output tokens (always present — zero-not-
+/// absent), and the total derived dollars THROUGH the single currency module
+/// (AD-8), carrying the honesty of the aggregate:
+///
+/// * A COMPLETE dollar total (every metered instance priced): `≈ $X.XX (estimated)`.
+/// * A PARTIAL total (a metered instance has no Rate): `≈ $X.XX (estimated; N
+///   instances unpriced)` — the honest lower-bound note (AC5, SM-C3), NAMING how many
+///   metered-but-unpriced rows the dollar sum omits so the reader knows the total's
+///   basis (AC7). `N` is [`FleetTotals::unpriced_count`], computed by the engine
+///   `domain` aggregate (`kt` only renders it, with the singular "1 instance unpriced").
+/// * NO instance has a Rate: the token total + an honest `—` dollar marker (AC4/AC5),
+///   NEVER a fabricated `$0.00`.
+///
+/// The `≈` marks the figure a labeled estimate; the dollar DIGITS come ONLY from the
+/// currency module ([`render_dollars_bare`]) and the estimate label is composed by
+/// this caller — the narrow-column pattern 3-3 established (the label survives, FR-23,
+/// and the `$` originates in the one module so the AD-8 grep-lint stays green; the CLI
+/// never formats a `$` string itself). Pure (no engine, no I/O) so it is unit-testable
+/// in-process; `list` prints the returned line to stdout as command output (AD-12).
+fn fleet_total_footer(totals: &FleetTotals) -> String {
+    let tokens = format!(
+        "in {} / out {}",
+        totals.total_input_tokens, totals.total_output_tokens
+    );
+    // The count of metered-but-unpriced rows that make the dollar total a lower bound
+    // is carried on `totals.unpriced_count` (the engine `domain` computed it alongside
+    // the sum — AD-2); the footer only NAMES it (AC5/AC7) on the partial path below.
+    let dollars = match (totals.total_dollars, totals.estimate_label) {
+        // A priced total: the bare dollar value through the ONE currency module, then
+        // the estimate label (+ the honest lower-bound note when partial). `≈` marks it
+        // an aggregate estimate. The label is ALWAYS present (FR-23 — no unlabeled
+        // dollar); on a partial total it is folded together with the unpriced count.
+        (Some(cost), Some(label)) => {
+            let bare = render_dollars_bare(cost);
+            if totals.dollars_partial {
+                // A lower bound — say so, and NAME how many rows are unpriced (AC5/AC7):
+                // "1 instance unpriced" / "N instances unpriced" (correct singular).
+                let n = totals.unpriced_count;
+                let unit = if n == 1 { "instance" } else { "instances" };
+                format!("≈ {bare} ({label}; {n} {unit} unpriced)")
+            } else {
+                format!("≈ {bare} ({label})")
+            }
+        }
+        // NO Rate anywhere ⇒ the dollar total is honestly absent (never $0.00).
+        _ => format!(
+            "{} (no Rate configured — dollars not derived)",
+            FleetEntry::METERING_SEED_CELL
+        ),
+    };
+    format!("Fleet total: {tokens} · {dollars}")
+}
+
 /// `kt agent list [--json]` — render the Fleet (FR-4).
 ///
 /// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the REAL
@@ -559,13 +640,19 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     let facade = engine.blocking();
     let entries = facade.fleet().map_err(map_error)?;
+    // Compose the versioned document ONCE (story 1-7 + 3-5): it carries the rows AND
+    // the Fleet-WIDE `totals`, computed PURELY from those rows by the engine `domain`
+    // (`FleetListing::new` → `FleetTotals::from_entries`). Both the `--json` document
+    // and the human footer read the SAME computed aggregate — one read pass, no second
+    // ledger query, `kt` never sums the ledger itself (AD-2).
+    let listing = FleetListing::new(entries);
 
     if json {
         // AC5/AC9: the whole result is ONE JSON document to stdout (an empty Fleet
-        // is a valid empty `instances` array). Any guidance/notes go to stderr so
-        // stdout is always parseable JSON.
-        let empty = entries.is_empty();
-        let document = fleet_json(entries)?;
+        // is a valid empty `instances` array + an all-zero/absent-dollars `totals`).
+        // Any guidance/notes go to stderr so stdout is always parseable JSON.
+        let empty = listing.instances.is_empty();
+        let document = fleet_json(&listing)?;
         println!("{document}");
         if empty {
             ui::note("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
@@ -575,10 +662,11 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if entries.is_empty() {
+    if listing.instances.is_empty() {
         ui::info("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
         return Ok(());
     }
+    let entries = &listing.instances;
 
     // The Metering Source rides the Fleet DETAIL (`kt agent show` + `--json`), which
     // is where AC-C requires it "visible in Fleet listing detail"; the human `list`
@@ -629,7 +717,12 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     ui::print_table("Fleet", &columns, &rows);
-    // One stderr note (AD-12): usage is real tokens; budget/dollars are later stories.
+    // Story 3-5 (AC-A/AC-B): the Fleet-WIDE total footer — total tokens + the labeled
+    // total dollars THROUGH the single currency module (AD-8), an honest lower-bound
+    // note when partial, and a `—` (never $0.00) when no instance is Rate'd. It is
+    // command output (a summary of the table above it), so it rides STDOUT (AD-12).
+    println!("{}", fleet_total_footer(&listing.totals));
+    // One stderr note (AD-12): usage is real tokens; dollars appear with a Rate.
     ui::note(METERING_NOTE);
     Ok(())
 }
@@ -1586,7 +1679,7 @@ mod tests {
         // The `list --json` document is a versioned FleetListing whose per-entry
         // `budget` is the honest JSON null seed (never 0) while `usage` is a real
         // token-totals object (story 3-1). Pure — no engine.
-        let doc = fleet_json(vec![sample_fleet_entry("alpha")]).unwrap();
+        let doc = fleet_json(&FleetListing::new(vec![sample_fleet_entry("alpha")])).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(
             value["schema_version"],
@@ -1602,14 +1695,20 @@ mod tests {
             serde_json::json!(0)
         );
         assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
+        // Story 3-5: the document carries a top-level `totals` object (an all-zero
+        // never-metered Fleet → zero tokens, dollars absent).
+        assert!(value["totals"].is_object(), "{value}");
+        assert_eq!(value["totals"]["total_input_tokens"], serde_json::json!(0));
     }
 
     #[test]
     fn fleet_json_on_empty_is_a_valid_empty_array() {
-        // AC9: an empty Fleet serializes as a valid empty `instances` array.
-        let doc = fleet_json(vec![]).unwrap();
+        // AC9: an empty Fleet serializes as a valid empty `instances` array + a
+        // zero/absent-dollars `totals` (story 3-5).
+        let doc = fleet_json(&FleetListing::new(vec![])).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(value["instances"], serde_json::json!([]));
+        assert_eq!(value["totals"]["total_output_tokens"], serde_json::json!(0));
     }
 
     #[test]
@@ -1640,6 +1739,159 @@ mod tests {
         assert!(wrapped
             .to_string()
             .contains("Failed to serialize the Fleet"));
+    }
+
+    // ---- Story 3-5: the Fleet-wide total footer + the per-instance scope render ----
+
+    /// A metered entry with the given cumulative tokens and, when `dollars` is `Some`,
+    /// a derived cost + `estimated` label (a Rate); `None` = a no-Rate instance.
+    fn metered_fleet_entry(
+        name: &str,
+        input: u64,
+        output: u64,
+        dollars: Option<Micros>,
+    ) -> FleetEntry {
+        let mut entry = sample_fleet_entry(name);
+        let base = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: input,
+                output_tokens: output,
+            },
+            ktesio_engine::UsageTotals::zero(),
+        );
+        entry.usage = match dollars {
+            Some(cost) => base.with_dollars(cost, Micros::ZERO, EstimateLabel::Estimated),
+            None => base,
+        };
+        entry
+    }
+
+    #[test]
+    fn fleet_footer_all_rated_shows_a_labeled_complete_total() {
+        // A complete dollar total (every metered instance priced): `≈ $X.XX
+        // (estimated)`, tokens summed, NO partial note.
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("a", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_fleet_entry("b", 0, 1_000_000, Some(Micros(15_000_000))),
+        ]);
+        let footer = fleet_total_footer(&totals);
+        assert!(footer.contains("in 1000000 / out 1000000"), "{footer}");
+        // $18.00 total, labeled estimated, an aggregate `≈`, no partial note.
+        assert!(footer.contains("≈ $18.00 (estimated)"), "{footer}");
+        assert!(!footer.contains("unpriced"), "complete total: {footer}");
+    }
+
+    #[test]
+    fn fleet_footer_partial_total_says_so_with_the_estimate_label() {
+        // A metered-but-unpriced instance makes the dollar total a LOWER BOUND — the
+        // footer says so (AC5/SM-C3) AND keeps the estimate label (FR-23 — no unlabeled
+        // dollar; the label lives here, not in a truncatable cell). With exactly ONE
+        // unpriced row the note NAMES the count in the singular (AC7).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_fleet_entry("unpriced", 500, 0, None),
+        ]);
+        assert_eq!(totals.unpriced_count, 1, "one metered-unpriced row");
+        let footer = fleet_total_footer(&totals);
+        assert!(
+            footer.contains("≈ $3.00"),
+            "the lower-bound value: {footer}"
+        );
+        assert!(footer.contains("estimated"), "label survives: {footer}");
+        // The count is NAMED, singular for one instance (AC7 nicety).
+        assert!(
+            footer.contains("1 instance unpriced"),
+            "singular count named: {footer}"
+        );
+        assert!(
+            !footer.contains("instances unpriced"),
+            "singular, not plural, for one: {footer}"
+        );
+    }
+
+    #[test]
+    fn fleet_footer_partial_total_names_the_plural_count_of_unpriced_instances() {
+        // TWO metered-but-unpriced instances (plus a Rate'd one that makes the total a
+        // priced lower bound): the footer NAMES the exact count in the plural — "2
+        // instances unpriced" — so the reader knows the basis of the lower bound (AC7).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_fleet_entry("unpriced-a", 500, 0, None),
+            metered_fleet_entry("unpriced-b", 250, 0, None),
+        ]);
+        assert_eq!(totals.unpriced_count, 2, "two metered-unpriced rows");
+        let footer = fleet_total_footer(&totals);
+        assert!(
+            footer.contains("2 instances unpriced"),
+            "plural count named: {footer}"
+        );
+    }
+
+    #[test]
+    fn fleet_footer_no_rate_shows_tokens_and_an_honest_dash_never_zero_dollars() {
+        // No instance has a Rate ⇒ the token total + an honest `—` marker, NEVER a
+        // fabricated `$0.00` (AC4/AC5). The tokens still sum (zero-not-absent).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("a", 100, 200, None),
+            metered_fleet_entry("idle", 0, 0, None),
+        ]);
+        let footer = fleet_total_footer(&totals);
+        assert!(footer.contains("in 100 / out 200"), "{footer}");
+        assert!(
+            footer.contains('—'),
+            "honest absent-dollars marker: {footer}"
+        );
+        assert!(
+            !footer.contains("$0.00"),
+            "never a fabricated zero: {footer}"
+        );
+        assert!(!footer.contains('$'), "no dollar figure at all: {footer}");
+    }
+
+    #[test]
+    fn fleet_footer_empty_fleet_is_zeros_and_no_dollars() {
+        // An empty Fleet: zero tokens + the honest no-dollars marker.
+        let footer = fleet_total_footer(&FleetTotals::from_entries(&[]));
+        assert!(footer.contains("in 0 / out 0"), "{footer}");
+        assert!(footer.contains('—'), "{footer}");
+    }
+
+    #[test]
+    fn usage_cell_show_surfaces_both_token_scopes_when_a_run_is_active() {
+        // AC8: the wide `show` Usage cell shows BOTH scopes — cumulative AND current-Run
+        // — when a Run has usage; a non-running/zero-run instance shows only cumulative
+        // (no fabricated `run: in 0 / out 0`).
+        let running = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+            },
+            ktesio_engine::UsageTotals {
+                input_tokens: 40,
+                output_tokens: 60,
+            },
+        );
+        let shown = usage_cell_show(&running);
+        assert!(shown.contains("in 100 / out 250"), "cumulative: {shown}");
+        assert!(
+            shown.contains("this run: in 40 / out 60"),
+            "run scope: {shown}"
+        );
+
+        // No current run → cumulative only.
+        let idle = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+            },
+            ktesio_engine::UsageTotals::zero(),
+        );
+        let shown = usage_cell_show(&idle);
+        assert!(shown.contains("in 100 / out 250"), "{shown}");
+        assert!(
+            !shown.contains("this run"),
+            "no fabricated run scope: {shown}"
+        );
     }
 
     #[test]

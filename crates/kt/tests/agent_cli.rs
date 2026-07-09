@@ -1272,9 +1272,20 @@ fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
     // stdout is PURE JSON and re-parses (nothing else on stdout, AC9/AD-12).
     let doc: serde_json::Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
-    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    // Story 3-5 bumped the Fleet document version 1 → 2 (additive: `totals` gained).
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
     let instances = doc["instances"].as_array().expect("instances array");
     assert_eq!(instances.len(), 1);
+    // Story 3-5: a top-level `totals` object aggregates the rows. A never-metered
+    // Fleet → zero tokens, dollars honestly absent (never a fabricated $0), not partial.
+    assert!(doc["totals"].is_object(), "totals present: {doc}");
+    assert_eq!(doc["totals"]["total_input_tokens"], serde_json::json!(0));
+    assert_eq!(doc["totals"]["total_output_tokens"], serde_json::json!(0));
+    assert!(
+        doc["totals"].get("total_dollars").is_none(),
+        "no Rate anywhere ⇒ no dollar total: {doc}"
+    );
+    assert_eq!(doc["totals"]["dollars_partial"], serde_json::json!(false));
     let entry = &instances[0];
     assert_eq!(entry["name"], serde_json::json!("alpha"));
     assert_eq!(entry["kind"], serde_json::json!("mock"));
@@ -1332,7 +1343,10 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
     let doc: serde_json::Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
     assert_eq!(doc["instances"], serde_json::json!([]), "{doc}");
-    assert_eq!(doc["schema_version"], serde_json::json!(1));
+    assert_eq!(doc["schema_version"], serde_json::json!(2));
+    // Story 3-5: an empty Fleet still carries a valid all-zero / absent-dollars totals.
+    assert_eq!(doc["totals"]["total_input_tokens"], serde_json::json!(0));
+    assert!(doc["totals"].get("total_dollars").is_none(), "{doc}");
     // The "no instances" guidance is on stderr (so stdout is pure JSON).
     assert!(
         run.stderr.contains("No Agent Instances"),
@@ -1399,7 +1413,14 @@ fn show_json_surfaces_the_same_entry_shape_with_budget_seed_and_real_usage() {
     );
     let doc: serde_json::Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
-    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    // The show document shares the bumped Fleet schema version (2) but — the recorded
+    // asymmetry — does NOT gain a Fleet `totals` (a single instance has no Fleet total;
+    // its own `usage` IS its total).
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert!(
+        doc.get("totals").is_none(),
+        "show --json must NOT carry a Fleet totals object: {doc}"
+    );
     let entry = &doc["instance"];
     assert_eq!(entry["name"], serde_json::json!("alpha"));
     assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
@@ -1798,6 +1819,180 @@ fn show_of_a_no_rate_instance_says_dollar_features_are_inert() {
     );
     // Token features still work: the Usage row is present.
     assert!(show.stdout.contains("Usage"), "stdout={}", show.stdout);
+}
+
+// ---- Story 3-5: the Fleet-wide total (footer + `list --json` totals) ----
+
+#[test]
+fn list_json_carries_a_fleet_totals_object_bumped_to_schema_2() {
+    // Story 3-5 (AC-A/AC9): `kt agent list --json` carries a top-level `totals` object
+    // and the Fleet document version is bumped 1 → 2 (additive). With one Rate'd
+    // instance at zero usage, the token totals are 0 and the dollar total is a labeled
+    // $0 (a Rate exists ⇒ nothing partial). Integer micros + label on the wire; NO `$`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        run.success,
+        "list --json should exit 0; stderr={}",
+        run.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    let totals = &doc["totals"];
+    assert!(totals.is_object(), "totals present: {doc}");
+    assert_eq!(totals["total_input_tokens"], serde_json::json!(0));
+    assert_eq!(totals["total_output_tokens"], serde_json::json!(0));
+    // A Rate exists ⇒ a labeled $0 dollar total (integer micros), not partial, not absent.
+    assert_eq!(totals["total_dollars"], serde_json::json!(0), "{doc}");
+    assert_eq!(totals["estimate_label"], serde_json::json!("estimated"));
+    assert_eq!(totals["dollars_partial"], serde_json::json!(false));
+    // NO `$` string on the wire (AD-14).
+    assert!(
+        !run.stdout.contains('$'),
+        "no `$` on the wire; stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn list_json_totals_carry_the_partial_flag_field() {
+    // AC5 (the honesty crux) SHAPE via the CLI: a Fleet mixing a Rate'd instance with a
+    // no-Rate instance carries the `dollars_partial` field in `list --json`. With zero
+    // usage NEITHER instance is metered yet, so the total is a complete labeled $0
+    // (`dollars_partial == false`) — this test therefore asserts the field is PRESENT +
+    // the document parses, NOT that it is `true`.
+    //
+    // The metered-partial arithmetic that flips the flag to `true` (and the "N unpriced"
+    // count) is proven exactly in the pure unit tests (`fleet.rs`, `agent.rs` footer
+    // tests) + the engine `totals == ledger` integration test — a rename here keeps this
+    // test's name honest about what it checks rather than over-promising `true`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "register", "free", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(run.success, "stderr={}", run.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+    // Two instances aggregated; the `priced` one has a Rate (dollar total present +
+    // labeled), the `free` one does not — but with zero tokens neither is metered, so
+    // the total is a complete labeled $0 (not partial). The shape is what we assert.
+    assert_eq!(doc["instances"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["totals"]["total_dollars"], serde_json::json!(0));
+    assert_eq!(
+        doc["totals"]["estimate_label"],
+        serde_json::json!("estimated")
+    );
+    assert!(doc["totals"].get("dollars_partial").is_some(), "{doc}");
+}
+
+#[test]
+fn human_list_renders_the_fleet_total_footer() {
+    // AC-A/AC-B: the human `kt agent list` renders a Fleet-wide total footer on stdout.
+    // A Rate'd instance ⇒ the footer carries a labeled dollar total THROUGH the currency
+    // module (a `$` figure + the estimate label); the footer names the token totals too.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(run.success, "list should exit 0; stderr={}", run.stderr);
+    // The footer is on stdout (command output, AD-12).
+    assert!(
+        run.stdout.contains("Fleet total:"),
+        "the human list must render a Fleet total footer; stdout=\n{}",
+        run.stdout
+    );
+    // The dollar total rides through the currency module (a `$` figure) + is labeled.
+    assert!(
+        run.stdout.contains('$'),
+        "labeled dollar total; stdout=\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("estimated"),
+        "the Fleet total dollar figure must carry its estimate label; stdout=\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn human_list_footer_no_rate_shows_dash_not_zero_dollars() {
+    // AC4/AC5: with NO instance Rate'd, the footer shows the token totals + an honest
+    // `—` dollar marker, NEVER a fabricated `$0.00` (dollars are not derivable). The
+    // per-instance rows stay honest too (tokens only).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "norate", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(run.success, "list should exit 0; stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("Fleet total:"),
+        "stdout=\n{}",
+        run.stdout
+    );
+    // No fabricated $0.00 Fleet total (no Rate ⇒ dollars honestly absent).
+    assert!(
+        !run.stdout.contains("$0.00"),
+        "a no-Rate Fleet must not fabricate a $0.00 total; stdout=\n{}",
+        run.stdout
+    );
+    // The footer line itself carries the honest absent-dollars marker.
+    assert!(
+        run.stdout.contains("dollars not derived"),
+        "the footer must say dollars are not derived (no Rate); stdout=\n{}",
+        run.stdout
+    );
 }
 
 // ---- Story 2-1: `kt agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
