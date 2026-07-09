@@ -121,9 +121,54 @@ class ReleaseDocsTests(unittest.TestCase):
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
         # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
         self.assertIn("cargo +stable test --workspace --all-targets", ci)
+        # Coverage runs tarpaulin ONCE PER CRATE (#101), not one --workspace pass:
+        # the --workspace instrumented run OOM'd the 7 GB runner even after the
+        # AI-23 fixes. Each per-crate run keeps its resident set small; the UNION of
+        # the per-crate LCOV tracefiles reproduces the --workspace result exactly
+        # (tarpaulin reports coverage for ALL workspace source each test binary
+        # touches, so cross-crate coverage is credited), and the merged aggregate is
+        # gated at the SAME workspace >= 95. Assert the whole structure so a
+        # regression to the OOM-prone single --workspace pass — or a dropped merge /
+        # gate — is caught. The old `--workspace --fail-under 95` command must be
+        # GONE (tarpaulin's own per-run fail-under is replaced by the merged gate).
+        self.assertNotIn("--workspace --fail-under 95", ci)
+        # The per-crate tarpaulin invocation shape (llvm + skip-clean + timeout 180 +
+        # verbose preserved; -p "$pkg" + Lcov out into cov/$pkg replaces --workspace).
         self.assertIn(
-            "cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 "
-            "--verbose --workspace --fail-under 95",
+            'cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 '
+            "--verbose \\\n              -p \"$pkg\" --out Lcov --output-dir "
+            '"cov/$pkg"',
+            ci,
+        )
+        # The exact five workspace crates, lightest → heaviest with ktesio-engine
+        # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers logged).
+        self.assertIn(
+            "set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes "
+            "ktesio ktesio-engine",
+            ci,
+        )
+        # Each per-crate run is grouped and dumps free/df first, so a per-crate OOM
+        # is diagnosable (which crate, at what memory/disk) instead of one opaque
+        # --workspace failure.
+        self.assertIn("::group::tarpaulin -p $pkg", ci)
+        self.assertIn("free -h || true", ci)
+        self.assertIn("df -h / || true", ci)
+        # lcov merges the per-crate tracefiles into the workspace aggregate; apt
+        # installs it. --ignore-errors inconsistent tolerates lcov 2.x's benign
+        # cross-run FN-start-line drift (line data unaffected).
+        self.assertIn("sudo apt-get install -y -qq lcov", ci)
+        self.assertIn("-o cov/merged.info --ignore-errors inconsistent", ci)
+        # The merged aggregate is gated at the SAME workspace >= 95: parse the
+        # `(<hit> of <found> lines)` fraction from `lcov --summary` and fail (exit 1,
+        # ::error::) below 95, else pass.
+        self.assertIn("lcov --summary cov/merged.info", ci)
+        self.assertIn(
+            r"sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/'", ci
+        )
+        self.assertIn("BEGIN { exit (p + 0 >= 95) ? 0 : 1 }", ci)
+        self.assertIn(
+            "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) "
+            "is below the 95% gate",
             ci,
         )
         # --engine llvm: parity with the local macOS gate (ptrace is unavailable
@@ -173,7 +218,8 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("runs-on: ${{ matrix.os }}", ci)
         self.assertIn("fail-fast: false", ci)
         # Only the `test` job matrixes; the other jobs stay ubuntu-only. The
-        # coverage job still stays Linux-only (a single tarpaulin run).
+        # coverage job still stays Linux-only (now a per-crate tarpaulin split
+        # merged into one aggregate, #101 — still Linux, still one job).
         self.assertIn("name: coverage", ci)
 
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
