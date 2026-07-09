@@ -142,7 +142,7 @@ fn self_reported_usage_lands_in_the_ledger_under_the_run_id() {
 
     // Wait for all 3 events to be COMMITTED to the ledger (the reaper drains the
     // captured output). Deterministic: we wait for the known row count, not a sleep.
-    let count = wait_for_usage_rows(state.path(), "meter", 3, Duration::from_secs(15));
+    let count = wait_for_usage_rows(state.path(), "meter", 3, Duration::from_secs(30));
     assert_eq!(count, 3, "exactly 3 usage rows (one per emitted event)");
 
     // Every row carries the SAME Run id (one Run so far).
@@ -197,7 +197,7 @@ fn a_replayed_batch_does_not_double_count() {
     facade.start("replay").unwrap();
 
     // Wait for the 3 distinct events to land.
-    wait_for_usage_rows(state.path(), "replay", 3, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "replay", 3, Duration::from_secs(30));
     // Give the reaper several more polls so the replayed sequence-0 line is
     // definitely drained + classified (a duplicate → no-op). A generous settle.
     std::thread::sleep(Duration::from_millis(800));
@@ -243,14 +243,14 @@ fn a_restart_opens_a_fresh_run_and_per_run_totals_do_not_bleed() {
 
     // Run 1: start, wait for its 2 events, then stop (closes the Run).
     facade.start("runs").unwrap();
-    wait_for_usage_rows(state.path(), "runs", 2, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "runs", 2, Duration::from_secs(30));
     facade.stop("runs", Some(Duration::from_secs(5))).unwrap();
     let after_run1 = distinct_run_ids(state.path(), "runs");
     assert_eq!(after_run1.len(), 1, "one Run so far: {after_run1:?}");
 
     // Run 2: start again (a NEW Run), wait for its 2 events (total 4 rows now).
     facade.start("runs").unwrap();
-    wait_for_usage_rows(state.path(), "runs", 4, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "runs", 4, Duration::from_secs(30));
 
     // TWO distinct Run ids now — the restart opened a fresh Run (AC-B).
     let runs = distinct_run_ids(state.path(), "runs");
@@ -310,7 +310,7 @@ fn a_final_newline_less_usage_line_is_not_stranded_on_exit() {
 
     // All THREE events land: the 2 newline-terminated ones + the final newline-less
     // one the terminal drain rescued. Deterministic on committed row count.
-    let count = wait_for_usage_rows(state.path(), "tail", 3, Duration::from_secs(15));
+    let count = wait_for_usage_rows(state.path(), "tail", 3, Duration::from_secs(30));
     assert_eq!(
         count, 3,
         "the final newline-less usage line must be ingested by the terminal drain"
@@ -357,7 +357,7 @@ fn a_huge_u64_token_count_clamps_positive_and_is_not_a_negative_bill() {
     facade.start("huge").unwrap();
 
     // The one event commits.
-    wait_for_usage_rows(state.path(), "huge", 1, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "huge", 1, Duration::from_secs(30));
 
     // The surfaced cumulative is the clamped POSITIVE value (i64::MAX as u64), NOT a
     // negative masked to 0, NOT a wrapped value.

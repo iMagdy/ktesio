@@ -38,6 +38,19 @@
 //!   `running`, so the supervisor's reaper detects the later `Exited` as a crash
 //!   and the Restart Policy fires. The `--heartbeat-ms` line count proves a
 //!   RESTARTED instance is alive again. Pure `std`, NO OS-cfg.
+//! * `--crash-times <N>` (+ `--crash-state <path>`)  BOUND the self-crash to the
+//!   first `<N>` LAUNCHES of the instance, so a restarted process eventually STOPS
+//!   crashing and stays up. Because each restart is a FRESH process (an in-memory
+//!   counter cannot survive it), the count is kept in a tiny `--crash-state` file
+//!   the engine's Agent Home persists across restarts: on each launch the process
+//!   reads the integer there (default 0); while it is `< N` it increments+persists
+//!   and crashes (after `--crash-after-ms`), and once it reaches `N` it does NOT
+//!   crash — it lingers normally. This makes an `on-failure` restart test
+//!   DETERMINISTIC: with `--crash-times 1` the instance crashes exactly once, is
+//!   restarted once, then stays `running` (its restart count is stably 1 and a
+//!   clean stop cannot race a second crash). ABSENT (or without `--crash-state`),
+//!   the self-crash is UNBOUNDED (every launch crashes) — the existing crash-loop
+//!   behavior is unchanged. Pure `std`, NO OS-cfg (a plain file read/write).
 //!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
@@ -86,7 +99,7 @@
 //!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -114,6 +127,14 @@ struct Opts {
     crash_after: Option<Duration>,
     /// The exit code the `--crash-after-ms` self-crash uses (default 1).
     crash_with: i32,
+    /// BOUND the self-crash to the first `<N>` launches (see the module docs).
+    /// `None` = unbounded (every launch crashes — the existing behavior). Only has
+    /// an effect together with `--crash-state` (the cross-restart counter file).
+    crash_times: Option<u64>,
+    /// The tiny file that carries the launch-crash counter ACROSS restarts (each
+    /// restart is a fresh process), so `--crash-times` can stop crashing after the
+    /// bound. `None` = no persisted counter (the bound cannot be enforced).
+    crash_state: Option<PathBuf>,
     /// Emit this many self-reported usage sentinel lines (story 3-1). `0` = none.
     emit_usage: u64,
     /// After the usage batch, re-emit `sequence 0` once — a replayed batch for the
@@ -177,6 +198,8 @@ fn parse() -> Opts {
     let mut heartbeat = None;
     let mut crash_after = None;
     let mut crash_with = 1;
+    let mut crash_times = None;
+    let mut crash_state = None;
     let mut emit_usage = 0;
     let mut replay_usage = false;
     let mut usage_input_tokens = None;
@@ -240,6 +263,16 @@ fn parse() -> Opts {
                     crash_with = code;
                 }
             }
+            "--crash-times" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    crash_times = Some(n);
+                }
+            }
+            "--crash-state" => {
+                if let Some(path) = args.next() {
+                    crash_state = Some(PathBuf::from(path));
+                }
+            }
             "--marker" => {
                 if let Some(path) = args.next() {
                     marker = Some(PathBuf::from(path));
@@ -264,6 +297,8 @@ fn parse() -> Opts {
         heartbeat,
         crash_after,
         crash_with,
+        crash_times,
+        crash_state,
         emit_usage,
         replay_usage,
         usage_input_tokens,
@@ -284,6 +319,32 @@ fn main() {
         write_marker(&opts.marker, "exit-fast");
         std::process::exit(code);
     }
+
+    // Resolve whether THIS launch should self-crash. Default: honor
+    // `--crash-after-ms` on EVERY launch (the unbounded crash-loop behavior). When
+    // BOTH `--crash-times <N>` and `--crash-state <path>` are set, the self-crash is
+    // BOUNDED to the first N launches via a tiny persisted counter that survives the
+    // restart (a fresh process): read the count, and if it is already `>= N` clear
+    // the crash so this (restarted) launch stays up; otherwise increment+persist and
+    // keep the crash armed. This makes an `on-failure` restart test deterministic —
+    // `--crash-times 1` crashes exactly once, then the restarted process lingers.
+    let effective_crash_after = match (
+        opts.crash_after,
+        opts.crash_times,
+        opts.crash_state.as_ref(),
+    ) {
+        (Some(after), Some(limit), Some(state_path)) => {
+            let prior = read_crash_count(state_path);
+            if prior >= limit {
+                None // bound reached — this launch does not crash
+            } else {
+                write_crash_count(state_path, prior + 1);
+                Some(after)
+            }
+        }
+        // No bound (or no state file to persist it): crash on every launch.
+        (other, _, _) => other,
+    };
 
     // Optionally spawn a looping child in the same process group / Job (it
     // inherits both), to prove the no-survivor kill catches the whole tree.
@@ -402,7 +463,7 @@ fn main() {
     // short poll keeps the process responsive to signals in all modes.
     let start = Instant::now();
     let deadline = start + opts.linger;
-    let crash_deadline = opts.crash_after.map(|d| start + d);
+    let crash_deadline = effective_crash_after.map(|d| start + d);
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     while Instant::now() < deadline {
@@ -428,6 +489,26 @@ fn main() {
     }
     // Lingered the whole window without being killed: exit cleanly.
     std::process::exit(0);
+}
+
+/// Read the cross-restart launch-crash counter (see `--crash-times`). A missing,
+/// empty, or unparsable file reads as `0` (this is the first launch) — best-effort,
+/// never a panic, so a filesystem hiccup degrades to "crash on this launch" rather
+/// than crashing the harness. Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn read_crash_count(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the cross-restart launch-crash counter (see `--crash-times`).
+/// Best-effort: a write failure just means the next launch re-reads the old value,
+/// so the bound might crash one extra time — never a panic. Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn write_crash_count(path: &Path, count: u64) {
+    let _ = std::fs::write(path, count.to_string());
 }
 
 /// Best-effort write of a one-line marker file so tests can confirm startup

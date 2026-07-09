@@ -293,7 +293,7 @@ fn engine_observed_usage_lands_in_the_ledger_tagged_engine_observed() {
     assert_eq!(started.state, LifecycleState::Running);
 
     // Wait for all 3 OBSERVED events to commit (the reaper drains the listener queue).
-    let count = wait_for_observed_rows(state.path(), "obs", 3, Duration::from_secs(20));
+    let count = wait_for_observed_rows(state.path(), "obs", 3, Duration::from_secs(30));
     assert_eq!(
         count, 3,
         "exactly 3 engine-observed rows (one per observed call)"
@@ -359,7 +359,7 @@ fn a_token_budget_enforces_on_observed_usage_and_pauses() {
         &engine,
         "obsbudget",
         LifecycleState::Paused,
-        Duration::from_secs(20),
+        Duration::from_secs(30),
     );
 
     // A token breach was recorded (FR-21 always-recorded), carrying the
@@ -425,7 +425,7 @@ fn a_dollar_cap_enforces_on_observed_usage_labeled_estimated() {
         &engine,
         "obsdollar",
         LifecycleState::Paused,
-        Duration::from_secs(20),
+        Duration::from_secs(30),
     );
 
     // A DOLLAR breach was recorded, labeled `estimated` (an observed figure is an
@@ -485,7 +485,7 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
         .unwrap();
 
     facade.start("noleak").unwrap();
-    wait_for_observed_rows(state.path(), "noleak", 2, Duration::from_secs(20));
+    wait_for_observed_rows(state.path(), "noleak", 2, Duration::from_secs(30));
 
     // The proxy relayed the key faithfully UPSTREAM (the stub saw it) — so the key DID
     // flow through the proxy; the point is it does not leak into ktesio's own surfaces.

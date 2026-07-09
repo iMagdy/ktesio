@@ -188,7 +188,7 @@ fn a_dollar_cap_breach_pauses_by_default_and_records_a_dollar_breach() {
         state.path(),
         "capdollar",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     // Exactly one DOLLAR breach for the single crossing (the dimension-keyed latch).
@@ -285,7 +285,7 @@ fn the_ge_boundary_a_cost_exactly_at_the_cap_breaches() {
         state.path(),
         "edgedollar",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     let breaches = facade.budget_breach_events("edgedollar").unwrap();
@@ -336,7 +336,7 @@ fn breach_action_stop_drives_the_instance_to_stopped_on_a_dollar_cap() {
         state.path(),
         "dollarstop",
         LifecycleState::Stopped,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     let breaches = facade.budget_breach_events("dollarstop").unwrap();
@@ -381,7 +381,7 @@ fn breach_action_warn_records_exactly_one_dollar_breach_across_many_events() {
 
     // Wait until ALL 5 usage events have committed — every post-breach event ran
     // enforcement — then assert the dollar breach COUNT is exactly 1.
-    wait_for_usage_rows(state.path(), "dollarwarn", 5, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "dollarwarn", 5, Duration::from_secs(30));
 
     let breaches = facade.budget_breach_events("dollarwarn").unwrap();
     let dollar: Vec<_> = breaches
@@ -446,7 +446,7 @@ fn a_cost_cap_with_no_rate_is_inert_while_token_budgets_still_fire() {
         state.path(),
         "inert",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     let breaches = facade.budget_breach_events("inert").unwrap();
@@ -514,7 +514,7 @@ fn a_token_and_a_dollar_cap_each_fire_once_on_the_same_run() {
         .unwrap();
 
     facade.start("both").unwrap();
-    wait_for_usage_rows(state.path(), "both", 5, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "both", 5, Duration::from_secs(30));
 
     let breaches = facade.budget_breach_events("both").unwrap();
     let tokens = breaches
@@ -572,7 +572,7 @@ fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
     facade.start("noretro").unwrap();
 
     // Let at least 3 events commit under the ORIGINAL rate (cost 30 micros each).
-    wait_for_usage_rows(state.path(), "noretro", 3, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "noretro", 3, Duration::from_secs(30));
     let rows_at_change = usage_row_count(state.path(), "noretro");
     let cost_before = facade
         .fleet()
@@ -599,7 +599,7 @@ fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
         .unwrap();
 
     // Let all 20 events commit (the later ones priced at the new rate).
-    wait_for_usage_rows(state.path(), "noretro", 20, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "noretro", 20, Duration::from_secs(30));
 
     let cost_after = facade
         .fleet()

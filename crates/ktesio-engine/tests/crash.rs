@@ -145,11 +145,35 @@ fn on_failure_crash_is_restarted_by_the_reaper() {
     // AC-A / AC4: an `on-failure` instance whose process crashes is AUTOMATICALLY
     // restarted by the engine reaper — the restart count grows and the instance
     // runs again. Tolerates the production 1s base backoff (a single restart).
+    //
+    // DETERMINISM (AI-49): the agent crashes EXACTLY ONCE, then the restarted
+    // process lingers instead of crashing again. `--crash-times 1` keeps a persisted
+    // launch counter in a file that survives the restart (a fresh process), so the
+    // FIRST launch crashes ~450ms in and the SECOND (restarted) launch stays up.
+    // This removes the parallel-load race the older single-`--crash-after-ms`
+    // version had: with the agent crashing on EVERY launch, the reaper could detect
+    // a SECOND crash and bump the persisted restart count to 2 in the window between
+    // this test observing the first `Restarted` event and reading the count — a
+    // flaky `restart_count == 1`. With a single crash the count is stably 1 and the
+    // final stop cannot race a second crash.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    // Crash once ~450ms after each (re)start. After the first crash + restart we
-    // stop it, so we only ever observe one restart (bounded runtime ~2s).
-    write_fake_manifest(manifest.path(), "recovering", &["--crash-after-ms", "450"]);
+    // The cross-restart crash counter lives in the manifest dir (stable across the
+    // reaper's restart, which re-execs the SAME manifest args). Crash once ~450ms
+    // after the first launch, then linger.
+    let crash_state = manifest.path().join("crash-count");
+    write_fake_manifest(
+        manifest.path(),
+        "recovering",
+        &[
+            "--crash-after-ms",
+            "450",
+            "--crash-times",
+            "1",
+            "--crash-state",
+            &crash_state.to_string_lossy(),
+        ],
+    );
 
     let engine = open(&state);
     let facade = engine.blocking();
@@ -170,11 +194,11 @@ fn on_failure_crash_is_restarted_by_the_reaper() {
     // perform the restart after the production 1s base backoff — proven by a
     // `Restarted` event appearing in the log (NOT merely the count bumping, which
     // happens at crash-detection time before the backoff). Generous timeout to
-    // accommodate the 1s backoff + readiness. We simply observe the restart land;
-    // note that a mid-backoff instance is `failed`, and there is no
-    // `failed → stopping` edge this story, so it cannot be stopped until it is
-    // `running` again (the restart is not pre-emptable during the backoff window).
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // accommodate the 1s backoff + readiness on a loaded CI runner. We simply
+    // observe the restart land; note that a mid-backoff instance is `failed`, and
+    // there is no `failed → stopping` edge this story, so it cannot be stopped until
+    // it is `running` again (the restart is not pre-emptable during the backoff).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let restart_evt = loop {
         let events = facade.transition_events("recovering").unwrap();
         if let Some(evt) = events
@@ -190,7 +214,8 @@ fn on_failure_crash_is_restarted_by_the_reaper() {
         std::thread::sleep(Duration::from_millis(100));
     };
 
-    // The `restarted` event records the count + the ≥1s backoff waited.
+    // The `restarted` event records the count + the ≥1s backoff waited (both are
+    // recorded DATA on the event, not wall-clock measurements — parallel-load safe).
     match &restart_evt.cause {
         ktesio_engine::TransitionCause::Restarted { count, waited_ms } => {
             assert_eq!(*count, 1);
@@ -202,11 +227,28 @@ fn on_failure_crash_is_restarted_by_the_reaper() {
         _ => unreachable!(),
     }
 
-    // The restart count is durably 1, and the instance is running again.
-    let status = facade.instance_status("recovering").unwrap();
-    assert_eq!(status.restart_count, 1);
+    // The restart count is durably 1 AND the instance is running again. Poll both to
+    // the terminal, stable post-restart condition (the restarted process no longer
+    // crashes, so this converges and holds): `running` with restart_count == 1. A
+    // generous bound tolerates a loaded runner finishing the restart's readiness.
+    let converge = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = facade.instance_status("recovering").unwrap();
+        if status.instance.state == LifecycleState::Running && status.restart_count == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < converge,
+            "expected the restarted instance to settle running with restart_count == 1 \
+             (state: {}, count: {})",
+            status.instance.state,
+            status.restart_count
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
-    // Stop it (now `running`) to bound the test — a stop is only effective once
-    // the instance is running again, which it is after the observed restart.
+    // Stop it (now stably `running`) to bound the test — a stop is only effective
+    // once the instance is running again, which it is after the observed restart,
+    // and (unlike the old every-launch-crash version) it cannot race a second crash.
     let _ = facade.stop("recovering", Some(Duration::from_secs(5)));
 }

@@ -178,7 +178,7 @@ fn a_cumulative_budget_breach_pauses_by_default_and_records_the_breach() {
         state.path(),
         "cap",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     // A breach event is ALWAYS recorded (AC-A / AC7), and EXACTLY ONE for the single
@@ -261,7 +261,7 @@ fn the_ge_boundary_a_total_exactly_at_the_budget_breaches() {
         state.path(),
         "edge",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     let breaches = facade.budget_breach_events("edge").unwrap();
@@ -309,7 +309,7 @@ fn breach_action_stop_drives_the_instance_to_stopped() {
         state.path(),
         "hardstop",
         LifecycleState::Stopped,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     // The breach is recorded with the stop action.
@@ -359,7 +359,7 @@ fn breach_action_warn_records_exactly_one_breach_across_many_post_breach_events(
     // Wait until ALL 5 usage events have committed — i.e. every post-breach event has
     // passed through the enforcement stage. Only then is the "exactly one" claim a
     // real test of the latch (all 4 post-crossing events had their chance to re-record).
-    wait_for_usage_rows(state.path(), "watchonly", 5, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "watchonly", 5, Duration::from_secs(30));
 
     // EXACTLY ONE breach event for the single logical crossing (the latch fix). A
     // small settle re-poll guards against a late 6th ingestion pass sneaking a
@@ -465,7 +465,7 @@ source = "self-reported"
 
     // The breach IS recorded even though pause is unsupported (FR-21). Poll the
     // committed breach log.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let breaches = facade.budget_breach_events("nopause").unwrap();
         if !breaches.is_empty() {
@@ -531,7 +531,7 @@ fn a_per_run_budget_breaches_within_the_run() {
         state.path(),
         "perrun",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
 
     // Exactly one per-run breach for the single crossing (the idempotence latch):
@@ -578,7 +578,7 @@ fn a_budget_changed_while_running_applies_immediately() {
     facade.start("live").unwrap();
 
     // Let at least 3 events commit under the high budget (no breach — still running).
-    wait_for_usage_rows(state.path(), "live", 3, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "live", 3, Duration::from_secs(30));
     assert_eq!(
         committed_state(state.path(), "live").as_deref(),
         Some("running"),
@@ -596,7 +596,7 @@ fn a_budget_changed_while_running_applies_immediately() {
         state.path(),
         "live",
         LifecycleState::Paused,
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     );
     let breaches = facade.budget_breach_events("live").unwrap();
     assert!(!breaches.is_empty(), "the lowered budget must breach live");
@@ -626,7 +626,7 @@ fn an_unbudgeted_instance_never_breaches() {
     facade.start("free").unwrap();
 
     // All 4 events commit...
-    wait_for_usage_rows(state.path(), "free", 4, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "free", 4, Duration::from_secs(30));
     // ...and the instance is STILL running (no breach, no pause/stop).
     assert_eq!(
         committed_state(state.path(), "free").as_deref(),

@@ -152,8 +152,8 @@ fn fleet_totals_equal_the_ledger_sum_across_instances_and_flag_partial() {
     facade.start("free").unwrap();
 
     // Wait for the KNOWN committed row counts (deterministic — not a sleep).
-    wait_for_usage_rows(state.path(), "rated", 3, Duration::from_secs(15));
-    wait_for_usage_rows(state.path(), "free", 2, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "rated", 3, Duration::from_secs(30));
+    wait_for_usage_rows(state.path(), "free", 2, Duration::from_secs(30));
 
     // Compose the Fleet-wide aggregate EXACTLY as the CLI does: engine `fleet()` rows
     // → `FleetListing::new` (which computes `FleetTotals::from_entries` purely).
@@ -243,8 +243,8 @@ fn fleet_totals_are_complete_and_labeled_when_every_metered_instance_is_rated() 
     }
     facade.start("a").unwrap();
     facade.start("b").unwrap();
-    wait_for_usage_rows(state.path(), "a", 4, Duration::from_secs(15));
-    wait_for_usage_rows(state.path(), "b", 2, Duration::from_secs(15));
+    wait_for_usage_rows(state.path(), "a", 4, Duration::from_secs(30));
+    wait_for_usage_rows(state.path(), "b", 2, Duration::from_secs(30));
 
     let listing = FleetListing::new(facade.fleet().unwrap());
     let totals = &listing.totals;
