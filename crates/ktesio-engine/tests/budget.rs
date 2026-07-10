@@ -44,8 +44,18 @@ const TOKENS_PER_EVENT: u64 = 30;
 /// deterministic.
 fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
     let bin = ktesio_conformance::fake_agent_bin();
+    // Append `--dump argv-dump.txt` (story 2-2's write_dump mechanism): the fake_agent
+    // writes its RECEIVED argv + env into this RELATIVE path, which resolves against
+    // the child's working_dir = the Agent Home (the backend sets `current_dir` to it),
+    // i.e. `<state_dir>/agents/<name>/argv-dump.txt`. That file sits under the state dir
+    // the timeout `dump_diagnostics` walks, so on a macOS/Windows failure the received
+    // argv is surfaced — revealing whether `--emit-usage` reached the process at all.
+    // It writes a SEPARATE file (never agent.log/stdout), so no test's committed-state /
+    // breach / usage-row assertions are affected; on a passing runner it is inert.
     let args_toml = args
         .iter()
+        .copied()
+        .chain(["--dump", "argv-dump.txt"])
         .map(|a| format!("{a:?}"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -216,9 +226,34 @@ fn dump_diagnostics(state_dir: &Path, name: &str) {
         }
     }
 
-    // (4) Full recursive walk of the state dir (which contains the agents/ tree, each
+    // (4) The argv the fake_agent actually RECEIVED (story 2-2's `--dump` mechanism:
+    // `write_fake_manifest` appends `--dump argv-dump.txt`, which the child writes into
+    // its working_dir = the Agent Home). Print ONLY the `arg=` lines — NEVER the `env=`
+    // lines, which could carry runner secrets. This is the decisive datum:
+    //   * file ABSENT     → args were dropped WHOLESALE (`--dump` never arrived either);
+    //   * present, NO `--emit-usage` → the flag was dropped before/at spawn;
+    //   * present, WITH `--emit-usage` → the flag arrived (a parser-side issue).
+    let argv_dump = state_dir.join("agents").join(name).join("argv-dump.txt");
+    match std::fs::read_to_string(&argv_dump) {
+        Ok(text) => {
+            eprintln!("received argv (from {}):", argv_dump.display());
+            for line in text.lines().filter(|l| l.starts_with("arg=")) {
+                eprintln!("    {line}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "argv dump ABSENT/UNREADABLE at {} ({e}) — the args were likely dropped \
+                 wholesale (`--dump` did not reach the process either)",
+                argv_dump.display()
+            );
+        }
+    }
+
+    // (5) Full recursive walk of the state dir (which contains the agents/ tree, each
     // Agent Home, and every per-instance log): each file's path + byte size, plus the
-    // full contents of small `*.log`/`*.toml`/`*.json` text files.
+    // full contents of small `*.log`/`*.toml`/`*.json` text files. The `argv-dump.txt`
+    // is `.txt`, so the walk lists it by SIZE only — its `env=` lines are never spewed.
     eprintln!(
         "--- recursive walk of state dir {} ---",
         state_dir.display()
