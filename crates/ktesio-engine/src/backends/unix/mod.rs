@@ -110,6 +110,12 @@ impl ProcessBackend for UnixBackend {
     fn spawn(&self, spec: &SpawnSpec) -> Result<Self::Handle, BackendError> {
         let mut command = Command::new(&spec.exec);
         command.args(&spec.args);
+        eprintln!(
+            "KTESIO_ARGDIAG unix-backend exec={:?} argc={} args={:?}",
+            spec.exec,
+            spec.args.len(),
+            spec.args
+        );
         command.current_dir(&spec.working_dir);
         // Apply env overrides on top of the inherited environment.
         for (key, value) in &spec.env {

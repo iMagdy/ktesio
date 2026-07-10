@@ -971,7 +971,7 @@ mod tests {
         assert!(
             resp_text.starts_with("HTTP/1.1 502"),
             "an over-cap upstream body must relay a clean 502: {}",
-            &resp_text.chars().take(200).collect::<String>()
+            resp_text.chars().take(200).collect::<String>()
         );
         // No-leak: the 502 the agent receives carries NONE of the oversize body content.
         assert!(

@@ -374,6 +374,11 @@ impl Supervisor {
             None => adapter::resolve_start_launch(&kind, manifest_path.as_deref())
                 .map_err(|e| launch_to_engine(&name, e))?,
         };
+        eprintln!(
+            "KTESIO_ARGDIAG resolved name={name} argc={} args={:?}",
+            launch.args.len(),
+            launch.args
+        );
 
         // Read the declared Metering Source (story 3-1) from the persisted adapter
         // snapshot — stamped on every UsageEvent ingested during this Run. Read here
@@ -442,6 +447,11 @@ impl Supervisor {
             .map_err(|e| secret_to_engine(&name, e))?;
         adapter::apply_config_mapping(&mut launch, &mapping, &mapping_effective, &secrets, &home)
             .map_err(|e| config_apply_to_engine(&name, e))?;
+        eprintln!(
+            "KTESIO_ARGDIAG mapped name={name} argc={} args={:?}",
+            launch.args.len(),
+            launch.args
+        );
 
         // (2c) Persist the effective-config snapshot into the Agent Home (story
         // 2-3, spine AD-9 "start resolves to an EffectiveConfig snapshot persisted

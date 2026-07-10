@@ -194,6 +194,12 @@ impl ProcessBackend for WindowsBackend {
 
         let mut command = Command::new(&spec.exec);
         command.args(&spec.args);
+        eprintln!(
+            "KTESIO_ARGDIAG windows-backend exec={:?} argc={} args={:?}",
+            spec.exec,
+            spec.args.len(),
+            spec.args
+        );
         command.current_dir(&spec.working_dir);
         for (key, value) in &spec.env {
             command.env(key, value);
