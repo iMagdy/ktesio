@@ -360,11 +360,20 @@ impl Supervisor {
 
         // (2) Resolve the launch spec (may reject: native-only / bad manifest),
         // still before any persisted state change.
-        let (kind, manifest_path) = registry
+        let (kind, manifest_path, persisted_launch) = registry
             .adapter_launch_facts(&name)
             .map_err(registry_to_engine)?;
-        let mut launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
-            .map_err(|e| launch_to_engine(&name, e))?;
+        // Prefer the launch SNAPSHOTTED at registration — this removes the fragile
+        // start-time manifest re-read that dropped `args` on hosted CI runners
+        // (the agent spawned with the right binary but ZERO args). Fall back to
+        // re-reading the manifest ONLY when the snapshot carries no launch: a
+        // native adapter (→ NativeHasNoLaunch, preserved) or an instance
+        // registered before the launch was persisted (legacy snapshot).
+        let mut launch = match persisted_launch {
+            Some(launch) => launch,
+            None => adapter::resolve_start_launch(&kind, manifest_path.as_deref())
+                .map_err(|e| launch_to_engine(&name, e))?,
+        };
 
         // Read the declared Metering Source (story 3-1) from the persisted adapter
         // snapshot — stamped on every UsageEvent ingested during this Run. Read here
@@ -2421,9 +2430,10 @@ mod tests {
         registry.set_config(&name, "model", "gpt-4").unwrap();
 
         // Resolve exactly as start_inner would for a native adapter.
-        let (kind, manifest_path) = registry.adapter_launch_facts(&name).unwrap();
+        let (kind, manifest_path, launch) = registry.adapter_launch_facts(&name).unwrap();
         assert_eq!(kind, "mock");
         assert!(manifest_path.is_none(), "mock is native (no manifest)");
+        assert!(launch.is_none(), "mock is native (no snapshotted launch)");
         let effective = registry
             .effective_config(&name, crate::domain::ConfigLayer::empty())
             .unwrap();
@@ -2450,6 +2460,107 @@ mod tests {
             launch.env.get("MODEL").map(String::as_str),
             Some("gpt-4"),
             "the documented model key must land in the mock's declared env target"
+        );
+    }
+
+    // ---- The launch-snapshot fix (hosted-runner arg-loss): start uses the
+    //      REGISTRATION snapshot, never a start-time manifest re-read ----
+
+    #[test]
+    fn start_uses_the_registration_launch_snapshot_not_a_manifest_reread() {
+        // The FIX, at the EXACT seam the supervisor uses (`adapter_launch_facts`),
+        // OS-agnostically (no spawn — runs on every platform, including the
+        // macOS/Windows CI that dropped the args): register a fake_agent manifest
+        // with distinctive args, DELETE the manifest file, then read the launch
+        // facts. The persisted exec + args + env still come back intact — and the
+        // fallback re-read now FAILS (the manifest is gone), proving the snapshot,
+        // not a re-read, is what carries the launch into `start`.
+        let (_state, manifest, registry) =
+            setup_fake("snap", &["--emit-usage", "5", "--linger-ms", "600000"]);
+        let name = InstanceName::new("snap").unwrap();
+
+        // Remove the manifest entirely — any start-time re-read of it now fails.
+        std::fs::remove_file(manifest.path().join("adapter.toml")).unwrap();
+
+        let (kind, manifest_path, launch) = registry.adapter_launch_facts(&name).unwrap();
+        assert_eq!(kind, "snap");
+        assert!(
+            manifest_path.is_some(),
+            "a manifest adapter records its path"
+        );
+        let launch = launch.expect("the launch is snapshotted at registration");
+        let bin = ktesio_conformance::fake_agent_bin();
+        assert_eq!(launch.exec, bin.to_string_lossy().into_owned());
+        // The manifest's [lifecycle.start] args survived — INCLUDING the args the
+        // hosted runners dropped on re-read.
+        assert_eq!(
+            launch.args,
+            vec!["--emit-usage", "5", "--linger-ms", "600000"]
+        );
+
+        // The fallback re-read WOULD fail now (the manifest is gone): proof that
+        // the snapshot — not a re-read — is what makes the start work.
+        assert!(
+            adapter::resolve_start_launch(&kind, manifest_path.as_deref()).is_err(),
+            "the manifest re-read is gone/broken; the snapshot carried the launch"
+        );
+    }
+
+    #[test]
+    fn manifest_start_uses_the_snapshot_launch_even_when_the_manifest_changes_live() {
+        // The FIX end-to-end: after registration the launch is FIXED by the
+        // snapshot, so mutating the manifest's [lifecycle.start] args no longer
+        // affects the started process. Register a fake_agent, REWRITE its manifest
+        // with a decoy arg only a re-read would surface, then START — the spawned
+        // argv carries the ORIGINAL args and NOT the decoy. Linux-only spawn+observe,
+        // matching the sibling `_live` proofs (macOS/Windows CI spawn scaffolding is
+        // the very fragility this fix removes; the OS-agnostic seam test above +
+        // Epic 1 backend tests cover the rest).
+        if OsId::current() != OsId::Linux {
+            return;
+        }
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("argv.txt");
+        let (_state, manifest, registry) = setup_fake(
+            "del",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+        );
+
+        // Rewrite the manifest AFTER registration, appending a decoy arg. The
+        // manifest stays valid (no [config]), so the unchanged config-mapping
+        // re-read still succeeds; only a LAUNCH re-read would surface the decoy.
+        write_fake_manifest(
+            manifest.path(),
+            "del",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+                "--decoy-from-reread",
+            ],
+        );
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "del").unwrap();
+        assert_eq!(state_of(&registry, "del"), LifecycleState::Running);
+
+        // The spawned fake_agent dumped its argv: the ORIGINAL start args are there,
+        // and the post-registration decoy is NOT — the launch came from the
+        // registration snapshot, not a re-read of the mutated manifest.
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == "arg=--linger-ms"),
+            "the snapshotted start args must reach argv; dump=\n{dumped}"
+        );
+        assert!(
+            !dumped.lines().any(|l| l == "arg=--decoy-from-reread"),
+            "the re-read decoy must NOT appear — the launch came from the snapshot; dump=\n{dumped}"
         );
     }
 

@@ -288,6 +288,18 @@ fn parse() -> Opts {
         }
     }
 
+    // Story 3-4 no-leak refinement: prefer an ENV-delivered observed auth over the
+    // `--observed-auth` flag. Delivering the key as a `secret:` config leaf (mapped
+    // onto this env var) keeps the sentinel OUT of the persisted registration
+    // snapshot — the resolved cleartext reaches this process only in its START-time
+    // environment — so the no-leak sweep can cover the WHOLE Agent Home (the
+    // registration snapshot `adapter.json` included). The flag stays a fallback for
+    // any caller that still passes it literally (e.g. a manifest `[lifecycle.start]`
+    // arg).
+    if let Ok(env_auth) = std::env::var("FAKE_AGENT_OBSERVED_AUTH") {
+        observed_auth = Some(env_auth);
+    }
+
     Opts {
         exit_fast,
         spawn_child,

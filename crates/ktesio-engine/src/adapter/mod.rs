@@ -78,6 +78,13 @@ pub struct ResolvedAdapter {
     /// For a manifest adapter, the resolved absolute manifest path (1-4 needs
     /// it to launch). `None` for a native adapter.
     manifest_path: Option<PathBuf>,
+    /// The resolved `start` launch (exec + args + env), captured from the SAME
+    /// manifest parse that produced `declaration`. `None` for a native adapter
+    /// (no launch command) or a manifest with no `[lifecycle.start]` template.
+    /// The registry persists this into the adapter snapshot so the start path
+    /// USES it instead of re-reading the manifest — removing the fragile
+    /// start-time re-read that dropped `args` on hosted CI runners.
+    launch: Option<StartLaunch>,
 }
 
 impl ResolvedAdapter {
@@ -99,6 +106,13 @@ impl ResolvedAdapter {
     /// The manifest path, if this is a manifest adapter.
     pub fn manifest_path(&self) -> Option<&Path> {
         self.manifest_path.as_deref()
+    }
+
+    /// The resolved `start` launch captured at resolution, if any. `None` for a
+    /// native adapter (no launch command). The registry snapshots this at
+    /// registration so the start path need not re-read the manifest.
+    pub fn launch(&self) -> Option<&StartLaunch> {
+        self.launch.as_ref()
     }
 
     /// Project the declaration onto `os` (the effective current-OS view).
@@ -172,6 +186,16 @@ pub enum AdapterResolveError {
 /// adapter's equivalent. The supervisor turns this into a
 /// [`SpawnSpec`](crate::ports::SpawnSpec) (adding the working dir + log file) and
 /// hands it to the [`ProcessBackend`](crate::ports::ProcessBackend).
+///
+/// Intentionally NOT `Serialize`/`Deserialize` (spine AD-10, the same discipline
+/// as `SecretString`): after [`apply_config_mapping`] runs at start, this
+/// launch's plain-`String` `args`/`env` can hold RESOLVED secret cleartext, so
+/// the type must not be serializable — a compile-time guard against a
+/// post-delivery launch leaking through a snapshot, log, or event. The registry
+/// persists only the REGISTRATION-time launch (which carries no resolved secrets
+/// — just the manifest's `[lifecycle.start]` exec/args/env) and does so through a
+/// dedicated `LaunchSnapshot` DTO, mirroring the serialize-a-DTO-not-the-live-type
+/// discipline of the effective-config snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartLaunch {
     /// The executable to run (program name or path).
@@ -263,18 +287,31 @@ pub fn resolve_start_launch(
             path: manifest_path.to_string_lossy().into_owned(),
             detail: e.to_string(),
         })?;
-    let start = manifest
+    start_launch_from_manifest(&manifest).ok_or_else(|| LaunchResolveError::NoStartTemplate {
+        path: manifest_path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Extract the `[lifecycle.start]` launch (exec + args + env) from an
+/// already-parsed manifest, if it declares one — `None` when there is no
+/// `[lifecycle.start]` template.
+///
+/// Shared by [`resolve`] (which captures the launch at REGISTRATION into the
+/// [`ResolvedAdapter`] the registry snapshots) and [`resolve_start_launch`] (the
+/// fallback re-read), so both derive the launch identically from one parse. A
+/// validated manifest always has a start template (`Manifest::validate` requires
+/// it), so `resolve` yields `Some` for every manifest that passes registration;
+/// the `Option` stays honest for the defensive re-read path.
+fn start_launch_from_manifest(manifest: &Manifest) -> Option<StartLaunch> {
+    manifest
         .lifecycle
         .as_ref()
         .and_then(|l| l.start.as_ref())
-        .ok_or_else(|| LaunchResolveError::NoStartTemplate {
-            path: manifest_path.to_string_lossy().into_owned(),
-        })?;
-    Ok(StartLaunch {
-        exec: start.exec.clone(),
-        args: start.args.clone(),
-        env: start.env.clone(),
-    })
+        .map(|start| StartLaunch {
+            exec: start.exec.clone(),
+            args: start.args.clone(),
+            env: start.env.clone(),
+        })
 }
 
 /// Why applying the adapter's config mapping to a launch failed (story 2-2). The
@@ -583,6 +620,8 @@ fn resolve_native(kind: &str) -> Result<ResolvedAdapter, AdapterResolveError> {
         declaration: adapter.capabilities().clone(),
         metering_source: adapter.metering_source(),
         manifest_path: None,
+        // A native builtin has no launch command (start yields NativeHasNoLaunch).
+        launch: None,
     })
 }
 
@@ -624,11 +663,17 @@ fn resolve_manifest(path: &Path) -> Result<ResolvedAdapter, AdapterResolveError>
 
     let kind = manifest.adapter_kind().unwrap_or("manifest").to_string();
 
+    // Capture the `start` launch from the SAME parse that produced the
+    // declaration, so the registry can snapshot it at registration and the start
+    // path need never re-read the manifest (mirrors the declaration precedent).
+    let launch = start_launch_from_manifest(&manifest);
+
     Ok(ResolvedAdapter {
         kind,
         declaration: manifest.capability_declaration(),
         metering_source,
         manifest_path: Some(manifest_path),
+        launch,
     })
 }
 
@@ -849,6 +894,7 @@ source = "self-reported"
             declaration,
             metering_source: MeteringSource::SelfReported,
             manifest_path: None,
+            launch: None,
         };
         let err = enforce_registration_invariants(&resolved).unwrap_err();
         assert!(
@@ -881,6 +927,47 @@ source = "self-reported"
         assert_eq!(launch.exec, "the-agent");
         assert_eq!(launch.args, vec!["--serve", "--port", "0"]);
         assert_eq!(launch.env.get("MODE").map(String::as_str), Some("test"));
+    }
+
+    #[test]
+    fn resolve_captures_the_start_launch_for_a_manifest_adapter() {
+        // The FIX: `resolve` captures the `[lifecycle.start]` launch from the SAME
+        // parse that produces the declaration, so the registry snapshots it at
+        // registration and the start path need never re-read the manifest.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+args = ["--serve", "--port", "0"]
+env = { MODE = "test" }
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        write_manifest(tmp.path(), body);
+        let resolved = resolve(&AdapterRef::Manifest(tmp.path().to_path_buf())).unwrap();
+        let launch = resolved
+            .launch()
+            .expect("a manifest adapter captures its launch at resolution");
+        assert_eq!(launch.exec, "the-agent");
+        assert_eq!(launch.args, vec!["--serve", "--port", "0"]);
+        assert_eq!(launch.env.get("MODE").map(String::as_str), Some("test"));
+    }
+
+    #[test]
+    fn resolve_native_adapter_has_no_launch_snapshot() {
+        // A native builtin carries no launch (start yields NativeHasNoLaunch). Its
+        // snapshot launch is None, so the start path falls back to the re-read —
+        // which keeps erroring NativeHasNoLaunch (native adapters still can't start).
+        let resolved = resolve(&AdapterRef::Native("mock".to_string())).unwrap();
+        assert!(
+            resolved.launch().is_none(),
+            "a native adapter has no captured launch"
+        );
     }
 
     #[test]
@@ -953,6 +1040,7 @@ source = "self-reported"
             declaration,
             metering_source: MeteringSource::SelfReported,
             manifest_path: None,
+            launch: None,
         };
         assert!(enforce_registration_invariants(&resolved).is_ok());
     }

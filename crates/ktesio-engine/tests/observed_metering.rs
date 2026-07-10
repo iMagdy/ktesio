@@ -458,18 +458,15 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     let stub = start_upstream_stub();
-    // The agent sends the sentinel API key on its forwarded requests.
+    // The agent forwards the sentinel key on its requests — but the key is NOT a
+    // manifest-arg literal (that would land in the persisted registration
+    // snapshot). It is delivered as a `secret:` config leaf below, so it reaches
+    // the child ONLY in its start-time environment and the sweep can cover the
+    // whole Agent Home (adapter.json included).
     write_observed_manifest(
         manifest.path(),
         "noleak",
-        &[
-            "--observed-calls",
-            "2",
-            "--observed-auth",
-            SENTINEL_API_KEY,
-            "--linger-ms",
-            "600000",
-        ],
+        &["--observed-calls", "2", "--linger-ms", "600000"],
     );
 
     let engine = open(&state);
@@ -482,6 +479,24 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
         .unwrap();
     facade
         .set_config("noleak", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+
+    // Deliver the sentinel as a SECRET via a pass-through env leaf (mirrors
+    // agent_cli.rs's `secret:` env-target delivery): the reference is stored in
+    // config, the cleartext is resolved at START from the env resolver and placed
+    // into the child env var `FAKE_AGENT_OBSERVED_AUTH` (which the fake_agent reads
+    // for its forwarded Authorization header) — NEVER into the registration
+    // snapshot. A UNIQUE secret-name + restore avoids racing sibling in-process
+    // tests (the established `set_var` pattern).
+    let secret_env = "KTESIO_NOLEAK_SENTINEL_OK";
+    let prev = std::env::var_os(secret_env);
+    std::env::set_var(secret_env, SENTINEL_API_KEY);
+    facade
+        .set_config(
+            "noleak",
+            "agent.FAKE_AGENT_OBSERVED_AUTH",
+            &format!("secret:{secret_env}"),
+        )
         .unwrap();
 
     facade.start("noleak").unwrap();
@@ -501,8 +516,9 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
         !contains(&db_bytes, SENTINEL_API_KEY.as_bytes()),
         "the API key must NOT appear in the ledger DB"
     );
-    // (2) the engine transition-event log + (3) the breach log + (4) the agent-output
-    // log — sweep the whole per-instance logs dir recursively.
+    // (2) the WHOLE Agent Home recursively — the engine transition-event log, the
+    // breach log, the agent-output log, AND the registration snapshot adapter.json
+    // (no exclusions: the secret-leaf delivery keeps the sentinel out of every one).
     let leaked = sweep_dir_for(&state.path().join("agents"), SENTINEL_API_KEY);
     assert!(
         leaked.is_none(),
@@ -518,6 +534,11 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
     );
 
     let _ = facade.stop("noleak", Some(Duration::from_secs(5)));
+    // Restore the env the unique secret-name borrowed.
+    match prev {
+        Some(v) => std::env::set_var(secret_env, v),
+        None => std::env::remove_var(secret_env),
+    }
 }
 
 #[test]
@@ -544,18 +565,13 @@ fn the_forwarded_api_key_never_leaks_on_the_forward_failure_path() {
 
     // The agent makes several observed calls carrying the sentinel key; each fails at
     // the proxy (dead upstream). No `usage` is ever parsed (nothing lands in the
-    // ledger), but the KEY still flowed through the failing forward.
+    // ledger), but the KEY still flowed through the failing forward. The key is
+    // delivered as a `secret:` config leaf below (NOT a manifest-arg literal), so it
+    // stays out of the registration snapshot and the sweep can cover the whole home.
     write_observed_manifest(
         manifest.path(),
         "noleakerr",
-        &[
-            "--observed-calls",
-            "3",
-            "--observed-auth",
-            SENTINEL_API_KEY,
-            "--linger-ms",
-            "600000",
-        ],
+        &["--observed-calls", "3", "--linger-ms", "600000"],
     );
 
     let engine = open(&state);
@@ -568,6 +584,21 @@ fn the_forwarded_api_key_never_leaks_on_the_forward_failure_path() {
         .unwrap();
     facade
         .set_config("noleakerr", "metering.upstream_base_url", &dead_upstream)
+        .unwrap();
+
+    // Deliver the sentinel as a SECRET via a pass-through env leaf (see the
+    // happy-path test): resolved at START into the child env, never the snapshot. A
+    // UNIQUE secret-name (distinct from the happy-path test) + restore avoids racing
+    // the sibling in-process test.
+    let secret_env = "KTESIO_NOLEAK_SENTINEL_ERR";
+    let prev = std::env::var_os(secret_env);
+    std::env::set_var(secret_env, SENTINEL_API_KEY);
+    facade
+        .set_config(
+            "noleakerr",
+            "agent.FAKE_AGENT_OBSERVED_AUTH",
+            &format!("secret:{secret_env}"),
+        )
         .unwrap();
 
     let started = facade.start("noleakerr").unwrap();
@@ -598,7 +629,8 @@ fn the_forwarded_api_key_never_leaks_on_the_forward_failure_path() {
         !contains(&db_bytes, SENTINEL_API_KEY.as_bytes()),
         "the API key must NOT appear in the ledger DB on the error path"
     );
-    // (2) the per-instance logs dir (agent-output + breach + transition-event files).
+    // (2) the WHOLE Agent Home recursively — agent-output + breach + transition-event
+    // files AND the registration snapshot adapter.json (no exclusions).
     let leaked = sweep_dir_for(&state.path().join("agents"), SENTINEL_API_KEY);
     assert!(
         leaked.is_none(),
@@ -614,6 +646,11 @@ fn the_forwarded_api_key_never_leaks_on_the_forward_failure_path() {
     );
 
     let _ = facade.stop("noleakerr", Some(Duration::from_secs(5)));
+    // Restore the env the unique secret-name borrowed.
+    match prev {
+        Some(v) => std::env::set_var(secret_env, v),
+        None => std::env::remove_var(secret_env),
+    }
 }
 
 #[test]
@@ -695,8 +732,16 @@ fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
         .expect("an engine-observed manifest registers under CONTRACT_VERSION 0.3.0");
 }
 
-/// Recursively read every file under `dir` and return the first path whose bytes
+/// Recursively read EVERY file under `dir` and return the first path whose bytes
 /// contain `needle`, or `None` if the needle appears nowhere (the no-leak sweep).
+///
+/// No exclusions — the whole Agent Home is swept, INCLUDING the registration
+/// snapshot `adapter.json`. The registration snapshot persists the manifest's
+/// `[lifecycle.start]` launch (exec + args + env), so a sentinel hard-coded as a
+/// manifest arg WOULD land here; these tests therefore deliver the sentinel as a
+/// `secret:` config leaf resolved into the child env at START (never a manifest
+/// literal, never the snapshot), keeping the sweep whole so any future leak into
+/// `adapter.json` is a true positive again.
 fn sweep_dir_for(dir: &Path, needle: &str) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
