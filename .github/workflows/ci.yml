@@ -99,16 +99,12 @@ jobs:
         # this is a test-harness cache artifact, not a product bug. `shell: bash` so
         # `rm` works on the Windows runner too.
         #
-        # RUST_TEST_THREADS=1 — serialize the suite. SEPARATE from the stale-binary
-        # bug above: the engine integration tests each spin up an in-process Engine +
-        # a real fake_agent, and run in parallel on the low-core macOS/Windows runners
-        # they can intermittently miss the ~250ms reaper cadence within a test's
-        # deadline (a rare oversubscription timing flake — AI-49; observed ~1/13 even
-        # locally). Serial makes it deterministic. The coverage job runs serial for the
-        # same reason (AI-23). Determinism beats wall-clock for a money-metering suite.
+        # Tests run PARALLEL (the harness default). The one real flake seen here was a
+        # read-consistency race in cost.rs (fixed deterministically — pause the agent +
+        # settle before sampling), NOT oversubscription; serializing the whole workspace
+        # was both unnecessary and harmful — its serial wall-clock overran the ubuntu
+        # leg's 25-min timeout. Fast + deterministic beats masking a race with serial.
         shell: bash
-        env:
-          RUST_TEST_THREADS: "1"
         run: |
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
           cargo +stable test --workspace --all-targets

@@ -144,6 +144,29 @@ fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64, within: Dura
     }
 }
 
+/// After the usage stream has been FROZEN (the instance paused/stopped), poll until
+/// the committed usage-row count STOPS advancing — two reads spanning MORE than one
+/// reaper cadence (~250ms) that agree — and return that settled count. The reaper can
+/// still drain a few already-buffered events for a cycle after the process suspends,
+/// so a bare read right after `paused` can still race a late commit; settling first
+/// makes a subsequent (row-count, cost) read a CONSISTENT snapshot of a ledger that
+/// can no longer grow (the fix for the no-retro-repricing read race).
+fn wait_for_settled_usage_rows(state_dir: &Path, name: &str, within: Duration) -> u64 {
+    let deadline = Instant::now() + within;
+    loop {
+        let before = usage_row_count(state_dir, name);
+        std::thread::sleep(Duration::from_millis(400));
+        let after = usage_row_count(state_dir, name);
+        if before == after {
+            return after;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "usage rows for '{name}' never settled after freeze (last {before} -> {after})"
+        );
+    }
+}
+
 /// Configure a Rate of `$1.00/1M` on both directions (1 micro/token) so a known
 /// token total yields a known micro-dollar cost.
 fn set_unit_rate(facade: &ktesio_engine::Blocking, name: &str) {
@@ -571,9 +594,25 @@ fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
 
     facade.start("noretro").unwrap();
 
-    // Let at least 3 events commit under the ORIGINAL rate (cost 30 micros each).
+    // Let at least 3 events commit under the ORIGINAL rate (30 micros each), then
+    // PAUSE so the usage stream FREEZES before we read the correlated (row-count,
+    // cost) pair. Reading the pair while the reaper is still committing rows is a
+    // race: the count (read A — a direct ledger COUNT) and the derived cost (read B —
+    // via `fleet()`) are two separate reads of an ADVANCING ledger, so read B can
+    // observe MORE rows than read A and the `cost == 30 × rows` equality flakes.
+    // Suspending the agent process stops new events; once the ledger settles both
+    // reads see the SAME committed set. (The rate is still $1/1M here, so a settled
+    // cumulative cost is exactly 30 micros per committed row.)
     wait_for_usage_rows(state.path(), "noretro", 3, Duration::from_secs(30));
-    let rows_at_change = usage_row_count(state.path(), "noretro");
+    facade.pause("noretro").unwrap();
+    wait_for_state(
+        state.path(),
+        "noretro",
+        LifecycleState::Paused,
+        Duration::from_secs(30),
+    );
+    let rows_at_change =
+        wait_for_settled_usage_rows(state.path(), "noretro", Duration::from_secs(30));
     let cost_before = facade
         .fleet()
         .unwrap()
@@ -590,13 +629,16 @@ fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
         "each early event is priced at $1/1M = 30 micros"
     );
 
-    // RAISE the Rate to $9/1M on both directions (9 micros/token → 270 micros/event).
+    // RAISE the Rate to $9/1M on both directions (9 micros/token → 270 micros/event),
+    // then RESUME — only the FUTURE (post-resume) events use the new rate; the frozen
+    // early events keep their original 30-micro price (the no-retro-repricing crux).
     facade
         .set_config("noretro", "cost.rate.input", "9.00")
         .unwrap();
     facade
         .set_config("noretro", "cost.rate.output", "9.00")
         .unwrap();
+    facade.resume("noretro").unwrap();
 
     // Let all 20 events commit (the later ones priced at the new rate).
     wait_for_usage_rows(state.path(), "noretro", 20, Duration::from_secs(30));

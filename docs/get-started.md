@@ -106,7 +106,7 @@ The Breach Action (`pause`, `stop`, or `warn`) fires the instant a ceiling is re
 ```bash
 kt agent list                  # name, kind, state, restarts, budget, usage
 kt agent show my-agent         # capabilities, runtime status, usage, budget, cost, metering source
-kt agent config get my-agent   # the effective config with each value's source layer
+kt agent config get my-agent   # the effective config with the source layer of each value
 ```
 
 Add `--json` to `list` or `show` for a versioned, machine-readable document. Token totals equal the Usage Ledger exactly; dollar figures appear only when a Rate is configured and are always labeled estimates.

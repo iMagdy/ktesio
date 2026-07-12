@@ -128,7 +128,7 @@ kt agent config set my-agent budget.dollars.cumulative 10.00
 ```bash
 kt agent list            # a table: name, kind, state, restarts, budget, usage
 kt agent show my-agent   # one instance: capabilities, state, budget, usage, cost, metering source
-kt agent config get my-agent   # the effective config, with each value's source layer
+kt agent config get my-agent   # the effective config, with the source layer of each value
 ```
 
 `kt agent list --json` and `kt agent show my-agent --json` emit a versioned, machine-readable document. Token totals are the Usage Ledger sums exactly; dollar figures appear only when a Rate is configured and are always labeled estimates.
