@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/ktesio-banner.jpg" alt="Ktesio banner: Share, install, and manage agent skills" width="100%">
+  <img src="docs/assets/ktesio-banner.jpg" alt="Ktesio banner: run AI agents like services — supervise, meter, and budget them" width="100%">
 </p>
 
 # Ktesio
@@ -8,51 +8,50 @@
 [![Crates.io](https://img.shields.io/crates/v/ktesio.svg)](https://crates.io/crates/ktesio)
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-orange.svg)](LICENSE)
 
-Ktesio is a tiny Rust CLI for installing and sharing agent skills. It makes reusable agent instructions portable across projects by keeping a simple `skills.json` manifest, a reproducible `skills.lock`, and installed skills under `.agents/skills/`.
+Ktesio is a Rust CLI and engine that **runs AI agents like services** — supervise their lifecycle, meter real token usage, and enforce dollar budgets. Register any agent, start and stop it under supervision, watch what it actually consumes, and set token and cost ceilings that stop runaway spend the moment they are crossed.
 
 ## Why Ktesio?
 
-- **Portable skills**: move agent workflows between repositories without manual copy-paste.
-- **Git-native distribution**: install skills from normal HTTPS or SSH git repositories.
-- **Reproducible installs**: lock every installed skill to the exact commit that was fetched.
-- **Friendly project state**: list, inspect, upgrade, publish, and remove skills from one CLI.
-- **Polished terminal UX**: color-coded statuses, icons, and progress bars keep git work readable.
-- **Agent-ready layout**: installed content lands where coding agents already look for skills.
+Long-running AI agents are processes that cost money on every call. Ktesio treats them like the services they are:
 
-## 60-Second Quickstart
+- **Lifecycle — run agents like services.** `start`, `stop`, `pause`, and `resume` any registered agent through one uniform state machine, with crash detection, a configurable Restart Policy, captured logs, and durable state (one SQLite database) that survives an engine restart or reboot and reconciles orphaned processes honestly.
+- **Metering — real token usage.** Every registered agent declares a Metering Source, and the engine records real per-run and cumulative token totals into a durable Usage Ledger. Usage is either **self-reported** by the agent or **engine-observed** through a loopback proxy, so governance never depends on the agent's cooperation.
+- **Budgets & cost control — ceilings that actually stop spend.** Set per-run and cumulative **token** budgets, and (with a configured Rate) **dollar** cost caps. Each carries a Breach Action — `pause`, `stop`, or `warn` — enforced the instant a ceiling is reached, in the same commit path as the usage that crossed it. Every dollar figure is integer micro-dollars, labeled an estimate.
+- **One vocabulary, any agent.** Register a native builtin, or bring your own agent with a small `adapter.toml` manifest that declares how to launch it, its per-OS capabilities, and its metering source. Configure every agent through one layered-TOML config with per-value provenance and `secret:NAME` references that stay masked in Ktesio's surfaces.
 
-Install Ktesio on macOS or Linux:
+## Install
+
+Ktesio ships a single `kt` binary for macOS, Linux, and Windows.
+
+Install on macOS or Linux:
 
 ```bash
 curl -fsSL https://cli.ktesio.dev/install.sh | sh
 ```
 
-Install Ktesio on Windows with PowerShell:
+Install on Windows with PowerShell:
 
 ```powershell
 irm https://cli.ktesio.dev/install.ps1 | iex
 ```
 
-The installer preserves existing Ktesio install channels when it can. New
-macOS and Linux installs prefer Homebrew, then Cargo, then a prebuilt GitHub
-Release binary. New Windows installs prefer Cargo, then a prebuilt GitHub
-Release binary.
+New macOS and Linux installs prefer Homebrew, then Cargo, then a prebuilt GitHub
+Release binary. New Windows installs prefer Cargo, then a prebuilt GitHub Release
+binary. The installer preserves an existing install channel when it can.
 
-If you already have Rust, you can also install from crates.io:
+If you already have Rust, install from crates.io (the `ktesio` package installs the `kt` binary):
 
 ```bash
 cargo install ktesio
 ```
 
-Or install with Homebrew:
+Or with Homebrew:
 
 ```bash
 brew install imagdy/tap/ktesio
 ```
 
-You can also download a release archive from [GitHub Releases](https://github.com/iMagdy/ktesio/releases), unpack it, and place `kt` on your `PATH`.
-
-Or install from the source repository:
+You can also download a release archive from [GitHub Releases](https://github.com/iMagdy/ktesio/releases), unpack it, and place `kt` on your `PATH`, or build from source:
 
 ```bash
 git clone https://github.com/iMagdy/ktesio.git
@@ -60,73 +59,117 @@ cd ktesio
 cargo install --path .
 ```
 
-Then, in a project where you want to use agent skills:
+See the [installation guide](docs/installation.md) for update behavior and per-platform notes.
+
+## Quickstart
+
+Register an agent, give it a budget, inspect it, and run it under supervision.
+
+### 1. Describe your agent with a manifest adapter
+
+An agent is registered through an `adapter.toml` that declares how to launch it, its per-OS capabilities, and its metering source. Create a directory `my-agent/` with an `adapter.toml`:
+
+```toml
+contract_version = "0.3.0"
+
+[adapter]
+kind = "my-agent"
+name = "My Agent"
+
+# How the engine launches the agent process. exec must be on PATH (or an
+# absolute path); args/env are optional. Replace this with your agent's command.
+[lifecycle.start]
+exec = "my-agent"
+args = ["--serve"]
+
+# A non-empty, per-OS Capability Declaration. "pause" is guaranteed on Unix
+# (SIGSTOP) and best-effort on Windows.
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+# A viable Metering Source: "self-reported" (the agent emits its own usage) or
+# "engine-observed" (the engine meters model traffic through a loopback proxy).
+[metering]
+source = "self-reported"
+```
+
+Register it under a Fleet-unique name:
 
 ```bash
-kt init .
-# Replace docs:example/agent-docs with skill_name:github_user/github_repo.
-kt install docs:example/agent-docs
-kt search tests
-kt list
+kt agent register my-agent --manifest ./my-agent
 ```
 
-This creates:
+Registration validates the manifest first, then creates an isolated Agent Home and prints its path plus the effective (current-OS) Capability Declaration. (To try the flow without writing a manifest, `kt agent register demo --kind mock` registers a native builtin — note that `mock` has no launch command, so it cannot be started.)
 
-```text
-skills.json
-skills.lock
-.agents/skills/
+### 2. Set a budget and a cost cap
+
+Budgets are ordinary layered-config values, inspectable and changeable at any time:
+
+```bash
+# Cap cumulative token usage and pause the agent on breach.
+kt agent config set my-agent budget.tokens.cumulative 500000
+kt agent config set my-agent budget.breach_action pause
+
+# Optional: price tokens ($/1M) so token usage derives a dollar cost, then cap it.
+kt agent config set my-agent cost.rate.input 3.00
+kt agent config set my-agent cost.rate.output 15.00
+kt agent config set my-agent budget.dollars.cumulative 10.00
 ```
 
-During install and upgrade, Ktesio shows progress bars for long-running git work and hides raw `git clone` or `git fetch` output unless an error needs to be summarized.
+### 3. Inspect the Fleet
+
+```bash
+kt agent list            # a table: name, kind, state, restarts, budget, usage
+kt agent show my-agent   # one instance: capabilities, state, budget, usage, cost, metering source
+kt agent config get my-agent   # the effective config, with each value's source layer
+```
+
+`kt agent list --json` and `kt agent show my-agent --json` emit a versioned, machine-readable document. Token totals are the Usage Ledger sums exactly; dollar figures appear only when a Rate is configured and are always labeled estimates.
+
+### 4. Run it under supervision
+
+```bash
+kt agent start my-agent
+kt agent pause my-agent      # honest per-OS: guaranteed / best-effort / unsupported
+kt agent resume my-agent
+kt agent stop my-agent --timeout 10   # graceful, then a forced kill after the window
+```
+
+> **Supervision boundary (current behavior):** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits; durable supervision across separate CLI invocations is future work (the supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
 ## Commands
 
+The agent runner lives under `kt agent`. Every command supports `--help`.
+
 | Command | Purpose |
 |---------|---------|
-| `kt init <path>` | Create `skills.json` in a project |
-| `kt search <query>` | Search public skill listings from skills.sh |
-| `kt install` | Install every dependency declared in `skills.json` |
-| `kt install <name:repo>` | Add and install one skill |
-| `kt install --all <repo>` | Install all published skills from one repo |
-| `kt publish` | Publish local skills from this repo |
-| `kt publish add <name> <path>` | Add or update one published local skill |
-| `kt upgrade` | Fetch latest commits for installed skills |
-| `kt self-update` | Update the kt command itself |
-| `kt list` | Show installed, missing, and orphaned skills |
-| `kt show <name>` | Show one skill's repo, commit, path, and status |
-| `kt doctor` | Validate manifest, lockfile, installed files, and git state |
-| `kt uninstall <name>` | Remove a skill from manifest, lockfile, and disk |
-| `kt remove <name>` | Alias for `kt uninstall <name>` |
+| `kt agent register <name> --kind <kind>` | Register an instance from a native builtin adapter |
+| `kt agent register <name> --manifest <path>` | Register an instance from an `adapter.toml` manifest adapter |
+| `kt agent list [--json]` | List every Agent Instance in the Fleet |
+| `kt agent show <name> [--json]` | Show one instance's capabilities, runtime status, usage, and budget |
+| `kt agent start <name>` | Start a registered instance |
+| `kt agent stop <name> [--timeout <secs>]` | Stop a running instance (graceful, then forced after the window) |
+| `kt agent pause <name>` | Pause a running instance (honest per-OS semantics) |
+| `kt agent resume <name>` | Resume a paused instance |
+| `kt agent remove <name> [--delete\|--retain] [--force]` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
+| `kt agent config set <name> <key> <value>` | Set one config key on the instance layer (validated at write time) |
+| `kt agent config get <name> [<key>] [--json] [--reveal]` | Read the effective config with per-value source (`--reveal` un-masks secrets) |
 
-## Manifest
-
-`skills.json` is intentionally small:
-
-```json
-{
-  "dependencies": {
-    "docs": {
-      "repo": "https://github.com/example/agent-docs.git",
-      "rev": "branch:main"
-    },
-    "local-docs": {
-      "path": ".agents/skills/local-docs"
-    }
-  },
-  "publish": ["local-docs"]
-}
-```
-
-`dependencies` declares skills this project uses. `publish` declares local skills this repo exposes for other projects to install. Ktesio installs only published paths from source repos; if the source repo has no `skills.json`, it asks before falling back to selectable directories under `skills/`, `SKILLS/`, or `.agents/skills/`.
+See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys.
 
 ## Documentation
 
 - [Getting started](docs/get-started.md)
 - [Installation](docs/installation.md)
 - [Command reference](docs/commands.md)
-- [Manifest format](docs/manifest.md)
-- [Lockfile format](docs/lockfile.md)
+- [Adapter manifest (`adapter.toml`)](docs/manifest.md)
 - [Architecture](docs/architecture.md)
 - [Testing](docs/testing.md)
 - [Release process](docs/release-process.md)
@@ -135,11 +178,7 @@ During install and upgrade, Ktesio shows progress bars for long-running git work
 
 ## Project Status
 
-Ktesio is early, useful, and intentionally conservative. The current package format is plain JSON plus git. Future work may add registries, richer metadata, and package signing without taking away the simple manifest workflow.
-
-## Thanks
-
-Thank you to [Skills.sh](https://www.skills.sh/) for providing public skill search, and to [Vercel](https://vercel.com/) for making Skills.sh available to everyone for free.
+Ktesio is early and moving fast. The lifecycle, layered configuration, secrets, the Usage Ledger, token budgets, dollar cost caps, and engine-observed metering are implemented today. A supervising daemon (durable cross-invocation supervision and a Host event stream) and a richer native adapter surface are on the roadmap.
 
 ## License
 

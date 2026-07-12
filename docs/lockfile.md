@@ -1,43 +1,16 @@
 ---
-title: Lockfile Format
-description: How skills.lock records exact skill sources, commits, and reproducible install state.
+title: Lockfile (removed)
+description: Ktesio no longer uses a project lockfile — durable Fleet state lives in the engine's SQLite store.
 ---
 
-# Lockfile Format
+# Lockfile (removed)
 
-`skills.lock` records the exact source and commit for installed skills.
+Earlier versions of Ktesio were a skill package manager that wrote a `skills.lock` file to reproduce installs. Ktesio is now an **AI agent runner**, and there is no project lockfile.
 
-## Shape
+Durable state — every Agent Instance registration, Lifecycle State, Restart Policy, restart count, and the Usage Ledger — lives in a single **SQLite database** under the engine state directory, plus per-instance files inside each **Agent Home**. That state survives an engine restart or reboot and reconciles orphaned processes on the next engine open.
 
-```json
-{
-  "docs": {
-    "commit": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-    "repo": "https://github.com/example/agent-docs.git",
-    "skill": "docs"
-  }
-}
-```
+See:
 
-## Purpose
-
-- Reproduce installs across machines.
-- Show exactly which commit is installed.
-- Preserve repo URLs for list/show/upgrade.
-- Preserve the exact source published/fallback skill when a multi-skill repo is installed interactively.
-
-## Behavior
-
-- `kt install` creates or updates `skills.lock` only after a repo fetch and content copy succeeds.
-- `kt upgrade` updates commits after successful fetch/checkout.
-- `kt uninstall` and `kt remove` remove lock entries.
-- `kt list` flags entries not present in `skills.json` as `orphaned`.
-
-For locally discovered skills, Ktesio records a zero commit (`0000000000000000000000000000000000000000`) because there is no remote commit to lock.
-
-The optional `skill` field is omitted for installs where the dependency name and source published skill name are the same.
-
-## See Also
-
-- [Manifest format](manifest.md)
-- [Command reference](commands.md)
+- [Architecture](architecture.md) — durable state, the Usage Ledger, and reconciliation.
+- [Adapter manifest](manifest.md) — how an agent is described and registered.
+- [Command reference](commands.md) — the `kt agent` commands.

@@ -1,32 +1,59 @@
 ---
 title: Troubleshooting
-description: Common Ktesio setup, git, install, upgrade, and release-doc issues with practical fixes.
+description: Common Ktesio install, registration, config, and lifecycle issues with practical fixes.
 ---
 
 # Troubleshooting
 
-## `skills.json` Not Found
+## Adapter Manifest Not Found or Invalid
 
-Run:
+`kt agent register --manifest <path>` reports the exact problem and writes nothing when a manifest is missing or invalid.
 
-```bash
-kt init .
+- **Not found** — pass a directory containing `adapter.toml`, or the path to the `adapter.toml` file itself.
+- **Invalid** — the error names the first missing or invalid mandatory section (`contract_version`, `[adapter]`, `[lifecycle.start]`, `[capabilities]`, or `[metering]`) or the unknown key it rejected.
+
+See the [adapter manifest reference](manifest.md) for the required shape.
+
+## Agent Won't Start ("no launch command")
+
+The native `mock` kind is a registration/config fixture with no launch command, so `kt agent start` fails for it:
+
+```text
+native adapter kind 'mock' has no launch command; supply a manifest adapter
 ```
 
-Then add skills manually or with `kt install <name:repo>`.
+Register a **manifest adapter** whose `[lifecycle.start]` declares a real `exec` to start a process.
 
-## Git Clone Fails
+## Agent Shows `failed` After Starting
 
-Ktesio hides raw git clone progress during normal installs, then prints the useful git error line when a clone fails.
+A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. A later, separate `kt agent list` then reports the instance as `failed` because the supervised process is gone.
 
-Check that:
+This is expected today — durable supervision across separate CLI invocations is future work (a supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
-- `git` is installed and on `PATH`.
-- The repo URL is correct.
-- SSH keys or credential helpers are configured for private repositories.
-- Your network can reach the remote.
+## Invalid Lifecycle Transition
 
-If you need full git diagnostics, run the equivalent `git clone <repo-url>` manually from the same shell.
+Commands are rejected uniformly when they don't apply to the current state (for example, `stop` on an instance that is `registered` or `failed`):
+
+```text
+cannot stop an Agent Instance while it is 'registered'
+```
+
+Check the current state with `kt agent list` or `kt agent show <name>`, then issue a valid command. To remove a **running** instance, pass `--force`.
+
+## Config Key Rejected
+
+`kt agent config set` validates at write time and changes nothing when a key is rejected. An unknown key outside the `agent.*` pass-through namespace is refused with the nearest valid key suggested:
+
+- Use a known unified key (see [Unified Config Keys](commands.md#unified-config-keys)).
+- Or put agent-native extras under the `agent.*` namespace, e.g. `kt agent config set demo agent.temperature 0.2`.
+
+Budget and rate values are validated too: token budgets must parse as integers, and rates/caps must be dollar strings (e.g. `3.00`).
+
+## A Secret Won't Resolve at Start
+
+A `secret:NAME` value is resolved at start from the process environment first, then the engine secrets file at `<state base>/secrets.toml`. If neither provides it, the start is rejected with an error naming the `NAME` and the resolvers tried (never the value). Export the variable or add it to the secrets file, then start again.
+
+On Unix the secrets file must be mode `0600` (owner-only); a group- or world-accessible file is refused with a `chmod 600` remediation.
 
 ## Installer Cannot Find `kt` After Installing
 
@@ -68,20 +95,6 @@ Retry the installer. If the error repeats, download the archive and checksum
 from [GitHub Releases](https://github.com/iMagdy/ktesio/releases) directly and
 compare them locally before installing.
 
-## Installer Package Manager Step Fails
-
-When Homebrew or Cargo is available, the installer lets that package manager do
-the install or upgrade. Re-run the printed command directly to see full package
-manager diagnostics:
-
-```bash
-brew install imagdy/tap/ktesio
-cargo install ktesio --force
-```
-
-Use `KTESIO_INSTALL_METHOD=binary` to bypass Homebrew and Cargo and install the
-prebuilt binary instead.
-
 ## Installer Refuses to Overwrite `kt`
 
 The installer checks `kt --version` before replacing an existing `kt` command.
@@ -92,7 +105,7 @@ Choose a different install directory and make sure it appears before the other
 `kt` command on `PATH`, or remove the conflicting command if it is no longer
 needed.
 
-## Update Check Is Unavailable Or Unwanted
+## Update Check Is Unavailable or Unwanted
 
 Ktesio checks GitHub Releases through an hourly cache before running subcommands.
 Network failures, cache write failures, and unexpected release responses are
@@ -101,7 +114,7 @@ ignored so the requested command can continue.
 If you do not want automatic update checks, run commands with:
 
 ```bash
-KTESIO_NO_UPDATE_CHECK=1 kt list
+KTESIO_NO_UPDATE_CHECK=1 kt agent list
 ```
 
 Ktesio also skips automatic update checks when `CI=true`.
@@ -130,49 +143,6 @@ If your platform does not have a prebuilt release archive, install with Cargo:
 ```bash
 cargo install ktesio --force
 ```
-
-## Search Is Rate Limited Or Unavailable
-
-`kt search` uses skills.sh for discovery only. If skills.sh returns a rate limit or temporary service failure, Ktesio retries automatically up to 3 total attempts and prints messages such as:
-
-```text
-skills.sh rate limit reached; retrying in 12s (attempt 2/3).
-```
-
-If all attempts fail, retry later, search less frequently, or configure `KTESIO_SKILLS_SH_API_KEY` after receiving skills.sh API access. Ktesio avoids unbounded retry loops so it can use the public API responsibly.
-
-## Search Result Is Not Installable
-
-Search results from non-GitHub sources are shown as `not installable yet`. Ktesio currently uses skills.sh for discovery and still installs by cloning git repositories.
-
-## Skill Is Listed as Missing
-
-`kt list` reports `missing` when `skills.lock` has an entry but `.agents/skills/<name>/` is absent.
-
-Fix it with:
-
-```bash
-kt install
-```
-
-## Skill Is Listed as Orphaned
-
-`orphaned` means `skills.lock` has an entry that is no longer in `skills.json`.
-
-Options:
-
-- Add the skill back under `dependencies` if it should be restored to the manifest.
-- Remove the stale lock entry by uninstalling or editing the lockfile.
-
-## Project State Looks Wrong
-
-Run:
-
-```bash
-kt doctor
-```
-
-`kt doctor` checks the manifest, lockfile, installed directories, published local paths, orphaned entries, and git availability, then prints repair hints.
 
 ## Release Workflow Did Not Update Docs
 
