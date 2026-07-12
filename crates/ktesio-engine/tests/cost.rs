@@ -144,27 +144,20 @@ fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64, within: Dura
     }
 }
 
-/// After the usage stream has been FROZEN (the instance paused/stopped), poll until
-/// the committed usage-row count STOPS advancing — two reads spanning MORE than one
-/// reaper cadence (~250ms) that agree — and return that settled count. The reaper can
-/// still drain a few already-buffered events for a cycle after the process suspends,
-/// so a bare read right after `paused` can still race a late commit; settling first
-/// makes a subsequent (row-count, cost) read a CONSISTENT snapshot of a ledger that
-/// can no longer grow (the fix for the no-retro-repricing read race).
-fn wait_for_settled_usage_rows(state_dir: &Path, name: &str, within: Duration) -> u64 {
-    let deadline = Instant::now() + within;
-    loop {
-        let before = usage_row_count(state_dir, name);
-        std::thread::sleep(Duration::from_millis(400));
-        let after = usage_row_count(state_dir, name);
-        if before == after {
-            return after;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "usage rows for '{name}' never settled after freeze (last {before} -> {after})"
-        );
-    }
+/// The derived cumulative dollar cost (in micros) the Fleet detail surfaces for
+/// `name` — the per-row sum over the whole instance lifetime (all Runs), each row
+/// priced at its OWN persisted Rate (no retro-repricing).
+fn fleet_cumulative_dollars(facade: &ktesio_engine::Blocking, name: &str) -> i64 {
+    facade
+        .fleet()
+        .unwrap()
+        .iter()
+        .find(|e| e.name.as_str() == name)
+        .unwrap()
+        .usage
+        .cumulative_dollars
+        .unwrap()
+        .get()
 }
 
 /// Configure a Rate of `$1.00/1M` on both directions (1 micro/token) so a known
@@ -562,19 +555,39 @@ fn a_token_and_a_dollar_cap_each_fire_once_on_the_same_run() {
 
 #[test]
 fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
-    // AC-A (the no-retro-repricing crux, end-to-end): start under a Rate, accrue some
-    // cost, then RAISE the Rate; the already-metered events keep their ORIGINAL price
-    // while only new events use the new Rate. We prove it by the derived cumulative
-    // cost: with a high cap (no breach), emit under rate $1/1M, then raise to $9/1M,
-    // and assert the cumulative cost is LESS than if the whole history had been
-    // repriced at the new rate.
+    // AC-A (the no-retro-repricing crux, end-to-end): usage metered under one Rate
+    // KEEPS that Rate's price when the Rate later changes; only usage metered AFTER the
+    // change takes the new Rate. Every ledger row persists the Rate in force when it
+    // was consumed (store `sum_cost_saturating`; supervisor resolves the LIVE Rate per
+    // ingested event), so the derived cumulative cost is the per-row SUM — never a
+    // re-price of history at the current Rate.
+    //
+    // PAUSE-FREE + cross-OS deterministic (retro: `pause` is a cooperative NO-OP on
+    // some OSes, so freezing a LIVE process is not a portable primitive). Instead every
+    // correlated read is taken on a PROVABLY STABLE ledger: the `fake_agent` emits
+    // EXACTLY `N` events per Run and then idles, so once `wait_for_usage_rows` observes
+    // the count it can no longer move. Run 1 accrues N events at Rate A; we STOP
+    // (terminal + guaranteed on every OS — SIGTERM→SIGKILL / Job Object — so the ledger
+    // is genuinely frozen), RAISE the Rate to B, then START a fresh Run that accrues N
+    // more at Rate B. The cumulative cost must be EXACTLY `N×A + N×B`: the Run-1 rows
+    // kept Rate A across the change (no retro), the Run-2 rows took Rate B. The
+    // cumulative ledger persists across a stop+restart (it is per-instance lifetime,
+    // not per-Run — see `tests/metering.rs`).
+    const N: u64 = 5;
+    // Each event is 10 input + 20 output = 30 tokens. Rate A = $1/1M on both directions
+    // (1 micro/token) → 30 micros/event; Rate B = $9/1M (9 micros/token) → 270
+    // micros/event.
+    const RATE_A_PER_EVENT: i64 = 30;
+    const RATE_B_PER_EVENT: i64 = 270;
+
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    // Many events so we can change the Rate mid-run and still have events left.
+    // Exactly N events per launch (then a long linger, so only our stop ends the Run) —
+    // waiting for the KNOWN count lands every read on a stable, non-advancing ledger.
     write_fake_manifest(
         manifest.path(),
         "noretro",
-        &["--emit-usage", "20", "--linger-ms", "600000"],
+        &["--emit-usage", "5", "--linger-ms", "600000"],
     );
 
     let engine = open(&state);
@@ -585,90 +598,70 @@ fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
             &AdapterRef::Manifest(manifest.path().to_path_buf()),
         )
         .unwrap();
-    // Start under a $1/1M Rate on both directions (1 micro/token), a HIGH dollar cap
-    // (no breach).
+    // Run 1 under a $1/1M Rate on both directions (1 micro/token), with a HIGH dollar
+    // cap (no breach — this test is about pricing, not enforcement).
     set_unit_rate(&facade, "noretro");
     facade
         .set_config("noretro", "budget.dollars.cumulative", "1000.00")
         .unwrap();
 
+    // --- Run 1: exactly N events, priced at Rate A. ---
     facade.start("noretro").unwrap();
-
-    // Let at least 3 events commit under the ORIGINAL rate (30 micros each), then
-    // PAUSE so the usage stream FREEZES before we read the correlated (row-count,
-    // cost) pair. Reading the pair while the reaper is still committing rows is a
-    // race: the count (read A — a direct ledger COUNT) and the derived cost (read B —
-    // via `fleet()`) are two separate reads of an ADVANCING ledger, so read B can
-    // observe MORE rows than read A and the `cost == 30 × rows` equality flakes.
-    // Suspending the agent process stops new events; once the ledger settles both
-    // reads see the SAME committed set. (The rate is still $1/1M here, so a settled
-    // cumulative cost is exactly 30 micros per committed row.)
-    wait_for_usage_rows(state.path(), "noretro", 3, Duration::from_secs(30));
-    facade.pause("noretro").unwrap();
-    wait_for_state(
-        state.path(),
-        "noretro",
-        LifecycleState::Paused,
-        Duration::from_secs(30),
-    );
-    let rows_at_change =
-        wait_for_settled_usage_rows(state.path(), "noretro", Duration::from_secs(30));
-    let cost_before = facade
-        .fleet()
-        .unwrap()
-        .iter()
-        .find(|e| e.name.as_str() == "noretro")
-        .unwrap()
-        .usage
-        .cumulative_dollars
-        .unwrap()
-        .get();
+    // The agent emits EXACTLY N events then idles, so the committed count settles at N
+    // and STAYS there: the row-count read and the cost read below both see the SAME
+    // stable ledger (nothing else is landing) — no read race.
+    wait_for_usage_rows(state.path(), "noretro", N, Duration::from_secs(30));
     assert_eq!(
-        cost_before,
-        30 * rows_at_change as i64,
-        "each early event is priced at $1/1M = 30 micros"
+        usage_row_count(state.path(), "noretro"),
+        N,
+        "run 1 committed exactly N events"
+    );
+    let cost_after_run1 = fleet_cumulative_dollars(&facade, "noretro");
+    assert_eq!(
+        cost_after_run1,
+        RATE_A_PER_EVENT * N as i64,
+        "run-1 events are priced at Rate A ($1/1M = 30 micros/event)"
     );
 
-    // RAISE the Rate to $9/1M on both directions (9 micros/token → 270 micros/event),
-    // then RESUME — only the FUTURE (post-resume) events use the new rate; the frozen
-    // early events keep their original 30-micro price (the no-retro-repricing crux).
+    // STOP the Run — terminal + guaranteed on every OS, so the process is genuinely
+    // dead and the ledger is frozen — then RAISE the Rate to $9/1M for the next Run.
+    facade
+        .stop("noretro", Some(Duration::from_secs(5)))
+        .unwrap();
     facade
         .set_config("noretro", "cost.rate.input", "9.00")
         .unwrap();
     facade
         .set_config("noretro", "cost.rate.output", "9.00")
         .unwrap();
-    facade.resume("noretro").unwrap();
 
-    // Let all 20 events commit (the later ones priced at the new rate).
-    wait_for_usage_rows(state.path(), "noretro", 20, Duration::from_secs(30));
-
-    let cost_after = facade
-        .fleet()
-        .unwrap()
-        .iter()
-        .find(|e| e.name.as_str() == "noretro")
-        .unwrap()
-        .usage
-        .cumulative_dollars
-        .unwrap()
-        .get();
-
-    // Had the WHOLE history been re-priced at $9/1M, all 20 events would cost
-    // 270 × 20 = 5400 micros. With no retro-repricing, the early events kept their
-    // 30-micro price, so the total is STRICTLY LESS than the fully-repriced figure.
-    let fully_repriced = 270 * 20;
-    assert!(
-        cost_after < fully_repriced,
-        "no retro-repricing: cumulative {cost_after} must be < the fully-repriced \
-         {fully_repriced} (early events kept their original rate)"
+    // --- Run 2: a fresh Run of N MORE events, now priced at Rate B. ---
+    facade.start("noretro").unwrap();
+    wait_for_usage_rows(state.path(), "noretro", 2 * N, Duration::from_secs(30));
+    assert_eq!(
+        usage_row_count(state.path(), "noretro"),
+        2 * N,
+        "run 2 added exactly N more events (2N total)"
     );
-    // And it is at LEAST the early cost (30/event) for every event plus the uplift on
-    // the later ones — strictly greater than a flat 30/event across all 20.
+    let cost_after_run2 = fleet_cumulative_dollars(&facade, "noretro");
+
+    // The cumulative cost is EXACTLY the per-row sum: the N Run-1 rows KEPT Rate A
+    // (30 micros each) even though the Rate was raised, and the N Run-2 rows took
+    // Rate B (270 micros each). This is the no-retro-repricing proof — history was
+    // NOT repriced at the current Rate.
+    assert_eq!(
+        cost_after_run2,
+        RATE_A_PER_EVENT * N as i64 + RATE_B_PER_EVENT * N as i64,
+        "cumulative = N×RateA + N×RateB: run-1 usage kept its consumed-time Rate; only \
+         run-2 usage repriced (no retroactive repricing)"
+    );
+    // Guard the anti-case explicitly: had the WHOLE history been re-priced at Rate B,
+    // all 2N rows would cost 270 each; the real total is strictly less.
+    let fully_repriced = RATE_B_PER_EVENT * (2 * N) as i64;
     assert!(
-        cost_after > 30 * 20,
-        "the later events DID reprice up: cumulative {cost_after} must exceed a flat \
-         30-micro/event total (600)"
+        cost_after_run2 < fully_repriced,
+        "no retro-repricing: cumulative {cost_after_run2} must be < the fully-repriced \
+         {fully_repriced} (the early Run kept its original Rate)"
     );
 
     let _ = facade.stop("noretro", Some(Duration::from_secs(5)));
