@@ -28,7 +28,7 @@
 //! `paused` state — not on process suspension timing — so it is deterministic
 //! everywhere.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ktesio_engine::{AdapterRef, BreachScope, Engine, LifecycleState, OsId};
@@ -44,18 +44,9 @@ const TOKENS_PER_EVENT: u64 = 30;
 /// deterministic.
 fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
     let bin = ktesio_conformance::fake_agent_bin();
-    // Append `--dump argv-dump.txt` (story 2-2's write_dump mechanism): the fake_agent
-    // writes its RECEIVED argv + env into this RELATIVE path, which resolves against
-    // the child's working_dir = the Agent Home (the backend sets `current_dir` to it),
-    // i.e. `<state_dir>/agents/<name>/argv-dump.txt`. That file sits under the state dir
-    // the timeout `dump_diagnostics` walks, so on a macOS/Windows failure the received
-    // argv is surfaced — revealing whether `--emit-usage` reached the process at all.
-    // It writes a SEPARATE file (never agent.log/stdout), so no test's committed-state /
-    // breach / usage-row assertions are affected; on a passing runner it is inert.
     let args_toml = args
         .iter()
         .copied()
-        .chain(["--dump", "argv-dump.txt"])
         .map(|a| format!("{a:?}"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -116,12 +107,6 @@ fn wait_for_state(state_dir: &Path, name: &str, want: LifecycleState, within: Du
         if state.as_deref() == Some(want.as_str()) {
             return;
         }
-        // On timeout, dump a rich diagnostic block to stderr (visible in CI) BEFORE
-        // the assert fires — so the next macOS/Windows CI run reveals the cause. The
-        // assert itself is unchanged (same message, same 30s deadline).
-        if Instant::now() >= deadline {
-            dump_diagnostics(state_dir, name);
-        }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for '{name}' to reach {} (committed state: {state:?})",
@@ -151,164 +136,12 @@ fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64, within: Dura
         if usage_row_count(state_dir, name) >= expected {
             return;
         }
-        // On timeout, dump diagnostics to stderr (see wait_for_state) BEFORE the
-        // assert fires. The assert (message + 30s deadline) is unchanged.
-        if Instant::now() >= deadline {
-            dump_diagnostics(state_dir, name);
-        }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {expected} committed usage rows for '{name}' (have {})",
             usage_row_count(state_dir, name)
         );
         std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-/// On a timeout, dump a rich diagnostic block to STDERR (visible in CI logs) BEFORE
-/// the caller panics — so the NEXT macOS/Windows CI run reveals WHY usage never
-/// drained there (this suite passes locally + on Ubuntu, so the dump only ever fires
-/// on the failing runner). It answers the key trichotomy: is the agent-output capture
-/// `agents/<name>/logs/agent.log` (a) MISSING, (b) present but EMPTY, or (c) present
-/// WITH `KTESIO_USAGE` lines that were emitted but never drained into the ledger?
-/// Self-contained + best-effort: a read hiccup is reported inline, never a panic that
-/// would mask the real timeout the caller is about to report.
-fn dump_diagnostics(state_dir: &Path, name: &str) {
-    eprintln!("\n===== KTESIO budget.rs TIMEOUT DIAGNOSTICS (instance '{name}') =====");
-
-    // (1) The committed DB view the assertions read (a fresh read-only connection).
-    eprintln!("committed usage rows: {}", usage_row_count(state_dir, name));
-    eprintln!(
-        "committed lifecycle state: {:?}",
-        committed_state(state_dir, name)
-    );
-
-    // (2) The resolved fake_agent helper binary. A stale/missing binary that does not
-    // understand `--emit-usage` would still reach `running` yet emit ZERO usage — so
-    // its path + presence is load-bearing for the "have 0 rows" trichotomy.
-    let bin = ktesio_conformance::fake_agent_bin();
-    eprintln!(
-        "fake_agent_bin(): {} (exists={}, is_file={})",
-        bin.display(),
-        bin.exists(),
-        bin.is_file()
-    );
-
-    // (3) TARGETED trichotomy on the agent-output capture — the exact file the reaper
-    // drains (`<state_dir>/agents/<name>/logs/agent.log`).
-    let agent_log = state_dir
-        .join("agents")
-        .join(name)
-        .join("logs")
-        .join("agent.log");
-    match std::fs::read_to_string(&agent_log) {
-        Ok(text) if text.is_empty() => {
-            eprintln!("agent.log: PRESENT BUT EMPTY at {}", agent_log.display());
-        }
-        Ok(text) => {
-            let total = text.lines().count();
-            let usage = text.lines().filter(|l| l.contains("KTESIO_USAGE")).count();
-            let verdict = if usage > 0 {
-                "emitted but NOT drained into the ledger"
-            } else {
-                "agent emitted NO KTESIO_USAGE lines"
-            };
-            eprintln!(
-                "agent.log: PRESENT at {} — {total} line(s), {usage} KTESIO_USAGE line(s) ({verdict})",
-                agent_log.display()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "agent.log: MISSING/UNREADABLE at {} ({e})",
-                agent_log.display()
-            );
-        }
-    }
-
-    // (4) The argv the fake_agent actually RECEIVED (story 2-2's `--dump` mechanism:
-    // `write_fake_manifest` appends `--dump argv-dump.txt`, which the child writes into
-    // its working_dir = the Agent Home). Print ONLY the `arg=` lines — NEVER the `env=`
-    // lines, which could carry runner secrets. This is the decisive datum:
-    //   * file ABSENT     → args were dropped WHOLESALE (`--dump` never arrived either);
-    //   * present, NO `--emit-usage` → the flag was dropped before/at spawn;
-    //   * present, WITH `--emit-usage` → the flag arrived (a parser-side issue).
-    let argv_dump = state_dir.join("agents").join(name).join("argv-dump.txt");
-    match std::fs::read_to_string(&argv_dump) {
-        Ok(text) => {
-            eprintln!("received argv (from {}):", argv_dump.display());
-            for line in text.lines().filter(|l| l.starts_with("arg=")) {
-                eprintln!("    {line}");
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "argv dump ABSENT/UNREADABLE at {} ({e}) — the args were likely dropped \
-                 wholesale (`--dump` did not reach the process either)",
-                argv_dump.display()
-            );
-        }
-    }
-
-    // (5) Full recursive walk of the state dir (which contains the agents/ tree, each
-    // Agent Home, and every per-instance log): each file's path + byte size, plus the
-    // full contents of small `*.log`/`*.toml`/`*.json` text files. The `argv-dump.txt`
-    // is `.txt`, so the walk lists it by SIZE only — its `env=` lines are never spewed.
-    eprintln!(
-        "--- recursive walk of state dir {} ---",
-        state_dir.display()
-    );
-    dump_tree(state_dir);
-    eprintln!("===== end diagnostics =====\n");
-}
-
-/// Recursively print every file under `dir`: path + byte size, and (for small
-/// `*.log`/`*.toml`/`*.json` text files) the full contents. Entries are sorted for
-/// stable CI output. Best-effort — a read error is printed inline, never a panic.
-fn dump_tree(dir: &Path) {
-    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
-        Err(e) => {
-            eprintln!("  <read_dir {} failed: {e}>", dir.display());
-            return;
-        }
-    };
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            dump_tree(&path);
-        } else {
-            dump_file(&path);
-        }
-    }
-}
-
-/// Print one file's path + byte size, plus the full contents of a small text log/
-/// config file — so the agent-output `agent.log` shows whether it is missing, empty,
-/// or holds undrained `KTESIO_USAGE` lines. Binary files (`state.db` + its
-/// `-wal`/`-shm` siblings) are listed by size only.
-fn dump_file(path: &Path) {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let bytes = meta.len();
-            eprintln!("  FILE {} ({bytes} bytes)", path.display());
-            let dump_text = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| matches!(e, "log" | "toml" | "json"));
-            if dump_text && bytes <= 256 * 1024 {
-                match std::fs::read_to_string(path) {
-                    Ok(text) if text.is_empty() => eprintln!("    <present but empty>"),
-                    Ok(text) => {
-                        for line in text.lines() {
-                            eprintln!("    | {line}");
-                        }
-                    }
-                    Err(e) => eprintln!("    <unreadable as utf-8: {e}>"),
-                }
-            }
-        }
-        Err(e) => eprintln!("  FILE {} <metadata failed: {e}>", path.display()),
     }
 }
 

@@ -89,29 +89,23 @@ jobs:
         # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable
         # on each OS; the pin governs only local bare cargo. MSRV floor: `msrv` job.
         #
-        # RUST_TEST_THREADS=1 — serialize the suite. The ktesio-engine integration
-        # tests each spin up a full in-process Engine (a multi-threaded tokio runtime
-        # + a 250ms background reaper) PLUS a real `fake_agent` process. Running
-        # several concurrently oversubscribes the low-core macOS/Windows runners (3-4
-        # cores) so the reaper cadence starves and the 30s budget/metering enforcement
-        # deadlines blow — budget.rs tests fail waiting on `paused`/`stopped` or on
-        # committed usage rows. A SINGLE engine drains + enforces fine even under a
-        # fully pegged CPU (verified locally), and production runs ONE engine per host,
-        # so the concurrency is a pure TEST artifact, not a product bug. Serialize to
-        # the proven-stable one-engine-at-a-time condition — the same posture the
-        # coverage job already runs the workspace under (AI-23). Nothing is weakened;
-        # the full end-to-end enforcement chain is still asserted, just not in parallel.
-        # Determinism beats wall-clock for a money-metering system.
-        #
         # `rm -f target/debug/fake_agent*` FORCES a fresh rebuild of the `fake_agent`
         # test helper. The per-OS `target/` cache can restore a STALE fake_agent whose
         # newer `--emit-usage`/`--dump` args are silently ignored (older `--linger-ms`/
         # `--heartbeat-ms` still work) — failing ONLY the metering integration tests on
         # macOS/Windows while Ubuntu + local pass. `fake_agent_bin()` reuses an existing
         # binary, so deleting the output makes cargo rebuild it fresh in the
-        # `--all-targets` build below. The engine passes the launch args correctly
-        # (verified via KTESIO_ARGDIAG traces); this is a test-harness cache artifact,
-        # not a product bug. `shell: bash` so `rm` works on the Windows runner too.
+        # `--all-targets` build below. The engine passes the launch args correctly;
+        # this is a test-harness cache artifact, not a product bug. `shell: bash` so
+        # `rm` works on the Windows runner too.
+        #
+        # RUST_TEST_THREADS=1 — serialize the suite. SEPARATE from the stale-binary
+        # bug above: the engine integration tests each spin up an in-process Engine +
+        # a real fake_agent, and run in parallel on the low-core macOS/Windows runners
+        # they can intermittently miss the ~250ms reaper cadence within a test's
+        # deadline (a rare oversubscription timing flake — AI-49; observed ~1/13 even
+        # locally). Serial makes it deterministic. The coverage job runs serial for the
+        # same reason (AI-23). Determinism beats wall-clock for a money-metering suite.
         shell: bash
         env:
           RUST_TEST_THREADS: "1"
