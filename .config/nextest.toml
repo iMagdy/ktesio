@@ -1,0 +1,39 @@
+# cargo-nextest configuration for the `test` CI job (#106).
+#
+# WHY nextest here (test-harness, not product): the `test` job runs the
+# process-spawning engine integration suite on a 3-OS matrix. Two chronic
+# GitHub-runner problems motivated the switch off plain `cargo test`:
+#   1. ubuntu-latest (a genuine 2-core runner) could exhaust the job-level
+#      timeout with NO per-test signal — `cargo test` gives no way to time-box
+#      or name an individual slow/hung test, so a single stuck test silently
+#      burned the whole budget and GitHub discarded the cancelled job's logs.
+#   2. windows-latest intermittently missed a per-test wall-clock deadline on
+#      the slow runner (a different engine test each run) — a pure timing flake
+#      that passed on re-run.
+#
+# nextest fixes both: `slow-timeout` time-boxes and NAMES a stuck test (it
+# becomes a normal, logged failure instead of a job-level hang), and `retries`
+# absorbs the Windows timing flake. Product code is untouched.
+
+[profile.default]
+# Retry a failed test up to twice (3 attempts total). A test only counts as
+# failed if EVERY attempt fails, so a flake that passes on re-run is absorbed.
+# This directly covers the windows-latest timing flake (an engine test that
+# occasionally misses its own ~30s convergence deadline on the slow runner and
+# fails an assert, then passes immediately on retry). Deterministic failures
+# still fail — a real bug fails all 3 attempts.
+retries = 2
+
+# Time-box each individual test. `period = "60s"` marks a test as SLOW after 60s
+# (logged, NOT killed — generous headroom over the suite's internal ~30s
+# convergence deadlines plus process spawn/stop overhead on a slow runner).
+# `terminate-after = 4` KILLS the test after 4 such periods (4 x 60s = 240s) and
+# reports it as a timeout FAILURE. This converts a hung test — which under plain
+# `cargo test` ran until the 25-min job cancel with no logs — into a NAMED
+# failure at ~4 min, so the job never silently hangs and the culprit is visible.
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+# Show output for failed (and retried) tests so a flake or a timeout kill lands
+# in the CI log with its captured stdout/stderr, not a bare status line.
+failure-output = "immediate-final"
+status-level = "retry"

@@ -120,7 +120,36 @@ class ReleaseDocsTests(unittest.TestCase):
         # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), so these jobs
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
         # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
-        self.assertIn("cargo +stable test --workspace --all-targets", ci)
+        #
+        # The `test` job runs the suite via cargo-nextest (#106): nextest gives a
+        # per-test kill-timeout so a hung/slow engine integration test becomes a
+        # NAMED, time-boxed failure instead of a silent job-level cancel whose
+        # logs GitHub discards (the ubuntu symptom), and its retries absorb the
+        # windows-latest per-test timing flake. Doctests run separately because
+        # nextest does not execute them. nextest is installed with the repo's
+        # standard `cargo install --locked` idiom (same as the semver / tarpaulin
+        # gates), not a third-party install action, so the SHA-pinned-actions
+        # posture is preserved. Assert the whole shape so a regression back to the
+        # hang-prone plain `cargo test` suite run — or a dropped doctest pass — is
+        # caught.
+        self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
+        self.assertIn("cargo +stable test --workspace --doc", ci)
+        # nextest (unlike `cargo test --all-targets`) does not hardlink the
+        # fake_agent bin to target/debug/fake_agent, so the test job rebuilds it
+        # explicitly between the stale-bin `rm` and the nextest run — otherwise the
+        # process-spawning tests race on the lib's on-demand build fallback. Guard
+        # both the `rm` and the explicit rebuild so neither is dropped.
+        self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
+        self.assertIn("cargo +stable build -p ktesio-conformance --bin fake_agent", ci)
+        self.assertIn(
+            "command -v cargo-nextest >/dev/null 2>&1 "
+            "|| cargo +stable install cargo-nextest --locked",
+            ci,
+        )
+        self.assertIn("${{ runner.os }}-cargo-nextest-bin", ci)
+        # The old plain-`cargo test` suite command must be GONE — the only
+        # remaining `cargo +stable test` in the test job is the `--doc` pass.
+        self.assertNotIn("cargo +stable test --workspace --all-targets", ci)
         # Coverage runs tarpaulin ONCE PER CRATE (#101), not one --workspace pass:
         # the --workspace instrumented run OOM'd the 7 GB runner even after the
         # AI-23 fixes. Each per-crate run keeps its resident set small; the UNION of
