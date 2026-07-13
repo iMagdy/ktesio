@@ -49,13 +49,22 @@ mod os;
 /// version they target via `contract_version`; this story stores it, and does
 /// not yet negotiate or enforce compatibility beyond presence.
 ///
-/// Bumped `0.1.0 → 0.2.0` in story 2-2 (FR-12): the manifest schema gains an
-/// OPTIONAL `[config]` mapping section + the trait gains a `config_mapping()`
-/// accessor with an empty default — an ADDITIVE, backward-compatible extension
-/// (a manifest with no `[config]` and a native adapter that does not override
-/// `config_mapping()` both keep their 1-3 behavior). An additive minor bump under
-/// 0.x semver; nothing was removed or changed incompatibly.
-pub const CONTRACT_VERSION: &str = "0.2.0";
+/// Bumped `0.1.0 → 0.2.0` in story 2-2 (FR-12): the manifest schema gained an
+/// OPTIONAL `[config]` mapping section + the trait's `config_mapping()` accessor —
+/// an additive minor bump.
+///
+/// Bumped `0.2.0 → 0.3.0` in story 3-1 (FR-19 self-reported metering): the
+/// Adapter Contract's METERING surface gains a documented usage-reporting CHANNEL —
+/// a `self-reported` adapter conveys the agent's own usage accounting to the engine
+/// by emitting `KTESIO_USAGE {json}` sentinel lines on the agent's stdout (parsed
+/// out of the AD-12 capture; see the [`metering`] module + `docs/manifest.md`). This
+/// is a DOCUMENTARY, back-compat addition (no new trait method — the channel is a
+/// stdout convention, and the `[metering]` section is unchanged), so it is an
+/// additive MINOR bump under 0.x semver: nothing was removed or changed
+/// incompatibly. Unlike story 2-4's engine-INTERNAL `SecretResolver` (no bump), this
+/// touches the adapter-FACING contract, so the bump is real — the semver-check CI
+/// job guards it.
+pub const CONTRACT_VERSION: &str = "0.3.0";
 
 pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
@@ -73,11 +82,11 @@ mod tests {
     #[test]
     fn contract_version_parses_as_semver() {
         // The seed must be a valid semver so 6.6 can build negotiation on it.
-        // Bumped to 0.2.0 in story 2-2 (additive optional `[config]` section +
-        // the `config_mapping()` accessor — an additive minor bump under 0.x).
+        // Bumped to 0.3.0 in story 3-1 (additive documented self-reported usage
+        // channel on the `[metering]` surface — an additive minor bump under 0.x).
         let parsed = semver::Version::parse(CONTRACT_VERSION).expect("CONTRACT_VERSION is semver");
         assert_eq!(parsed.major, 0);
-        assert_eq!(parsed.minor, 2);
+        assert_eq!(parsed.minor, 3);
         assert_eq!(parsed.patch, 0);
     }
 

@@ -88,7 +88,26 @@ jobs:
       - name: Run tests
         # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable
         # on each OS; the pin governs only local bare cargo. MSRV floor: `msrv` job.
-        run: cargo +stable test --workspace --all-targets
+        #
+        # `rm -f target/debug/fake_agent*` FORCES a fresh rebuild of the `fake_agent`
+        # test helper. The per-OS `target/` cache can restore a STALE fake_agent whose
+        # newer `--emit-usage`/`--dump` args are silently ignored (older `--linger-ms`/
+        # `--heartbeat-ms` still work) — failing ONLY the metering integration tests on
+        # macOS/Windows while Ubuntu + local pass. `fake_agent_bin()` reuses an existing
+        # binary, so deleting the output makes cargo rebuild it fresh in the
+        # `--all-targets` build below. The engine passes the launch args correctly;
+        # this is a test-harness cache artifact, not a product bug. `shell: bash` so
+        # `rm` works on the Windows runner too.
+        #
+        # Tests run PARALLEL (the harness default). The one real flake seen here was a
+        # read-consistency race in cost.rs (fixed deterministically — pause the agent +
+        # settle before sampling), NOT oversubscription; serializing the whole workspace
+        # was both unnecessary and harmful — its serial wall-clock overran the ubuntu
+        # leg's 25-min timeout. Fast + deterministic beats masking a race with serial.
+        shell: bash
+        run: |
+          rm -f target/debug/fake_agent target/debug/fake_agent.exe
+          cargo +stable test --workspace --all-targets
 
   build:
     name: build
@@ -220,6 +239,54 @@ jobs:
             exit 1
           fi
           echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
+      - name: Enforce single currency-formatting module (story 3-3, AD-8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # AD-8: exactly ONE module formats currency. Money becomes a `$X.XX` human
+          # string ONLY in crates/ktesio-engine/src/domain/cost.rs (render_dollars /
+          # render_dollars_bare). Every other module passes Micros + EstimateLabel as
+          # DATA; --json emits integer micros, never a `$` string. This gate FAILS if a
+          # `$`-string-building form appears anywhere else.
+          #
+          # BROADENED alternation (a narrow `\$\{` missed several dollar-string shapes):
+          #   \$ ?\{  — `${...}` AND `$ {...}` (a `$` glued to a format placeholder,
+          #             with or without a space): format!("${x}") / "$ {}"
+          #   \}\$    — `}$` (a placeholder immediately followed by a `$`): "{}$"
+          #   "\$     — a string literal STARTING with `$`: "$", "$0.00", write!(f,"$")
+          #   '\$'    — a bare `$` char literal: '$'
+          pattern='\$ ?\{|\}\$|"\$|'\''\$'\'''
+          # Allowlist (precise, not blanket-by-file): the ONE currency module (the
+          # render home + its unit tests), PLUS the genuinely NON-currency `$` uses the
+          # broadened pattern also matches —
+          #   contains\(.\$  — `.contains('$')` / `.contains("$...` DISCIPLINE READ-checks
+          #                    (they assert a `$` is absent/present on a surface; a read
+          #                    never FORMATS currency, so it cannot hide a regression).
+          #   \$PWD / \$KT_TEST — shell-variable interpolation in a spawned command
+          #                    string (a process backend test), not a dollar figure.
+          # No NEW currency formatting may appear anywhere else in the workspace.
+          allowlist='^crates/ktesio-engine/src/domain/cost\.rs:|contains\(.\$|\$PWD|\$KT_TEST'
+          scan_status=0
+          hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
+          if [ "$scan_status" -ge 2 ]; then
+            echo "::error::grep exited ${scan_status} while scanning for currency formatting."
+            exit "$scan_status"
+          fi
+          violations=''
+          if [ -n "$hits" ]; then
+            filter_status=0
+            violations="$(printf '%s\n' "$hits" | grep -Ev "$allowlist")" || filter_status=$?
+            if [ "$filter_status" -ge 2 ]; then
+              echo "::error::grep exited ${filter_status} while applying the currency allowlist."
+              exit "$filter_status"
+            fi
+          fi
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo "::error::Currency formatting (a \`\$\`-string form: \`\${...}\`, \`\$ {}\`, \`{}\$\`, a \"\$\"-prefixed string, or a '\$' char) is allowed ONLY in crates/ktesio-engine/src/domain/cost.rs (AD-8: one currency module). Pass Micros + EstimateLabel as data and render through render_dollars / render_dollars_bare."
+            exit 1
+          fi
+          echo "Currency gate green: dollar formatting lives only in the one currency module."
 
   semver:
     name: semver
@@ -304,14 +371,17 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test, build, docs, boundary, semver]
-    # 75: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
+    # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
     # graph WITH coverage instrumentation — a separate fingerprint from the other
     # jobs' normal-profile target, so nothing is reusable. That one-time cold build
     # (not the test run) is what repeatedly blew the 20- then 40-min caps (AI-23);
     # llvm did not help because the cost is compile, not execution. The dedicated
     # coverage cache below persists the instrumented target so every later run is
-    # warm (~10 min); 75 is generous headroom for the single cold build.
-    timeout-minutes: 75
+    # warm; 90 is generous headroom because coverage now runs tarpaulin ONCE PER
+    # CRATE (5 sequential runs, #101) instead of one --workspace pass — the split
+    # keeps each instrumented run's live process tree small enough to fit the 7 GB
+    # runner, but the sum of the sequential runs is longer than a single pass.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -357,6 +427,11 @@ jobs:
         # cache hit the binary is already on PATH, so the `command -v` guard skips
         # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
+      - name: Install lcov (per-crate coverage merge, #101)
+        # The per-crate split (#101) writes one LCOV tracefile per crate; lcov
+        # merges them into the workspace-aggregate the --fail-under 95 gate is
+        # enforced on. apt's lcov is enough — only `lcov -a`/`--summary` are used.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lcov
       - name: Reclaim disk + add swap for the instrumented run
         # The instrumented build is far heavier than the normal `test` job (coverage
         # counters + the fleet/adoption tests each spawning several instrumented
@@ -377,18 +452,99 @@ jobs:
           sudo mkswap /mnt/covswap
           sudo swapon /mnt/covswap
           echo "after:"; df -h / /mnt; free -h
-      - name: Enforce coverage
-        # --engine llvm: parity with the local gate (see docs/testing.md).
-        # --skip-clean: reuse the cached instrumented target. --timeout 180: raise
-        # the per-test cap from tarpaulin's 60 s default. --verbose: log progress.
-        # Env, all aimed at the OOM (AI-23):
-        #   RUST_TEST_THREADS=1 — instrumented tests run SERIALLY (one subprocess-
-        #     spawning test's process tree resident at a time).
-        #   CARGO_PROFILE_DEV_DEBUG=1 — line-tables-only debuginfo instead of full:
-        #     smaller instrumented binaries (less RAM) and a smaller target on `/`
-        #     (less disk). Verified locally to leave coverage unchanged at 95.20% —
-        #     llvm line-mapping needs only line tables, not full debuginfo.
+      - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
+        # WHY the split (#101): a single `cargo tarpaulin --workspace` instruments
+        # the ENTIRE graph (tokio + bundled-SQLite C + a 13-crate hyper stack) and
+        # runs all ~1075 tests instrumented; even after the AI-23 fixes (dedicated
+        # cache, --engine llvm, serial tests, 8 GB swap, disk reclaim, line-tables
+        # debuginfo) the instrumented run's live process tree still OOM'd the 7 GB
+        # runner ("runner lost communication", no log). Running tarpaulin ONCE PER
+        # CRATE (`-p <crate>`) keeps each run's resident set small enough to fit.
+        #
+        # CORRECTNESS (de-risked locally before this landed): tarpaulin reports
+        # coverage for ALL workspace source each built test binary touches, NOT just
+        # the `-p` crate's own source — so a ktesio-engine line covered only by a
+        # `kt` CLI test IS credited under `-p ktesio`. The UNION of the five
+        # per-crate tracefiles therefore reproduces the --workspace result exactly:
+        # locally the merged aggregate is 95.22% (5718/6005), identical to
+        # --workspace to the line (0 lines lost, 0 gained). No report-scope flag is
+        # needed; the merge just needs `lcov --ignore-errors inconsistent` because
+        # lcov 2.x rejects the benign FN-start-line drift tarpaulin emits across
+        # runs (function metadata only — it does not touch DA/LF/LH line data).
+        #
+        # ORDER: lightest → heaviest, ktesio-engine LAST. If the heavy crate still
+        # OOMs the runner, the lighter crates' tracefiles + per-crate numbers are
+        # already printed, so a per-crate OOM is diagnosable (which crate, at what
+        # `free`/`df`) instead of one opaque --workspace failure.
+        #
+        # Flags unchanged from the --workspace gate: --engine llvm (parity with the
+        # local macOS gate, see docs/testing.md), --skip-clean (reuse the cached
+        # instrumented target), --timeout 180 (raise tarpaulin's 60 s per-test cap),
+        # --verbose (progress). Env unchanged (AI-23): RUST_TEST_THREADS=1 runs the
+        # instrumented tests serially; CARGO_PROFILE_DEV_DEBUG=1 builds line-tables-
+        # only debuginfo (smaller instrumented binaries, coverage unchanged). The
+        # merged aggregate replaces tarpaulin's per-run --fail-under 95 with the SAME
+        # workspace >= 95 gate enforced on the union (a per-crate --fail-under would
+        # wrongly fail the lighter crates, which see only part of the workspace).
         env:
           RUST_TEST_THREADS: "1"
           CARGO_PROFILE_DEV_DEBUG: "1"
-        run: cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose --workspace --fail-under 95
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf cov && mkdir -p cov
+          # Crate list as positional params (portable, no word-split reliance):
+          # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
+          set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes ktesio ktesio-engine
+          for pkg in "$@"; do
+            echo "::group::tarpaulin -p $pkg"
+            echo "--- resources before $pkg ---"
+            free -h || true
+            df -h / || true
+            cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+              -p "$pkg" --out Lcov --output-dir "cov/$pkg"
+            echo "::endgroup::"
+          done
+          # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
+          # is a doc-only stub today (0 coverable lines, no tracefile) — skip any
+          # crate that produced no lcov.info so the merge does not choke on it, and
+          # it lights up automatically once epic 6 gives it code. --ignore-errors
+          # inconsistent: tolerate lcov 2.x's benign cross-run FN-start-line drift
+          # (line data is unaffected).
+          add_args=""
+          for pkg in "$@"; do
+            if [ -s "cov/$pkg/lcov.info" ]; then
+              add_args="$add_args -a cov/$pkg/lcov.info"
+            else
+              echo "::notice::no coverable lines for $pkg (expected for the hermes stub); skipping in merge."
+            fi
+          done
+          echo "::group::merge tracefiles"
+          # shellcheck disable=SC2086
+          lcov $add_args -o cov/merged.info --ignore-errors inconsistent,inconsistent
+          echo "::endgroup::"
+          # Enforce the SAME workspace >= 95 gate on the MERGED aggregate. Parse the
+          # `(<hit> of <found> lines)` FRACTION from `lcov --summary` (version-stable
+          # across lcov 1.x/2.x) and compute the exact percentage — more robust than
+          # the 1-decimal rounded `NN.N%` near the boundary. `lines_pair` is the two
+          # integers "<hit> <found>"; a single awk both extracts and decides, so
+          # there is no heredoc / read indentation fragility.
+          echo "::group::merged coverage summary"
+          lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
+          echo "::endgroup::"
+          lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
+            | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
+          hit="${lines_pair%% *}"
+          found="${lines_pair##* }"
+          if [ -z "${found:-}" ] || ! [ "${found}" -gt 0 ] 2>/dev/null; then
+            echo "::error::Could not parse merged line coverage from lcov --summary; aborting the coverage gate (#101)."
+            exit 1
+          fi
+          pct="$(awk -v h="$hit" -v f="$found" 'BEGIN { printf "%.4f", (h / f) * 100 }')"
+          echo "Merged workspace coverage: ${pct}% (${hit}/${found} lines) across the per-crate split (#101)."
+          if awk -v p="$pct" 'BEGIN { exit (p + 0 >= 95) ? 0 : 1 }'; then
+            echo "Coverage gate green: merged ${pct}% >= 95% on the per-crate union (#101)."
+          else
+            echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
+            exit 1
+          fi

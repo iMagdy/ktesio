@@ -7,10 +7,36 @@
 //! variant — so this enum only ever holds a real, viable source. An
 //! [`crate::AgentAdapter`] that successfully registers always has one.
 //!
-//! ## Scope this story
+//! ## The self-reported usage channel (story 3-1, FR-19, CONTRACT_VERSION 0.3.0)
 //!
-//! This story only DECLARES the source and validates its presence. The metering
-//! pipeline (UsageEvent ingestion → ledger → budget evaluation) is epic 3.
+//! A `self-reported` adapter forwards the AGENT'S OWN usage accounting to the
+//! engine over a documented CHANNEL: the agent emits **`KTESIO_USAGE {json}`**
+//! sentinel lines on its **stdout**, which the engine captures (AD-12) and parses
+//! into Usage-Ledger events. The JSON object carries the agent-supplied fields
+//! (snake_case, matching the `usage_events` columns):
+//!
+//! ```json
+//! {"sequence": 0, "input_tokens": 128, "output_tokens": 512}
+//! ```
+//!
+//! * `sequence` — a per-Run-monotonic ordinal the agent stamps; it is the
+//!   replay-dedup key, so a re-delivered (delayed) batch with the same `sequence`
+//!   is recognized and **not** double-counted (the FR-19 "delayed batches
+//!   reconcile without double-counting" guarantee).
+//! * `input_tokens` / `output_tokens` — non-negative token counts for the event.
+//!
+//! The engine stamps the Run id, the instance, the Metering Source, and the
+//! timestamp; the agent supplies only the three fields above. A malformed usage
+//! line is a diagnostic (ignored), never fatal and never mixed into `kt`'s output.
+//! This is a DOCUMENTARY contract addition (no new trait method — the channel is a
+//! stdout convention), hence the additive `0.2.0 → 0.3.0` MINOR bump. The
+//! `engine-observed` channel (a loopback listener) is a later story (3-4).
+//!
+//! ## Scope of THIS type
+//!
+//! [`MeteringSource`] only DECLARES the source kind and validates its presence;
+//! the ingestion port + ledger write live in the engine. Budget evaluation +
+//! enforcement are later Epic-3 stories.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +51,11 @@ use serde::{Deserialize, Serialize};
 /// source = "self-reported"
 /// ```
 ///
-/// There is deliberately no `None`/`none` variant: "no viable source" is a
-/// missing/invalid section caught by validation, keeping this type honest.
+/// A `self-reported` adapter additionally emits `KTESIO_USAGE {json}` usage
+/// sentinel lines on the agent's stdout (the documented usage channel, story 3-1 —
+/// see the module docs). There is deliberately no `None`/`none` variant: "no
+/// viable source" is a missing/invalid section caught by validation, keeping this
+/// type honest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MeteringSource {

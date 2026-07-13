@@ -54,6 +54,77 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use toml::Value;
 
+use super::budget::{BreachAction, TokenBudget};
+use super::cost::{CostCap, Micros, Rate, MICROS_PER_DOLLAR};
+
+/// The engine-namespace config key for the PER-RUN token ceiling (story 3-2,
+/// AD-9). A validated key (NOT `agent.*` pass-through): its value parses as a
+/// `u64` at write time. Absent → the per-run scope is unset (never breaches).
+pub const BUDGET_TOKENS_PER_RUN_KEY: &str = "budget.tokens.per_run";
+
+/// The engine-namespace config key for the CUMULATIVE token ceiling (story 3-2).
+/// A validated key; its value parses as a `u64` at write time. Absent → the
+/// cumulative scope is unset.
+pub const BUDGET_TOKENS_CUMULATIVE_KEY: &str = "budget.tokens.cumulative";
+
+/// The engine-namespace config key for the Breach Action (story 3-2, AC-C). A
+/// validated key; its value parses as a [`BreachAction`] (`pause`/`stop`/`warn`)
+/// at write time. Absent → [`BreachAction::default`] (`pause`, the ratified
+/// default). Story 3-3: the SAME key governs a DOLLAR breach too (one action for
+/// both token and dollar breaches — see [`resolve_cost`]).
+pub const BUDGET_BREACH_ACTION_KEY: &str = "budget.breach_action";
+
+/// The engine-namespace config key for the per-direction INPUT Rate (story 3-3,
+/// FR-20). A validated key; its value is a DOLLAR STRING (e.g. `"3.00"`) parsed to
+/// micro-dollars-per-1M-tokens at WRITE time (rejecting a non-numeric or sub-micro
+/// value — see [`validate_cost_value`]). Absent → no input Rate; because BOTH
+/// directions are required for a Rate to be "supplied", an absent input direction
+/// makes the whole Rate inert (AC-B).
+pub const COST_RATE_INPUT_KEY: &str = "cost.rate.input";
+
+/// The engine-namespace config key for the per-direction OUTPUT Rate (story 3-3,
+/// FR-20). A dollar-string leaf parsed to micros at write time, exactly like
+/// [`COST_RATE_INPUT_KEY`]. Absent → the Rate is inert (both directions required).
+pub const COST_RATE_OUTPUT_KEY: &str = "cost.rate.output";
+
+/// The engine-namespace config key for the PER-RUN dollar Cost Cap (story 3-3,
+/// FR-21). A dollar-string leaf parsed to micros at write time. Absent → the
+/// per-run dollar scope is unset (never breaches). A cap set with no Rate is inert
+/// (AC-B).
+pub const BUDGET_DOLLARS_PER_RUN_KEY: &str = "budget.dollars.per_run";
+
+/// The engine-namespace config key for the CUMULATIVE dollar Cost Cap (story 3-3,
+/// FR-21). A dollar-string leaf parsed to micros at write time. Absent → the
+/// cumulative dollar scope is unset.
+pub const BUDGET_DOLLARS_CUMULATIVE_KEY: &str = "budget.dollars.cumulative";
+
+/// The engine-namespace config key for the ENGINE-OBSERVED upstream provider base
+/// URL (story 3-4, FR-19/AD-7). The OPERATOR sets it to the agent's REAL
+/// OpenAI-compatible provider endpoint (e.g. `"http://127.0.0.1:1234"` for a local
+/// gateway); the engine's loopback forward listener FORWARDS observed traffic
+/// there. Absent → an `engine-observed` instance cannot start its listener (a
+/// typed start error naming this key), since there is nowhere to forward. v1 is
+/// HTTP-only (an `https://` upstream is a documented deferral). ENGINE-INTERNAL
+/// config — it does NOT touch the Adapter Contract surface (no `CONTRACT_VERSION`
+/// bump), exactly like the budget/cost keys.
+pub const METERING_UPSTREAM_BASE_URL_KEY: &str = "metering.upstream_base_url";
+
+/// The RESERVED engine-namespace config key the engine INJECTS the loopback
+/// listener address into at start (story 3-4, AC6). The engine writes
+/// `http://127.0.0.1:<port>` here as an INVOCATION-OVERRIDE leaf at `starting` for
+/// an `engine-observed` instance, and the adapter's EXISTING `[config]` mapping
+/// (story 2-2) delivers it into the agent's native mechanism — the adapter
+/// declares e.g. `[config."metering.base_url"] env = "OPENAI_BASE_URL"`, pointing
+/// the agent's OpenAI-compatible `base_url` at the listener (FR-19 "the Adapter
+/// routes the Agent's model traffic through an Engine-provided interception
+/// point"). A KNOWN key so a mapping can target it, but the OPERATOR does NOT set
+/// it — the address is ephemeral (known only at spawn) and ENGINE-computed (the
+/// engine is the sole authority on the listen address, AC-B). Reusing the existing
+/// config-mapping means NO new contract surface (no `CONTRACT_VERSION` bump). A
+/// hand-set value in a lower layer is harmless — the engine's start-time override
+/// always wins (the invocation layer is strongest).
+pub const METERING_BASE_URL_KEY: &str = "metering.base_url";
+
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
 /// delivered verbatim (the mapping into an agent's native mechanism is 2-2,
@@ -478,7 +549,35 @@ fn merge_table_into(
 /// freeze the schema. Keys are compared as full DOTTED paths. (The resolver
 /// itself is key-agnostic — it merges whatever TOML the layers hold; this set
 /// governs only WRITE validation.)
-const KNOWN_KEYS: &[&str] = &["model"];
+///
+/// Story 3-2 (AD-7/AD-9) ADDS the three engine-namespace Token-Budget keys
+/// ([`BUDGET_TOKENS_PER_RUN_KEY`], [`BUDGET_TOKENS_CUMULATIVE_KEY`],
+/// [`BUDGET_BREACH_ACTION_KEY`]) — validated keys whose VALUES are additionally
+/// type-checked by [`validate_write`] (a budget number must parse as `u64`, the
+/// breach action as [`BreachAction`]); they are NOT `agent.*` pass-through.
+///
+/// Story 3-3 (AD-8/AD-9) ADDS the four engine-namespace dollar keys
+/// ([`COST_RATE_INPUT_KEY`], [`COST_RATE_OUTPUT_KEY`], [`BUDGET_DOLLARS_PER_RUN_KEY`],
+/// [`BUDGET_DOLLARS_CUMULATIVE_KEY`]) — validated keys whose VALUES are dollar
+/// strings parsed to micros + type-checked by [`validate_write`] (a malformed
+/// dollar value or one with sub-micro precision is rejected at write time, never
+/// silently defaulted); they are NOT `agent.*` pass-through.
+const KNOWN_KEYS: &[&str] = &[
+    "model",
+    BUDGET_TOKENS_PER_RUN_KEY,
+    BUDGET_TOKENS_CUMULATIVE_KEY,
+    BUDGET_BREACH_ACTION_KEY,
+    COST_RATE_INPUT_KEY,
+    COST_RATE_OUTPUT_KEY,
+    BUDGET_DOLLARS_PER_RUN_KEY,
+    BUDGET_DOLLARS_CUMULATIVE_KEY,
+    // Story 3-4 (engine-observed metering): the operator-set real-upstream URL, and
+    // the engine-injected loopback base_url the adapter's mapping delivers. Both are
+    // engine-namespace keys (NOT `agent.*` pass-through); neither touches the Adapter
+    // Contract surface (no CONTRACT_VERSION bump).
+    METERING_UPSTREAM_BASE_URL_KEY,
+    METERING_BASE_URL_KEY,
+];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
 /// against [`KNOWN_KEYS`]).
@@ -551,20 +650,24 @@ pub fn secret_name(value: &str) -> Option<&str> {
 /// [`SUGGESTION_MAX_DISTANCE`], so the diagnostic says "no close match" rather
 /// than suggesting nonsense).
 ///
-/// `_value` is accepted for signature-completeness (the write API passes it) but
-/// is NOT inspected here: validation is the KEY namespace only. In particular a
-/// `secret:NAME` VALUE is stored verbatim as an ordinary TOML string — write-time
-/// validation neither resolves nor rejects it (story 2-4 resolves + masks a
-/// `secret:` value at START and DISPLAY, not at write; the reference is what is
-/// persisted, AD-10). So a `set model secret:OPENAI_KEY` is accepted here exactly
-/// like any other known-key write.
+/// `value` is inspected ONLY for the keys that carry a typed contract — the
+/// story-3-2 Token-Budget keys (AC-C: an unknown Breach-Action string or a
+/// malformed budget number is rejected at WRITE time with a clear diagnostic,
+/// never silently defaulted). For every OTHER known key (e.g. `model`) and for
+/// `agent.*` pass-through keys the value is NOT inspected: validation is the KEY
+/// namespace only. In particular a `secret:NAME` VALUE is stored verbatim as an
+/// ordinary TOML string — write-time validation neither resolves nor rejects it
+/// (story 2-4 resolves + masks a `secret:` value at START and DISPLAY, not at
+/// write; the reference is what is persisted, AD-10). So a
+/// `set model secret:OPENAI_KEY` is accepted here exactly like any other
+/// known-key write.
 ///
 /// A key with an EMPTY dotted segment (`agent..b`, `agent.foo.`, `.x`, a bare
 /// `.`) is rejected up front (review patch #5): an empty segment would otherwise
 /// persist a `""` key in the TOML tree — a malformed, un-addressable key. It is
 /// reported as an [`ConfigError::UnknownKey`] with no suggestion (the shape is
 /// wrong, not a near-miss of a known key).
-pub fn validate_write(key: &str, _value: &str) -> Result<(), ConfigError> {
+pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
     // Reject empty dotted segments first (a malformed key shape). An empty `key`
     // has one empty segment and is caught here too.
     if has_empty_segment(key) {
@@ -573,13 +676,298 @@ pub fn validate_write(key: &str, _value: &str) -> Result<(), ConfigError> {
             suggestion: None,
         });
     }
-    if is_known_key(key) || is_pass_through(key) {
+    if is_known_key(key) {
+        // The story-3-2 budget keys + the story-3-3 dollar keys additionally
+        // TYPE-CHECK their value at write time (never silently defaulted). `model`
+        // (and any future value-free known key) skips this.
+        validate_budget_value(key, value)?;
+        validate_cost_value(key, value)?;
+        return Ok(());
+    }
+    if is_pass_through(key) {
         return Ok(());
     }
     Err(ConfigError::UnknownKey {
         key: key.to_string(),
         suggestion: nearest_known_key(key),
     })
+}
+
+/// Type-check the VALUE of a story-3-2 Token-Budget key at write time (AC-C).
+/// A budget number (`budget.tokens.*`) must parse as a `u64`; the breach action
+/// (`budget.breach_action`) must parse as a [`BreachAction`]. A non-budget key is
+/// a no-op (its value is not inspected). Rejects with [`ConfigError::InvalidValue`]
+/// naming the key + reason so `kt` renders a remediation (the write is rejected
+/// BEFORE any persistence — the "validate then persist" atomicity).
+fn validate_budget_value(key: &str, value: &str) -> Result<(), ConfigError> {
+    match key {
+        BUDGET_TOKENS_PER_RUN_KEY | BUDGET_TOKENS_CUMULATIVE_KEY => value
+            .trim()
+            .parse::<u64>()
+            .map(|_| ())
+            .map_err(|_| ConfigError::InvalidValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                reason: "expected a non-negative whole number of tokens (u64)".to_string(),
+            }),
+        BUDGET_BREACH_ACTION_KEY => value
+            .trim()
+            .parse::<BreachAction>()
+            .map(|_| ())
+            .map_err(|e| ConfigError::InvalidValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                reason: e.to_string(),
+            }),
+        _ => Ok(()),
+    }
+}
+
+/// Type-check the VALUE of a story-3-3 dollar key at write time (AC-A/AC-B/AC11).
+/// The Rate directions (`cost.rate.*`) and the dollar cap scopes
+/// (`budget.dollars.*`) are all DOLLAR STRINGS parsed to micro-dollars: a malformed
+/// value (non-numeric, negative, or sub-micro precision) is rejected BEFORE any
+/// persistence with a clear diagnostic (never silently defaulted — the honesty
+/// rule; a bad value must not crash ingestion, so we gate it at write). A non-cost
+/// key is a no-op.
+fn validate_cost_value(key: &str, value: &str) -> Result<(), ConfigError> {
+    match key {
+        COST_RATE_INPUT_KEY
+        | COST_RATE_OUTPUT_KEY
+        | BUDGET_DOLLARS_PER_RUN_KEY
+        | BUDGET_DOLLARS_CUMULATIVE_KEY => {
+            parse_dollars_to_micros(value)
+                .map(|_| ())
+                .map_err(|reason| ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    reason,
+                })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Parse a DOLLAR STRING (e.g. `"3.00"`, `"0"`, `"15"`, `"0.000003"`) into
+/// integer micro-dollars (story 3-3 — the money-parse crux, AC11). PURE + total.
+///
+/// Recorded decision (the config leaf is a decimal-dollar STRING parsed to micros,
+/// NOT a raw micros integer — the operator writes `"3.00"`, not `3000000`): a
+/// human-facing Rate is a dollar figure. Rules (rejected → `Err(reason)`, never a
+/// silent default):
+///
+/// * At most ONE `.`; a leading/trailing sign is NOT accepted (a Rate/cap is
+///   non-negative — a `-` is rejected).
+/// * The fractional part is at most 6 digits (the micro-dollar quantum). MORE than
+///   6 fractional digits is SUB-MICRO precision and is REJECTED (a clear
+///   diagnostic) rather than silently truncated — the story's "reject a value with
+///   sub-micro precision".
+/// * The integer and fractional parts must be ASCII digits (an empty integer part,
+///   as in `".5"`, is treated as `0`; an empty fractional part, as in `"3."`, is
+///   treated as `0`). A non-digit (`"abc"`, `"3.0x"`) is rejected.
+/// * The whole-dollar magnitude must fit in the micro-dollar `i64` domain (a
+///   value above ~9.2e12 dollars overflows and is rejected — implausible for a
+///   real Rate/cap, so the ceiling loses nothing real).
+pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("expected a dollar amount like \"3.00\", got an empty value".to_string());
+    }
+    // No sign: a Rate/cap is non-negative.
+    if trimmed.starts_with('-') || trimmed.starts_with('+') {
+        return Err(format!(
+            "'{trimmed}' is not a valid dollar amount (a Rate/cap must be non-negative, no sign)"
+        ));
+    }
+    let mut parts = trimmed.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next();
+    // A second '.' would remain in frac_part; reject a multi-dot value.
+    if let Some(frac) = frac_part {
+        if frac.contains('.') {
+            return Err(format!(
+                "'{trimmed}' is not a valid dollar amount (more than one decimal point)"
+            ));
+        }
+    }
+    // Integer dollars: an empty int part (".5") is 0.
+    let dollars: u64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse::<u64>().map_err(|_| {
+            format!(
+                "'{trimmed}' is not a valid dollar amount (the whole-dollar part is not a number)"
+            )
+        })?
+    };
+    // Fractional micros: pad/reject to exactly 6 digits (the micro quantum).
+    let frac_micros: u64 = match frac_part {
+        None | Some("") => 0,
+        Some(frac) => {
+            if !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "'{trimmed}' is not a valid dollar amount (the fractional part is not a number)"
+                ));
+            }
+            if frac.len() > 6 {
+                return Err(format!(
+                    "'{trimmed}' has sub-micro-dollar precision (more than 6 decimal places); \
+                     the finest supported unit is one micro-dollar ($0.000001)"
+                ));
+            }
+            // Right-pad to 6 digits so "3" fractional means 300_000 micros, "000003"
+            // means 3 micros.
+            let padded = format!("{frac:0<6}");
+            padded.parse::<u64>().map_err(|_| {
+                format!("'{trimmed}' is not a valid dollar amount (the fractional part is not a number)")
+            })?
+        }
+    };
+    // dollars × 1e6 + frac_micros, in i64, rejecting an overflow (implausible Rate).
+    let micros = (dollars as i128)
+        .checked_mul(MICROS_PER_DOLLAR as i128)
+        .and_then(|d| d.checked_add(frac_micros as i128))
+        .filter(|m| *m <= i64::MAX as i128)
+        .ok_or_else(|| {
+            format!("'{trimmed}' is too large to represent as micro-dollars (max ~$9.2 trillion)")
+        })?;
+    Ok(Micros(micros as i64))
+}
+
+/// Resolve the current [`TokenBudget`] + [`BreachAction`] from an already-resolved
+/// [`EffectiveConfig`] (story 3-2, AC-B/AC-C — the LIVE read the evaluator calls on
+/// EACH ingestion).
+///
+/// A read of the CURRENT resolved config (NOT a start-time snapshot): a budget
+/// changed while `running` is reflected on the very next `UsageEvent` (AC-B
+/// "changes apply immediately") because the supervisor re-resolves + re-reads here
+/// each time. Absent scopes → `None` (never breach); an absent action →
+/// [`BreachAction::default`] (`pause`).
+///
+/// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
+/// somehow present but MALFORMED (e.g. a negative or non-integer that slipped past
+/// write-validation via a hand-edited `config.toml`, or an unknown action string)
+/// is treated as ABSENT for that scope/action rather than erroring — the honest
+/// degrade is "no ceiling / default action", never a panic mid-ingestion. Write
+/// validation ([`validate_write`]) is the primary gate; this read is defensive.
+pub fn resolve_token_budget(effective: &EffectiveConfig) -> (TokenBudget, BreachAction) {
+    let per_run = budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY);
+    let cumulative = budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY);
+    let action = effective
+        .value(BUDGET_BREACH_ACTION_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<BreachAction>().ok())
+        .unwrap_or_default();
+    (
+        TokenBudget {
+            per_run,
+            cumulative,
+        },
+        action,
+    )
+}
+
+/// Read a `u64` budget ceiling from a resolved leaf, coercing the TOML value
+/// (story 3-2). Accepts a TOML integer (the natural `set` form) or a numeric
+/// STRING (a `secret:`-free string leaf), rejecting a negative / non-integer as
+/// ABSENT (the defensive degrade — see [`resolve_token_budget`]).
+fn budget_u64(effective: &EffectiveConfig, key: &str) -> Option<u64> {
+    let value = effective.value(key)?;
+    match value {
+        // A TOML integer: accept only a non-negative value (a negative ceiling is
+        // meaningless — treat as absent).
+        Value::Integer(i) => u64::try_from(*i).ok(),
+        // A string leaf that parses as u64 (defensive; the `set` path stores a
+        // number, but a hand-edited quoted value still resolves honestly).
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Resolve the current [`Rate`] (per-direction, if BOTH set) + [`CostCap`] +
+/// [`BreachAction`] from an already-resolved [`EffectiveConfig`] (story 3-3,
+/// AC-A/AC-B/AC-C/AC11 — the LIVE read the dollar enforcement calls on EACH
+/// ingestion, mirroring [`resolve_token_budget`]).
+///
+/// A read of the CURRENT resolved config (NOT a start-time snapshot): a Rate/cap
+/// changed while `running` is reflected on the very next `UsageEvent` (AC-A "a Rate
+/// change re-prices FUTURE consumption only"; AC-B "changeable while running")
+/// because the supervisor re-resolves + re-reads here each time. The Rate REQUIRES
+/// BOTH directions to be "supplied" (Key design decision 2): a half-configured Rate
+/// (only input, or only output) resolves to `None` — inert, treated as no-Rate
+/// (AC-B), avoiding a silently-half-priced ledger. Absent cap scopes → `None`
+/// (never breach); the SAME `budget.breach_action` key governs a dollar breach
+/// (one action for both dimensions).
+///
+/// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
+/// somehow present but MALFORMED (slipped past write-validation via a hand-edited
+/// `config.toml`) is treated as ABSENT for that direction/scope rather than
+/// erroring — the honest degrade is "no Rate / no ceiling", never a panic
+/// mid-ingestion. [`validate_write`] is the primary gate; this read is defensive.
+pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, BreachAction) {
+    // Both directions required for a "supplied" Rate (AC6/AC-B). A missing or
+    // malformed direction → no Rate (inert).
+    let input = cost_micros_leaf(effective, COST_RATE_INPUT_KEY);
+    let output = cost_micros_leaf(effective, COST_RATE_OUTPUT_KEY);
+    let rate = match (input, output) {
+        (Some(i), Some(o)) => Some(Rate::new(micros_to_u64(i), micros_to_u64(o))),
+        _ => None,
+    };
+    let cap = CostCap {
+        per_run: cost_micros_leaf(effective, BUDGET_DOLLARS_PER_RUN_KEY),
+        cumulative: cost_micros_leaf(effective, BUDGET_DOLLARS_CUMULATIVE_KEY),
+    };
+    // The SAME breach-action key governs dollar breaches too (story 3-3): resolve it
+    // exactly as `resolve_token_budget` does (absent → the ratified `pause` default).
+    let action = effective
+        .value(BUDGET_BREACH_ACTION_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<BreachAction>().ok())
+        .unwrap_or_default();
+    (rate, cap, action)
+}
+
+/// Resolve the ENGINE-OBSERVED upstream provider base URL from an already-resolved
+/// [`EffectiveConfig`] (story 3-4, AC6) — the operator's real OpenAI-compatible
+/// endpoint the loopback listener forwards to. Returns the trimmed string value of
+/// [`METERING_UPSTREAM_BASE_URL_KEY`], or `None` when unset / not a string /
+/// empty. A secret-classified value is NOT a URL → `None` (defensive; the URL is
+/// not a secret). The listener validates it is a usable `http://…` URL at start
+/// (v1 HTTP-only); this only reads the leaf.
+pub fn resolve_upstream_base_url(effective: &EffectiveConfig) -> Option<String> {
+    let value = effective.value(METERING_UPSTREAM_BASE_URL_KEY)?;
+    match value {
+        Value::String(s) if !is_secret_ref(s) && !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Read a dollar-string leaf into [`Micros`], coercing the TOML value (story 3-3,
+/// the defensive resolve). Accepts a TOML string (the `set` path stores the dollar
+/// string verbatim) parsed via [`parse_dollars_to_micros`], or a bare TOML integer
+/// interpreted as WHOLE DOLLARS (a hand-edited `budget.dollars.cumulative = 5`
+/// resolves to $5). A malformed / negative value → `None` (absent — the defensive
+/// degrade). A `secret:`-classified string is not a dollar value → `None`.
+fn cost_micros_leaf(effective: &EffectiveConfig, key: &str) -> Option<Micros> {
+    let value = effective.value(key)?;
+    match value {
+        // The `set` path stores the dollar string; parse it to micros.
+        Value::String(s) if !is_secret_ref(s) => parse_dollars_to_micros(s).ok(),
+        // A hand-edited bare integer means whole dollars (defensive convenience).
+        Value::Integer(i) => u64::try_from(*i)
+            .ok()
+            .and_then(|d| (d as i128).checked_mul(MICROS_PER_DOLLAR as i128))
+            .filter(|m| *m <= i64::MAX as i128)
+            .map(|m| Micros(m as i64)),
+        _ => None,
+    }
+}
+
+/// The non-negative micro count of a [`Micros`] as `u64` for the [`Rate`] fields
+/// (which are `u64` micros-per-1M). A cost value is non-negative; a defensive
+/// negative clamps to 0.
+fn micros_to_u64(m: Micros) -> u64 {
+    u64::try_from(m.get()).unwrap_or(0)
 }
 
 /// Whether a dotted key has any EMPTY segment (a leading/trailing/doubled dot, or
@@ -669,6 +1057,23 @@ pub enum ConfigError {
         key: String,
         /// The ancestor segment that is a scalar (so a child cannot be nested).
         conflicting_ancestor: String,
+    },
+
+    /// A config write supplied a VALUE that failed the key's typed contract
+    /// (story 3-2, AC-C) — a `budget.tokens.*` value that is not a `u64`, or a
+    /// `budget.breach_action` that is not `pause`/`stop`/`warn`. Rejected BEFORE
+    /// any persistence (the instance `config.toml` is left byte-unchanged), NAMES
+    /// the key + the offending value + the reason so `kt` renders a remediation.
+    /// (Distinct from [`ConfigError::UnknownKey`]: the KEY is known/valid — its
+    /// VALUE is wrong.)
+    #[error("invalid value '{value}' for config key '{key}': {reason}")]
+    InvalidValue {
+        /// The (known) key whose value was rejected.
+        key: String,
+        /// The offending value.
+        value: String,
+        /// Why it was rejected (the expected type / accepted set).
+        reason: String,
     },
 
     /// A config layer's TOML failed to parse OR the instance layer could not be
@@ -1246,7 +1651,30 @@ mod tests {
         // sole known key.
         assert!(!is_known_key("restart.policy"));
         assert!(validate_write("restart.policy", "never").is_err());
-        assert_eq!(KNOWN_KEYS, &["model"]);
+        // `model` + the three story-3-2 Token-Budget keys + the four story-3-3 dollar
+        // keys (Rate ×2 + Cost Cap ×2) + the two story-3-4 engine-observed metering
+        // keys (the operator-set upstream URL + the engine-injected loopback base_url)
+        // are the known set.
+        assert_eq!(
+            KNOWN_KEYS,
+            &[
+                "model",
+                "budget.tokens.per_run",
+                "budget.tokens.cumulative",
+                "budget.breach_action",
+                "cost.rate.input",
+                "cost.rate.output",
+                "budget.dollars.per_run",
+                "budget.dollars.cumulative",
+                "metering.upstream_base_url",
+                "metering.base_url",
+            ]
+        );
+        // Story 3-4: both metering keys are known (a mapping can target them) and
+        // accepted as ordinary string writes (no special value type-check).
+        assert!(is_known_key("metering.upstream_base_url"));
+        assert!(is_known_key("metering.base_url"));
+        assert!(validate_write("metering.upstream_base_url", "http://127.0.0.1:1234").is_ok());
     }
 
     #[test]
@@ -1426,6 +1854,349 @@ mod tests {
         assert_eq!(
             ConfigLayer::from_table(full.as_table().clone()).as_table(),
             full.as_table()
+        );
+    }
+
+    // ---- Story 3-2: Token-Budget config keys (AC-B/AC-C, AD-9) ----
+
+    #[test]
+    fn validate_write_accepts_valid_budget_keys() {
+        // The three budget keys are known validated keys; a well-typed value passes.
+        assert!(validate_write("budget.tokens.per_run", "1000").is_ok());
+        assert!(validate_write("budget.tokens.cumulative", "50000").is_ok());
+        assert!(validate_write("budget.breach_action", "pause").is_ok());
+        assert!(validate_write("budget.breach_action", "stop").is_ok());
+        assert!(validate_write("budget.breach_action", "warn").is_ok());
+        // Zero is a valid (if degenerate) ceiling.
+        assert!(validate_write("budget.tokens.per_run", "0").is_ok());
+        // Surrounding whitespace is tolerated (trimmed).
+        assert!(validate_write("budget.tokens.cumulative", "  42  ").is_ok());
+    }
+
+    #[test]
+    fn validate_write_rejects_a_malformed_budget_number() {
+        // AC-C: a non-numeric / negative budget value is rejected at write time
+        // (InvalidValue), naming the key + value — never silently defaulted.
+        for bad in ["lots", "-5", "1.5", "12x", ""] {
+            let err = validate_write("budget.tokens.per_run", bad).unwrap_err();
+            match err {
+                ConfigError::InvalidValue { key, value, .. } => {
+                    assert_eq!(key, "budget.tokens.per_run");
+                    assert_eq!(value, bad);
+                }
+                other => panic!("expected InvalidValue for {bad:?}, got {other:?}"),
+            }
+        }
+        // The message is a helpful remediation.
+        let msg = validate_write("budget.tokens.cumulative", "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("budget.tokens.cumulative"), "{msg}");
+        assert!(msg.contains("nope"), "{msg}");
+    }
+
+    #[test]
+    fn validate_write_rejects_an_unknown_breach_action() {
+        // AC-C: an unknown Breach-Action string is rejected at write time, naming
+        // it + the accepted set.
+        let err = validate_write("budget.breach_action", "throttle").unwrap_err();
+        match err {
+            ConfigError::InvalidValue { key, value, reason } => {
+                assert_eq!(key, "budget.breach_action");
+                assert_eq!(value, "throttle");
+                assert!(reason.contains("pause"), "{reason}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_token_budget_reads_the_current_resolved_values() {
+        // AC-B: the evaluator's live read. A resolved config with both scopes + an
+        // action yields the right TokenBudget + BreachAction.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget]\nbreach_action = \"stop\"\n[budget.tokens]\nper_run = 100\ncumulative = 5000\n",
+        ));
+        let (budget, action) = resolve_token_budget(&eff);
+        assert_eq!(budget.per_run, Some(100));
+        assert_eq!(budget.cumulative, Some(5000));
+        assert_eq!(action, BreachAction::Stop);
+    }
+
+    #[test]
+    fn resolve_token_budget_absent_keys_yield_none_and_pause_default() {
+        // Absent scopes → None (never breach); absent action → Pause (the ratified
+        // default).
+        let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
+        let (budget, action) = resolve_token_budget(&eff);
+        assert_eq!(budget.per_run, None);
+        assert_eq!(budget.cumulative, None);
+        assert!(!budget.is_set());
+        assert_eq!(action, BreachAction::Pause);
+    }
+
+    #[test]
+    fn resolve_token_budget_reflects_a_changed_value_no_caching() {
+        // AC-B "changes apply immediately": resolving a config with a LOWERED
+        // ceiling yields the new value — there is no caching in the resolve path.
+        let high = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\ncumulative = 10000\n",
+        ));
+        assert_eq!(resolve_token_budget(&high).0.cumulative, Some(10000));
+        let low = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\ncumulative = 10\n",
+        ));
+        assert_eq!(resolve_token_budget(&low).0.cumulative, Some(10));
+    }
+
+    #[test]
+    fn resolve_token_budget_degrades_a_malformed_present_value_to_absent() {
+        // Defensive read (AD-12): a value that slipped past write-validation (a
+        // hand-edited negative / non-integer, or an unknown action string) is
+        // treated as ABSENT rather than crashing ingestion.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget]\nbreach_action = \"bogus\"\n[budget.tokens]\nper_run = -3\ncumulative = \"lots\"\n",
+        ));
+        let (budget, action) = resolve_token_budget(&eff);
+        assert_eq!(
+            budget.per_run, None,
+            "a negative ceiling degrades to absent"
+        );
+        assert_eq!(
+            budget.cumulative, None,
+            "a non-numeric string ceiling degrades to absent"
+        );
+        assert_eq!(
+            action,
+            BreachAction::Pause,
+            "an unknown action degrades to the default"
+        );
+    }
+
+    #[test]
+    fn resolve_token_budget_accepts_a_numeric_string_ceiling() {
+        // A quoted numeric value (a hand-edited string leaf) still resolves to the
+        // ceiling (defensive coercion).
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\nper_run = \"250\"\n",
+        ));
+        assert_eq!(resolve_token_budget(&eff).0.per_run, Some(250));
+    }
+
+    // ---- Story 3-3: dollar-string → micros parse (AC11) ----
+
+    #[test]
+    fn parse_dollars_accepts_common_forms() {
+        assert_eq!(parse_dollars_to_micros("3.00").unwrap(), Micros(3_000_000));
+        assert_eq!(parse_dollars_to_micros("3").unwrap(), Micros(3_000_000));
+        assert_eq!(parse_dollars_to_micros("15").unwrap(), Micros(15_000_000));
+        assert_eq!(parse_dollars_to_micros("0").unwrap(), Micros(0));
+        assert_eq!(parse_dollars_to_micros("0.00").unwrap(), Micros(0));
+        // Sub-cent but at/above the micro quantum: $0.000003 = 3 micros ($3/1M).
+        assert_eq!(parse_dollars_to_micros("0.000003").unwrap(), Micros(3));
+        // Partial fractional digits right-pad: "0.3" = $0.30 = 300_000 micros.
+        assert_eq!(parse_dollars_to_micros("0.3").unwrap(), Micros(300_000));
+        // Leading-dot integer defaults to 0: ".5" = $0.50.
+        assert_eq!(parse_dollars_to_micros(".5").unwrap(), Micros(500_000));
+        // Trailing-dot fractional defaults to 0: "3." = $3.00.
+        assert_eq!(parse_dollars_to_micros("3.").unwrap(), Micros(3_000_000));
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            parse_dollars_to_micros("  3.00  ").unwrap(),
+            Micros(3_000_000)
+        );
+    }
+
+    #[test]
+    fn parse_dollars_rejects_sub_micro_precision() {
+        // MORE than 6 fractional digits is sub-micro precision — REJECTED (a clear
+        // diagnostic), never silently truncated.
+        let err = parse_dollars_to_micros("3.0000001").unwrap_err();
+        assert!(err.contains("sub-micro"), "{err}");
+        assert!(err.contains("0.000001"), "{err}");
+        // Exactly 6 digits is fine (the quantum).
+        assert!(parse_dollars_to_micros("3.000001").is_ok());
+    }
+
+    #[test]
+    fn parse_dollars_rejects_non_numeric_and_signed_and_multi_dot() {
+        assert!(parse_dollars_to_micros("abc").is_err());
+        assert!(parse_dollars_to_micros("3.0x").is_err());
+        assert!(parse_dollars_to_micros("").is_err());
+        // A Rate/cap is non-negative — a sign is rejected.
+        assert!(parse_dollars_to_micros("-3.00").is_err());
+        assert!(parse_dollars_to_micros("+3.00").is_err());
+        // More than one decimal point.
+        assert!(parse_dollars_to_micros("3.0.0").is_err());
+        // An implausibly huge value overflows the micro domain and is rejected.
+        assert!(parse_dollars_to_micros("100000000000000").is_err());
+    }
+
+    // ---- Story 3-3: validate_write on the dollar keys (AC-A/AC11) ----
+
+    #[test]
+    fn validate_write_accepts_valid_dollar_keys() {
+        assert!(validate_write(COST_RATE_INPUT_KEY, "3.00").is_ok());
+        assert!(validate_write(COST_RATE_OUTPUT_KEY, "15.00").is_ok());
+        assert!(validate_write(BUDGET_DOLLARS_PER_RUN_KEY, "5").is_ok());
+        assert!(validate_write(BUDGET_DOLLARS_CUMULATIVE_KEY, "50.00").is_ok());
+    }
+
+    #[test]
+    fn validate_write_rejects_a_malformed_dollar_value_with_a_diagnostic() {
+        // AC11: a malformed Rate/cap dollar value is rejected at WRITE time (never
+        // silently defaulted; a bad value must not crash ingestion). It is an
+        // InvalidValue (the KEY is known — its VALUE is wrong), naming key + value.
+        let err = validate_write(COST_RATE_INPUT_KEY, "three dollars").unwrap_err();
+        match err {
+            ConfigError::InvalidValue { key, value, reason } => {
+                assert_eq!(key, COST_RATE_INPUT_KEY);
+                assert_eq!(value, "three dollars");
+                assert!(!reason.is_empty(), "a remediation reason is present");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        // Sub-micro precision on a cap is likewise rejected.
+        assert!(matches!(
+            validate_write(BUDGET_DOLLARS_CUMULATIVE_KEY, "5.0000001"),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+    }
+
+    // ---- Story 3-3: resolve_cost (AC-A/AC-B/AC-C/AC11) ----
+
+    #[test]
+    fn resolve_cost_requires_both_rate_directions_else_inert() {
+        // Both directions present → a real Rate.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\noutput = \"15.00\"\n",
+        ));
+        let (rate, _cap, _action) = resolve_cost(&eff);
+        assert_eq!(
+            rate,
+            Some(Rate::new(3_000_000, 15_000_000)),
+            "both directions set → the Rate is supplied"
+        );
+
+        // Only input set → inert (no Rate), avoiding a silently-half-priced ledger.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\n",
+        ));
+        assert_eq!(resolve_cost(&eff).0, None, "a half-Rate is inert (AC-B)");
+
+        // Only output set → inert.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(resolve_cost(&eff).0, None);
+    }
+
+    #[test]
+    fn resolve_cost_reads_the_dollar_cap_scopes_and_action() {
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"1.00\"\noutput = \"1.00\"\n\
+             [budget.dollars]\nper_run = \"5.00\"\ncumulative = \"50.00\"\n\
+             [budget]\nbreach_action = \"stop\"\n",
+        ));
+        let (rate, cap, action) = resolve_cost(&eff);
+        assert_eq!(rate, Some(Rate::new(1_000_000, 1_000_000)));
+        assert_eq!(cap.per_run, Some(Micros(5_000_000)));
+        assert_eq!(cap.cumulative, Some(Micros(50_000_000)));
+        // The SAME breach-action key governs the dollar breach.
+        assert_eq!(action, BreachAction::Stop);
+    }
+
+    #[test]
+    fn resolve_upstream_base_url_reads_the_operator_key_or_none() {
+        // Story 3-4 (AC6): the operator's real provider endpoint is read from
+        // `metering.upstream_base_url` (trimmed); absent / empty / secret → None.
+        let set = resolve(one_layer(
+            SourceLayer::Instance,
+            "[metering]\nupstream_base_url = \"  http://127.0.0.1:1234  \"\n",
+        ));
+        assert_eq!(
+            resolve_upstream_base_url(&set).as_deref(),
+            Some("http://127.0.0.1:1234"),
+            "trimmed operator upstream"
+        );
+        // Absent → None (an engine-observed start then fails fast with a clear error).
+        let absent = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
+        assert_eq!(resolve_upstream_base_url(&absent), None);
+        // A secret-classified value is NOT a URL → None (defensive).
+        let secret = resolve(one_layer(
+            SourceLayer::Instance,
+            "[metering]\nupstream_base_url = \"secret:UPSTREAM\"\n",
+        ));
+        assert_eq!(resolve_upstream_base_url(&secret), None);
+        // An empty string → None.
+        let empty = resolve(one_layer(
+            SourceLayer::Instance,
+            "[metering]\nupstream_base_url = \"   \"\n",
+        ));
+        assert_eq!(resolve_upstream_base_url(&empty), None);
+    }
+
+    #[test]
+    fn resolve_cost_absent_yields_no_rate_no_cap_default_action() {
+        // AC-B: nothing configured → no Rate, no cap, the ratified `pause` default.
+        let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
+        let (rate, cap, action) = resolve_cost(&eff);
+        assert_eq!(rate, None);
+        assert!(!cap.is_set());
+        assert_eq!(action, BreachAction::Pause);
+    }
+
+    #[test]
+    fn resolve_cost_degrades_a_malformed_value_to_absent_never_panics() {
+        // AD-12 defensive read: a hand-edited malformed value resolves to absent for
+        // that direction/scope rather than erroring. Malformed input → no Rate.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"garbage\"\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(resolve_cost(&eff).0, None, "a malformed direction → inert");
+    }
+
+    #[test]
+    fn resolve_cost_accepts_a_bare_integer_leaf_as_whole_dollars() {
+        // A hand-edited bare integer means whole dollars (defensive convenience):
+        // `cumulative = 5` → $5.00 = 5_000_000 micros.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.dollars]\ncumulative = 5\n",
+        ));
+        assert_eq!(resolve_cost(&eff).1.cumulative, Some(Micros(5_000_000)));
+    }
+
+    #[test]
+    fn resolve_cost_reflects_a_live_rate_change_no_caching() {
+        // AC-A/AC-B: a Rate changed in config is reflected on the next resolve (a
+        // live read, no caching) — the mechanism behind "re-prices future only".
+        let eff1 = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&eff1).0,
+            Some(Rate::new(3_000_000, 15_000_000))
+        );
+        // A fresh resolve of a CHANGED config sees the new Rate immediately.
+        let eff2 = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"6.00\"\noutput = \"30.00\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&eff2).0,
+            Some(Rate::new(6_000_000, 30_000_000))
         );
     }
 }

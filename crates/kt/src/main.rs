@@ -134,9 +134,9 @@ Details:
   Declaration. remove deletes the registry entry and, with --delete, the Agent
   Home too (--retain, the default, keeps it); list shows the Fleet; show renders
   one instance's effective capabilities and runtime status. Both list and show
-  accept --json for a machine-readable document (budget/cap and Usage Ledger
-  columns are honest Epic-3 seeds until metering lands: '—' in the table, null in
-  JSON). config set writes a key to the Agent Instance layer (validated at write
+  accept --json for a machine-readable document (usage is now real token totals
+  from the Usage Ledger, while budget/cap stays the honest seed: '—' in the table,
+  null in JSON). config set writes a key to the Agent Instance layer (validated at write
   time — an unknown key outside the agent.* pass-through namespace is rejected
   with the nearest valid key suggested, and nothing is persisted); config get
   prints the effective (resolved) config, where a key set at the instance layer

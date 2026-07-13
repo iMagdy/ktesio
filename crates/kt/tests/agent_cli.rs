@@ -9,7 +9,7 @@ mod helpers;
 
 use std::path::Path;
 
-use helpers::{run_kt_agent, TestContext};
+use helpers::{run_kt_agent, run_kt_agent_with_env, TestContext};
 
 /// Path to the SQLite state DB the engine creates under a state base.
 fn state_db(state_dir: &Path) -> std::path::PathBuf {
@@ -1246,11 +1246,13 @@ source = "self-reported"
 }
 
 #[test]
-fn list_json_emits_a_parseable_document_with_null_metering_seeds() {
-    // Story 1-7 (Task 5, AC5/AC9): `kt agent list --json` writes ONE parseable
-    // JSON document to stdout (and NOTHING non-JSON there), carrying a top-level
-    // schema_version + per-instance objects whose budget/usage are the honest
-    // JSON `null` seed (never 0, never fabricated). The Epic-3 note is on stderr.
+fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
+    // Story 1-7 (AC5/AC9) + story 3-1 (AC-C/AC11): `kt agent list --json` writes ONE
+    // parseable JSON document to stdout (and NOTHING non-JSON there), carrying a
+    // top-level schema_version + per-instance objects whose `budget` is the honest
+    // JSON `null` seed (budgets are 3-2) while `usage` is a REAL token-totals object
+    // (zeros for a never-metered instance, not null) and `metering_source` is
+    // surfaced. The metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1270,29 +1272,55 @@ fn list_json_emits_a_parseable_document_with_null_metering_seeds() {
     // stdout is PURE JSON and re-parses (nothing else on stdout, AC9/AD-12).
     let doc: serde_json::Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
-    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    // Story 3-5 bumped the Fleet document version 1 → 2 (additive: `totals` gained).
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
     let instances = doc["instances"].as_array().expect("instances array");
     assert_eq!(instances.len(), 1);
+    // Story 3-5: a top-level `totals` object aggregates the rows. A never-metered
+    // Fleet → zero tokens, dollars honestly absent (never a fabricated $0), not partial.
+    assert!(doc["totals"].is_object(), "totals present: {doc}");
+    assert_eq!(doc["totals"]["total_input_tokens"], serde_json::json!(0));
+    assert_eq!(doc["totals"]["total_output_tokens"], serde_json::json!(0));
+    assert!(
+        doc["totals"].get("total_dollars").is_none(),
+        "no Rate anywhere ⇒ no dollar total: {doc}"
+    );
+    assert_eq!(doc["totals"]["dollars_partial"], serde_json::json!(false));
     let entry = &instances[0];
     assert_eq!(entry["name"], serde_json::json!("alpha"));
     assert_eq!(entry["kind"], serde_json::json!("mock"));
     assert_eq!(entry["state"], serde_json::json!("registered"));
     assert_eq!(entry["restart_count"], serde_json::json!(0));
-    // The honest Epic-1 metering seed: JSON null, NOT 0, NOT a fabricated number.
+    // budget: the honest JSON null seed, NOT 0, NOT a fabricated number.
     assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
-    assert_eq!(entry["usage"], serde_json::Value::Null, "{entry}");
     assert_ne!(entry["budget"], serde_json::json!(0));
+    // usage: a real object with zero token totals (story 3-1) — NOT null.
+    assert!(
+        entry["usage"].is_object(),
+        "usage must be an object: {entry}"
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_output_tokens"],
+        serde_json::json!(0)
+    );
+    // The active Metering Source is surfaced (AC-C).
+    assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
+    // No dollar figure anywhere (tokens only — AD-8).
+    assert!(entry["usage"].get("cost").is_none(), "{entry}");
     assert!(entry.get("agent_home").is_some());
 
-    // The Epic-3 metering note rides on stderr (never stdout), so stdout stays
-    // valid JSON. stdout must NOT contain the note text.
+    // The metering note rides on stderr (never stdout), so stdout stays valid JSON.
     assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "the Epic-3 note must be on stderr; stderr={}",
+        run.stderr.contains("Usage Ledger"),
+        "the metering note must be on stderr; stderr={}",
         run.stderr
     );
     assert!(
-        !run.stdout.contains("Epic 3"),
+        !run.stdout.contains("Usage Ledger"),
         "stdout must be pure JSON (no note); stdout={}",
         run.stdout
     );
@@ -1315,7 +1343,10 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
     let doc: serde_json::Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
     assert_eq!(doc["instances"], serde_json::json!([]), "{doc}");
-    assert_eq!(doc["schema_version"], serde_json::json!(1));
+    assert_eq!(doc["schema_version"], serde_json::json!(2));
+    // Story 3-5: an empty Fleet still carries a valid all-zero / absent-dollars totals.
+    assert_eq!(doc["totals"]["total_input_tokens"], serde_json::json!(0));
+    assert!(doc["totals"].get("total_dollars").is_none(), "{doc}");
     // The "no instances" guidance is on stderr (so stdout is pure JSON).
     assert!(
         run.stderr.contains("No Agent Instances"),
@@ -1325,9 +1356,10 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
 }
 
 #[test]
-fn human_list_shows_the_honest_metering_seed_columns() {
-    // Story 1-7 (Task 5, AC4): the human `list` renders Budget/cap + Usage columns
-    // as the honest `—` seed (never a number), and the Epic-3 note is on stderr.
+fn human_list_shows_the_budget_column_and_real_usage_columns() {
+    // Story 1-7 (AC4) + story 3-1/3-2 (AC-C/AC9): the human `list` renders a Budget
+    // (tokens) column — the honest `—` for an UN-budgeted instance — AND a real
+    // Usage (tokens) column; the metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1339,27 +1371,27 @@ fn human_list_shows_the_honest_metering_seed_columns() {
 
     let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
-    // The new columns are present (headers) and render the `—` seed (stdout).
-    assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
+    // The columns are present (headers): a Budget column (story 3-3 renamed it from
+    // "Budget (tokens)" to "Budget (tok, est. $)") + Usage (real). The header may
+    // truncate on a narrow terminal, so match a stable prefix.
+    assert!(run.stdout.contains("Budget"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
+    // An un-budgeted instance's budget cell renders the honest `—` absence.
     assert!(
         run.stdout.contains('—'),
-        "the metering seed cell must render the em dash; stdout={}",
+        "the un-budgeted cell must render the em dash; stdout={}",
         run.stdout
     );
-    // The Epic-3 note is on stderr (AD-12), never stdout.
-    assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "stderr={}",
-        run.stderr
-    );
+    // The metering note is on stderr (AD-12), never stdout.
+    assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
 #[test]
-fn show_json_surfaces_the_same_entry_shape_with_null_seeds() {
-    // Story 1-7 (Task 5, AC5): `kt agent show <name> --json` writes ONE JSON
-    // document to stdout: { schema_version, instance: <the same FleetEntry
-    // shape> }, budget/usage the honest null seed. The Epic-3 note is on stderr.
+fn show_json_surfaces_the_same_entry_shape_with_budget_seed_and_real_usage() {
+    // Story 1-7 (AC5) + story 3-1: `kt agent show <name> --json` writes ONE JSON
+    // document to stdout: { schema_version, instance: <the same FleetEntry shape> },
+    // `budget` the honest null seed and `usage` a real token-totals object. The
+    // metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1381,24 +1413,41 @@ fn show_json_surfaces_the_same_entry_shape_with_null_seeds() {
     );
     let doc: serde_json::Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
-    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    // The show document shares the bumped Fleet schema version (2) but — the recorded
+    // asymmetry — does NOT gain a Fleet `totals` (a single instance has no Fleet total;
+    // its own `usage` IS its total).
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert!(
+        doc.get("totals").is_none(),
+        "show --json must NOT carry a Fleet totals object: {doc}"
+    );
     let entry = &doc["instance"];
     assert_eq!(entry["name"], serde_json::json!("alpha"));
     assert_eq!(entry["budget"], serde_json::Value::Null, "{entry}");
-    assert_eq!(entry["usage"], serde_json::Value::Null, "{entry}");
-    // stdout is pure JSON; the note is on stderr.
-    assert!(!run.stdout.contains("Epic 3"), "stdout={}", run.stdout);
     assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "stderr={}",
-        run.stderr
+        entry["usage"].is_object(),
+        "usage must be an object: {entry}"
     );
+    assert_eq!(
+        entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(0)
+    );
+    assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
+    // stdout is pure JSON; the note is on stderr.
+    assert!(
+        !run.stdout.contains("Usage Ledger"),
+        "stdout={}",
+        run.stdout
+    );
+    assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
 #[test]
-fn human_show_surfaces_the_metering_seed_rows() {
-    // Story 1-7 (Task 5, AC4): human `show` adds Budget/cap + Usage seed rows
-    // (rendered `—`) to the runtime-status block, with the Epic-3 note on stderr.
+fn human_show_surfaces_the_budget_row_and_real_usage_rows() {
+    // Story 1-7 (AC4) + story 3-1/3-2 (AC-C/AC9): human `show` renders a Budget
+    // (tokens) row (the honest `—` for an un-budgeted instance) plus REAL Usage
+    // (tokens) + Metering source rows in the runtime-status block, with the
+    // metering note on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1410,13 +1459,539 @@ fn human_show_surfaces_the_metering_seed_rows() {
 
     let run = run_kt_agent(&["agent", "show", "alpha"], &ctx.project_dir, state_dir);
     assert!(run.success, "show should exit 0; stderr={}", run.stderr);
-    assert!(run.stdout.contains("Budget/cap"), "stdout={}", run.stdout);
+    assert!(run.stdout.contains("Budget"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
-    assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
+    // The Metering source row + the self-reported value are surfaced (AC-C).
     assert!(
-        run.stderr.contains("metering in Epic 3"),
-        "stderr={}",
+        run.stdout.contains("Metering source"),
+        "stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("self-reported"),
+        "stdout={}",
+        run.stdout
+    );
+    // The un-budgeted budget row renders the honest `—` absence.
+    assert!(run.stdout.contains('—'), "stdout={}", run.stdout);
+    assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
+}
+
+// ---- Story 3-3: dollar cost + Cost Cap rendering (AC-B/AC10 — AD-8) ----
+
+#[test]
+fn config_set_rejects_a_malformed_rate_value_with_a_diagnostic() {
+    // AC11: a malformed Rate dollar value is rejected at WRITE time (never silently
+    // defaulted; a bad value must not crash). The write fails with a diagnostic and
+    // the config is unchanged.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let bad = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "cost.rate.input",
+            "three-dollars",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !bad.success,
+        "a malformed Rate must be rejected; stdout={}",
+        bad.stdout
+    );
+    assert!(
+        bad.stderr.contains("cost.rate.input"),
+        "the diagnostic must name the key; stderr={}",
+        bad.stderr
+    );
+    // Sub-micro precision is likewise rejected.
+    let submicro = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.dollars.cumulative",
+            "5.0000001",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !submicro.success,
+        "sub-micro precision must be rejected; stdout={}",
+        submicro.stdout
+    );
+}
+
+#[test]
+fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
+    // AC10/AC-B: a Rate'd + capped instance surfaces the DOLLAR cost + cap in
+    // `list --json` as INTEGER MICROS + the estimate label (NO `$` string on the
+    // wire — AD-14), and in the human table THROUGH the single currency module
+    // (a `$X.XX (estimated)` cell — AD-8). Even with zero usage, a Rate'd instance
+    // shows `$0.00 (estimated)` (an honest labeled zero, distinct from the no-Rate
+    // inert absence).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Both directions → a supplied Rate; a cumulative dollar cap.
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.input",
+            "3.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.output",
+            "15.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "budget.dollars.cumulative",
+            "5.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // --json: integer micros + label, NO `$` string.
+    let json = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        json.success,
+        "list --json should exit 0; stderr={}",
+        json.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", json.stdout));
+    let entry = &doc["instances"][0];
+    // The cumulative cost cap is $5.00 = 5_000_000 micros (an integer, not a string).
+    assert_eq!(
+        entry["budget"]["cumulative_cost_cap"],
+        serde_json::json!(5_000_000),
+        "the cap must be integer micros: {entry}"
+    );
+    // A Rate'd instance surfaces the derived cost ($0.00 at zero usage) + the label.
+    assert_eq!(
+        entry["usage"]["cumulative_dollars"],
+        serde_json::json!(0),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["usage"]["estimate_label"],
+        serde_json::json!("estimated"),
+        "{entry}"
+    );
+    // NO pre-formatted `$` string anywhere in the JSON document (AD-14).
+    assert!(
+        !json.stdout.contains('$'),
+        "no `$` string on the wire; stdout={}",
+        json.stdout
+    );
+
+    // Human table: the dollar cap cell rendered THROUGH the currency module shows a
+    // `$` figure. (The narrow `list` Budget column may TRUNCATE the trailing
+    // `(estimated)` label; the untruncated `show` surface asserts the label — see
+    // `show_of_a_rated_instance_surfaces_a_labeled_cost_row`.)
+    let human = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(human.success, "list should exit 0; stderr={}", human.stderr);
+    assert!(
+        human.stdout.contains('$'),
+        "the human dollar cell must render a `$` figure; stdout={}",
+        human.stdout
+    );
+}
+
+#[test]
+fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
+    // FR-23/AD-8 (primary review L1): the human `list` Budget column is NARROW and
+    // truncates its cell with `…`. Rendering the estimate qualifier INLINE in the
+    // cell (`… $0.50 (estimated) …`) would let truncation CHOP `(estimated)` and
+    // leave a human staring at a bare, UNLABELED dollar. The fix moves the qualifier
+    // OUT of the cell and into the COLUMN HEADER ("est. $"): the cell renders the
+    // dollar value BARE (via render_dollars_bare), so there is no inline estimate
+    // label in the cell to mangle, and the header carries the label instead.
+    //
+    // COLUMNS=110 is chosen so the Budget header + cell BOTH render in full while the
+    // other columns (Usage / Agent Home) truncate — the truncation pressure is real,
+    // yet the Budget column is the one under test and is fully observable.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A supplied Rate (both directions) + a cumulative dollar cap → the Budget cell
+    // renders a `$` cost-cap figure.
+    for (key, value) in [
+        ("cost.rate.input", "3.00"),
+        ("cost.rate.output", "15.00"),
+        ("budget.dollars.cumulative", "5.00"),
+    ] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let human = run_kt_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "110")],
+    );
+    assert!(human.success, "list should exit 0; stderr={}", human.stderr);
+
+    // (1) The estimate qualifier lives in the HEADER ("est. $") — the stable home of
+    // the dollar label on this truncatable surface (FR-23).
+    assert!(
+        human.stdout.contains("est. $"),
+        "the Budget header must carry the estimate qualifier 'est. $'; stdout=\n{}",
+        human.stdout
+    );
+    // (2) The header is NOT the stale "Budget (tokens)" mislabel — the column now
+    // also renders an ESTIMATED dollar Cost Cap, so "(tokens)" would misdescribe it.
+    assert!(
+        !human.stdout.contains("Budget (tokens)"),
+        "the header must not be the stale 'Budget (tokens)' mislabel; stdout=\n{}",
+        human.stdout
+    );
+    // (3) The Budget cell renders BARE dollar figures whose only trailing
+    // parenthetical is the Breach Action `(pause)` — NEVER an inline `(estimated)`
+    // (which truncation could mangle into `(esti…` glued to a dollar). The exact
+    // `cum $5.00/$5.00 (pause)` cell is proof: the `$` cap + remaining are bare, the
+    // estimate label is not in the cell at all, so no mangled label can appear here.
+    assert!(
+        human.stdout.contains("cum $5.00/$5.00 (pause)"),
+        "the Budget cell must render bare dollars + only the breach action (no inline \
+         estimate label to truncate); stdout=\n{}",
+        human.stdout
+    );
+
+    // (4) Belt-and-suspenders: the estimate qualifier is ALSO carried by the
+    // always-present, never-truncated stderr metering note ("labeled estimates"),
+    // which covers every rendered dollar on the surface regardless of terminal width.
+    assert!(
+        human.stderr.contains("labeled estimates"),
+        "the stderr metering note must state dollar figures are labeled estimates; \
+         stderr=\n{}",
+        human.stderr
+    );
+}
+
+#[test]
+fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
+    // AC10: human `show` of a Rate'd instance renders a `Cost (estimated)` row with
+    // a labeled dollar figure THROUGH the currency module.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.input",
+            "3.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "cost.rate.output",
+            "15.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A cumulative dollar cap too, so the Budget row renders a dollar Cost Cap pair.
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "priced",
+            "budget.dollars.cumulative",
+            "5.00",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let show = run_kt_agent(&["agent", "show", "priced"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("Cost (estimated)"),
+        "show must render a Cost row; stdout={}",
+        show.stdout
+    );
+    assert!(
+        show.stdout.contains("$0.00 (estimated)"),
+        "the Cost row must show a labeled dollar figure; stdout={}",
+        show.stdout
+    );
+    // The `show` Value column is WIDE (no truncation), so its Budget row labels the
+    // dollar Cost Cap INLINE (DollarLabel::Inline) — the full `remaining/cap (estimated)`
+    // pair. At zero usage the remaining equals the $5.00 cap, so the pair is
+    // `$5.00/$5.00 (estimated)`. This is the un-truncated companion to the `list`
+    // truncation test, where the same label instead lives in the column header.
+    assert!(
+        show.stdout.contains("$5.00/$5.00 (estimated)"),
+        "the `show` Budget row must render the inline-labeled dollar cap pair; \
+         stdout={}",
+        show.stdout
+    );
+}
+
+#[test]
+fn show_of_a_no_rate_instance_says_dollar_features_are_inert() {
+    // AC-B: with NO Rate, dollar features are INERT and SAY SO — the human `show`
+    // Cost row is an honest "no Rate configured — dollar features inert" note, never
+    // a fabricated `$0.00`. Token features (the Budget/Usage rows) still render.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "norate", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let show = run_kt_agent(&["agent", "show", "norate"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("dollar features inert"),
+        "with no Rate, the Cost row must say dollar features are inert; stdout={}",
+        show.stdout
+    );
+    // No fabricated dollar figure for a no-Rate instance.
+    assert!(
+        !show.stdout.contains("$0.00"),
+        "a no-Rate instance must NOT fabricate a $0.00 cost; stdout={}",
+        show.stdout
+    );
+    // Token features still work: the Usage row is present.
+    assert!(show.stdout.contains("Usage"), "stdout={}", show.stdout);
+}
+
+// ---- Story 3-5: the Fleet-wide total (footer + `list --json` totals) ----
+
+#[test]
+fn list_json_carries_a_fleet_totals_object_bumped_to_schema_2() {
+    // Story 3-5 (AC-A/AC9): `kt agent list --json` carries a top-level `totals` object
+    // and the Fleet document version is bumped 1 → 2 (additive). With one Rate'd
+    // instance at zero usage, the token totals are 0 and the dollar total is a labeled
+    // $0 (a Rate exists ⇒ nothing partial). Integer micros + label on the wire; NO `$`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        run.success,
+        "list --json should exit 0; stderr={}",
         run.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", run.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    let totals = &doc["totals"];
+    assert!(totals.is_object(), "totals present: {doc}");
+    assert_eq!(totals["total_input_tokens"], serde_json::json!(0));
+    assert_eq!(totals["total_output_tokens"], serde_json::json!(0));
+    // A Rate exists ⇒ a labeled $0 dollar total (integer micros), not partial, not absent.
+    assert_eq!(totals["total_dollars"], serde_json::json!(0), "{doc}");
+    assert_eq!(totals["estimate_label"], serde_json::json!("estimated"));
+    assert_eq!(totals["dollars_partial"], serde_json::json!(false));
+    // NO `$` string on the wire (AD-14).
+    assert!(
+        !run.stdout.contains('$'),
+        "no `$` on the wire; stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn list_json_totals_carry_the_partial_flag_field() {
+    // AC5 (the honesty crux) SHAPE via the CLI: a Fleet mixing a Rate'd instance with a
+    // no-Rate instance carries the `dollars_partial` field in `list --json`. With zero
+    // usage NEITHER instance is metered yet, so the total is a complete labeled $0
+    // (`dollars_partial == false`) — this test therefore asserts the field is PRESENT +
+    // the document parses, NOT that it is `true`.
+    //
+    // The metered-partial arithmetic that flips the flag to `true` (and the "N unpriced"
+    // count) is proven exactly in the pure unit tests (`fleet.rs`, `agent.rs` footer
+    // tests) + the engine `totals == ledger` integration test — a rename here keeps this
+    // test's name honest about what it checks rather than over-promising `true`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &["agent", "register", "free", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(run.success, "stderr={}", run.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+    // Two instances aggregated; the `priced` one has a Rate (dollar total present +
+    // labeled), the `free` one does not — but with zero tokens neither is metered, so
+    // the total is a complete labeled $0 (not partial). The shape is what we assert.
+    assert_eq!(doc["instances"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["totals"]["total_dollars"], serde_json::json!(0));
+    assert_eq!(
+        doc["totals"]["estimate_label"],
+        serde_json::json!("estimated")
+    );
+    assert!(doc["totals"].get("dollars_partial").is_some(), "{doc}");
+}
+
+#[test]
+fn human_list_renders_the_fleet_total_footer() {
+    // AC-A/AC-B: the human `kt agent list` renders a Fleet-wide total footer on stdout.
+    // A Rate'd instance ⇒ the footer carries a labeled dollar total THROUGH the currency
+    // module (a `$` figure + the estimate label); the footer names the token totals too.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "priced", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
+        run_kt_agent(
+            &["agent", "config", "set", "priced", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(run.success, "list should exit 0; stderr={}", run.stderr);
+    // The footer is on stdout (command output, AD-12).
+    assert!(
+        run.stdout.contains("Fleet total:"),
+        "the human list must render a Fleet total footer; stdout=\n{}",
+        run.stdout
+    );
+    // The dollar total rides through the currency module (a `$` figure) + is labeled.
+    assert!(
+        run.stdout.contains('$'),
+        "labeled dollar total; stdout=\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("estimated"),
+        "the Fleet total dollar figure must carry its estimate label; stdout=\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn human_list_footer_no_rate_shows_dash_not_zero_dollars() {
+    // AC4/AC5: with NO instance Rate'd, the footer shows the token totals + an honest
+    // `—` dollar marker, NEVER a fabricated `$0.00` (dollars are not derivable). The
+    // per-instance rows stay honest too (tokens only).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "norate", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(run.success, "list should exit 0; stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("Fleet total:"),
+        "stdout=\n{}",
+        run.stdout
+    );
+    // No fabricated $0.00 Fleet total (no Rate ⇒ dollars honestly absent).
+    assert!(
+        !run.stdout.contains("$0.00"),
+        "a no-Rate Fleet must not fabricate a $0.00 total; stdout=\n{}",
+        run.stdout
+    );
+    // The footer line itself carries the honest absent-dollars marker.
+    assert!(
+        run.stdout.contains("dollars not derived"),
+        "the footer must say dollars are not derived (no Rate); stdout=\n{}",
+        run.stdout
     );
 }
 
@@ -2471,12 +3046,194 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
         !snapshot_path.exists(),
         "an unresolved secret must reject the start before the snapshot is written"
     );
-    // And `agent list` still shows it as `registered` (never `running`/`failed`
-    // from a half-launch).
-    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
-    assert!(
-        list.stdout.contains("registered"),
+    // And `agent list --json` still shows it as `registered` (never
+    // `running`/`failed` from a half-launch). Assert on the JSON `state` field —
+    // deterministic committed state, not the width-dependent human table.
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout)
+        .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
+    let state = doc["instances"][0]["state"].as_str().unwrap_or("");
+    assert_eq!(
+        state, "registered",
         "the instance must stay registered after a rejected start; list=\n{}",
+        list.stdout
+    );
+}
+
+// ---- Story 3-2: Token-Budget config + Fleet-detail budget surface (AC-C, AC9) ----
+
+#[test]
+fn budget_config_keys_set_and_surface_in_list_json() {
+    // AC9: a budgeted instance surfaces the ceiling(s) + remaining + Breach Action
+    // in `list --json` (tokens only, deterministic — no process spawn needed since
+    // the budget is a config read). AC-C: the budget + action keys are settable.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Set a cumulative budget + a non-default action.
+    let set = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.tokens.cumulative",
+            "5000",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "set budget should exit 0; stderr={}",
+        set.stderr
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.breach_action",
+            "stop",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        list.success,
+        "list --json should exit 0; stderr={}",
+        list.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout)
+        .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
+    let budget = &doc["instances"][0]["budget"];
+    assert_eq!(
+        budget["cumulative_limit"], 5000,
+        "the cumulative ceiling surfaces in --json; doc={}",
+        list.stdout
+    );
+    // Never metered → remaining equals the ceiling (ledger is zero).
+    assert_eq!(budget["cumulative_remaining"], 5000);
+    assert_eq!(budget["breach_action"], "stop");
+    // Tokens only — no dollar cap/headroom.
+    assert!(budget.get("cost_cap").is_none(), "no dollars: {budget}");
+
+    // The human table shows the token budget cell (not `—`). The cell may truncate
+    // on a narrow terminal, so match a stable prefix; the exact values are asserted
+    // on --json above. `show` uses a wider Value column, so assert the full cell
+    // there for the action + remaining.
+    let show = run_kt_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
+    assert!(
+        show.stdout.contains("cum 5000/5000") && show.stdout.contains("stop"),
+        "human show must render the full token budget cell; stdout=\n{}",
+        show.stdout
+    );
+}
+
+#[test]
+fn an_unbudgeted_instance_shows_the_honest_absent_budget() {
+    // AC9: an instance with NO budget configured shows an honest absent budget
+    // (`null` in --json, `—` in the human table) — never a fabricated ceiling.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "bare", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout)
+        .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
+    assert_eq!(
+        doc["instances"][0]["budget"],
+        serde_json::Value::Null,
+        "an un-budgeted instance's budget is null; doc={}",
+        list.stdout
+    );
+
+    // The human show shows the `—` absence in the budget cell. (Story 3-3 renamed
+    // the `show` row "Budget (tokens)" → "Budget" since it now covers tokens AND the
+    // dollar Cost Cap.)
+    let human = run_kt_agent(&["agent", "show", "bare"], &ctx.project_dir, state_dir);
+    assert!(
+        human.stdout.contains("Budget") && human.stdout.contains('—'),
+        "human show must render the honest absent budget; stdout=\n{}",
+        human.stdout
+    );
+}
+
+#[test]
+fn a_malformed_budget_value_is_rejected_at_write_time() {
+    // AC-C: a malformed budget number / unknown Breach-Action string is rejected at
+    // config-write time (non-zero exit, a clear diagnostic on stderr, nothing
+    // persisted) — never silently defaulted.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let bad_num = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.tokens.per_run",
+            "lots",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!bad_num.success, "a non-numeric budget must be rejected");
+    assert!(
+        bad_num.stderr.contains("budget.tokens.per_run"),
+        "the diagnostic names the key; stderr={}",
+        bad_num.stderr
+    );
+
+    let bad_action = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.breach_action",
+            "throttle",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !bad_action.success,
+        "an unknown breach action must be rejected"
+    );
+    assert!(
+        bad_action.stderr.contains("pause") && bad_action.stderr.contains("throttle"),
+        "the diagnostic names the accepted set + the offending value; stderr={}",
+        bad_action.stderr
+    );
+
+    // Nothing was persisted: the budget is still absent in --json.
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(
+        doc["instances"][0]["budget"],
+        serde_json::Value::Null,
+        "a rejected write must persist nothing; doc={}",
         list.stdout
     );
 }

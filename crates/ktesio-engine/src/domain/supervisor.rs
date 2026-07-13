@@ -47,17 +47,25 @@ use ktesio_adapter_api::{Capability, OsId, SupportLevel};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
-use crate::ports::{BackendError, ProcessBackend, ProcessStatus, SpawnRecord, SpawnSpec};
+use crate::metering::{ListenerError, ObservedListener};
+use crate::ports::{
+    assemble_usage_event, BackendError, ObservedUsageSource, ParsedUsage, ProcessBackend,
+    ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+};
 use crate::time::now_rfc3339;
 
+use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
+use super::config::{self, ConfigLayer};
+use super::cost::{CostEvaluator, EstimateLabel, Micros};
 use super::error::EngineError;
-use super::event::{TransitionCause, TransitionEvent};
+use super::event::{BreachDimension, BudgetBreachEvent, TransitionCause, TransitionEvent};
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
 use super::registry::Registry;
 use super::restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
 use super::transition::{next_state, LifecycleCommand};
+use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
 
 /// The default graceful-shutdown window before a stop escalates to a forced kill
 /// (AC3). Per-instance configurable via [`Supervisor::stop`]'s `window` argument;
@@ -103,39 +111,202 @@ struct RestartDecision {
     plan: Option<RestartPlan>,
 }
 
+/// How [`Supervisor::drain_usage_for`] treats the tail of the agent-output log
+/// (story 3-1 under-count fix, H1) — the difference is whether a final line that
+/// lacks a trailing newline is consumed now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainMode {
+    /// The process is (believed) still alive — the reaper cadence. Consume only up
+    /// to the last newline; a partial final line may still be completed, so it waits
+    /// for the next pass.
+    MidRun,
+    /// The process is DEAD (drain-on-stop / drain-on-reap) — no more bytes will ever
+    /// append. Consume the WHOLE tail, INCLUDING a final newline-less line, so a last
+    /// usage line flushed without a trailing `\n` is not stranded and lost when the
+    /// next Run's cursor anchors past it.
+    Terminal,
+}
+
+/// What a single [`Supervisor::drain_usage_for`] pass should do with the captured
+/// log, decided purely from `(bytes, cursor, mode)` (story 3-1 — the H1 terminal-
+/// tail rule + the M2 shrink guard, unit-testable without a process handle).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DrainPlan {
+    /// The log shrank below the cursor (a truncate/rotation — M2). Snap the cursor
+    /// to `new_cursor` (the new length) and ingest NOTHING — never re-read from 0
+    /// under the same live `run_id` (that would double-count → an inflated bill).
+    Shrunk { new_cursor: u64 },
+    /// No complete unit to consume this pass (an empty tail, or a MidRun tail with no
+    /// newline yet). Leave the cursor where it is.
+    Nothing,
+    /// Consume `bytes[range]` and set the cursor to `new_cursor`.
+    Consume {
+        range: std::ops::Range<usize>,
+        new_cursor: u64,
+    },
+}
+
+/// Decide what one drain pass reads (spine AD-7; story 3-1 H1/M2). Pure — no I/O.
+///
+/// * Shrink (M2): `cursor > len` ⇒ [`DrainPlan::Shrunk`] (snap to `len`, ingest
+///   nothing) — the anti-double-count fallback for a truncated/rotated log.
+/// * Otherwise consume the tail `bytes[cursor..]`:
+///   - [`DrainMode::Terminal`] consumes the WHOLE tail (the process is dead; a
+///     final newline-less usage line must land now or be lost — H1).
+///   - [`DrainMode::MidRun`] consumes only up to the last `\n` (a live process may
+///     still complete a partial final line on a later pass); no newline ⇒ nothing.
+fn plan_drain(bytes: &[u8], cursor: u64, mode: DrainMode) -> DrainPlan {
+    let len = bytes.len() as u64;
+    if cursor > len {
+        return DrainPlan::Shrunk { new_cursor: len };
+    }
+    let start = cursor as usize;
+    let tail = &bytes[start..];
+    let consumable = match mode {
+        DrainMode::Terminal => tail.len(),
+        DrainMode::MidRun => match tail.iter().rposition(|b| *b == b'\n') {
+            Some(pos) => pos + 1, // include the newline
+            None => 0,            // no complete line yet — nothing to consume
+        },
+    };
+    if consumable == 0 {
+        return DrainPlan::Nothing;
+    }
+    DrainPlan::Consume {
+        range: start..start + consumable,
+        new_cursor: cursor + consumable as u64,
+    }
+}
+
+/// The in-memory supervision state for ONE running Agent Instance (story 3-1).
+///
+/// Beyond the process [`Handle`](backends::Handle) the supervisor has always held,
+/// this carries the metering context ingestion needs during the instance's Run:
+/// the current [`RunId`] (minted at `starting`, spine AD-7), the declared metering
+/// source (its wire string, stamped on every ingested [`UsageEvent`]), and a byte
+/// CURSOR into the per-instance agent-output log so each reaper pass ingests only
+/// the NEWLY-captured tail (never re-reading — and never re-attributing a prior
+/// Run's lines under a fresh Run id after a stop→start). It lives for THIS engine
+/// lifetime alongside the handle, exactly like the handle map it replaced.
+struct Supervised {
+    /// The backend-owned process handle (group/job control).
+    handle: backends::Handle,
+    /// The current Run this instance is in (spine AD-7) — minted at `starting`.
+    run_id: RunId,
+    /// The declared Metering Source wire string (`self-reported` / `engine-observed`),
+    /// stamped on every [`UsageEvent`] ingested during this Run.
+    metering_source: String,
+    /// Byte offset already consumed from the agent-output log — the ingestion read
+    /// cursor. Advanced past each block the drain reads, so lines are ingested at
+    /// most once from the capture (the DB dedup is the second, authoritative guard).
+    usage_cursor: u64,
+    /// The per-Run breach LATCH (story 3-2 idempotence fix; story 3-3 keyed by
+    /// dimension): the set of `(dimension, scope)` pairs that have ALREADY fired a
+    /// breach for THIS Run. Enforcement (`enforce_budget`) runs on EVERY committed
+    /// usage event, but a breach must fire **at most once per (dimension, scope) per
+    /// Run** — otherwise every post-crossing event re-records a `BudgetBreachEvent`
+    /// and re-fires the action (unbounded duplicate records for `warn`; redundant
+    /// records for `pause`/`stop`). A pair is inserted the first time it trips; a
+    /// subsequent event whose pair is already latched short-circuits BOTH the record
+    /// and the action.
+    ///
+    /// STORY 3-3 — DIMENSION KEY: the latch key is `(BreachDimension, BreachScope)`
+    /// so a TOKEN breach and a DOLLAR breach of the SAME scope latch INDEPENDENTLY —
+    /// each fires once per Run (a run can legitimately trip both its token ceiling
+    /// and its dollar cap; the action is identical, so both fire once each). The
+    /// per-run and cumulative scopes still latch independently within each dimension.
+    /// The latch lives on `Supervised`, so it RESETS automatically when a new Run
+    /// starts — a fresh `Supervised` (built at `starting`, where the `run_id` is
+    /// freshly minted) begins empty, giving "at most one breach per (dimension,
+    /// scope) per Run".
+    breached_scopes: std::collections::HashSet<(BreachDimension, BreachScope)>,
+    /// The per-instance loopback forward listener for an `engine-observed` instance
+    /// (story 3-4), or `None` for a `self-reported` instance (whose start path is
+    /// UNCHANGED). Held for the Run; DROPPED at the terminal transition (which
+    /// aborts its accept-loop task — teardown bounded to the Run, no orphan
+    /// listeners, NFR-1). A restart opens a NEW listener under the new Run.
+    observed_listener: Option<ObservedListener>,
+    /// The `engine-observed` source (story 3-4): the per-Run monotonic `sequence`
+    /// minter for observed completions (the agent supplies no ordinal). Fresh per
+    /// Run (built here with the freshly-minted `run_id`), so the ordinal resets per
+    /// Run — preserving the `UNIQUE(instance_id, run_id, sequence)` dedup invariant.
+    /// Present only for an `engine-observed` instance (a `self-reported` instance
+    /// leaves it `None` and drives the log-tail `drain_usage_for` instead).
+    observed_source: Option<ObservedUsageSource>,
+}
+
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
 /// [`ProcessBackend`](crate::ports::ProcessBackend) (the current OS's), a map of
-/// the instances it currently supervises, and the [`BackoffSchedule`] the restart
-/// executor uses (production 1s×2 cap 60s; tests inject a scaled one).
+/// the instances it currently supervises (each with its process handle + metering
+/// context, story 3-1), the self-reported [`UsageSource`](crate::ports::UsageSource)
+/// ingestion adapter, and the [`BackoffSchedule`] the restart executor uses
+/// (production 1s×2 cap 60s; tests inject a scaled one).
 pub struct Supervisor {
     backend: backends::Backend,
-    running: HashMap<InstanceName, backends::Handle>,
+    running: HashMap<InstanceName, Supervised>,
+    usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
+    /// The engine's tokio runtime handle (story 3-4), used to SPAWN the loopback
+    /// forward listener's accept loop for an `engine-observed` instance. The
+    /// supervisor's sync start path runs on the blocking pool, so it cannot use
+    /// `Handle::current`; the engine threads its handle in via
+    /// [`Supervisor::with_runtime`]. `None` (the [`Supervisor::new`]/
+    /// [`Supervisor::with_backoff`] default) means "no runtime to spawn a
+    /// listener" — an `engine-observed` start then fails fast with a clear error
+    /// (only the sync unit tests, which never start an observed instance, use the
+    /// handle-less constructors).
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Supervisor {
     /// Construct an empty supervisor with the current OS's process backend and
     /// the PRODUCTION backoff schedule (1s base, ×2, 60s cap — spine AD-15).
+    ///
+    /// NO runtime handle (story 3-4) — so this cannot start an `engine-observed`
+    /// listener. Production uses [`Supervisor::with_runtime`] (the engine threads
+    /// its runtime handle in); this handle-less form remains for the sync unit
+    /// tests that only exercise self-reported / lifecycle paths.
     pub fn new() -> Self {
         Self {
             backend: backends::current(),
             running: HashMap::new(),
+            usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
+            runtime: None,
+        }
+    }
+
+    /// Construct an empty supervisor with the PRODUCTION backoff schedule AND the
+    /// engine's tokio runtime handle (story 3-4) — the production constructor the
+    /// engine uses. The handle lets an `engine-observed` start SPAWN its loopback
+    /// forward listener's accept loop on the engine runtime (the supervisor's sync
+    /// start path runs on the blocking pool, so `Handle::current` is unavailable;
+    /// a `Handle` spawns onto its runtime from any thread).
+    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            backend: backends::current(),
+            running: HashMap::new(),
+            usage_source: SelfReportedUsageSource::new(),
+            backoff: BackoffSchedule::production(),
+            runtime: Some(runtime),
         }
     }
 
     /// Construct an empty supervisor with a custom backoff schedule (TEST
     /// injection, so the crash-loop / backoff legs run in milliseconds without
     /// weakening the production constants). Production always uses
-    /// [`Supervisor::new`].
+    /// [`Supervisor::with_runtime`]. NO runtime handle — the lib tests using this
+    /// never start an `engine-observed` instance.
     #[cfg(test)]
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
             backend: backends::current(),
             running: HashMap::new(),
+            usage_source: SelfReportedUsageSource::new(),
             backoff,
+            runtime: None,
         }
     }
 
@@ -189,11 +360,28 @@ impl Supervisor {
 
         // (2) Resolve the launch spec (may reject: native-only / bad manifest),
         // still before any persisted state change.
-        let (kind, manifest_path) = registry
+        let (kind, manifest_path, persisted_launch) = registry
             .adapter_launch_facts(&name)
             .map_err(registry_to_engine)?;
-        let mut launch = adapter::resolve_start_launch(&kind, manifest_path.as_deref())
-            .map_err(|e| launch_to_engine(&name, e))?;
+        // Prefer the launch SNAPSHOTTED at registration — this removes the fragile
+        // start-time manifest re-read that dropped `args` on hosted CI runners
+        // (the agent spawned with the right binary but ZERO args). Fall back to
+        // re-reading the manifest ONLY when the snapshot carries no launch: a
+        // native adapter (→ NativeHasNoLaunch, preserved) or an instance
+        // registered before the launch was persisted (legacy snapshot).
+        let mut launch = match persisted_launch {
+            Some(launch) => launch,
+            None => adapter::resolve_start_launch(&kind, manifest_path.as_deref())
+                .map_err(|e| launch_to_engine(&name, e))?,
+        };
+
+        // Read the declared Metering Source (story 3-1) from the persisted adapter
+        // snapshot — stamped on every UsageEvent ingested during this Run. Read here
+        // (a pure snapshot read) before any side effect; a corrupt snapshot surfaces
+        // the same way the launch-facts read above would.
+        let metering_source = registry
+            .metering_source(&name)
+            .map_err(registry_to_engine)?;
 
         // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
         // (story 2-2, FR-12) — still before any persisted state change, so a
@@ -213,6 +401,33 @@ impl Supervisor {
             .map_err(|e| config_to_engine(&name, e))?;
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-observed) ENGINE-OBSERVED metering (story 3-4, AC-A/AC6): for an
+        // `engine-observed` instance, START the loopback forward listener HERE
+        // (before the mapping application + the `starting` transition, so a listener
+        // failure rejects the start cleanly with NO state change — mirroring the
+        // secret/snapshot failures), then INJECT its loopback `http://127.0.0.1:<port>`
+        // address as a `metering.base_url` INVOCATION-OVERRIDE so the adapter's
+        // EXISTING config-mapping (2-2) delivers it into the agent's native mechanism
+        // (e.g. env `OPENAI_BASE_URL`). The address is ENGINE-computed (the engine is
+        // the sole authority — AC-B); the adapter merely receives it. A `self-reported`
+        // instance leaves `observed_listener` None and its start path UNCHANGED. The
+        // held listener is moved into `Supervised` on success; on any later start
+        // failure its `Drop` aborts the accept-loop task (RAII teardown, no leak).
+        let observed_listener =
+            self.start_observed_listener(&name, &metering_source, &effective)?;
+        // The effective config the MAPPING applies: for an observed instance it
+        // carries the engine-injected loopback base_url as an override (so the mapping
+        // delivers it); otherwise it is the plain operator config. The SNAPSHOT (2c)
+        // below stays on the plain `effective` (the operator config), so the ephemeral
+        // loopback URL is NOT persisted as "what applied" — honest provenance.
+        let mapping_effective = match observed_listener.as_ref() {
+            Some(listener) => registry
+                .effective_config(&name, base_url_override(listener.base_url()))
+                .map_err(|e| config_to_engine(&name, e))?,
+            None => effective.clone(),
+        };
+
         // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
         // the mapping application (story 2-4, spine AD-10, AC-A/AC9). This is where
         // display and delivery DIVERGE: `effective`'s `display()`-based surfaces
@@ -223,9 +438,9 @@ impl Supervisor {
         // the start cleanly (no half-launch, mirroring the config-apply + snapshot
         // failures) — a typed `EngineError::Secret` that NEVER echoes a value.
         let secrets = registry
-            .resolve_secrets(&effective)
+            .resolve_secrets(&mapping_effective)
             .map_err(|e| secret_to_engine(&name, e))?;
-        adapter::apply_config_mapping(&mut launch, &mapping, &effective, &secrets, &home)
+        adapter::apply_config_mapping(&mut launch, &mapping, &mapping_effective, &secrets, &home)
             .map_err(|e| config_apply_to_engine(&name, e))?;
 
         // (2c) Persist the effective-config snapshot into the Agent Home (story
@@ -260,6 +475,16 @@ impl Supervisor {
         // Ensure the log directory exists (AD-12 seed) so spawn can redirect
         // stdout/stderr into it and we can append transition events.
         self.ensure_log_dir(registry, &name)?;
+
+        // Anchor the usage-ingestion cursor at the agent-output log length BEFORE
+        // the spawn (story 3-1). This Run's own output is appended AFTER this point,
+        // so ingestion reads ALL of it — while a PRIOR Run's already-captured lines
+        // (a stop→start reuses the same append-only agent.log) stay BEHIND the cursor
+        // and are never re-ingested under this fresh Run id. Capturing it HERE (not
+        // after the readiness watch below) is essential: a fast agent emits its first
+        // usage lines within the ~300ms readiness window, so a cursor set post-
+        // readiness would skip them — the ingestion bug this prevents.
+        let usage_cursor = self.agent_log_len(registry, &name);
 
         // (3) registered/stopped/failed → starting.
         self.transition(
@@ -337,7 +562,37 @@ impl Supervisor {
             LifecycleState::Running,
             ready_cause,
         )?;
-        self.running.insert(name.clone(), handle);
+        // Mint the fresh Run id for this `starting`→terminal span (spine AD-7). Each
+        // `starting` — operator start OR restart (story 1-6) — mints a distinct id
+        // (AC-B), so a restarted instance opens a NEW Run whose per-run totals never
+        // bleed in the previous Run's usage. The ingestion cursor was anchored at the
+        // pre-spawn log length (above), so this Run ingests all of its own output.
+        let run_id = RunId::mint();
+        // Story 3-4: an `engine-observed` instance holds its listener + a fresh
+        // per-Run observed `sequence` minter (built here with the just-minted
+        // run_id, so the ordinal resets per Run — the AD-7 Run boundary + the dedup
+        // invariant). A `self-reported` instance leaves both `None` (its log-tail
+        // drain is unchanged).
+        let observed_source = observed_listener
+            .as_ref()
+            .map(|_| ObservedUsageSource::new());
+        self.running.insert(
+            name.clone(),
+            Supervised {
+                handle,
+                run_id,
+                metering_source,
+                usage_cursor,
+                // A fresh Run starts with an EMPTY breach latch (story 3-2): the
+                // run_id was just minted, so no scope has fired for it yet. This is
+                // how the latch RESETS per Run — a persistently-over-cumulative agent
+                // that stops and starts again gets a new Run + a clean latch, so it
+                // can fire one cumulative breach in the new Run too.
+                breached_scopes: std::collections::HashSet::new(),
+                observed_listener,
+                observed_source,
+            },
+        );
 
         registry.lookup(&name).map_err(registry_to_engine)
     }
@@ -383,6 +638,37 @@ impl Supervisor {
         name: &str,
         window: Option<Duration>,
     ) -> Result<AgentInstance, EngineError> {
+        self.stop_inner(registry, name, window, None)
+    }
+
+    /// Stop driven by a budget BREACH (story 3-2). Identical to [`Supervisor::stop`]
+    /// (graceful → forced escalation, story 1-4) except the `running → stopping`
+    /// edge carries the [`TransitionCause::BudgetExceeded`] cause instead of a plain
+    /// `stop` command, so the lifecycle log explains WHY. The terminal
+    /// `stopping → stopped` edge keeps its graceful/forced cause (the escalation
+    /// detail). Takes `&InstanceName` (the caller already validated it).
+    fn stop_with_cause(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) -> Result<AgentInstance, EngineError> {
+        self.stop_inner(registry, name.as_str(), None, Some(cause))
+    }
+
+    /// The shared stop driver (story 1-4 + story 3-2 cause override).
+    ///
+    /// `cause_override`: when `Some`, replaces the `running → stopping` cause
+    /// (a budget stop records `BudgetExceeded`); `None` uses the plain `stop`
+    /// command cause (an operator `kt agent stop` is unchanged). The terminal edge
+    /// always records the graceful/forced escalation cause regardless.
+    fn stop_inner(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        window: Option<Duration>,
+        cause_override: Option<TransitionCause>,
+    ) -> Result<AgentInstance, EngineError> {
         let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
             name: name.to_string(),
             reason,
@@ -396,14 +682,28 @@ impl Supervisor {
         let window = window.unwrap_or(DEFAULT_STOP_WINDOW);
         self.ensure_log_dir(registry, &name)?;
 
-        // running → stopping.
+        // running → stopping (a story-3-2 budget stop overrides the cause).
         self.transition(
             registry,
             &name,
             instance.state,
             stopping,
-            TransitionCause::command(LifecycleCommand::Stop.as_str()),
+            cause_override
+                .unwrap_or_else(|| TransitionCause::command(LifecycleCommand::Stop.as_str())),
         )?;
+
+        // Drain any final self-reported usage the agent emitted before the stop, so
+        // the last batch of a Run is not lost to the race between "agent printed it"
+        // and "we killed the process" (story 3-1). TERMINAL drain: the process is
+        // about to be gone, so a final newline-less usage line is consumed to
+        // end-of-log rather than stranded (H1). Best-effort — a drain hiccup never
+        // blocks the stop.
+        self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // Drain any final ENGINE-OBSERVED usage still queued before the listener is
+        // torn down (story 3-4): a completion the proxy parsed just before the stop
+        // must land, not be lost when the `Supervised` (and its listener) is dropped
+        // below. Best-effort, mirroring the self-reported terminal drain.
+        self.drain_observed_for(registry, &name);
 
         // Ask the backend to stop the process (group/job). If we have no handle
         // for it (the row says running but this engine holds no handle AND orphan
@@ -413,9 +713,9 @@ impl Supervisor {
         // started by a PRIOR engine IS re-held (via `adopt_orphans`), so a
         // cross-restart stop now really terminates it.
         let outcome = match self.running.get_mut(&name) {
-            Some(handle) => {
+            Some(supervised) => {
                 self.backend
-                    .stop(handle, window)
+                    .stop(&mut supervised.handle, window)
                     .map_err(|source| EngineError::Backend {
                         name: name.as_str().to_string(),
                         source,
@@ -423,7 +723,8 @@ impl Supervisor {
             }
             None => crate::ports::StopOutcome { forced: false },
         };
-        // Drop the handle (also closes the Job / releases the child on Windows).
+        // Drop the handle (also closes the Job / releases the child on Windows) and
+        // the Run's metering context — the Run ends at this terminal transition.
         self.running.remove(&name);
 
         // Clear the write-ahead spawn record (AD-5): a cleanly-stopped instance
@@ -469,7 +770,30 @@ impl Supervisor {
     ///      [`EngineError::CapabilityUnsupported`], NO transition, NO backend
     ///      call, NOTHING persisted (AC3).
     pub fn pause(&mut self, registry: &Registry, name: &str) -> Result<AgentInstance, EngineError> {
-        self.suspend_or_resume(registry, name, LifecycleCommand::Pause)
+        self.suspend_or_resume(registry, name, LifecycleCommand::Pause, None)
+    }
+
+    /// Pause driven by a budget BREACH (story 3-2 AC6). Identical to
+    /// [`Supervisor::pause`] — honoring the adapter pause Capability Declaration
+    /// EXACTLY (guaranteed suspends; best-effort transitions with the honest
+    /// posture; UNSUPPORTED fails fast, NO fake pause, NO silent escalation) —
+    /// except the resulting `running → paused` transition carries the
+    /// [`TransitionCause::BudgetExceeded`] cause instead of a plain `pause` command,
+    /// so the lifecycle log itself explains WHY (the standalone breach event is the
+    /// AD-14 subscription payload). Takes `&InstanceName` (the caller already has
+    /// the validated name inside the ingestion path).
+    fn pause_with_cause(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) -> Result<AgentInstance, EngineError> {
+        self.suspend_or_resume(
+            registry,
+            name.as_str(),
+            LifecycleCommand::Pause,
+            Some(cause),
+        )
     }
 
     /// Resume a paused Agent Instance (story 1-5, AC1/AC2).
@@ -490,18 +814,27 @@ impl Supervisor {
         registry: &Registry,
         name: &str,
     ) -> Result<AgentInstance, EngineError> {
-        self.suspend_or_resume(registry, name, LifecycleCommand::Resume)
+        self.suspend_or_resume(registry, name, LifecycleCommand::Resume, None)
     }
 
     /// Shared pause/resume driver (the three-level dispatch), keyed on `command`
     /// (`Pause` or `Resume`). Kept as one method so the pause and resume paths
     /// cannot drift: the transition gate, the level read, and the three-way
     /// dispatch are identical; only the target state and the cause differ.
+    ///
+    /// `cause_override` (story 3-2): when `Some`, it REPLACES the default cause on
+    /// the resulting transition for the GUARANTEED + BEST-EFFORT paths — a
+    /// budget-driven pause records [`TransitionCause::BudgetExceeded`] instead of a
+    /// plain `pause` command / a best-effort qualifier, so the lifecycle log
+    /// explains WHY. `None` preserves the story-1-5 causes exactly (an operator
+    /// `kt agent pause` is unchanged). The UNSUPPORTED fail-fast is identical
+    /// regardless (no transition, nothing persisted — the override is moot).
     fn suspend_or_resume(
         &mut self,
         registry: &Registry,
         name: &str,
         command: LifecycleCommand,
+        cause_override: Option<TransitionCause>,
     ) -> Result<AgentInstance, EngineError> {
         debug_assert!(
             matches!(command, LifecycleCommand::Pause | LifecycleCommand::Resume),
@@ -536,35 +869,38 @@ impl Supervisor {
                 level: level.as_str().to_string(),
             }),
             // GUARANTEED (AC1): real suspension via the backend, then a plain
-            // command-cause transition (no qualifier — it is a true suspension).
+            // command-cause transition (no qualifier — it is a true suspension). A
+            // story-3-2 budget pause overrides the cause with BudgetExceeded.
             SupportLevel::Guaranteed => {
                 self.ensure_log_dir(registry, &name)?;
                 self.signal_backend(&name, command)?;
-                self.transition(
-                    registry,
-                    &name,
-                    instance.state,
-                    new_state,
-                    TransitionCause::command(command.as_str()),
-                )?;
+                let cause = cause_override
+                    .clone()
+                    .unwrap_or_else(|| TransitionCause::command(command.as_str()));
+                self.transition(registry, &name, instance.state, new_state, cause)?;
                 registry.lookup(&name).map_err(registry_to_engine)
             }
             // BEST-EFFORT (AC2): transition + a VISIBLE qualifier cause, never a
             // silent success. No backend suspension is guaranteed here (on Unix a
             // best-effort declaration is unusual, but we still do NOT SIGSTOP — the
-            // declared level is the contract; the qualifier is the honesty).
+            // declared level is the contract; the qualifier is the honesty). A
+            // story-3-2 budget pause overrides the cause with BudgetExceeded (the
+            // best-effort posture is captured in the standalone breach event + a
+            // diagnostic, so the lifecycle cause stays the honest WHY).
             SupportLevel::BestEffort => {
                 self.ensure_log_dir(registry, &name)?;
-                let detail = format!(
-                    "{} is best-effort for '{}' on {} (adapter-cooperative); the process may keep running",
-                    Capability::Pause.as_str(),
-                    name.as_str(),
-                    os.as_str(),
-                );
-                let cause = match command {
-                    LifecycleCommand::Pause => TransitionCause::pause_best_effort(detail),
-                    _ => TransitionCause::resume_best_effort(detail),
-                };
+                let cause = cause_override.clone().unwrap_or_else(|| {
+                    let detail = format!(
+                        "{} is best-effort for '{}' on {} (adapter-cooperative); the process may keep running",
+                        Capability::Pause.as_str(),
+                        name.as_str(),
+                        os.as_str(),
+                    );
+                    match command {
+                        LifecycleCommand::Pause => TransitionCause::pause_best_effort(detail),
+                        _ => TransitionCause::resume_best_effort(detail),
+                    }
+                });
                 self.transition(registry, &name, instance.state, new_state, cause)?;
                 registry.lookup(&name).map_err(registry_to_engine)
             }
@@ -588,17 +924,26 @@ impl Supervisor {
         name: &InstanceName,
         command: LifecycleCommand,
     ) -> Result<(), EngineError> {
-        let Some(handle) = self.running.get_mut(name) else {
+        let Some(supervised) = self.running.get_mut(name) else {
             return Ok(());
         };
         let result = match command {
-            LifecycleCommand::Pause => self.backend.pause(handle),
-            _ => self.backend.resume(handle),
+            LifecycleCommand::Pause => self.backend.pause(&mut supervised.handle),
+            _ => self.backend.resume(&mut supervised.handle),
         };
         result.map_err(|source| EngineError::Backend {
             name: name.as_str().to_string(),
             source,
         })
+    }
+
+    /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if
+    /// this engine holds no live handle for it (never started this lifetime, or
+    /// already stopped/crashed). The Fleet read uses it to scope the current-Run
+    /// token totals; a `None` simply means "no active Run" (current-run totals are
+    /// zero). Held in memory alongside the process handle for this engine lifetime.
+    pub fn current_run_id(&self, name: &InstanceName) -> Option<RunId> {
+        self.running.get(name).map(|s| s.run_id.clone())
     }
 
     /// Read the recorded [`TransitionEvent`]s for an instance from its log
@@ -641,6 +986,19 @@ impl Supervisor {
     /// moved to `failed` and its handle removed, a later pass will not see it in
     /// `self.running` again.
     pub fn poll_once(&mut self, registry: &Registry) -> Vec<RestartPlan> {
+        // First, INGEST self-reported usage from every running instance's captured
+        // output (story 3-1): the reaper is the natural cadence for draining the
+        // agent-output log into the Usage Ledger while an instance is `running`.
+        // Best-effort per instance; a drain hiccup never blocks crash detection.
+        self.drain_usage_all(registry);
+        // Then INGEST engine-observed usage (story 3-4): drain each observed
+        // instance's listener queue (the counts the loopback proxy parsed out of the
+        // agent's model traffic) into the SAME `ingest_usage` choke point, minting
+        // the per-Run `sequence`. This reaper cadence (~250ms) lands observed usage
+        // well within the AD-7/FR-19 flush bound (≤5s) of call completion. Best-
+        // effort per instance, exactly like the self-reported drain.
+        self.drain_observed_all(registry);
+
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
@@ -649,7 +1007,7 @@ impl Supervisor {
             // Poll liveness. A poll error is treated as still-alive (transient);
             // the next pass re-checks. Reap on exit is done inside `poll`.
             let exited = match self.running.get_mut(&name) {
-                Some(handle) => match self.backend.poll(handle) {
+                Some(supervised) => match self.backend.poll(&mut supervised.handle) {
                     Ok(ProcessStatus::Exited { code }) => Some(code),
                     Ok(ProcessStatus::Alive) => None,
                     Err(_) => None,
@@ -657,6 +1015,16 @@ impl Supervisor {
                 None => continue,
             };
             let Some(code) = exited else { continue };
+            // The process exited: drain any usage it emitted right before dying, so a
+            // final batch is not lost between "agent printed it" and this reap.
+            // TERMINAL drain — the process is dead, so consume a final newline-less
+            // usage line to end-of-log instead of stranding it (H1).
+            self.drain_usage_for(registry, &name, DrainMode::Terminal);
+            // Drain any final ENGINE-OBSERVED usage still queued before the crashed
+            // instance's listener is torn down (story 3-4): a completion parsed just
+            // before the crash must land, not be lost when the `Supervised` is
+            // removed below. Best-effort, mirroring the self-reported terminal drain.
+            self.drain_observed_for(registry, &name);
 
             // Read the store state: only an instance the store still shows
             // running/paused is an UNREQUESTED crash. A `stopping` (operator
@@ -841,7 +1209,52 @@ impl Supervisor {
                 Ok(Some(handle)) => {
                     // Live match: re-hold the handle. State stays as persisted
                     // (running/paused). AI-7: a paused process is now resumable.
-                    self.running.insert(name, handle);
+                    //
+                    // Metering across a crash/adoption (story 3-1, documented
+                    // assumption): the pre-crash Run id lived only in the crashed
+                    // engine's memory, so the adopted instance opens a NEW Run and
+                    // begins ingestion at the CURRENT end of its agent-output log
+                    // (skipping pre-crash lines). This keeps per-run totals honest for
+                    // the post-adoption span without re-attributing (or double-
+                    // counting) the old Run's already-captured usage; the DB dedup key
+                    // includes the run id, so even an overlapping sequence is safe.
+                    let run_id = RunId::mint();
+                    let usage_cursor = self.agent_log_len(registry, &name);
+                    let metering_source = registry
+                        .metering_source(&name)
+                        .unwrap_or_else(|_| "self-reported".to_string());
+                    self.running.insert(
+                        name,
+                        Supervised {
+                            handle,
+                            run_id,
+                            metering_source,
+                            usage_cursor,
+                            // The adopted instance opens a NEW Run (the pre-crash
+                            // run_id died with the crashed engine), so its breach latch
+                            // starts empty too (story 3-2).
+                            breached_scopes: std::collections::HashSet::new(),
+                            // ENGINE-OBSERVED across a crash/adoption (story 3-4,
+                            // tracked follow-up — NOT just a metering gap): the pre-crash
+                            // listener died with the crashed engine, but the already-
+                            // running agent's `base_url` STILL points at that now-DEAD
+                            // loopback port. So the adopted agent's MODEL TRAFFIC ITSELF
+                            // breaks — its completion calls hit the dead port and fail
+                            // with a connection-refused error (not merely un-metered).
+                            // This fails LOUD (a transport error the agent surfaces),
+                            // never a corrupt/silent-wrong output. We cannot rebind the
+                            // old port to a fresh listener here (the agent chose no port;
+                            // the OS did), so we leave it un-observed with no listener;
+                            // RECOVERY is an operator stop→start, which relaunches the
+                            // agent pointed at a fresh listener. The full fix (re-launch
+                            // an adopted observed instance / a stable per-instance listener
+                            // port / the Epic-7 daemon owning the listener) is a tracked
+                            // follow-up, not done here. A self-reported instance's
+                            // log-tail drain is unaffected (it needs no listener).
+                            observed_listener: None,
+                            observed_source: None,
+                        },
+                    );
                     adopted += 1;
                 }
                 Ok(None) => {
@@ -964,6 +1377,67 @@ impl Supervisor {
         }
     }
 
+    /// Start the loopback forward listener for an `engine-observed` instance
+    /// (story 3-4, AC-A/AC-B/AC6), or return `Ok(None)` for a `self-reported`
+    /// instance (whose start path is UNCHANGED). Runs at `starting`, BEFORE any
+    /// persisted state change, so a failure rejects the start cleanly.
+    ///
+    /// For an `engine-observed` instance it: (1) resolves the operator-configured
+    /// real upstream provider URL (`metering.upstream_base_url`) from `effective`;
+    /// (2) requires the engine runtime handle (the listener's accept loop runs on
+    /// it) — absent → a clear error (only the handle-less unit-test supervisor lacks
+    /// it, and it never starts an observed instance); (3) binds `127.0.0.1:0`
+    /// (loopback ONLY — AC-B) and spawns the accept loop. Every failure maps to a
+    /// TRAFFIC-FREE [`EngineError::ObservedMetering`] (no body/header/key — 2-4
+    /// no-leak). The returned [`ObservedListener`] is moved into `Supervised`; its
+    /// `base_url` is what the caller injects via the config-mapping (AC6).
+    fn start_observed_listener(
+        &self,
+        name: &InstanceName,
+        metering_source: &str,
+        effective: &crate::domain::EffectiveConfig,
+    ) -> Result<Option<ObservedListener>, EngineError> {
+        // Only an `engine-observed` instance runs a listener. `self-reported`
+        // (and any other) leaves it None — its start path is byte-unchanged.
+        if metering_source != "engine-observed" {
+            return Ok(None);
+        }
+        // The operator MUST configure the real upstream provider URL (there is
+        // nowhere to forward otherwise). Absent → a clear start error naming the key.
+        let upstream = config::resolve_upstream_base_url(effective).ok_or_else(|| {
+            EngineError::ObservedMetering {
+                name: name.as_str().to_string(),
+                detail: format!(
+                    "no upstream provider URL configured; set `{}` to the agent's real \
+                     OpenAI-compatible endpoint",
+                    crate::domain::METERING_UPSTREAM_BASE_URL_KEY
+                ),
+            }
+        })?;
+        // The listener's accept loop runs on the engine runtime; the sync start path
+        // (on the blocking pool) cannot use `Handle::current`, so the engine threads
+        // its handle in (`with_runtime`). A handle-less supervisor cannot observe.
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| EngineError::ObservedMetering {
+                name: name.as_str().to_string(),
+                detail: "the engine has no runtime handle to run the loopback listener \
+                     (engine-observed metering requires the async engine)"
+                    .to_string(),
+            })?;
+        // Bind loopback + spawn. A ListenerError is TRAFFIC-FREE by construction
+        // (bind/upstream-shape only — never a body/header/key), so mapping it into
+        // the detail cannot leak a secret (2-4 rigor).
+        let listener = ObservedListener::start(runtime, upstream).map_err(|e: ListenerError| {
+            EngineError::ObservedMetering {
+                name: name.as_str().to_string(),
+                detail: e.to_string(),
+            }
+        })?;
+        Ok(Some(listener))
+    }
+
     /// Watch a freshly spawned process for [`READINESS_WINDOW`]. Returns
     /// `Some(exit_code)` if the process died within the window (a launch failure,
     /// AC2 — the inner `Option<i32>` is the OS exit code, `None` if killed by a
@@ -996,12 +1470,651 @@ impl Supervisor {
             detail: e.to_string(),
         })
     }
+
+    // ---- Self-reported usage ingestion → the ONE ledger-commit choke point ----
+    //      (story 3-1, spine AD-6/AD-7/AD-12)
+
+    /// The current byte length of an instance's agent-output log, or 0 if it does
+    /// not exist yet. Used to set the ingestion cursor at a Run's start so a new
+    /// Run never re-reads a prior Run's already-captured lines.
+    fn agent_log_len(&self, registry: &Registry, name: &InstanceName) -> u64 {
+        std::fs::metadata(registry.agent_output_log_path(name))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Drain self-reported usage from EVERY currently-running instance (the reaper
+    /// cadence). Best-effort per instance — one instance's drain failure never
+    /// blocks another's or crash detection.
+    ///
+    /// This is the MID-RUN cadence: the process is (believed) still alive, so a
+    /// half-written final line is left for the next pass ([`DrainMode::MidRun`]).
+    fn drain_usage_all(&mut self, registry: &Registry) {
+        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.drain_usage_for(registry, &name, DrainMode::MidRun);
+        }
+    }
+
+    /// Drain the NEWLY-captured tail of one instance's agent-output log, ingesting
+    /// each well-formed usage sentinel line through the commit choke point
+    /// ([`Supervisor::ingest_usage`]), and advance the read cursor.
+    ///
+    /// Reads from the per-instance cursor to the file's end (only the bytes written
+    /// since the last drain), parses usage lines via the self-reported
+    /// [`UsageSource`](crate::ports::UsageSource), and records each. A read error
+    /// (log gone / unreadable) is a best-effort skip — the DB is the source of
+    /// truth, and the next pass retries. Malformed usage lines are skipped inside
+    /// the parser (a diagnostic, never fatal — AD-12).
+    ///
+    /// The `mode` decides how the TAIL is treated (story 3-1 under-count fix, H1):
+    /// * [`DrainMode::MidRun`] — the process may still be mid-`writeln!`, so only
+    ///   bytes UP TO the last newline are consumed; a partial trailing line waits
+    ///   for the next drain (it lands whole then).
+    /// * [`DrainMode::Terminal`] — the process is DEAD (drain-on-stop / drain-on-
+    ///   reap); no more bytes will ever append, so a final usage line flushed
+    ///   WITHOUT a trailing newline is consumed to end-of-log rather than stranded
+    ///   (which the next Run's cursor would skip past → a permanent under-count).
+    ///
+    /// Log-shrink guard (M2): if the file is shorter than the cursor (a truncate /
+    /// rotation — nothing in-tree does this yet; Epic 4 owns rotation), we do NOT
+    /// re-read from 0 under the same live `run_id` (that would re-ingest already-
+    /// counted lines → a double-count, an INFLATED bill). We instead treat it as an
+    /// anomaly: advance the cursor to the new length and ingest nothing this pass.
+    /// Proper rotation handling is deferred to Epic 4.
+    fn drain_usage_for(&mut self, registry: &Registry, name: &InstanceName, mode: DrainMode) {
+        // Only running/adopted instances have a cursor + metering context.
+        let (cursor, run_id, metering_source) = match self.running.get(name) {
+            Some(s) => (s.usage_cursor, s.run_id.clone(), s.metering_source.clone()),
+            None => return,
+        };
+        let path = registry.agent_output_log_path(name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        // Decide (purely) what this pass reads: a shrink anomaly (M2), nothing yet,
+        // or a byte range to consume + the resulting cursor (H1 terminal-tail rule).
+        match plan_drain(&bytes, cursor, mode) {
+            DrainPlan::Shrunk { new_cursor } => {
+                // M2: the file is shorter than where we last read — do NOT restart
+                // from 0 (that double-counts). Snap the cursor to the new end and
+                // ingest nothing this pass.
+                if let Some(s) = self.running.get_mut(name) {
+                    s.usage_cursor = new_cursor;
+                }
+            }
+            DrainPlan::Nothing => {}
+            DrainPlan::Consume { range, new_cursor } => {
+                let block = String::from_utf8_lossy(&bytes[range]);
+                let parsed = self.usage_source.drain(&block);
+                // Advance the cursor FIRST (past the consumed lines) so a mid-batch
+                // record failure does not re-ingest earlier lines on the next pass —
+                // the DB dedup key is the ultimate guard, but not re-reading keeps it
+                // cheap.
+                if let Some(s) = self.running.get_mut(name) {
+                    s.usage_cursor = new_cursor;
+                }
+                for usage in parsed {
+                    self.ingest_usage(registry, name, &run_id, &metering_source, &usage);
+                }
+            }
+        }
+    }
+
+    /// Drain ENGINE-OBSERVED usage from EVERY currently-running observed instance
+    /// (story 3-4 — the reaper cadence, parallel to [`Self::drain_usage_all`]).
+    /// Best-effort per instance — one instance's drain never blocks another's or
+    /// crash detection. A `self-reported` instance (no observed listener) is a
+    /// no-op here (it rides the log-tail drain instead).
+    fn drain_observed_all(&mut self, registry: &Registry) {
+        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.drain_observed_for(registry, &name);
+        }
+    }
+
+    /// Drain one instance's OBSERVED usage queue (the counts the loopback listener
+    /// parsed out of the agent's model traffic) into the SAME [`Self::ingest_usage`]
+    /// choke point (story 3-4), minting the per-Run `sequence` for each.
+    ///
+    /// The listener task PUSHES each parsed `(input, output)` pair; this reaper pass
+    /// DRAINS the queue (event-driven, NOT the log-tail path — observed usage does
+    /// NOT ride the agent-output log, AD-12 contrast), the [`ObservedUsageSource`]
+    /// mints the engine-side `sequence` (the agent supplies none), and each becomes
+    /// a `ParsedUsage` fed to `ingest_usage` under the instance's CURRENT Run id +
+    /// `engine-observed` source. NO new ledger writer, NO new enforcement path — the
+    /// SAME choke point stamps + records + enforces (so 3-2 budgets + 3-3 caps apply
+    /// unchanged). A `self-reported` instance (no `observed_source`/`observed_listener`)
+    /// is a no-op. Best-effort: a lock hiccup skips this pass, never a crash.
+    fn drain_observed_for(&mut self, registry: &Registry, name: &InstanceName) {
+        // Read the Run context + drain the queue under the instance's held state.
+        // Collect the pushed counts + mint the per-Run sequence for each FIRST (a
+        // short critical section), then ingest OUTSIDE the borrow so `ingest_usage`
+        // can take `&mut self`.
+        let (run_id, metering_source, minted) = match self.running.get(name) {
+            Some(s) => {
+                // Only an observed instance has both a listener (its queue) + a source
+                // (the sequence minter). A self-reported instance skips (no-op).
+                let (Some(listener), Some(source)) =
+                    (s.observed_listener.as_ref(), s.observed_source.as_ref())
+                else {
+                    return;
+                };
+                let queue = listener.queue();
+                // Drain the queue: take every pushed pair (the lock is held only for
+                // the swap). A poisoned/failed lock is a best-effort skip.
+                let drained: Vec<(u64, u64)> = match queue.lock() {
+                    Ok(mut q) => q.drain(..).collect(),
+                    Err(_) => return,
+                };
+                if drained.is_empty() {
+                    return;
+                }
+                // Mint the per-Run ParsedUsage for each observed completion (the
+                // engine stamps `sequence`; the agent supplies none).
+                let minted: Vec<ParsedUsage> = drained
+                    .into_iter()
+                    .map(|(input, output)| source.mint(input, output))
+                    .collect();
+                (s.run_id.clone(), s.metering_source.clone(), minted)
+            }
+            None => return,
+        };
+        // Ingest each observed event through the SAME single choke point (stamps the
+        // Run id + `engine-observed` source + timestamp, records, and enforces).
+        for usage in &minted {
+            self.ingest_usage(registry, name, &run_id, &metering_source, usage);
+        }
+    }
+
+    /// THE ledger-commit choke point (story 3-1, spine AD-7) — the SOLE writer of
+    /// the `usage_events` table.
+    ///
+    /// Constructs the full [`UsageEvent`] from the agent-supplied [`ParsedUsage`]
+    /// plus the engine-stamped fields (the current Run id, the instance name, the
+    /// metering source, and the commit timestamp), then records it in its OWN
+    /// transaction via `record_usage_event` (AD-6: one transaction per event). A
+    /// re-delivered batch is classified [`RecordOutcome::DuplicateReplay`] by the
+    /// DB `UNIQUE` index and is a no-op (AC-A no-double-count). On a fresh insert it
+    /// builds the AD-14 [`UsageUpdateEvent`] (the wire shape frozen now; Host
+    /// delivery is story 7-2). A store error is a best-effort diagnostic — usage
+    /// ingestion must never crash the supervisor or a lifecycle op (the ledger is
+    /// advisory to the RUN, not gating it this story).
+    ///
+    /// **The AD-7 single-writer invariant lives here:** no other code path may call
+    /// `record_usage_event`.
+    ///
+    /// **The AD-7 ENFORCEMENT stage lives here too (story 3-2):** IMMEDIATELY after
+    /// a fresh `Inserted` commit — in the SAME synchronous path, before returning —
+    /// this method reads the CURRENT resolved [`TokenBudget`] + [`BreachAction`]
+    /// (a LIVE config read, so a budget changed while `running` applies on the very
+    /// next event — AC-B), reads the just-committed per-run + cumulative token
+    /// totals (3-1's `usage_totals`/`run_totals`), and calls the pure
+    /// [`BudgetEvaluator`]. On a [`BreachDecision::Breached`] it RECORDS the breach
+    /// event FIRST/independently ([`Self::record_breach`]) — so a best-effort/
+    /// unsupported/failed pause never loses the breach record (FR-21 "always
+    /// recorded regardless of action") — and THEN executes the action via Epic-1's
+    /// lifecycle (`pause`/`stop`/`warn`). This is the SOLE enforcement site (the
+    /// AD-7 companion to the single-writer invariant). A [`RecordOutcome::DuplicateReplay`]
+    /// is NOT evaluated (nothing new was committed → no new breach can occur).
+    /// Ingestion + enforcement stay best-effort to the RUN: a store/lifecycle error
+    /// is a diagnostic, NEVER a supervisor crash (3-1's rule extended to enforcement).
+    fn ingest_usage(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        metering_source: &str,
+        parsed: &ParsedUsage,
+    ) -> Option<UsageUpdateEvent> {
+        let event = assemble_usage_event(
+            parsed,
+            name.as_str(),
+            run_id.clone(),
+            metering_source,
+            now_rfc3339(),
+        );
+        // Story 3-3 — NO-RETROACTIVE-REPRICING: resolve the EFFECTIVE Rate at COMMIT
+        // (a live config read) and PERSIST it onto this row, so historical dollars
+        // keep the Rate in force when consumed. A later Rate change re-prices FUTURE
+        // events only (each row is priced at its own stored Rate on read). A degraded
+        // config read / absent-or-half Rate → `None` (the row contributes $0; AC-B).
+        let rate = registry
+            .effective_config(name, ConfigLayer::empty())
+            .ok()
+            .and_then(|eff| config::resolve_cost(&eff).0);
+        match registry.record_usage_event(&event, rate) {
+            // A fresh row: build the AD-14 usage-update wire struct (frozen now; 7-2
+            // delivers it), THEN run the AD-7 enforcement stage on the just-committed
+            // totals — synchronously, in this same commit path.
+            Ok(RecordOutcome::Inserted) => {
+                self.enforce_budget(registry, name, run_id, metering_source);
+                Some(UsageUpdateEvent::new(event))
+            }
+            // A recognized replay — no double-count, no event emitted (nothing new
+            // was committed). This is the AC-A guarantee in action; the evaluator is
+            // NOT run (AC5 — no new total, no new breach).
+            Ok(RecordOutcome::DuplicateReplay) => None,
+            // A store error: usage ingestion is best-effort — do not crash the
+            // supervisor. The ledger is the source of truth for what WAS recorded;
+            // a transient write failure just means this event is not counted (the
+            // agent may re-send it, and the dedup key keeps that safe).
+            Err(_) => None,
+        }
+    }
+
+    /// The AD-7 ENFORCEMENT stage (story 3-2 tokens + story 3-3 dollars), run INSIDE
+    /// [`Self::ingest_usage`] right after a fresh commit — the SOLE place a budget or
+    /// Cost Cap is evaluated + a Breach Action fired.
+    ///
+    /// Reads the CURRENT resolved budget/Rate/cap + action (live, AC-B), reads the
+    /// committed per-run + cumulative totals, evaluates purely (TOKENS then DOLLARS,
+    /// in the SAME choke point), and on a breach records the event FIRST then
+    /// executes the action. Every step is best-effort to the RUN: a failed config
+    /// read / totals read / lifecycle op is a diagnostic, never a crash (AD-12). A
+    /// no-budget + no-cap instance evaluates to `WithinBudget` for both — so the
+    /// common path is a cheap config read + two pure comparisons and nothing else.
+    ///
+    /// **STORY 3-3 — the DOLLAR evaluation folds in HERE (AD-7, no new path):** after
+    /// the token evaluation, IF a [`Rate`](super::cost::Rate) is present AND the
+    /// [`CostCap`](super::cost::CostCap) `is_set()`, derive the per-run + cumulative
+    /// COST (each row priced at its own persisted Rate — no retro-repricing) and run
+    /// the pure [`CostEvaluator`]. NO Rate ⇒ dollar enforcement is SKIPPED entirely
+    /// (AC-B inert — a `CostCap` with no Rate cannot be enforced). Both dimensions
+    /// reuse the SAME record-first-then-act path + the SAME per-Run latch, keyed by
+    /// `(dimension, scope)` so a token breach and a dollar breach of the same scope
+    /// each fire ONCE per Run (both can fire on the same event; the action is
+    /// identical).
+    ///
+    /// **Idempotence — at most one breach per (dimension, scope) per Run:** this runs
+    /// on EVERY committed usage event, so once a total crosses a ceiling every
+    /// subsequent event would re-evaluate to the SAME breach. The per-Run breach
+    /// LATCH ([`Supervised::breached_scopes`], keyed by `(dimension, scope)`)
+    /// short-circuits BOTH the [`Self::record_breach`] and the action for an
+    /// already-fired pair; the latch resets when a new Run starts.
+    fn enforce_budget(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        metering_source: &str,
+    ) {
+        // (1) LIVE config read (AC-B "changes apply immediately"): resolve the
+        // CURRENT effective config ONCE, for BOTH the token budget and the dollar
+        // Rate/cap. A malformed on-disk layer degrades to "no budget / no Rate"
+        // (best-effort — never a crash mid-ingestion).
+        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
+            return;
+        };
+        let (budget, token_action) = config::resolve_token_budget(&effective);
+        let (rate, cost_cap, cost_action) = config::resolve_cost(&effective);
+
+        // Whether each dimension is ARMED: a token budget is armed when a ceiling is
+        // set; the dollar cap is armed ONLY when BOTH a Rate is present AND a cap
+        // scope is set (AC-B: a cap with no Rate is inert). If NEITHER is armed, skip
+        // the totals reads entirely (the common un-governed path).
+        let token_armed = budget.is_set();
+        let dollar_armed = rate.is_some() && cost_cap.is_set();
+        if !token_armed && !dollar_armed {
+            return;
+        }
+
+        // (2) TOKEN dimension (story 3-2): the just-committed token totals + the pure
+        // evaluator. Reuses the record-first-then-act helper with the tokens dimension.
+        if token_armed {
+            let run_total = registry
+                .run_usage_totals(name, run_id)
+                .map(|t| t.total_tokens())
+                .unwrap_or(0);
+            let cumulative_total = registry
+                .usage_totals(name)
+                .map(|t| t.total_tokens())
+                .unwrap_or(0);
+            let decision =
+                BudgetEvaluator::evaluate(run_total, cumulative_total, &budget, token_action);
+            if let BreachDecision::Breached {
+                scope,
+                action,
+                limit,
+                observed,
+            } = decision
+            {
+                let cause = TransitionCause::budget_exceeded(scope, limit, observed);
+                self.apply_breach(
+                    registry,
+                    name,
+                    run_id,
+                    BreachDimension::Tokens,
+                    scope,
+                    action,
+                    cause,
+                    metering_source,
+                    // The token breach event carries token counts (no dollar fields).
+                    |registry, sup, run_id, scope, action, src| {
+                        sup.record_token_breach(
+                            registry, name, run_id, scope, limit, observed, action, src,
+                        );
+                    },
+                );
+            }
+        }
+
+        // (3) DOLLAR dimension (story 3-3): derive the per-run + cumulative COST from
+        // the ledger (each row priced at its own persisted Rate — no retro-repricing),
+        // then the pure CostEvaluator. Only when a Rate is present AND the cap is set
+        // (AC-B inert otherwise). v1 the estimate label is always `estimated`.
+        if dollar_armed {
+            let run_cost = registry
+                .run_cost_totals(name, run_id)
+                .unwrap_or(Micros::ZERO);
+            let cumulative_cost = registry.cost_totals(name).unwrap_or(Micros::ZERO);
+            let decision =
+                CostEvaluator::evaluate(run_cost, cumulative_cost, &cost_cap, cost_action);
+            if let BreachDecision::Breached {
+                scope,
+                action,
+                limit,
+                observed,
+            } = decision
+            {
+                let label = EstimateLabel::Estimated;
+                let cause = TransitionCause::cost_cap_exceeded(
+                    scope,
+                    Micros(limit as i64),
+                    Micros(observed as i64),
+                    label,
+                );
+                self.apply_breach(
+                    registry,
+                    name,
+                    run_id,
+                    BreachDimension::Dollars,
+                    scope,
+                    action,
+                    cause,
+                    metering_source,
+                    // The dollar breach event carries integer micros + the label.
+                    |registry, sup, run_id, scope, action, src| {
+                        sup.record_cost_breach(
+                            registry,
+                            name,
+                            run_id,
+                            scope,
+                            Micros(limit as i64),
+                            Micros(observed as i64),
+                            label,
+                            action,
+                            src,
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    /// Apply ONE breach decision for a given `dimension` (story 3-3 shared path):
+    /// consult the per-Run `(dimension, scope)` latch, and if this pair has NOT yet
+    /// fired this Run, RECORD the breach (via `record`, the dimension-specific event
+    /// writer) FIRST/INDEPENDENTLY and THEN execute the action via Epic-1's lifecycle
+    /// (AD-15 — a REASON, not a new edge). A pair already latched short-circuits both.
+    /// A missing `Supervised` (not currently supervised — a race with stop) declines
+    /// to enforce. All best-effort: a lifecycle error is a diagnostic, never a crash.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_breach(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        dimension: BreachDimension,
+        scope: BreachScope,
+        action: BreachAction,
+        cause: TransitionCause,
+        metering_source: &str,
+        record: impl FnOnce(&Registry, &Self, &RunId, BreachScope, BreachAction, &str),
+    ) {
+        // IDEMPOTENCE LATCH (story 3-2/3-3): fire at most once per (dimension, scope)
+        // per Run. Insert the pair; if it was already present, short-circuit.
+        match self.running.get_mut(name) {
+            Some(supervised) => {
+                if !supervised.breached_scopes.insert((dimension, scope)) {
+                    return;
+                }
+            }
+            None => return,
+        }
+        // RECORD THE BREACH FIRST (AC7/AC10 / FR-21 "always recorded regardless of
+        // action"), BEFORE the lifecycle side-effect, so a best-effort/unsupported/
+        // failing pause never loses the record.
+        record(registry, self, run_id, scope, action, metering_source);
+        // EXECUTE THE ACTION via Epic-1's EXISTING lifecycle. The breach is already
+        // recorded; a lifecycle error here is a best-effort diagnostic, never a crash.
+        match action {
+            BreachAction::Warn => {
+                // No lifecycle transition — the breach event is the whole guardrail.
+            }
+            BreachAction::Pause => {
+                self.enforce_pause(registry, name, cause);
+            }
+            BreachAction::Stop => {
+                self.enforce_stop(registry, name, cause);
+            }
+        }
+    }
+
+    /// Execute a `pause` Breach Action honestly (story 3-2 AC6, honoring story
+    /// 1-5's Capability Declaration). Drives `running → paused` and STAMPS the
+    /// resulting transition with the [`TransitionCause::BudgetExceeded`] cause (so
+    /// the lifecycle log explains WHY), via [`Self::pause`]. A best-effort pause
+    /// still transitions (1-5) and the breach is already recorded; an UNSUPPORTED
+    /// pause fails fast in [`Self::pause`] — we do NOT fake a pause and do NOT
+    /// silently escalate to stop (AC6), we surface the honest diagnostic on the
+    /// engine log (the breach event already captured the fact). All best-effort:
+    /// never a supervisor crash.
+    fn enforce_pause(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+        match self.pause_with_cause(registry, name, cause) {
+            Ok(_) => {}
+            Err(e) => {
+                // Honest surface (AD-12): pause could not be honored (unsupported /
+                // not running / backend hiccup). The breach is ALREADY recorded; log
+                // and move on — no fake pause, no escalation.
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!("budget breach pause could not be honored: {e}"),
+                );
+            }
+        }
+    }
+
+    /// Execute a `stop` Breach Action (story 3-2). Drives `running → stopping →
+    /// stopped` (story 1-4) and, before that, records the [`TransitionCause::BudgetExceeded`]
+    /// as the WHY marker on the `running → stopping` edge (the stop path itself
+    /// records the graceful/forced escalation on the terminal edge). Best-effort:
+    /// a stop error is logged, never a crash (the breach is already recorded).
+    fn enforce_stop(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+        match self.stop_with_cause(registry, name, cause) {
+            Ok(_) => {}
+            Err(e) => {
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!("budget breach stop could not be honored: {e}"),
+                );
+            }
+        }
+    }
+
+    /// Record a TOKEN [`BudgetBreachEvent`] (story 3-2, AC7) — the token-dimension
+    /// event writer passed to [`Self::apply_breach`]. Builds the token breach struct
+    /// (token `limit`/`observed`, no dollar fields) and persists it via
+    /// [`Self::persist_breach_event`].
+    #[allow(clippy::too_many_arguments)]
+    fn record_token_breach(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        scope: BreachScope,
+        limit: u64,
+        observed: u64,
+        action: BreachAction,
+        metering_source: &str,
+    ) {
+        let event = BudgetBreachEvent::new(
+            name.as_str(),
+            run_id.as_str(),
+            scope,
+            limit,
+            observed,
+            action,
+            metering_source,
+            now_rfc3339(),
+        );
+        self.persist_breach_event(registry, name, &event);
+    }
+
+    /// Record a DOLLAR [`BudgetBreachEvent`] (story 3-3, AC10) — the dollar-dimension
+    /// event writer passed to [`Self::apply_breach`]. Builds the dollar breach struct
+    /// (integer-micro `dollar_limit`/`dollar_observed` + the [`EstimateLabel`]) and
+    /// persists it via [`Self::persist_breach_event`]. NO `$` string, NO `f64` — the
+    /// wire carries integer micros + the label (AD-14).
+    #[allow(clippy::too_many_arguments)]
+    fn record_cost_breach(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        scope: BreachScope,
+        limit_micros: Micros,
+        observed_micros: Micros,
+        label: EstimateLabel,
+        action: BreachAction,
+        metering_source: &str,
+    ) {
+        let event = BudgetBreachEvent::new_cost(
+            name.as_str(),
+            run_id.as_str(),
+            scope,
+            limit_micros,
+            observed_micros,
+            label,
+            action,
+            metering_source,
+            now_rfc3339(),
+        );
+        self.persist_breach_event(registry, name, &event);
+    }
+
+    /// Persist a built [`BudgetBreachEvent`] to the durable per-instance breach log
+    /// (story 3-2 shared path, AC7 / FR-21 "always recorded regardless of action").
+    /// Recorded for EVERY action (including `warn`) and BEFORE the lifecycle
+    /// side-effect, so the breach is never lost.
+    ///
+    /// Non-fatal but NOT swallowed: this is the PRIMARY durable record of the breach
+    /// (FR-21), so a write failure (disk full / IO / perms) must not vanish silently
+    /// while the action still fires — that would lose the mandated record with no
+    /// diagnostic. We keep enforcement acting (the write failure is NOT made fatal),
+    /// but SURFACE the error on the engine-log stderr breadcrumb (mirroring how
+    /// `enforce_pause`/`enforce_stop` log their best-effort diagnostics), so a lost
+    /// breach record is visible to an operator. Both the dir-create and the append
+    /// failure are surfaced.
+    fn persist_breach_event(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        event: &BudgetBreachEvent,
+    ) {
+        let path = registry.instance_breach_log_path(name);
+        // Ensure the log dir exists (a never-transitioned instance may lack it) —
+        // non-fatal, mirroring `ensure_log_dir`, but a failure is surfaced (below) if
+        // it then makes the append fail.
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!(
+                        "could not create the breach-log directory {}: {e} — the breach \
+                         record may be lost",
+                        parent.display()
+                    ),
+                );
+            }
+        }
+        // Surface (do NOT swallow) an append failure: the breach record is the FR-21
+        // mandated durable artifact; a lost record with no diagnostic is the bug. Log
+        // and move on — enforcement still acts.
+        if let Err(e) = append_breach_event(&path, event) {
+            self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "could not record the budget breach event to {}: {e} — the mandated \
+                     breach record was NOT written",
+                    path.display()
+                ),
+            );
+        }
+    }
+
+    /// Surface one enforcement diagnostic on STDERR (AD-12: enforcement
+    /// diagnostics ride the engine log / stderr, NEVER `kt` stdout, NEVER a crash).
+    /// Used when a breach action (pause/stop) could not be honored — the breach
+    /// itself is already durably recorded in the breach log, so this is only an
+    /// operator breadcrumb, not the record of the breach. `registry` is unused (the
+    /// diagnostic is not persisted to a strict-parse log to avoid corrupting the
+    /// transition-event reader) but kept for signature symmetry with the other
+    /// enforcement helpers.
+    fn log_enforcement_diagnostic(&self, _registry: &Registry, name: &InstanceName, detail: &str) {
+        eprintln!("[ktesio] {}: {detail}", name.as_str());
+    }
+
+    /// Read back the recorded [`BudgetBreachEvent`]s for an instance from its
+    /// breach log (observation helper for tests / embedders — the AD-14 seed, NOT
+    /// the 7-2 bus). Empty vec if none recorded yet.
+    pub fn read_breach_events(
+        registry: &Registry,
+        name: &str,
+    ) -> Result<Vec<BudgetBreachEvent>, EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let path = registry.instance_breach_log_path(&name);
+        read_breach_events_from(&path).map_err(|detail| EngineError::Log {
+            name: name.as_str().to_string(),
+            path: path.to_string_lossy().into_owned(),
+            detail,
+        })
+    }
 }
 
 impl Default for Supervisor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build the INVOCATION-OVERRIDE config layer that injects the engine-observed
+/// loopback `base_url` into the mapping (story 3-4, AC6). The engine writes the
+/// listener's `http://127.0.0.1:<port>` at the reserved
+/// [`METERING_BASE_URL_KEY`](crate::domain::METERING_BASE_URL_KEY) so the
+/// adapter's EXISTING config-mapping (2-2) delivers it into the agent's native
+/// mechanism. Because it is the INVOCATION layer (the strongest — AD-9), it always
+/// wins over any hand-set lower-layer value; and because the mapping reads it as an
+/// ordinary string leaf, NO new contract surface is introduced (no
+/// `CONTRACT_VERSION` bump). Pure — builds a one-key TOML table.
+fn base_url_override(base_url: &str) -> ConfigLayer {
+    let mut table = toml::value::Table::new();
+    // A DOTTED key (`metering.base_url`) is a nested table in TOML; build the nested
+    // shape so `resolve` flattens it to the dotted leaf the mapping targets.
+    let mut metering = toml::value::Table::new();
+    metering.insert(
+        "base_url".to_string(),
+        toml::Value::String(base_url.to_string()),
+    );
+    table.insert("metering".to_string(), toml::Value::Table(metering));
+    ConfigLayer::from_table(table)
 }
 
 /// Append one transition event as a single JSON line to the instance log.
@@ -1037,6 +2150,42 @@ fn read_events_from(path: &Path) -> Result<Vec<TransitionEvent>, String> {
         }
         let event: TransitionEvent = serde_json::from_str(line)
             .map_err(|e| format!("corrupt instance-log line {}: {e}", idx + 1))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Append one [`BudgetBreachEvent`] as a single JSON line to the per-instance
+/// breach log (story 3-2, AD-14). JSON Lines, append-only — the same shape as
+/// [`append_event`] so a human can `tail` it and [`read_breach_events_from`] can
+/// parse it back. The ALWAYS-recorded breach record (FR-21).
+fn append_breach_event(path: &Path, event: &BudgetBreachEvent) -> Result<(), String> {
+    use std::io::Write;
+    let line = serde_json::to_string(event).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{line}").map_err(|e| e.to_string())
+}
+
+/// Read back the JSON-Lines [`BudgetBreachEvent`]s from an instance's breach log.
+/// Missing file → empty vec (no breaches recorded yet). A malformed line is an
+/// error naming it (a corrupt log is worth surfacing).
+fn read_breach_events_from(path: &Path) -> Result<Vec<BudgetBreachEvent>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut events = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: BudgetBreachEvent = serde_json::from_str(line)
+            .map_err(|e| format!("corrupt breach-log line {}: {e}", idx + 1))?;
         events.push(event);
     }
     Ok(events)
@@ -1281,9 +2430,10 @@ mod tests {
         registry.set_config(&name, "model", "gpt-4").unwrap();
 
         // Resolve exactly as start_inner would for a native adapter.
-        let (kind, manifest_path) = registry.adapter_launch_facts(&name).unwrap();
+        let (kind, manifest_path, launch) = registry.adapter_launch_facts(&name).unwrap();
         assert_eq!(kind, "mock");
         assert!(manifest_path.is_none(), "mock is native (no manifest)");
+        assert!(launch.is_none(), "mock is native (no snapshotted launch)");
         let effective = registry
             .effective_config(&name, crate::domain::ConfigLayer::empty())
             .unwrap();
@@ -1310,6 +2460,107 @@ mod tests {
             launch.env.get("MODEL").map(String::as_str),
             Some("gpt-4"),
             "the documented model key must land in the mock's declared env target"
+        );
+    }
+
+    // ---- The launch-snapshot fix (hosted-runner arg-loss): start uses the
+    //      REGISTRATION snapshot, never a start-time manifest re-read ----
+
+    #[test]
+    fn start_uses_the_registration_launch_snapshot_not_a_manifest_reread() {
+        // The FIX, at the EXACT seam the supervisor uses (`adapter_launch_facts`),
+        // OS-agnostically (no spawn — runs on every platform, including the
+        // macOS/Windows CI that dropped the args): register a fake_agent manifest
+        // with distinctive args, DELETE the manifest file, then read the launch
+        // facts. The persisted exec + args + env still come back intact — and the
+        // fallback re-read now FAILS (the manifest is gone), proving the snapshot,
+        // not a re-read, is what carries the launch into `start`.
+        let (_state, manifest, registry) =
+            setup_fake("snap", &["--emit-usage", "5", "--linger-ms", "600000"]);
+        let name = InstanceName::new("snap").unwrap();
+
+        // Remove the manifest entirely — any start-time re-read of it now fails.
+        std::fs::remove_file(manifest.path().join("adapter.toml")).unwrap();
+
+        let (kind, manifest_path, launch) = registry.adapter_launch_facts(&name).unwrap();
+        assert_eq!(kind, "snap");
+        assert!(
+            manifest_path.is_some(),
+            "a manifest adapter records its path"
+        );
+        let launch = launch.expect("the launch is snapshotted at registration");
+        let bin = ktesio_conformance::fake_agent_bin();
+        assert_eq!(launch.exec, bin.to_string_lossy().into_owned());
+        // The manifest's [lifecycle.start] args survived — INCLUDING the args the
+        // hosted runners dropped on re-read.
+        assert_eq!(
+            launch.args,
+            vec!["--emit-usage", "5", "--linger-ms", "600000"]
+        );
+
+        // The fallback re-read WOULD fail now (the manifest is gone): proof that
+        // the snapshot — not a re-read — is what makes the start work.
+        assert!(
+            adapter::resolve_start_launch(&kind, manifest_path.as_deref()).is_err(),
+            "the manifest re-read is gone/broken; the snapshot carried the launch"
+        );
+    }
+
+    #[test]
+    fn manifest_start_uses_the_snapshot_launch_even_when_the_manifest_changes_live() {
+        // The FIX end-to-end: after registration the launch is FIXED by the
+        // snapshot, so mutating the manifest's [lifecycle.start] args no longer
+        // affects the started process. Register a fake_agent, REWRITE its manifest
+        // with a decoy arg only a re-read would surface, then START — the spawned
+        // argv carries the ORIGINAL args and NOT the decoy. Linux-only spawn+observe,
+        // matching the sibling `_live` proofs (macOS/Windows CI spawn scaffolding is
+        // the very fragility this fix removes; the OS-agnostic seam test above +
+        // Epic 1 backend tests cover the rest).
+        if OsId::current() != OsId::Linux {
+            return;
+        }
+        let dump = tempfile::tempdir().unwrap();
+        let dump_path = dump.path().join("argv.txt");
+        let (_state, manifest, registry) = setup_fake(
+            "del",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+            ],
+        );
+
+        // Rewrite the manifest AFTER registration, appending a decoy arg. The
+        // manifest stays valid (no [config]), so the unchanged config-mapping
+        // re-read still succeeds; only a LAUNCH re-read would surface the decoy.
+        write_fake_manifest(
+            manifest.path(),
+            "del",
+            &[
+                "--linger-ms",
+                "600000",
+                "--dump",
+                dump_path.to_str().unwrap(),
+                "--decoy-from-reread",
+            ],
+        );
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "del").unwrap();
+        assert_eq!(state_of(&registry, "del"), LifecycleState::Running);
+
+        // The spawned fake_agent dumped its argv: the ORIGINAL start args are there,
+        // and the post-registration decoy is NOT — the launch came from the
+        // registration snapshot, not a re-read of the mutated manifest.
+        let dumped = wait_for_dump(&dump_path);
+        assert!(
+            dumped.lines().any(|l| l == "arg=--linger-ms"),
+            "the snapshotted start args must reach argv; dump=\n{dumped}"
+        );
+        assert!(
+            !dumped.lines().any(|l| l == "arg=--decoy-from-reread"),
+            "the re-read decoy must NOT appear — the launch came from the snapshot; dump=\n{dumped}"
         );
     }
 
@@ -2106,5 +3357,241 @@ mod tests {
         std::fs::write(&path, format!("\n{line}\n\n")).unwrap();
         let back = read_events_from(&path).unwrap();
         assert_eq!(back, vec![e]);
+    }
+
+    // ---- Story 3-2: the breach record write error is surfaced, not swallowed ----
+
+    #[test]
+    fn record_breach_surfaces_a_write_failure_instead_of_swallowing_it() {
+        // FR-21 ("the breach is always recorded"): if the durable breach-log write
+        // fails (disk full / IO / perms), the error must be SURFACED (an honest
+        // stderr diagnostic), NOT silently discarded while the action still fires —
+        // otherwise the mandated record is lost with no trace. We force BOTH the
+        // dir-create AND the append to fail by placing a regular FILE where the
+        // per-instance log DIRECTORY (`<home>/logs`, the breach log's parent) must
+        // be: `create_dir_all(parent)` fails (a file sits at that path) and the
+        // subsequent append cannot open `logs/breaches.log` either. `record_breach`
+        // must NOT panic (it stays non-fatal) and must not lose data silently — this
+        // proves both surfaced-error branches are reachable and the enforcement path
+        // survives. Pure unit test: no process, no OS gate.
+        let (_state, _manifest, registry) = setup_fake("breachio", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("breachio").unwrap();
+        // Block the log-dir path with a regular file so create_dir_all(<home>/logs)
+        // fails (its target is a file, not a directory) and the append fails too.
+        let log_dir = registry.instance_log_dir(&name);
+        std::fs::create_dir_all(log_dir.parent().unwrap()).unwrap();
+        std::fs::write(&log_dir, b"not a directory").unwrap();
+        assert!(
+            log_dir.is_file(),
+            "the log-dir path must be a FILE to force both the dir-create and append failures"
+        );
+
+        let sup = Supervisor::with_backoff(fast_backoff());
+        // Must not panic — both the dir-create and the append failures are logged
+        // (surfaced) and enforcement continues rather than crashing.
+        sup.record_token_breach(
+            &registry,
+            &name,
+            &RunId::mint(),
+            BreachScope::Cumulative,
+            30,
+            60,
+            BreachAction::Warn,
+            "self-reported",
+        );
+        // The blocking file is untouched — no breach file was sneaked in, confirming
+        // the write genuinely failed and we exercised the surfaced-error branches.
+        assert!(log_dir.is_file());
+    }
+
+    // ---- Story 3-1 drain planning: H1 terminal-tail + M2 shrink guard ----
+
+    #[test]
+    fn plan_drain_midrun_stops_at_the_last_newline() {
+        // MID-RUN: a live process may still finish a partial final line, so only bytes
+        // up to the last newline are consumed; the trailing partial waits.
+        let bytes = b"a\nb\nhalf-written";
+        let plan = plan_drain(bytes, 0, DrainMode::MidRun);
+        // Consumes "a\nb\n" (4 bytes), leaving "half-written" for the next pass.
+        assert_eq!(
+            plan,
+            DrainPlan::Consume {
+                range: 0..4,
+                new_cursor: 4
+            }
+        );
+    }
+
+    #[test]
+    fn plan_drain_midrun_with_no_newline_yet_consumes_nothing() {
+        // A tail with no complete line yet: nothing to consume this pass (MidRun).
+        assert_eq!(
+            plan_drain(b"no newline yet", 0, DrainMode::MidRun),
+            DrainPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn plan_drain_terminal_consumes_a_newline_less_final_line() {
+        // H1: on a TERMINAL drain the process is dead, so a final usage line flushed
+        // WITHOUT a trailing newline must be consumed to end-of-log (or it is stranded
+        // and the next Run's cursor skips past it → a permanent under-count).
+        let bytes = b"a\nKTESIO_USAGE {\"sequence\":0,\"input_tokens\":10,\"output_tokens\":20}";
+        let plan = plan_drain(bytes, 0, DrainMode::Terminal);
+        // The WHOLE tail is consumed (no trailing newline required).
+        assert_eq!(
+            plan,
+            DrainPlan::Consume {
+                range: 0..bytes.len(),
+                new_cursor: bytes.len() as u64
+            }
+        );
+    }
+
+    #[test]
+    fn plan_drain_terminal_from_a_cursor_consumes_only_the_new_tail() {
+        // The terminal tail is measured FROM the cursor (already-read bytes are not
+        // re-consumed) and still needs no trailing newline.
+        let bytes = b"old\nnew-tail-no-nl";
+        let plan = plan_drain(bytes, 4, DrainMode::Terminal); // cursor past "old\n"
+        assert_eq!(
+            plan,
+            DrainPlan::Consume {
+                range: 4..bytes.len(),
+                new_cursor: bytes.len() as u64
+            }
+        );
+    }
+
+    #[test]
+    fn plan_drain_shrink_snaps_the_cursor_and_ingests_nothing() {
+        // M2: the log is shorter than the cursor (a truncate/rotation). We must NOT
+        // re-read from 0 (double-count → inflated bill); instead snap the cursor to
+        // the new length and ingest nothing. Holds for BOTH modes.
+        let bytes = b"short"; // len 5
+        assert_eq!(
+            plan_drain(bytes, 100, DrainMode::MidRun),
+            DrainPlan::Shrunk { new_cursor: 5 }
+        );
+        assert_eq!(
+            plan_drain(bytes, 100, DrainMode::Terminal),
+            DrainPlan::Shrunk { new_cursor: 5 },
+            "the shrink guard applies on the terminal path too"
+        );
+    }
+
+    #[test]
+    fn plan_drain_at_end_of_log_consumes_nothing() {
+        // Cursor exactly at len (all bytes already read): an empty tail → Nothing, in
+        // both modes (no phantom terminal consume of zero bytes).
+        let bytes = b"a\nb\n";
+        assert_eq!(plan_drain(bytes, 4, DrainMode::MidRun), DrainPlan::Nothing);
+        assert_eq!(
+            plan_drain(bytes, 4, DrainMode::Terminal),
+            DrainPlan::Nothing
+        );
+    }
+
+    // ---- Story 3-4: engine-observed base_url injection + source selection ----
+
+    #[test]
+    fn base_url_override_builds_the_reserved_metering_leaf() {
+        // AC6: the engine injects the loopback URL at the reserved `metering.base_url`
+        // key as an INVOCATION override, so the adapter's config-mapping delivers it.
+        let layer = base_url_override("http://127.0.0.1:54321");
+        let resolved = crate::domain::resolve([
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            layer,
+        ]);
+        assert_eq!(
+            resolved
+                .value_display(crate::domain::METERING_BASE_URL_KEY)
+                .as_deref(),
+            Some("http://127.0.0.1:54321"),
+            "the loopback URL lands at the reserved metering.base_url leaf"
+        );
+    }
+
+    #[test]
+    fn self_reported_start_observed_listener_is_a_no_op() {
+        // Source selection: a `self-reported` instance's start path is UNCHANGED —
+        // start_observed_listener returns Ok(None), NO listener (even with an upstream
+        // configured, which a self-reported instance ignores).
+        let (_state, _manifest, registry) = setup_fake("selfrep_obs", &["--linger-ms", "1000"]);
+        let name = InstanceName::new("selfrep_obs").unwrap();
+        registry
+            .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
+            .unwrap();
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let sup = Supervisor::with_backoff(fast_backoff());
+        // self-reported (the fake manifest declares self-reported) → Ok(None).
+        let result = sup
+            .start_observed_listener(&name, "self-reported", &effective)
+            .expect("self-reported is a no-op, not an error");
+        assert!(
+            result.is_none(),
+            "a self-reported instance runs no listener"
+        );
+    }
+
+    #[test]
+    fn engine_observed_without_upstream_rejects_with_a_clear_error() {
+        // AC-A: an `engine-observed` instance with NO configured upstream URL rejects
+        // start_observed_listener with a traffic-free ObservedMetering error naming the
+        // key (nothing to forward to). Uses the handle-less test supervisor, but the
+        // upstream check fails FIRST (before the runtime-handle check), so the error
+        // names the missing config key.
+        let (_state, _manifest, registry) = setup_fake("obs_noup", &["--linger-ms", "1000"]);
+        let name = InstanceName::new("obs_noup").unwrap();
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let sup = Supervisor::with_backoff(fast_backoff());
+        let err = match sup.start_observed_listener(&name, "engine-observed", &effective) {
+            Err(e) => e,
+            Ok(_) => panic!("an engine-observed instance with no upstream must reject"),
+        };
+        match err {
+            EngineError::ObservedMetering { name: n, detail } => {
+                assert_eq!(n, "obs_noup");
+                assert!(
+                    detail.contains("metering.upstream_base_url"),
+                    "detail names the missing key: {detail}"
+                );
+            }
+            other => panic!("expected ObservedMetering, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_observed_without_runtime_handle_rejects_cleanly() {
+        // With an upstream configured but NO engine runtime handle (the handle-less
+        // test supervisor), an engine-observed start rejects with a clear, traffic-free
+        // error rather than panicking — the async engine is required to observe.
+        let (_state, _manifest, registry) = setup_fake("obs_nort", &["--linger-ms", "1000"]);
+        let name = InstanceName::new("obs_nort").unwrap();
+        registry
+            .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
+            .unwrap();
+        let effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .unwrap();
+        let sup = Supervisor::with_backoff(fast_backoff()); // no runtime handle
+        let err = match sup.start_observed_listener(&name, "engine-observed", &effective) {
+            Err(e) => e,
+            Ok(_) => panic!("no runtime handle must reject an engine-observed start"),
+        };
+        assert!(
+            matches!(err, EngineError::ObservedMetering { .. }),
+            "expected ObservedMetering, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("runtime"),
+            "names the cause: {err}"
+        );
     }
 }

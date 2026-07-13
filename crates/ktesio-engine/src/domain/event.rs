@@ -16,6 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::budget::{BreachAction, BreachScope};
+use super::cost::{EstimateLabel, Micros};
 use super::lifecycle::LifecycleState;
 
 /// The schema version stamped on every emitted [`TransitionEvent`].
@@ -25,10 +27,15 @@ use super::lifecycle::LifecycleState;
 /// unversioned event.
 ///
 /// NOTE (additive vs breaking): story 1-5 ADDS `TransitionCause` variants
-/// (`pause-best-effort` / `resume-best-effort`) and story 1-6 ADDS `crashed` /
-/// `restarted`. Adding a new closed-vocabulary variant is a backward-ADDITIVE
-/// change: a NEW reader parses every OLD event, and no field is renamed or
-/// removed, so the version is NOT bumped. (The
+/// (`pause-best-effort` / `resume-best-effort`), story 1-6 ADDS `crashed` /
+/// `restarted`, and story 3-2 ADDS `budget-exceeded` (the Breach-Action cause on
+/// the `running → paused`/`stopping` edge). Story 3-3 ADDS a `dimension`
+/// discriminator + optional dollar fields to the EXISTING `budget-exceeded` cause
+/// (a token breach's `dimension` defaults to `tokens`, its dollar fields absent) —
+/// a NEW reader parses every OLD event and no field is renamed/removed, so this is
+/// backward-additive and does NOT bump the version. Adding a new closed-vocabulary
+/// variant is likewise backward-ADDITIVE: a NEW reader parses every OLD event, and
+/// no field is renamed or removed, so the version is NOT bumped. (The
 /// converse — an OLD reader meeting a NEW cause — is a separate forward-compat
 /// question: because `TransitionCause` is `#[serde(tag = "kind")]` with no
 /// `#[serde(other)]` fallback, an old reader that hits an unknown tag ERRORS
@@ -50,11 +57,34 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 /// shape must not force a version bump on the other). It rides on the
 /// [`crate::FleetListing`] wrapper (for `list`) and each `show --json` object.
 ///
-/// Bumped only on an INCOMPATIBLE change to the Fleet document shape. Adding a
-/// field (e.g. populating the Epic-3 `budget`/`usage` from `null` to a real
-/// type) is backward-ADDITIVE and does NOT bump the version — a new reader
-/// parses every old document and no field is renamed or removed.
-pub const FLEET_SCHEMA_VERSION: u32 = 1;
+/// Bumped only on a change to the Fleet document shape that consumers negotiate on.
+/// POPULATING an existing field from `null` to a real type (e.g. the Epic-3
+/// `budget`/`usage`) is transparently backward-additive and did NOT bump it. Story
+/// 3-5 bumps it **1 → 2**: the `list --json` document GAINS a first-class top-level
+/// `totals` object (the Fleet-WIDE [`crate::FleetTotals`] aggregate) that consumers
+/// and the future 7-2 Host stream will want to negotiate on. The change is ADDITIVE
+/// — a v2 reader parses every v1 document (no field is renamed or removed), and a v1
+/// consumer that ignores the new `totals` still parses `instances` — but the bump is
+/// the honest signal that a new first-class field exists, matching the 1-7/3-1/3-3
+/// discipline of treating the Fleet document version as the `--json` contract. (The
+/// `show --json` document carries this same version but does NOT gain `totals`: a
+/// single instance has no Fleet total — its own `usage` IS its total.) A future
+/// INCOMPATIBLE change (renaming/removing a field) would bump it again.
+pub const FLEET_SCHEMA_VERSION: u32 = 2;
+
+/// The schema version stamped on every emitted [`BudgetBreachEvent`] (story 3-2,
+/// AD-14).
+///
+/// AD-14 names "breaches" explicitly among the versioned engine event structs the
+/// subscription API + `kt --json` share. 3-2 FREEZES the breach-event wire shape
+/// now — a versioned serde struct carrying the TOKEN breach fields — so `kt --json`
+/// and the future 7-2 Host stream cannot drift into two dialects. A SEPARATE
+/// constant from the sibling schemas ([`EVENT_SCHEMA_VERSION`],
+/// [`FLEET_SCHEMA_VERSION`], [`crate::USAGE_SCHEMA_VERSION`]) — the wire shapes
+/// evolve independently, so a change to one must not force a version bump on the
+/// others. It starts at 1, aligned with the siblings. Bumped only on an
+/// INCOMPATIBLE change; adding a field is backward-additive and does NOT bump it.
+pub const BUDGET_SCHEMA_VERSION: u32 = 1;
 
 /// Why a lifecycle transition happened (the transition event's `cause`).
 ///
@@ -127,6 +157,81 @@ pub enum TransitionCause {
         /// The backoff waited before this restart, in milliseconds.
         waited_ms: u64,
     },
+    /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
+    /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
+    /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
+    /// explains WHY. Wire tag `budget-exceeded` — the SAME edge for both dimensions
+    /// (3-3 adds a REASON, not a new edge). Carries the breached scope + the ceiling
+    /// reached + the observed total.
+    ///
+    /// DIMENSION (story 3-3, additive per AD-14): [`dimension`](Self::BudgetExceeded)
+    /// distinguishes a TOKEN breach (`tokens`, the 3-2 default — `limit`/`observed`
+    /// are token counts, the dollar fields ABSENT) from a DOLLAR breach (`dollars`
+    /// — `limit`/`observed` mirror the dollar micros, and `dollar_limit`/
+    /// `dollar_observed`/`estimate_label` carry the honest labeled money). The
+    /// discriminator + optional fields are backward-ADDITIVE: an OLD reader that
+    /// predates 3-3 parses a token `budget-exceeded` unchanged (the `dimension`
+    /// defaults to `tokens`, the dollar fields are absent). A `warn` action produces
+    /// NO transition, so it NEVER carries this cause (only the standalone
+    /// [`BudgetBreachEvent`] records a `warn`).
+    BudgetExceeded {
+        /// Which budget scope tripped (`per-run` / `cumulative`).
+        scope: BreachScope,
+        /// The dimension that tripped (`tokens` / `dollars`) — story 3-3. Defaults
+        /// to `tokens` on the wire when absent (a pre-3-3 token breach).
+        #[serde(default)]
+        dimension: BreachDimension,
+        /// The ceiling that was reached (token count for a `tokens` breach; the
+        /// dollar-cap micros for a `dollars` breach).
+        limit: u64,
+        /// The committed total that reached it (`>= limit`).
+        observed: u64,
+        /// The dollar cap that was reached, in micro-dollars (story 3-3) — present
+        /// ONLY for a `dollars` breach, absent (JSON omitted) for a `tokens` breach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dollar_limit: Option<Micros>,
+        /// The derived cost that reached the dollar cap, in micro-dollars (story
+        /// 3-3) — present ONLY for a `dollars` breach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dollar_observed: Option<Micros>,
+        /// The estimate label on the dollar figures (story 3-3, AD-8) — present
+        /// ONLY for a `dollars` breach; v1 always `estimated`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimate_label: Option<EstimateLabel>,
+    },
+}
+
+/// Which DIMENSION of a budget tripped (story 3-3, AD-8) — a TOKEN ceiling
+/// (story 3-2) or a DOLLAR Cost Cap (story 3-3). The discriminator that lets the
+/// SINGLE [`BudgetBreachEvent`] + the SINGLE `budget-exceeded`
+/// [`TransitionCause::BudgetExceeded`] carry BOTH dimensions (AD-14: one breach
+/// struct for the subscription). `tokens` is the DEFAULT so a pre-3-3 breach
+/// (which had no `dimension` field) parses as a token breach. Kebab-case on the
+/// wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BreachDimension {
+    /// A TOKEN-count ceiling tripped (story 3-2). The default (back-compat).
+    #[default]
+    Tokens,
+    /// A DOLLAR Cost Cap tripped (story 3-3).
+    Dollars,
+}
+
+impl BreachDimension {
+    /// The stable wire/label form (`"tokens"` / `"dollars"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BreachDimension::Tokens => "tokens",
+            BreachDimension::Dollars => "dollars",
+        }
+    }
+}
+
+impl std::fmt::Display for BreachDimension {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl TransitionCause {
@@ -177,6 +282,49 @@ impl TransitionCause {
     pub fn restarted(count: u32, waited_ms: u64) -> Self {
         TransitionCause::Restarted { count, waited_ms }
     }
+
+    /// A TOKEN BUDGET-EXCEEDED cause recording the breached `scope` + the `limit`
+    /// reached + the `observed` total (story 3-2, AC7). The `dimension` is `tokens`
+    /// and the dollar fields are absent. Mirrors the other constructors; used on the
+    /// `running → paused`/`stopping` transition the Breach Action drives.
+    pub fn budget_exceeded(scope: BreachScope, limit: u64, observed: u64) -> Self {
+        TransitionCause::BudgetExceeded {
+            scope,
+            dimension: BreachDimension::Tokens,
+            limit,
+            observed,
+            dollar_limit: None,
+            dollar_observed: None,
+            estimate_label: None,
+        }
+    }
+
+    /// A DOLLAR Cost-Cap-EXCEEDED cause (story 3-3, AC10) — the `dimension` is
+    /// `dollars`, `limit`/`observed` mirror the dollar micros, and the dedicated
+    /// dollar fields carry the labeled money. Used on the SAME
+    /// `running → paused`/`stopping` transition a dollar breach drives (a REASON,
+    /// not a new edge — AD-15). `limit_micros`/`observed_micros` are the cap + the
+    /// derived cost in micro-dollars; `label` is the estimate label (v1 `estimated`).
+    pub fn cost_cap_exceeded(
+        scope: BreachScope,
+        limit_micros: Micros,
+        observed_micros: Micros,
+        label: EstimateLabel,
+    ) -> Self {
+        // The unit-agnostic limit/observed carry the same micros (a non-negative
+        // cost clamps to 0 defensively) so an old reader still sees a numeric total.
+        let limit = u64::try_from(limit_micros.get()).unwrap_or(0);
+        let observed = u64::try_from(observed_micros.get()).unwrap_or(0);
+        TransitionCause::BudgetExceeded {
+            scope,
+            dimension: BreachDimension::Dollars,
+            limit,
+            observed,
+            dollar_limit: Some(limit_micros),
+            dollar_observed: Some(observed_micros),
+            estimate_label: Some(label),
+        }
+    }
 }
 
 /// A recorded lifecycle state transition (spine AD-14 seed).
@@ -220,6 +368,141 @@ impl TransitionEvent {
             prior_state,
             new_state,
             cause,
+            at: at.into(),
+        }
+    }
+}
+
+/// A recorded Token-Budget BREACH (spine AD-14, story 3-2) — the ALWAYS-recorded
+/// event FR-21 requires "regardless of action".
+///
+/// Emitted from the ledger-commit choke point the instant a just-committed total
+/// reaches a configured ceiling ([`super::budget::BudgetEvaluator`] returns
+/// `Breached`), recorded BEFORE/independently of the lifecycle side-effect so a
+/// best-effort/unsupported/failed pause NEVER loses the breach record (the FR-21
+/// invariant + the NFR safety note). Recorded for EVERY action — including `warn`
+/// (no transition) — as a durable JSON line, and (for `pause`/`stop`) mirrored as
+/// a [`TransitionCause::BudgetExceeded`] on the resulting transition.
+///
+/// DIMENSION (story 3-3, AD-8/AD-14 — additive, back-compatible): a TOKEN breach
+/// (3-2) keeps its shape — `dimension` defaults to `tokens`, the dollar fields
+/// ABSENT — while a DOLLAR breach carries `dimension = dollars`, the dollar
+/// cap/observed cost as integer micros, and the [`EstimateLabel`]. This is the ONE
+/// breach struct the AD-14 subscription publishes for BOTH dimensions (the story's
+/// recommendation: a discriminator + optional fields over a schema bump). The
+/// additive optional fields default-null, so an OLD (`schema_version = 1`) reader
+/// parses every token breach unchanged and never sees a dollar field it does not
+/// understand — so [`BUDGET_SCHEMA_VERSION`] does NOT bump. The wire carries INTEGER
+/// MICROS + the label, NEVER a pre-formatted `$` string (AD-14 — a Host formats its
+/// own currency). Full subscription DELIVERY is 7-2's; 3-2/3-3 record + freeze the
+/// struct.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetBreachEvent {
+    /// The breach-event schema version ([`BUDGET_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The Agent Instance whose ledger crossed the ceiling.
+    pub instance: String,
+    /// The Run (spine AD-7) the breaching event was committed under.
+    pub run_id: String,
+    /// Which budget scope tripped (`per-run` / `cumulative`).
+    pub scope: BreachScope,
+    /// Which DIMENSION tripped (`tokens` / `dollars`) — story 3-3. Defaults to
+    /// `tokens` when absent on the wire (a pre-3-3 token breach).
+    #[serde(default)]
+    pub dimension: BreachDimension,
+    /// The ceiling that was reached — a token count for a `tokens` breach, the
+    /// dollar-cap micros for a `dollars` breach.
+    pub limit: u64,
+    /// The committed total that reached it (`>= limit`) — tokens or micros per
+    /// `dimension`.
+    pub observed: u64,
+    /// The dollar cap reached, in micro-dollars (story 3-3) — present ONLY for a
+    /// `dollars` breach, absent (JSON omitted) for a `tokens` breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollar_limit: Option<Micros>,
+    /// The derived cost that reached the dollar cap, in micro-dollars (story 3-3) —
+    /// present ONLY for a `dollars` breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollar_observed: Option<Micros>,
+    /// The estimate label on the dollar figures (story 3-3, AD-8) — present ONLY
+    /// for a `dollars` breach; v1 always `estimated`. NEVER a pre-formatted `$`
+    /// string — the render module is human-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_label: Option<EstimateLabel>,
+    /// The Breach Action taken (`pause` / `stop` / `warn`).
+    pub action: BreachAction,
+    /// The Metering Source that produced the breaching event's usage, as its wire
+    /// string (`self-reported` / `engine-observed`).
+    pub metering_source: String,
+    /// RFC 3339 UTC timestamp the engine stamped when it recorded the breach.
+    pub at: String,
+}
+
+impl BudgetBreachEvent {
+    /// Build a TOKEN breach event (story 3-2), stamping the current
+    /// [`BUDGET_SCHEMA_VERSION`]. `dimension` is `tokens`, the dollar fields absent.
+    /// `at` is an RFC 3339 UTC timestamp (a parameter so the struct stays pure and
+    /// unit-testable with a fixed clock, like [`TransitionEvent::new`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instance: impl Into<String>,
+        run_id: impl Into<String>,
+        scope: BreachScope,
+        limit: u64,
+        observed: u64,
+        action: BreachAction,
+        metering_source: impl Into<String>,
+        at: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: BUDGET_SCHEMA_VERSION,
+            instance: instance.into(),
+            run_id: run_id.into(),
+            scope,
+            dimension: BreachDimension::Tokens,
+            limit,
+            observed,
+            dollar_limit: None,
+            dollar_observed: None,
+            estimate_label: None,
+            action,
+            metering_source: metering_source.into(),
+            at: at.into(),
+        }
+    }
+
+    /// Build a DOLLAR breach event (story 3-3, AC10), stamping the current
+    /// [`BUDGET_SCHEMA_VERSION`]. `dimension` is `dollars`; the dollar cap +
+    /// observed cost ride BOTH the unit-agnostic `limit`/`observed` (as micros, so
+    /// an old reader still sees a numeric total) AND the dedicated
+    /// `dollar_limit`/`dollar_observed` micro fields; `label` is the estimate label.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_cost(
+        instance: impl Into<String>,
+        run_id: impl Into<String>,
+        scope: BreachScope,
+        limit_micros: Micros,
+        observed_micros: Micros,
+        label: EstimateLabel,
+        action: BreachAction,
+        metering_source: impl Into<String>,
+        at: impl Into<String>,
+    ) -> Self {
+        let limit = u64::try_from(limit_micros.get()).unwrap_or(0);
+        let observed = u64::try_from(observed_micros.get()).unwrap_or(0);
+        Self {
+            schema_version: BUDGET_SCHEMA_VERSION,
+            instance: instance.into(),
+            run_id: run_id.into(),
+            scope,
+            dimension: BreachDimension::Dollars,
+            limit,
+            observed,
+            dollar_limit: Some(limit_micros),
+            dollar_observed: Some(observed_micros),
+            estimate_label: Some(label),
+            action,
+            metering_source: metering_source.into(),
             at: at.into(),
         }
     }
@@ -286,10 +569,201 @@ mod tests {
             ),
             (TransitionCause::crashed("x"), "crashed"),
             (TransitionCause::restarted(1, 1000), "restarted"),
+            (
+                TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
+                "budget-exceeded",
+            ),
         ];
         for (cause, tag) in cases {
             let json = serde_json::to_string(&cause).unwrap();
             assert!(json.contains(&format!("\"kind\":\"{tag}\"")), "{json}");
+        }
+    }
+
+    #[test]
+    fn budget_exceeded_cause_round_trips_with_its_fields() {
+        // AC7: the Breach-Action cause carries the honest WHY (scope + limit +
+        // observed, tokens only) and survives a JSON round-trip through the log.
+        let cause = TransitionCause::budget_exceeded(BreachScope::Cumulative, 500, 512);
+        let json = serde_json::to_string(&cause).unwrap();
+        assert!(json.contains("\"kind\":\"budget-exceeded\""), "{json}");
+        assert!(json.contains("\"scope\":\"cumulative\""), "{json}");
+        // Tokens only — no dollar field leaked into the cause payload.
+        assert!(!json.contains("cost"), "{json}");
+        let back: TransitionCause = serde_json::from_str(&json).unwrap();
+        match back {
+            TransitionCause::BudgetExceeded {
+                scope,
+                dimension,
+                limit,
+                observed,
+                dollar_limit,
+                ..
+            } => {
+                assert_eq!(scope, BreachScope::Cumulative);
+                // A TOKEN breach: dimension = tokens, no dollar fields.
+                assert_eq!(dimension, BreachDimension::Tokens);
+                assert_eq!(dollar_limit, None);
+                assert_eq!(limit, 500);
+                assert_eq!(observed, 512);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_breach_event_round_trips_with_schema_version_and_snake_case() {
+        // AC10: the versioned breach wire struct `kt --json` + 7-2 share. Carries
+        // the schema version + the token breach fields, snake_case, tokens only.
+        let e = BudgetBreachEvent::new(
+            "web-1",
+            "run-42-7",
+            BreachScope::PerRun,
+            1000,
+            1000,
+            BreachAction::Pause,
+            "self-reported",
+            "2026-07-08T00:00:00Z",
+        );
+        assert_eq!(e.schema_version, BUDGET_SCHEMA_VERSION);
+        let value: serde_json::Value = serde_json::to_value(&e).unwrap();
+        let obj = value.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "action",
+                "at",
+                "dimension",
+                "instance",
+                "limit",
+                "metering_source",
+                "observed",
+                "run_id",
+                "schema_version",
+                "scope",
+            ]
+        );
+        assert_eq!(value["scope"], serde_json::json!("per-run"));
+        assert_eq!(value["action"], serde_json::json!("pause"));
+        assert_eq!(value["limit"], serde_json::json!(1000));
+        // A TOKEN breach: dimension = tokens, and the dollar fields are ABSENT
+        // (skip_serializing_if) — no dollar figure leaks into a token breach.
+        assert_eq!(value["dimension"], serde_json::json!("tokens"));
+        assert!(obj.get("dollar_limit").is_none());
+        assert!(obj.get("dollar_observed").is_none());
+        assert!(obj.get("estimate_label").is_none());
+        assert!(obj.get("cost").is_none());
+        assert!(obj.get("dollars").is_none());
+        let json = serde_json::to_string(&e).unwrap();
+        let back: BudgetBreachEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn a_pre_3_3_token_breach_without_dimension_still_parses_as_tokens() {
+        // BACK-COMPAT (AD-14): a breach JSON that predates 3-3 (NO `dimension`, NO
+        // dollar fields) must still deserialize — `dimension` defaults to `tokens`
+        // and the dollar fields to None. This proves the additive change does not
+        // break an old wire document.
+        let legacy = r#"{
+            "schema_version": 1,
+            "instance": "web-1",
+            "run_id": "run-1-0",
+            "scope": "cumulative",
+            "limit": 500,
+            "observed": 512,
+            "action": "pause",
+            "metering_source": "self-reported",
+            "at": "2026-07-08T00:00:00Z"
+        }"#;
+        let back: BudgetBreachEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.dimension, BreachDimension::Tokens);
+        assert_eq!(back.dollar_limit, None);
+        assert_eq!(back.estimate_label, None);
+        assert_eq!(back.limit, 500);
+    }
+
+    #[test]
+    fn a_dollar_breach_event_round_trips_with_integer_micros_and_label_no_dollar_string() {
+        // AC10: a DOLLAR breach carries dimension=dollars, integer-micro dollar
+        // limit/observed, and the estimate label — snake_case, NO `$` string, NO
+        // f64. A $0.50 cap reached by $0.50 of derived cost.
+        let e = BudgetBreachEvent::new_cost(
+            "web-1",
+            "run-9-0",
+            BreachScope::Cumulative,
+            Micros(500_000),
+            Micros(500_000),
+            EstimateLabel::Estimated,
+            BreachAction::Pause,
+            "self-reported",
+            "2026-07-08T00:00:00Z",
+        );
+        assert_eq!(e.schema_version, BUDGET_SCHEMA_VERSION);
+        let value: serde_json::Value = serde_json::to_value(&e).unwrap();
+        assert_eq!(value["dimension"], serde_json::json!("dollars"));
+        // Integer micros on the wire — never a float, never a `$` string.
+        assert_eq!(value["dollar_limit"], serde_json::json!(500_000));
+        assert_eq!(value["dollar_observed"], serde_json::json!(500_000));
+        assert_eq!(value["estimate_label"], serde_json::json!("estimated"));
+        // The unit-agnostic limit/observed carry the same micros (an old reader sees
+        // a numeric total).
+        assert_eq!(value["limit"], serde_json::json!(500_000));
+        // No pre-formatted `$` string anywhere in the payload.
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains('$'), "no `$` string on the wire: {json}");
+        let back: BudgetBreachEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn breach_dimension_wire_form() {
+        assert_eq!(BreachDimension::Tokens.as_str(), "tokens");
+        assert_eq!(BreachDimension::Dollars.as_str(), "dollars");
+        assert_eq!(BreachDimension::default(), BreachDimension::Tokens);
+        // Display agrees with as_str (the BreachScope/BreachAction convention).
+        assert_eq!(BreachDimension::Tokens.to_string(), "tokens");
+        assert_eq!(BreachDimension::Dollars.to_string(), "dollars");
+        assert_eq!(
+            serde_json::to_string(&BreachDimension::Dollars).unwrap(),
+            "\"dollars\""
+        );
+    }
+
+    #[test]
+    fn cost_cap_exceeded_cause_round_trips_with_dollar_fields() {
+        // AC10: the dollar breach CAUSE reuses the `budget-exceeded` tag (the same
+        // edge — AD-15) but carries dimension=dollars + the labeled micros.
+        let cause = TransitionCause::cost_cap_exceeded(
+            BreachScope::PerRun,
+            Micros(5_000_000),
+            Micros(5_250_000),
+            EstimateLabel::Estimated,
+        );
+        let json = serde_json::to_string(&cause).unwrap();
+        assert!(json.contains("\"kind\":\"budget-exceeded\""), "{json}");
+        assert!(json.contains("\"dimension\":\"dollars\""), "{json}");
+        assert!(json.contains("\"estimate_label\":\"estimated\""), "{json}");
+        assert!(!json.contains('$'), "no `$` string on the wire: {json}");
+        let back: TransitionCause = serde_json::from_str(&json).unwrap();
+        match back {
+            TransitionCause::BudgetExceeded {
+                scope,
+                dimension,
+                dollar_limit,
+                dollar_observed,
+                estimate_label,
+                ..
+            } => {
+                assert_eq!(scope, BreachScope::PerRun);
+                assert_eq!(dimension, BreachDimension::Dollars);
+                assert_eq!(dollar_limit, Some(Micros(5_000_000)));
+                assert_eq!(dollar_observed, Some(Micros(5_250_000)));
+                assert_eq!(estimate_label, Some(EstimateLabel::Estimated));
+            }
+            other => panic!("expected BudgetExceeded(dollars), got {other:?}"),
         }
     }
 

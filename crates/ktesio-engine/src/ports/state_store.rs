@@ -12,7 +12,10 @@
 //! sync is the correct altitude now. The trait takes no runtime handle and
 //! holds no global state, keeping it facade-friendly for the 1.4 migration.
 
-use crate::domain::{AgentInstance, InstanceName, LifecycleState, RestartPolicy};
+use crate::domain::{
+    AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome, RestartPolicy, RunId,
+    UsageEvent, UsageTotals,
+};
 
 use super::{ProcessFingerprint, StoreError};
 
@@ -43,10 +46,12 @@ pub struct SpawnRecord {
     pub last_known_cause: Option<String>,
 }
 
-/// Persistence port for registry + lifecycle + Usage Ledger reads.
+/// Persistence port for registry + lifecycle + the Usage Ledger.
 ///
-/// The minimal surface this story needs. Later stories widen it (lifecycle
-/// transitions, usage-event writes) additively.
+/// The surface grows additively per story. Story 3-1 adds the append-only
+/// Usage-Ledger WRITE ([`StateStore::record_usage_event`]) and the token-total
+/// READS ([`StateStore::usage_totals`] / [`StateStore::run_usage_totals`]) beside
+/// the existing [`StateStore::count_usage_events`] (spine AD-6/AD-7).
 pub trait StateStore {
     /// Insert a new instance row.
     ///
@@ -74,15 +79,71 @@ pub trait StateStore {
     ///
     /// Fails with [`StoreError::NotFound`] if no such row exists, so callers
     /// can distinguish "removed" from "was never there". `ON DELETE CASCADE`
-    /// cleans up any `usage_events` rows (none this story).
+    /// cleans up the instance's `usage_events` rows (story 3-1 populates them).
     fn delete_instance(&self, name: &InstanceName) -> Result<(), StoreError>;
 
     /// Count Usage Ledger events for an instance.
     ///
-    /// Used to prove the "empty Usage Ledger" acceptance criterion: a freshly
-    /// registered instance returns `0`. The Usage Ledger is table rows scoped
-    /// by instance, not a file (AD-6).
+    /// A freshly registered instance returns `0` (Epic 1's "empty Usage Ledger"
+    /// proof); story 3-1 populates the table so a metered instance returns a real
+    /// count. The Usage Ledger is table rows scoped by instance, not a file (AD-6).
     fn count_usage_events(&self, name: &InstanceName) -> Result<u64, StoreError>;
+
+    // ---- Usage Ledger writes + reads (story 3-1, spine AD-6/AD-7) ----
+
+    /// Append ONE [`UsageEvent`] to the Usage Ledger in its OWN transaction (AD-6:
+    /// one transaction per usage event, the ≤1s durability bound). A single-
+    /// statement INSERT.
+    ///
+    /// Idempotent on the event's `(instance_id, run_id, sequence)` key — the
+    /// no-double-count DB invariant (AC-A). A re-delivered batch whose key already
+    /// exists hits the `UNIQUE` index and is classified [`RecordOutcome::DuplicateReplay`]
+    /// (a NO-OP, NOT an error): nothing is inserted, the ledger total is unchanged.
+    /// A brand-new event returns [`RecordOutcome::Inserted`]. Fails with
+    /// [`StoreError::NotFound`] if the instance row is gone (the FK target).
+    ///
+    /// This is the SOLE Usage-Ledger writer the engine's commit choke point calls;
+    /// no other code path may mutate `usage_events` (the AD-7 single-writer
+    /// invariant, which story 3-2's enforcement relies on).
+    ///
+    /// `rate` (story 3-3) is the EFFECTIVE per-direction [`Rate`] resolved AT COMMIT,
+    /// persisted onto the row so historical dollars keep the Rate in force when
+    /// consumed (no retroactive repricing — AC-A). `None` = no Rate configured at
+    /// commit → the row contributes $0 to the derived cost (honestly absent — AC-B).
+    /// It is stamped alongside the frozen [`UsageEvent`] token fields WITHOUT
+    /// touching the adapter-facing wire type (AD-6: an engine-side ledger concern).
+    fn record_usage_event(
+        &self,
+        event: &UsageEvent,
+        rate: Option<Rate>,
+    ) -> Result<RecordOutcome, StoreError>;
+
+    /// The CUMULATIVE token totals for an instance — the sum of `input_tokens` /
+    /// `output_tokens` over ALL its `usage_events` rows (every Run), the AD-6
+    /// "rollup aggregates" summed on read. An absent instance (or one with no
+    /// events) totals [`UsageTotals::zero`] (mirrors [`StateStore::count_usage_events`]).
+    fn usage_totals(&self, name: &InstanceName) -> Result<UsageTotals, StoreError>;
+
+    /// The PER-RUN token totals for an instance — the sum scoped to a single
+    /// `(instance_id, run_id)` (AC-B: per-run totals reflect the `starting`→terminal
+    /// span). An absent instance / unknown Run totals [`UsageTotals::zero`].
+    fn run_usage_totals(
+        &self,
+        name: &InstanceName,
+        run_id: &RunId,
+    ) -> Result<UsageTotals, StoreError>;
+
+    /// The CUMULATIVE derived DOLLAR cost for an instance (story 3-3, AC-A) — the
+    /// sum over ALL its `usage_events` rows of each row's cost priced at THAT ROW'S
+    /// OWN persisted Rate (no retroactive repricing). A row with a NULL rate (no
+    /// Rate at commit, or a pre-v4 row) contributes [`Micros::ZERO`]. An absent
+    /// instance totals [`Micros::ZERO`]. Overflow SATURATES (billing discipline).
+    fn cost_totals(&self, name: &InstanceName) -> Result<Micros, StoreError>;
+
+    /// The PER-RUN derived DOLLAR cost for an instance (story 3-3) — the same
+    /// per-row-priced sum scoped to a single `(instance_id, run_id)`. An absent
+    /// instance / unknown Run totals [`Micros::ZERO`].
+    fn run_cost_totals(&self, name: &InstanceName, run_id: &RunId) -> Result<Micros, StoreError>;
 
     // ---- Write-ahead spawn records (story 1-6, spine AD-5/AD-6) ----
 

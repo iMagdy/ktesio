@@ -53,6 +53,11 @@ pub mod adapter;
 mod backends;
 pub mod domain;
 mod engine;
+// Engine-observed metering (AD-7 / FR-19), story 3-4: the loopback forward
+// listener + the OpenAI `usage` parse. Engine-INTERNAL (AD-2 — `kt` never sees
+// the listener); the supervisor drives it. Portable — NO OS cfg (in core, not
+// `backends/`; the OS-cfg gate stays green).
+mod metering;
 pub mod paths;
 pub mod ports;
 mod store;
@@ -64,11 +69,14 @@ mod time;
 // collaborators + tests but is no longer what `kt` uses directly.
 pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
-    is_pass_through, resolve, AgentInstance, ConfigError, ConfigLayer, EffectiveConfig,
-    EngineError, FleetEntry, FleetListing, InstanceName, LifecycleCommand, LifecycleError,
-    LifecycleState, MeteringSeed, NameError, Registry, RegistryError, RemoveDisposition,
-    ResolvedValue, RestartPolicy, SourceLayer, TransitionCause, TransitionEvent,
-    EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, PASS_THROUGH_PREFIX, SECRET_MASK,
+    is_pass_through, render_dollars, render_dollars_bare, resolve, AgentInstance, BreachAction,
+    BreachDimension, BreachScope, BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap,
+    EffectiveConfig, EngineError, EstimateLabel, FleetEntry, FleetListing, FleetTotals,
+    InstanceName, LifecycleCommand, LifecycleError, LifecycleState, Micros, NameError, Rate,
+    Registry, RegistryError, RemoveDisposition, ResolvedValue, RestartPolicy, RunId, SourceLayer,
+    TokenBudget, TransitionCause, TransitionEvent, UsageEvent, UsageTotals, UsageUpdateEvent,
+    UsageView, BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
+    MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, InstanceStatus};
 

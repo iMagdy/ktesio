@@ -1,17 +1,23 @@
 //! Hexagonal ports (spine AD-1).
 //!
 //! Ports are the traits through which all variability enters the engine core.
-//! This crate realizes three: [`StateStore`] (persistence), [`ProcessBackend`]
+//! This crate realizes four: [`StateStore`] (persistence), [`ProcessBackend`]
 //! (per-OS process control, AD-4 — its per-OS impls live in `backends/`, the sole
-//! allowlisted `#[cfg]` home), and, from story 2-4, [`SecretResolver`] (secret
+//! allowlisted `#[cfg]` home), from story 2-4 [`SecretResolver`] (secret
 //! resolution, AD-10 — env + the 0600 secrets file; OS-keychain stays a deferred
-//! resolver behind the same port). The remaining ports (`MeteringSource`,
-//! `MemoryBacking`) arrive with the stories that need them (entity-timing) — no
-//! speculative port trees.
+//! resolver behind the same port), and, from story 3-1, [`UsageSource`] (the AD-7
+//! metering INGESTION seam — the self-reported channel that yields usage from a
+//! running instance). Story 3-4 landed the SECOND source, [`ObservedUsageSource`]
+//! (`engine-observed`): it is fed by the loopback forward listener
+//! (`crate::metering`) and, being event-driven rather than a log-tail drainer,
+//! mints its [`ParsedUsage`] directly while yielding the SAME shape into the SAME
+//! commit choke point. The remaining port (`MemoryBacking`) arrives with the story
+//! that needs it (entity-timing) — no speculative port trees.
 
 mod process_backend;
 mod secret_resolver;
 mod state_store;
+mod usage_source;
 
 pub use process_backend::{
     BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
@@ -21,6 +27,10 @@ pub use secret_resolver::{
     FileSecretResolver, SecretError, SecretResolver,
 };
 pub use state_store::{SpawnRecord, StateStore};
+pub use usage_source::{
+    assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line,
+    ObservedUsageSource, ParsedUsage, SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
+};
 
 use thiserror::Error;
 

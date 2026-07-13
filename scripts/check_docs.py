@@ -39,7 +39,24 @@ KT_COMMANDS = {
     "uninstall",
     "remove",
     "help",
+    "agent",
 }
+# `kt agent` owns its own subcommand tree (crates/kt/src/main.rs `AgentCommands`).
+# Model it the same way as the top level — an allowlist per nesting level — so the
+# agent-runner surface validates without a blanket bypass.
+AGENT_COMMANDS = {
+    "register",
+    "remove",
+    "start",
+    "stop",
+    "pause",
+    "resume",
+    "list",
+    "show",
+    "config",
+}
+# `kt agent config` nests one level deeper (`ConfigCommands`).
+CONFIG_COMMANDS = {"get", "set"}
 
 
 def main() -> int:
@@ -145,6 +162,54 @@ def validate_command_examples(
         if command not in KT_COMMANDS:
             errors.append(
                 f"{rel_path}: shell fence #{fence_index}, line {line_number}: unknown `kt` command `{command}`"
+            )
+            continue
+        if command == "agent":
+            validate_agent_subcommands(
+                rel_path, fence_index, line_number, tokens[command_index + 2 :], errors
+            )
+
+
+def first_non_flag(tokens: list[str]) -> tuple[int, str] | None:
+    """Return the (index, token) of the first non-flag token, or None if every token
+    is a flag (or the list is empty)."""
+    for index, token in enumerate(tokens):
+        if not token.startswith("-"):
+            return index, token
+    return None
+
+
+def validate_agent_subcommands(
+    rel_path: Path,
+    fence_index: int,
+    line_number: int,
+    rest: list[str],
+    errors: list[str],
+) -> None:
+    """Validate the `kt agent` subcommand tree (crates/kt/src/main.rs `AgentCommands`
+    / `ConfigCommands`), mirroring the top-level allowlist at each nesting level.
+
+    `rest` is the tokens AFTER `kt agent`. A flag-only tail (e.g. `kt agent --help`)
+    is left to clap and not flagged; only a present-but-unknown subcommand is an error.
+    """
+    found = first_non_flag(rest)
+    if found is None:
+        return
+    index, subcommand = found
+    if subcommand not in AGENT_COMMANDS:
+        errors.append(
+            f"{rel_path}: shell fence #{fence_index}, line {line_number}: unknown `kt agent` command `{subcommand}`"
+        )
+        return
+    if subcommand == "config":
+        config_found = first_non_flag(rest[index + 1 :])
+        if config_found is None:
+            return
+        _, config_subcommand = config_found
+        if config_subcommand not in CONFIG_COMMANDS:
+            errors.append(
+                f"{rel_path}: shell fence #{fence_index}, line {line_number}: "
+                f"unknown `kt agent config` command `{config_subcommand}`"
             )
 
 

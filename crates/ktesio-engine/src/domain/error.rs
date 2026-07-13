@@ -273,6 +273,24 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// The `engine-observed` loopback forward listener could not START at `start`
+    /// (story 3-4, FR-19/AD-7). Reasons: no configured upstream provider URL
+    /// (`metering.upstream_base_url` unset), a non-http/https upstream (v1
+    /// HTTP-only), a loopback bind failure, or no engine runtime handle to spawn on.
+    /// The listener starts BEFORE the `starting` transition, so a failure FAILS the
+    /// start cleanly — the instance stays in its prior state, NO half-launch
+    /// (mirroring the snapshot/secret failures). `detail` carries the underlying
+    /// [`crate::ports`]-level listener reason, which is TRAFFIC-FREE by construction
+    /// (no request/response body, header, URL, or API key — the 2-4 no-leak rigor,
+    /// since this proxy carries the agent's model traffic). Names the instance.
+    #[error("could not start engine-observed metering for Agent Instance '{name}': {detail}")]
+    ObservedMetering {
+        /// The instance whose observed listener failed to start.
+        name: String,
+        /// The underlying listener reason (traffic-free — never a body/header/key).
+        detail: String,
+    },
+
     /// A per-instance log I/O operation failed (AD-12 seed). Names the path.
     #[error("could not write the instance log for '{name}' at {path}: {detail}")]
     Log {

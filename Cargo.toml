@@ -33,11 +33,29 @@ clap = { version = "4", features = ["derive"] }
 # Async runtime for the engine supervision core (AD-13, Islam-approved in story
 # 1-4). Minimal feature set — NOT "full": rt-multi-thread (the runtime the
 # blocking facade owns), process (spawn/wait child agents), time (the graceful
-# stop window), sync (supervisor channels), macros (#[tokio::test]). We do NOT
-# enable/require tokio_unstable — process-group control uses nix/windows-sys in
-# the engine backends instead. Referenced by ktesio-engine only (kt uses the
-# blocking facade; adapter-api is pure contract types). MSRV 1.71 << floor 1.96.1.
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros"] }
+# stop window), sync (supervisor channels), macros (#[tokio::test]), net +
+# io-util (story 3-4: the engine-observed loopback forward listener's async TCP +
+# stream copy — loopback HTTP is portable, NO OS cfg). We do NOT enable/require
+# tokio_unstable — process-group control uses nix/windows-sys in the engine
+# backends instead. Referenced by ktesio-engine only (kt uses the blocking
+# facade; adapter-api is pure contract types). MSRV 1.71 << floor 1.96.1.
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros", "net", "io-util"] }
+# Engine-observed metering (AD-7 / FR-19), story 3-4: the loopback forward
+# listener's HTTP substrate. `hyper` is the de-facto LEAN async HTTP building
+# block (server + client + http1); `hyper-util` provides the tokio glue (the
+# legacy client for the outbound forward leg + the auto/graceful server conn);
+# `http-body-util` + `bytes` collect/relay request/response bodies faithfully.
+# NFR-8 architecture justification: this is the SINGLE new HTTP dependency family
+# for the engine-observed interception point — no heavier web framework, and NO
+# TLS stack (v1 forwards to an HTTP upstream; an HTTPS upstream is a documented
+# deferral, keeping the tree lean + free of a system-OpenSSL/ring C build, in the
+# same spirit as bundling SQLite). All build cleanly on MSRV 1.96.1 (verified).
+# Referenced by ktesio-engine ONLY (the listener is engine-internal, AD-2; kt
+# never sees it) — a normal external edge, unaffected by the AD-2 boundary gate.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
 # Engine state store (AD-6): bundled SQLite, no system dependency.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Cross-platform data-dir resolution; keeps engine path code cfg-free (OS-cfg gate).

@@ -1,26 +1,25 @@
 ---
 title: Ktesio
-description: Share, install, and manage reusable agent skills from a tiny Rust CLI.
+description: Run AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets, from a single Rust CLI.
 ---
 
 # Ktesio Documentation
 
-![Ktesio banner: Share, install, and manage agent skills](assets/ktesio-banner.jpg)
+![Ktesio banner: run AI agents like services — supervise, meter, and budget them](assets/ktesio-banner.jpg)
 
-Welcome to the Ktesio docs. These pages explain how to install, use, contribute to, test, and release the skills package manager.
+Welcome to the Ktesio docs. Ktesio is a Rust CLI and engine that **runs AI agents like services**: register any agent, supervise its lifecycle, meter its real token usage, and enforce token and dollar budgets. These pages explain how to install it, run agents, configure them, and contribute.
 
 ## Start Here
 
 - [Getting started](get-started.md)
 - [Installation](installation.md)
 - [Command reference](commands.md)
+- [Troubleshooting](troubleshooting.md)
 
 ## Concepts
 
-- [Manifest format](manifest.md)
-- [Lockfile format](lockfile.md)
+- [Adapter manifest (`adapter.toml`)](manifest.md)
 - [Architecture](architecture.md)
-- [Troubleshooting](troubleshooting.md)
 
 ## Project Workflows
 

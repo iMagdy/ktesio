@@ -15,9 +15,10 @@
 use std::time::Duration;
 
 use ktesio_engine::{
-    AdapterRef, Capability, ConfigError, ConfigLayer, EffectiveCapabilities, EffectiveConfig,
-    Engine, EngineError, FleetEntry, FleetListing, RegistryError, RemoveDisposition, SupportLevel,
-    FLEET_SCHEMA_VERSION,
+    render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
+    ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
+    FleetEntry, FleetListing, FleetTotals, Micros, RegistryError, RemoveDisposition, SupportLevel,
+    UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -175,14 +176,15 @@ impl ShowDocument {
     }
 }
 
-/// Serialize the Fleet entries into the pretty `list --json` document (a
-/// versioned [`FleetListing`]). Pure (no engine, no I/O) so it is unit-testable
-/// in-process; the CLI just prints the returned string to stdout. A serialize
-/// failure (not reachable for these plain serde structs) becomes an [`AgentIo`]
-/// diagnostic rather than a panic.
-fn fleet_json(entries: Vec<FleetEntry>) -> Result<String, Box<dyn std::error::Error>> {
-    let listing = FleetListing::new(entries);
-    serde_json::to_string_pretty(&listing).map_err(|e| serialize_error("Fleet", e))
+/// Serialize the composed [`FleetListing`] into the pretty `list --json` document (a
+/// versioned wrapper carrying the rows AND the Fleet-WIDE `totals`, story 3-5). Pure
+/// (no engine, no I/O) so it is unit-testable in-process; the CLI just prints the
+/// returned string to stdout. The listing is composed by the caller
+/// ([`FleetListing::new`], which computes the aggregate from the rows), so this stays
+/// a thin serialize. A serialize failure (not reachable for these plain serde structs)
+/// becomes an [`AgentIo`] diagnostic rather than a panic.
+fn fleet_json(listing: &FleetListing) -> Result<String, Box<dyn std::error::Error>> {
+    serde_json::to_string_pretty(listing).map_err(|e| serialize_error("Fleet", e))
 }
 
 /// Serialize one entry into the pretty `show --json` document (a versioned
@@ -205,8 +207,9 @@ fn serialize_error(what: &str, err: serde_json::Error) -> Box<dyn std::error::Er
 /// `kt agent show <name> [--json]` — render an instance's effective Capability
 /// Declaration (AC1 "visible for the instance") plus its runtime status (story
 /// 1-6, AC9): the current Lifecycle State, the active Restart Policy, the restart
-/// count, the honest Budget/cap + Usage metering seed (Epic 3 — `—`/`null`), and
-/// — for a `failed` instance — the failed cause.
+/// count, the REAL story-3-1 Usage token totals + the REAL story-3-2 Token Budget
+/// (ceilings + remaining + Breach Action, or `—`/`null` when un-budgeted), and —
+/// for a `failed` instance — the failed cause.
 ///
 /// `--json` mode (story 1-7) writes a single versioned document to STDOUT and
 /// nothing else there: `{ schema_version, instance: <FleetEntry> }` — the SAME
@@ -234,38 +237,68 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
             })?;
         let json = show_json(entry)?;
         println!("{json}");
-        // The metering-seed note rides on stderr (AD-12), keeping stdout pure JSON.
-        ui::note(METERING_EPIC3_NOTE);
+        // The metering note rides on stderr (AD-12), keeping stdout pure JSON.
+        ui::note(METERING_NOTE);
         return Ok(());
     }
 
     let caps = facade.effective_capabilities(name).map_err(map_error)?;
     render_capabilities(name, &caps);
     // Runtime status (story 1-6, AC9): state + policy + restart count + failed
-    // cause. A status read-back failure must not fail `show` (the capabilities
-    // already printed); note it and continue.
+    // cause + the story-3-1 usage totals + Metering Source. A status read-back
+    // failure must not fail `show` (the capabilities already printed); note it and
+    // continue. The usage/metering rows come from the Fleet entry (the same read
+    // `list` uses), so `show` and `list` agree exactly.
     match facade.instance_status(name) {
         Ok(status) => {
-            render_runtime_status(&status);
-            // One stderr note (AD-12) that the budget/usage rows are Epic-3 seeds.
-            ui::note(METERING_EPIC3_NOTE);
+            let entry = facade
+                .fleet()
+                .ok()
+                .and_then(|f| f.into_iter().find(|e| e.name.as_str() == name));
+            render_runtime_status(&status, entry.as_ref());
+            // One stderr note (AD-12): usage is real tokens; budget/dollars are later.
+            ui::note(METERING_NOTE);
         }
         Err(err) => ui::warning(format!("Could not read runtime status for '{name}': {err}")),
     }
     Ok(())
 }
 
-/// Render the per-instance runtime status (story 1-6, AC9) as a small table:
-/// State, Restart Policy, Restart count, and the honest Budget/cap + Usage
-/// metering seed (story 1-7 — Epic 3, rendered `—`); for a `failed` instance the
-/// failed cause is printed below (result → stdout, AD-12). The caller prints the
-/// Epic-3 metering note to stderr.
-fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
+/// Render the per-instance runtime status (story 1-6, AC9) as a small table.
+///
+/// Rows: State, Restart Policy, Restart count, the REAL story-3-2 Token Budget
+/// (ceilings, remaining, Breach Action — or `—` when un-budgeted), the REAL
+/// story-3-1 Usage token totals, the active Metering Source, and — for a `failed`
+/// instance — the failed cause below (result to stdout, AD-12). The caller prints
+/// the metering note to stderr. `entry` is the instance's Fleet entry (the same
+/// read `list` uses), or `None` if that read degraded — in which case the
+/// usage/metering/budget rows fall back to zero/unknown/absent so the table still
+/// renders (mirroring the runtime-field degradation).
+fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&FleetEntry>) {
     let title = format!("Runtime status for {}", status.instance.name.as_str());
     let columns = [
         ui::TableColumn::new("Field", 14, 20),
         ui::TableColumn::new("Value", 14, 48),
     ];
+    // Usage + Metering Source from the Fleet entry (story 3-1); a degraded read
+    // falls back to zero usage / "unknown" source so `show` never fails on it.
+    let usage_value = entry
+        .map(|e| usage_cell_show(&e.usage))
+        .unwrap_or_else(|| "in 0 / out 0".to_string());
+    let metering_value = entry
+        .map(|e| e.metering_source.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    // Budget from the Fleet entry (story 3-2 tokens + story 3-3 dollar cap): the
+    // token ceiling(s) + remaining, the dollar Cost Cap + remaining (WHEN a Rate is
+    // configured), and the Breach Action — or the honest `—` absence when nothing is
+    // configured (or the read degraded). The `show` Value column is wide (no
+    // truncation), so the estimate qualifier is labeled INLINE in the cell.
+    let budget_value = budget_cell(entry.and_then(|e| e.budget.as_ref()), DollarLabel::Inline);
+    // Cost from the Fleet entry (story 3-3): the DERIVED cumulative dollar cost,
+    // rendered THROUGH the single currency module + labeled (AD-8), or the honest
+    // inert note when no Rate is configured (AC-B: dollar features inert and SAY SO).
+    let cost_value =
+        cost_row_value(entry.and_then(|e| e.usage.cumulative_dollars.zip(e.usage.estimate_label)));
     let rows = vec![
         vec![
             ui::TableCell::plain("State"),
@@ -279,15 +312,28 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus) {
             ui::TableCell::plain("Restart count"),
             ui::TableCell::plain(status.restart_count.to_string()),
         ],
-        // The honest Epic-1 metering seed rows (story 1-7): a single `—`, never a
-        // fabricated number. Populated by Epic 3 metering.
+        // Budget is REAL for TOKENS (story 3-2) and DOLLARS (story 3-3, when a Rate
+        // is configured): the ceiling(s) + remaining + Breach Action, or `—`.
         vec![
-            ui::TableCell::plain("Budget/cap"),
-            ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+            ui::TableCell::plain("Budget"),
+            ui::TableCell::plain(budget_value),
         ],
+        // Usage is REAL now (story 3-1): the cumulative token totals (+ dollars when
+        // a Rate is configured, via usage_cell through the currency module).
         vec![
-            ui::TableCell::plain("Usage"),
-            ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+            ui::TableCell::plain("Usage (tokens)"),
+            ui::TableCell::plain(usage_value),
+        ],
+        // Cost is REAL for a Rate'd instance (story 3-3): the labeled derived dollar
+        // cost; an honest inert note when no Rate is configured (AC-B).
+        vec![
+            ui::TableCell::plain("Cost (estimated)"),
+            ui::TableCell::plain(cost_value),
+        ],
+        // The active Metering Source (AC-C).
+        vec![
+            ui::TableCell::plain("Metering source"),
+            ui::TableCell::plain(metering_value),
         ],
     ];
     ui::print_table(&title, &columns, &rows);
@@ -350,19 +396,241 @@ pub fn remove(
     }
 }
 
-/// The one-line stderr NOTE (AD-12: notices → stderr) that the budget/cap +
-/// Usage Ledger columns are HONEST Epic-1 seeds — metering arrives in Epic 3.
-/// Shared by `list` and `show` so both surfaces state it identically.
-const METERING_EPIC3_NOTE: &str =
-    "budget/cap status and Usage Ledger totals arrive with metering in Epic 3; \
-     they show as '—' (JSON null) until then.";
+/// The one-line stderr NOTE (AD-12: notices → stderr) about the honest metering
+/// boundary now that stories 3-1/3-2/3-3 ship: `usage`/`budget` show REAL token
+/// counts, and — WHEN a Rate is configured — the DERIVED dollar cost + Cost Cap +
+/// remaining, every dollar figure LABELED an estimate (AD-8/FR-23). With no Rate,
+/// dollar features are honestly INERT (no dollar figure — AC-B). Shared by `list`
+/// and `show` so both surfaces state it identically.
+const METERING_NOTE: &str =
+    "usage + budget are real TOKEN counts from the Usage Ledger (budget '—' means \
+     no budget configured); dollar figures appear only when a Rate is configured \
+     (cost.rate.input/output) and are labeled estimates — with no Rate, dollar \
+     features are inert.";
+
+/// The `kt agent list` Budget column HEADER (story 3-3, FR-23/AD-8).
+///
+/// Honestly names BOTH dimensions the column now shows — a token budget AND an
+/// ESTIMATED dollar Cost Cap — and carries the estimate qualifier ("est. $") in the
+/// HEADER. The narrow Budget cell truncates with `…`; because the estimate label
+/// lives here in the header (never in the truncatable cell), truncation can NEVER
+/// strip the mandated estimate qualifier off a real dollar figure and leave a bare,
+/// unlabeled dollar. Replaces the stale "Budget (tokens)" header, which mislabeled a
+/// column that now also renders a dollar cap. (The `show` human view + `--json` are
+/// fully labeled already; this is the `list`-surface fix.)
+const BUDGET_LIST_HEADER: &str = "Budget (tok, est. $)";
+
+/// Render a [`UsageView`]'s CUMULATIVE totals as a compact human cell (story 3-1
+/// tokens + story 3-3 dollars), e.g. `in 120 / out 340` or, with a Rate,
+/// `in 120 / out 340 · $0.30 (estimated)`. The dollar figure is rendered THROUGH
+/// the single currency module ([`render_dollars`], AD-8) and appears ONLY when a
+/// Rate is configured (`cumulative_dollars`/`estimate_label` present); with no Rate
+/// the cell is tokens-only (honest inert dollar view — AC-B). Kept here so `list`
+/// and `show` render the cumulative scope identically. The narrow `list` column shows
+/// the CUMULATIVE scope only; the wide `show` Value column additionally surfaces the
+/// current-Run scope via [`usage_cell_show`] (AC8 — tokens by BOTH scopes are legible
+/// where the column can hold them; `--json` carries both on every surface).
+fn usage_cell(usage: &UsageView) -> String {
+    let tokens = format!(
+        "in {} / out {}",
+        usage.cumulative_input_tokens, usage.cumulative_output_tokens
+    );
+    match (usage.cumulative_dollars, usage.estimate_label) {
+        (Some(dollars), Some(label)) => format!("{tokens} · {}", render_dollars(dollars, label)),
+        // No Rate ⇒ tokens only (dollar view honestly inert — AC-B).
+        _ => tokens,
+    }
+}
+
+/// The `show` "Usage (tokens)" cell (story 3-5, AC8 — tokens BY SCOPE on the wide
+/// detail surface). Renders the CUMULATIVE scope (via [`usage_cell`], including the
+/// labeled dollar cost when a Rate exists) AND — when the instance has a current Run
+/// with usage — the CURRENT-RUN token scope, so BOTH scopes the AC names are legible
+/// in human `show` detail (the `--json` `FleetEntry` already carries all four token
+/// fields). A non-running / zero-current-run instance shows only the cumulative scope
+/// (the current-Run scope is an honest absence, not a fabricated `run: in 0 / out 0`).
+fn usage_cell_show(usage: &UsageView) -> String {
+    let cumulative = usage_cell(usage);
+    let run_total = usage
+        .current_run_input_tokens
+        .saturating_add(usage.current_run_output_tokens);
+    if run_total > 0 {
+        format!(
+            "cumulative {cumulative}; this run: in {} / out {}",
+            usage.current_run_input_tokens, usage.current_run_output_tokens
+        )
+    } else {
+        cumulative
+    }
+}
+
+/// Where the estimate qualifier (`(estimated)`) for a rendered dollar figure lives
+/// on a given surface (FR-23/AD-8 — every rendered dollar MUST stay labeled).
+///
+/// The `show` "Value" column is WIDE (no truncation), so it carries the label
+/// INLINE in the cell (`… $0.20/$0.50 (estimated) …`). The `list` "Budget" column
+/// is NARROW and TRUNCATES with `…`, which could CHOP an inline `(estimated)` off a
+/// real dollar figure and leave a bare, unlabeled dollar (the FR-23 violation this
+/// fixes). So on `list` the qualifier lives in the COLUMN HEADER ([`BUDGET_LIST_HEADER`])
+/// and the cell renders the dollar value BARE — the label can never be truncated
+/// because it is not in the cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DollarLabel {
+    /// Append `(estimated)` inline in the cell (the wide `show` Value column).
+    Inline,
+    /// Omit the inline label; the qualifier lives in the column HEADER (the narrow,
+    /// truncatable `list` Budget column).
+    InHeader,
+}
+
+/// Render a [`BudgetView`] as a compact human `budget` cell (story 3-2 tokens +
+/// story 3-3 dollars, AC9/AC10): the configured token ceiling(s) + remaining, the
+/// dollar Cost Cap + remaining (WHEN a Rate is configured, rendered THROUGH the
+/// single currency module — AD-8), and the Breach Action. E.g.
+/// `cum 380/500 tok (pause)` or `cum 380/500 tok, cum $0.20/$0.50 (estimated) (pause)`.
+/// An instance with NEITHER a budget nor an enforceable cap (`None`) renders the
+/// honest absence token `—`. A cap with no Rate is inert (no dollar figure — AC-B).
+///
+/// `dollar_label` chooses WHERE the estimate qualifier lives: [`DollarLabel::Inline`]
+/// for the wide `show` Value column (labeled in-cell), [`DollarLabel::InHeader`] for
+/// the narrow, truncatable `list` Budget column (the qualifier is in the header —
+/// [`BUDGET_LIST_HEADER`] — so truncation can never strip it, FR-23). Shared by both
+/// surfaces so tokens + action render identically; only the dollar label placement
+/// differs.
+fn budget_cell(budget: Option<&BudgetView>, dollar_label: DollarLabel) -> String {
+    let Some(b) = budget else {
+        return FleetEntry::METERING_SEED_CELL.to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let (Some(limit), Some(remaining)) = (b.per_run_limit, b.per_run_remaining) {
+        parts.push(format!("run {remaining}/{limit} tok"));
+    }
+    if let (Some(limit), Some(remaining)) = (b.cumulative_limit, b.cumulative_remaining) {
+        parts.push(format!("cum {remaining}/{limit} tok"));
+    }
+    // DOLLAR cap/remaining THROUGH the single currency module (AD-8) — present only
+    // when a Rate is configured (the label carries the dimension's honesty).
+    let label = b.estimate_label.unwrap_or_default();
+    if let (Some(cap), Some(remaining)) = (b.per_run_cost_cap, b.per_run_dollars_remaining) {
+        parts.push(format!(
+            "run {}",
+            dollar_cap_cell(remaining, cap, label, dollar_label)
+        ));
+    }
+    if let (Some(cap), Some(remaining)) = (b.cumulative_cost_cap, b.cumulative_dollars_remaining) {
+        parts.push(format!(
+            "cum {}",
+            dollar_cap_cell(remaining, cap, label, dollar_label)
+        ));
+    }
+    // A budget with an action but somehow no scope (defensive) still shows the
+    // action honestly rather than an empty cell.
+    if parts.is_empty() {
+        return format!("({})", b.breach_action.as_str());
+    }
+    format!("{} ({})", parts.join(", "), b.breach_action.as_str())
+}
+
+/// Render a dollar `remaining/cap` pair THROUGH the single currency module (AD-8)
+/// — e.g. `$0.20/$0.50 (estimated)`. The SOLE currency formatting in `kt` routes
+/// through the currency module: the `remaining` value ALWAYS uses the module's
+/// bare-value form ([`render_dollars_bare`]); the `cap` uses [`render_dollars`]
+/// (inline label) or [`render_dollars_bare`] (label in the header) per
+/// `dollar_label`. Either way the `$X.XX` digits ORIGINATE in that one module —
+/// there is NO string-surgery on a labeled string (primary L1). On the
+/// [`DollarLabel::InHeader`] surface the qualifier is carried by the column header
+/// ([`BUDGET_LIST_HEADER`]) instead of the cell, so a truncated cell can never drop
+/// the label.
+fn dollar_cap_cell(
+    remaining: Micros,
+    cap: Micros,
+    label: EstimateLabel,
+    dollar_label: DollarLabel,
+) -> String {
+    let cap_str = match dollar_label {
+        DollarLabel::Inline => render_dollars(cap, label),
+        DollarLabel::InHeader => render_dollars_bare(cap),
+    };
+    format!("{}/{}", render_dollars_bare(remaining), cap_str)
+}
+
+/// The `show` "Cost (estimated)" row value (story 3-3, AC-B): the DERIVED
+/// cumulative dollar cost rendered THROUGH the single currency module + labeled
+/// (AD-8) when a Rate is configured, or the honest INERT note when no Rate exists
+/// (dollar features inert and SAY SO — never a fabricated `$0.00`). `dollars` is
+/// `Some((cost, label))` iff a Rate is configured.
+fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
+    match dollars {
+        Some((cost, label)) => render_dollars(cost, label),
+        None => format!(
+            "{} (no Rate configured — dollar features inert)",
+            FleetEntry::METERING_SEED_CELL
+        ),
+    }
+}
+
+/// Render the Fleet-WIDE total footer for the human `kt agent list` (story 3-5,
+/// AC-A/AC-B/AC5/AC7 — FR-22/FR-23). Summarizes the [`FleetTotals`] the engine
+/// composed over the rows: total input/output tokens (always present — zero-not-
+/// absent), and the total derived dollars THROUGH the single currency module
+/// (AD-8), carrying the honesty of the aggregate:
+///
+/// * A COMPLETE dollar total (every metered instance priced): `≈ $X.XX (estimated)`.
+/// * A PARTIAL total (a metered instance has no Rate): `≈ $X.XX (estimated; N
+///   instances unpriced)` — the honest lower-bound note (AC5, SM-C3), NAMING how many
+///   metered-but-unpriced rows the dollar sum omits so the reader knows the total's
+///   basis (AC7). `N` is [`FleetTotals::unpriced_count`], computed by the engine
+///   `domain` aggregate (`kt` only renders it, with the singular "1 instance unpriced").
+/// * NO instance has a Rate: the token total + an honest `—` dollar marker (AC4/AC5),
+///   NEVER a fabricated `$0.00`.
+///
+/// The `≈` marks the figure a labeled estimate; the dollar DIGITS come ONLY from the
+/// currency module ([`render_dollars_bare`]) and the estimate label is composed by
+/// this caller — the narrow-column pattern 3-3 established (the label survives, FR-23,
+/// and the `$` originates in the one module so the AD-8 grep-lint stays green; the CLI
+/// never formats a `$` string itself). Pure (no engine, no I/O) so it is unit-testable
+/// in-process; `list` prints the returned line to stdout as command output (AD-12).
+fn fleet_total_footer(totals: &FleetTotals) -> String {
+    let tokens = format!(
+        "in {} / out {}",
+        totals.total_input_tokens, totals.total_output_tokens
+    );
+    // The count of metered-but-unpriced rows that make the dollar total a lower bound
+    // is carried on `totals.unpriced_count` (the engine `domain` computed it alongside
+    // the sum — AD-2); the footer only NAMES it (AC5/AC7) on the partial path below.
+    let dollars = match (totals.total_dollars, totals.estimate_label) {
+        // A priced total: the bare dollar value through the ONE currency module, then
+        // the estimate label (+ the honest lower-bound note when partial). `≈` marks it
+        // an aggregate estimate. The label is ALWAYS present (FR-23 — no unlabeled
+        // dollar); on a partial total it is folded together with the unpriced count.
+        (Some(cost), Some(label)) => {
+            let bare = render_dollars_bare(cost);
+            if totals.dollars_partial {
+                // A lower bound — say so, and NAME how many rows are unpriced (AC5/AC7):
+                // "1 instance unpriced" / "N instances unpriced" (correct singular).
+                let n = totals.unpriced_count;
+                let unit = if n == 1 { "instance" } else { "instances" };
+                format!("≈ {bare} ({label}; {n} {unit} unpriced)")
+            } else {
+                format!("≈ {bare} ({label})")
+            }
+        }
+        // NO Rate anywhere ⇒ the dollar total is honestly absent (never $0.00).
+        _ => format!(
+            "{} (no Rate configured — dollars not derived)",
+            FleetEntry::METERING_SEED_CELL
+        ),
+    };
+    format!("Fleet total: {tokens} · {dollars}")
+}
 
 /// `kt agent list [--json]` — render the Fleet (FR-4).
 ///
-/// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the honest
-/// Budget/cap + Usage metering-seed columns (Epic 3 — rendered `—`), and the
-/// Agent Home; one stderr note explains the metering seed (AD-12: result →
-/// stdout, note → stderr). `--json` mode writes a single versioned
+/// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the REAL
+/// story-3-2 Token Budget column (ceilings + remaining + Breach Action, or `—`
+/// when un-budgeted) + the REAL story-3-1 Usage token totals, and the Agent Home;
+/// one stderr note explains the
+/// metering boundary (AD-12: result → stdout, note → stderr). `--json` mode writes a single versioned
 /// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `kt --json`
 /// serializes the same struct the Host event stream will publish). Freshness
 /// (≤2s, AC6) is structural: each invocation opens the engine and reads live
@@ -372,54 +640,90 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     let facade = engine.blocking();
     let entries = facade.fleet().map_err(map_error)?;
+    // Compose the versioned document ONCE (story 1-7 + 3-5): it carries the rows AND
+    // the Fleet-WIDE `totals`, computed PURELY from those rows by the engine `domain`
+    // (`FleetListing::new` → `FleetTotals::from_entries`). Both the `--json` document
+    // and the human footer read the SAME computed aggregate — one read pass, no second
+    // ledger query, `kt` never sums the ledger itself (AD-2).
+    let listing = FleetListing::new(entries);
 
     if json {
         // AC5/AC9: the whole result is ONE JSON document to stdout (an empty Fleet
-        // is a valid empty `instances` array). Any guidance/notes go to stderr so
-        // stdout is always parseable JSON.
-        let empty = entries.is_empty();
-        let document = fleet_json(entries)?;
+        // is a valid empty `instances` array + an all-zero/absent-dollars `totals`).
+        // Any guidance/notes go to stderr so stdout is always parseable JSON.
+        let empty = listing.instances.is_empty();
+        let document = fleet_json(&listing)?;
         println!("{document}");
         if empty {
             ui::note("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
         }
-        // The metering-seed note still rides on stderr (AD-12).
-        ui::note(METERING_EPIC3_NOTE);
+        // The metering note still rides on stderr (AD-12), keeping stdout pure JSON.
+        ui::note(METERING_NOTE);
         return Ok(());
     }
 
-    if entries.is_empty() {
+    if listing.instances.is_empty() {
         ui::info("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
         return Ok(());
     }
+    let entries = &listing.instances;
 
+    // The Metering Source rides the Fleet DETAIL (`kt agent show` + `--json`), which
+    // is where AC-C requires it "visible in Fleet listing detail"; the human `list`
+    // table keeps a compact column set (adding a Metering column here overflows the
+    // 80-col default and truncates cells), surfacing the real Usage token totals.
+    //
+    // The Budget column header is [`BUDGET_LIST_HEADER`] ("Budget (tok, est. $)"):
+    // it honestly names BOTH dimensions (a token budget AND an ESTIMATED dollar Cost
+    // Cap) and — crucially — carries the "est. $" estimate qualifier in the HEADER.
+    // The narrow Budget cell truncates with `…`; putting the qualifier in the header
+    // (not the cell) means truncation can NEVER strip the estimate label off a real
+    // dollar figure (FR-23/AD-8 — every rendered dollar stays labeled). The cell
+    // therefore renders the dollar value BARE (DollarLabel::InHeader).
     let columns = [
         ui::TableColumn::new("Name", 12, 32),
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
         ui::TableColumn::new("Restarts", 8, 10),
-        ui::TableColumn::new("Budget/cap", 10, 12),
-        ui::TableColumn::new("Usage", 8, 12),
+        ui::TableColumn::new(BUDGET_LIST_HEADER, 15, 34),
+        ui::TableColumn::new("Usage (tokens)", 14, 24),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
     let rows: Vec<Vec<ui::TableCell>> = entries
         .iter()
         .map(|entry| {
+            // Budget is REAL for TOKENS (story 3-2) and DOLLARS (story 3-3): ceiling(s)
+            // + remaining + action, or `—` when un-budgeted. The estimate qualifier for
+            // any dollar figure lives in the column HEADER (DollarLabel::InHeader), so a
+            // truncated cell never drops the label. A budgeted cell is `plain`, an
+            // absent one stays `muted` (the honest `—`).
+            let budget = entry.budget.as_ref();
+            let budget_text = budget_cell(budget, DollarLabel::InHeader);
+            let budget_cell = if budget.is_some() {
+                ui::TableCell::plain(budget_text)
+            } else {
+                ui::TableCell::muted(budget_text)
+            };
             vec![
                 ui::TableCell::skill(entry.name.as_str()),
                 ui::TableCell::plain(entry.kind.clone()),
                 ui::TableCell::status(entry.state.as_str()),
                 ui::TableCell::plain(entry.restart_count.to_string()),
-                // The honest Epic-1 metering seed: a single `—`, never a number.
-                ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
-                ui::TableCell::muted(FleetEntry::METERING_SEED_CELL),
+                budget_cell,
+                // Usage is REAL now (story 3-1): the cumulative token totals.
+                ui::TableCell::plain(usage_cell(&entry.usage)),
                 ui::TableCell::muted(entry.agent_home.clone()),
             ]
         })
         .collect();
     ui::print_table("Fleet", &columns, &rows);
-    // One stderr note (AD-12) that budget/usage are Epic-3 seeds, not fabricated.
-    ui::note(METERING_EPIC3_NOTE);
+    // Story 3-5 (AC-A/AC-B): the Fleet-WIDE total footer — total tokens + the labeled
+    // total dollars THROUGH the single currency module (AD-8), an honest lower-bound
+    // note when partial, and a `—` (never $0.00) when no instance is Rate'd. It is
+    // command output (a summary of the table above it), so it rides STDOUT (AD-12).
+    println!("{}", fleet_total_footer(&listing.totals));
+    // One stderr note (AD-12): usage is real tokens; dollars appear with a Rate.
+    ui::note(METERING_NOTE);
     Ok(())
 }
 
@@ -927,6 +1231,14 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 3-2 (AC-C): a KNOWN budget key with a malformed VALUE — a
+        // `budget.tokens.*` that is not a whole number, or a `budget.breach_action`
+        // that is not pause/stop/warn. Rejected before any persistence (nothing
+        // changed); the message names the key + value + the accepted form.
+        ConfigError::InvalidValue { .. } => AgentConfig {
+            message: format!("{err}. Nothing was changed. Fix the value and try again."),
+        }
+        .into(),
     }
 }
 
@@ -1143,6 +1455,17 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 3-4 (AC-A): the engine-observed loopback forward listener could not
+        // start (no configured upstream URL, a non-http upstream, or a bind failure).
+        // It starts before the `starting` transition, so the instance stays in its
+        // prior state; the detail is traffic-free (never a body/header/key — NFR-6).
+        EngineError::ObservedMetering { name, detail } => AgentConfig {
+            message: format!(
+                "Agent Instance '{name}' could not start engine-observed metering: {detail}. \
+                 Nothing was changed; fix the metering configuration and start it again."
+            ),
+        }
+        .into(),
         EngineError::Backend { name, source } => AgentIo {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
         }
@@ -1342,16 +1665,21 @@ mod tests {
             restart_policy: ktesio_engine::RestartPolicy::OnFailure,
             failed_cause: None,
             budget: None,
-            usage: None,
+            usage: UsageView::new(
+                ktesio_engine::UsageTotals::zero(),
+                ktesio_engine::UsageTotals::zero(),
+            ),
+            metering_source: "self-reported".to_string(),
             agent_home: format!("/x/agents/{name}"),
         }
     }
 
     #[test]
-    fn fleet_json_emits_versioned_document_with_null_seeds() {
+    fn fleet_json_emits_versioned_document_with_budget_seed_and_real_usage() {
         // The `list --json` document is a versioned FleetListing whose per-entry
-        // budget/usage are the honest JSON null seed (never 0). Pure — no engine.
-        let doc = fleet_json(vec![sample_fleet_entry("alpha")]).unwrap();
+        // `budget` is the honest JSON null seed (never 0) while `usage` is a real
+        // token-totals object (story 3-1). Pure — no engine.
+        let doc = fleet_json(&FleetListing::new(vec![sample_fleet_entry("alpha")])).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(
             value["schema_version"],
@@ -1360,21 +1688,34 @@ mod tests {
         let entry = &value["instances"][0];
         assert_eq!(entry["name"], serde_json::json!("alpha"));
         assert_eq!(entry["budget"], serde_json::Value::Null);
-        assert_eq!(entry["usage"], serde_json::Value::Null);
+        // usage is a real object with zero token totals (not null).
+        assert!(entry["usage"].is_object(), "{entry}");
+        assert_eq!(
+            entry["usage"]["cumulative_input_tokens"],
+            serde_json::json!(0)
+        );
+        assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
+        // Story 3-5: the document carries a top-level `totals` object (an all-zero
+        // never-metered Fleet → zero tokens, dollars absent).
+        assert!(value["totals"].is_object(), "{value}");
+        assert_eq!(value["totals"]["total_input_tokens"], serde_json::json!(0));
     }
 
     #[test]
     fn fleet_json_on_empty_is_a_valid_empty_array() {
-        // AC9: an empty Fleet serializes as a valid empty `instances` array.
-        let doc = fleet_json(vec![]).unwrap();
+        // AC9: an empty Fleet serializes as a valid empty `instances` array + a
+        // zero/absent-dollars `totals` (story 3-5).
+        let doc = fleet_json(&FleetListing::new(vec![])).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(value["instances"], serde_json::json!([]));
+        assert_eq!(value["totals"]["total_output_tokens"], serde_json::json!(0));
     }
 
     #[test]
     fn show_json_wraps_one_entry_with_the_shared_schema_version() {
         // `show --json` is { schema_version, instance: <FleetEntry> } — the SAME
-        // schema version as list --json (AD-14: one schema), null metering seed.
+        // schema version as list --json (AD-14: one schema). `budget` is the null
+        // seed; `usage` is a real token-totals object (story 3-1).
         let doc = show_json(sample_fleet_entry("web-1")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert_eq!(
@@ -1383,7 +1724,11 @@ mod tests {
         );
         assert_eq!(value["instance"]["name"], serde_json::json!("web-1"));
         assert_eq!(value["instance"]["budget"], serde_json::Value::Null);
-        assert_eq!(value["instance"]["usage"], serde_json::Value::Null);
+        assert!(value["instance"]["usage"].is_object(), "{value}");
+        assert_eq!(
+            value["instance"]["metering_source"],
+            serde_json::json!("self-reported")
+        );
     }
 
     #[test]
@@ -1394,6 +1739,159 @@ mod tests {
         assert!(wrapped
             .to_string()
             .contains("Failed to serialize the Fleet"));
+    }
+
+    // ---- Story 3-5: the Fleet-wide total footer + the per-instance scope render ----
+
+    /// A metered entry with the given cumulative tokens and, when `dollars` is `Some`,
+    /// a derived cost + `estimated` label (a Rate); `None` = a no-Rate instance.
+    fn metered_fleet_entry(
+        name: &str,
+        input: u64,
+        output: u64,
+        dollars: Option<Micros>,
+    ) -> FleetEntry {
+        let mut entry = sample_fleet_entry(name);
+        let base = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: input,
+                output_tokens: output,
+            },
+            ktesio_engine::UsageTotals::zero(),
+        );
+        entry.usage = match dollars {
+            Some(cost) => base.with_dollars(cost, Micros::ZERO, EstimateLabel::Estimated),
+            None => base,
+        };
+        entry
+    }
+
+    #[test]
+    fn fleet_footer_all_rated_shows_a_labeled_complete_total() {
+        // A complete dollar total (every metered instance priced): `≈ $X.XX
+        // (estimated)`, tokens summed, NO partial note.
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("a", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_fleet_entry("b", 0, 1_000_000, Some(Micros(15_000_000))),
+        ]);
+        let footer = fleet_total_footer(&totals);
+        assert!(footer.contains("in 1000000 / out 1000000"), "{footer}");
+        // $18.00 total, labeled estimated, an aggregate `≈`, no partial note.
+        assert!(footer.contains("≈ $18.00 (estimated)"), "{footer}");
+        assert!(!footer.contains("unpriced"), "complete total: {footer}");
+    }
+
+    #[test]
+    fn fleet_footer_partial_total_says_so_with_the_estimate_label() {
+        // A metered-but-unpriced instance makes the dollar total a LOWER BOUND — the
+        // footer says so (AC5/SM-C3) AND keeps the estimate label (FR-23 — no unlabeled
+        // dollar; the label lives here, not in a truncatable cell). With exactly ONE
+        // unpriced row the note NAMES the count in the singular (AC7).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_fleet_entry("unpriced", 500, 0, None),
+        ]);
+        assert_eq!(totals.unpriced_count, 1, "one metered-unpriced row");
+        let footer = fleet_total_footer(&totals);
+        assert!(
+            footer.contains("≈ $3.00"),
+            "the lower-bound value: {footer}"
+        );
+        assert!(footer.contains("estimated"), "label survives: {footer}");
+        // The count is NAMED, singular for one instance (AC7 nicety).
+        assert!(
+            footer.contains("1 instance unpriced"),
+            "singular count named: {footer}"
+        );
+        assert!(
+            !footer.contains("instances unpriced"),
+            "singular, not plural, for one: {footer}"
+        );
+    }
+
+    #[test]
+    fn fleet_footer_partial_total_names_the_plural_count_of_unpriced_instances() {
+        // TWO metered-but-unpriced instances (plus a Rate'd one that makes the total a
+        // priced lower bound): the footer NAMES the exact count in the plural — "2
+        // instances unpriced" — so the reader knows the basis of the lower bound (AC7).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("rated", 1_000_000, 0, Some(Micros(3_000_000))),
+            metered_fleet_entry("unpriced-a", 500, 0, None),
+            metered_fleet_entry("unpriced-b", 250, 0, None),
+        ]);
+        assert_eq!(totals.unpriced_count, 2, "two metered-unpriced rows");
+        let footer = fleet_total_footer(&totals);
+        assert!(
+            footer.contains("2 instances unpriced"),
+            "plural count named: {footer}"
+        );
+    }
+
+    #[test]
+    fn fleet_footer_no_rate_shows_tokens_and_an_honest_dash_never_zero_dollars() {
+        // No instance has a Rate ⇒ the token total + an honest `—` marker, NEVER a
+        // fabricated `$0.00` (AC4/AC5). The tokens still sum (zero-not-absent).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("a", 100, 200, None),
+            metered_fleet_entry("idle", 0, 0, None),
+        ]);
+        let footer = fleet_total_footer(&totals);
+        assert!(footer.contains("in 100 / out 200"), "{footer}");
+        assert!(
+            footer.contains('—'),
+            "honest absent-dollars marker: {footer}"
+        );
+        assert!(
+            !footer.contains("$0.00"),
+            "never a fabricated zero: {footer}"
+        );
+        assert!(!footer.contains('$'), "no dollar figure at all: {footer}");
+    }
+
+    #[test]
+    fn fleet_footer_empty_fleet_is_zeros_and_no_dollars() {
+        // An empty Fleet: zero tokens + the honest no-dollars marker.
+        let footer = fleet_total_footer(&FleetTotals::from_entries(&[]));
+        assert!(footer.contains("in 0 / out 0"), "{footer}");
+        assert!(footer.contains('—'), "{footer}");
+    }
+
+    #[test]
+    fn usage_cell_show_surfaces_both_token_scopes_when_a_run_is_active() {
+        // AC8: the wide `show` Usage cell shows BOTH scopes — cumulative AND current-Run
+        // — when a Run has usage; a non-running/zero-run instance shows only cumulative
+        // (no fabricated `run: in 0 / out 0`).
+        let running = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+            },
+            ktesio_engine::UsageTotals {
+                input_tokens: 40,
+                output_tokens: 60,
+            },
+        );
+        let shown = usage_cell_show(&running);
+        assert!(shown.contains("in 100 / out 250"), "cumulative: {shown}");
+        assert!(
+            shown.contains("this run: in 40 / out 60"),
+            "run scope: {shown}"
+        );
+
+        // No current run → cumulative only.
+        let idle = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+            },
+            ktesio_engine::UsageTotals::zero(),
+        );
+        let shown = usage_cell_show(&idle);
+        assert!(shown.contains("in 100 / out 250"), "{shown}");
+        assert!(
+            !shown.contains("this run"),
+            "no fabricated run scope: {shown}"
+        );
     }
 
     #[test]

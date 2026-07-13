@@ -1,251 +1,162 @@
 ---
 title: Command Reference
-description: Every kt command, its expected arguments, and the workflows each command supports.
+description: Every kt agent command, its arguments and flags, and the unified config keys for budgets, rates, and metering.
 ---
 
 # Command Reference
 
-All commands support `--help`. `kt --version` prints the package version.
+The agent runner lives under `kt agent`. Every command supports `--help`, and `kt --version` prints the package version.
 
-## Update Checks
+Output discipline: command results go to stdout, while notices and diagnostics go to stderr, so `--json` output on stdout is always machine-parseable.
 
-When a `kt` subcommand runs, Ktesio checks whether a newer GitHub Release is
-available. The check uses an hourly cache, so repeated commands only contact
-GitHub after the cached result is at least one hour old.
+## `kt agent register <name> (--kind <kind> | --manifest <path>)`
 
-If an update is available, Ktesio prints a short notice to stderr that asks you
-to run `kt self-update`. Machine-readable JSON output on stdout remains
-unchanged.
-
-Disable automatic update checks with:
+Register a new Agent Instance under a Fleet-unique name.
 
 ```bash
-KTESIO_NO_UPDATE_CHECK=1 kt list
+kt agent register demo --kind mock
+kt agent register my-agent --manifest ./my-agent
 ```
 
-## `kt self-update`
+Arguments and options:
 
-Update the `kt` binary itself.
+- `<name>` — Fleet-unique instance name matching `^[a-z0-9][a-z0-9_-]*$`.
+- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`). Mutually exclusive with `--manifest`.
+- `--manifest <path>` — a manifest adapter loaded from a directory (or an `adapter.toml` file). Mutually exclusive with `--kind`.
+
+Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
+
+The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process.
+
+## `kt agent list [--json]`
+
+List every Agent Instance in the Fleet.
+
+```bash
+kt agent list
+kt agent list --json
+```
+
+The human table shows name, kind, state, restart count, the token budget (ceilings + remaining + Breach Action, or `—` when un-budgeted), the real usage token totals, and the Agent Home, followed by a Fleet-wide totals footer. `--json` emits a versioned document (`schema_version`, `instances`, `totals`); token totals equal the Usage Ledger exactly, and dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates).
+
+## `kt agent show <name> [--json]`
+
+Show one instance's effective per-OS Capability Declaration plus its runtime status.
+
+```bash
+kt agent show demo
+kt agent show demo --json
+```
+
+The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.
+
+## `kt agent start <name>`
+
+Start a registered Agent Instance.
+
+```bash
+kt agent start my-agent
+```
+
+On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr.
+
+A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits (a note is printed to stderr). Durable supervision across separate CLI invocations is future work.
+
+## `kt agent stop <name> [--timeout <secs>]`
+
+Stop a running Agent Instance: graceful shutdown, then a forced kill after the window.
+
+```bash
+kt agent stop my-agent
+kt agent stop my-agent --timeout 10
+```
+
+- `--timeout <secs>` — the graceful-shutdown window before a forced kill (default 30). No child process survives.
+
+## `kt agent pause <name>` / `kt agent resume <name>`
+
+Pause a running instance, or resume a paused one, with honest per-OS semantics.
+
+```bash
+kt agent pause my-agent
+kt agent resume my-agent
+```
+
+A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration.
+
+## `kt agent remove <name> [--delete | --retain] [--force]`
+
+Remove an Agent Instance from the Fleet.
+
+```bash
+kt agent remove demo
+kt agent remove demo --delete
+kt agent remove my-agent --force
+```
+
+- `--retain` — keep the Agent Home directory on disk (the default).
+- `--delete` — delete the Agent Home directory as well.
+- `--force` — remove even if the instance is running. Required for a running instance.
+
+`--delete` and `--retain` are mutually exclusive; when neither is given, the safe default is to retain.
+
+## `kt agent config set <name> <key> <value>`
+
+Set one config key on the Agent Instance layer. Validated at write time.
+
+```bash
+kt agent config set demo model gpt-4
+kt agent config set demo budget.tokens.cumulative 500000
+kt agent config set demo agent.api_key secret:OPENAI_KEY
+```
+
+A known unified key or an `agent.*` pass-through key is accepted and persisted; an unknown key **outside** `agent.*` is rejected before anything is written, with the nearest valid key suggested. The value is stored verbatim — a `secret:NAME` reference is stored as-is and resolved + masked at start/read (never resolved or echoed by this write).
+
+## `kt agent config get <name> [<key>] [--json] [--reveal]`
+
+Read the effective (resolved) config with per-value provenance.
+
+```bash
+kt agent config get demo
+kt agent config get demo model
+kt agent config get demo --json
+kt agent config get demo --reveal
+```
+
+- `<key>` — optional; omitted prints the whole effective config. With a key, prints just that value.
+- `--json` — emit a versioned document whose per-leaf objects carry `{ key, value, source, unvalidated }`.
+- `--reveal` — the sole explicit un-mask for `secret:` values. It re-resolves secrets **live** (environment, then the secrets file) at read time, so a revealed value may differ from what a running instance resolved at its start. It never un-masks the persisted snapshot, logs, or events.
+
+Values resolve across four layers — engine defaults &lt; agent-kind defaults &lt; instance config &lt; invocation overrides — and each value names its winning source layer (a **Source** column, or a `source` field with `--json`).
+
+## Unified Config Keys
+
+Set these with `kt agent config set <name> <key> <value>`.
+
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `budget.tokens.per_run` | integer | Per-run token ceiling |
+| `budget.tokens.cumulative` | integer | Cumulative token ceiling |
+| `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`) |
+| `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
+| `cost.rate.output` | dollar string | Output price per 1M tokens |
+| `budget.dollars.per_run` | dollar string | Per-run dollar Cost Cap (needs a Rate to enforce) |
+| `budget.dollars.cumulative` | dollar string | Cumulative dollar Cost Cap (needs a Rate to enforce) |
+| `metering.upstream_base_url` | URL | Real upstream endpoint for an `engine-observed` instance |
+| `agent.<key>` | any | Pass-through namespace delivered verbatim to the agent (bypasses known-key validation) |
+
+Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Ktesio displays it.
+
+## Global Behavior
+
+### Update checks
+
+When a `kt` subcommand runs, Ktesio checks whether a newer GitHub Release is available, using an hourly cache. If an update is available, it prints a short stderr notice asking you to run `kt self-update`. Machine-readable JSON on stdout is unaffected. Disable checks with `KTESIO_NO_UPDATE_CHECK=1` (also skipped when `CI=true`).
+
+### `kt self-update`
+
+Update the `kt` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary).
 
 ```bash
 kt self-update
-```
-
-Behavior:
-
-- Detects the current install channel automatically.
-- Uses `brew upgrade imagdy/tap/ktesio` for Homebrew installs.
-- Uses `cargo install ktesio --force` for Cargo installs.
-- Downloads, verifies, extracts, and replaces the current binary for manual release installs.
-- Fails with an actionable Cargo install recommendation when no prebuilt binary exists for the current platform.
-- Skips the passive update notice while the explicit update command is running.
-
-## `kt search <query>`
-
-Search public skill listings from skills.sh.
-
-```bash
-kt search tests
-kt search "react native" --limit 10
-kt search tests --json
-kt search tests --install
-```
-
-Behavior:
-
-- Uses the public skills.sh search endpoint by default.
-- Uses the documented authenticated skills.sh API when `KTESIO_SKILLS_SH_API_KEY` is set.
-- Prints install commands for GitHub-backed results, such as `kt install owner/repo/skill`.
-- Marks unsupported sources as `not installable yet`.
-- Retries rate limits, temporary service failures, and transient network errors up to 3 total attempts.
-- For `429 Too Many Requests`, respects `Retry-After` or `X-RateLimit-Reset` before falling back to short exponential backoff with jitter.
-- Shows friendly retry and final failure messages instead of raw HTTP or JSON errors.
-
-Ktesio uses the skills.sh public API responsibly as described in the skills.sh terms, respects rate limits, and will use the documented authenticated API once API access is available.
-
-## `kt init <path>`
-
-Create a `skills.json` manifest in a directory.
-
-```bash
-kt init .
-```
-
-Behavior:
-
-- Creates `skills.json` with `dependencies` and `publish` fields.
-- Scans existing `.agents/skills/*` directories.
-- Shows per-skill progress while looking up public matches, cloning matched repos to resolve commits, and falling back to local path dependencies.
-- Uses existing `skills.lock` entries or exact public skills.sh matches to adopt known installed skills as remote dependencies and lock their current commit.
-- Records unmatched installed skills as local path dependencies.
-- Does not automatically publish adopted local skills.
-- Leaves an existing manifest untouched.
-- Fails if the target directory does not exist.
-
-## `kt install`
-
-Install every dependency declared in `skills.json`. If `dependencies` is omitted, it is treated as empty.
-
-```bash
-kt install
-```
-
-Behavior:
-
-- Fetches each remote dependency into a temporary workspace.
-- Shows a progress bar while cloning each repo and copying published content.
-- Suppresses raw git clone progress; clone failures are summarized after the skill finishes.
-- Installs only paths declared in the source repo's `skills.json` `publish` list.
-- Supports local path dependencies with `dependencies.<name>.path`.
-- Supports optional `rev` selectors: `commit:<sha>`, `branch:<name>`, or `tag:<name>`.
-- If the source repo has no `skills.json`, asks before discovering directories under `skills/`, `SKILLS/`, or `.agents/skills/`; multiple directories can be selected.
-- Records resolved commits in `skills.lock` only for successful installs.
-- Continues after individual clone/copy failures and reports all errors.
-
-## `kt install <name:repo>`
-
-Add one skill to `skills.json` and install it.
-
-```bash
-kt install docs:https://github.com/example/agent-docs.git
-kt install docs:example/agent-docs
-kt install docs:example/agent-docs --ssh
-kt install docs:example/agent-docs/review
-```
-
-The `repo` value can be an HTTPS URL, SSH URL, local git path, GitHub `owner/repo` shorthand, or GitHub `owner/repo/skill` shorthand. GitHub shorthand resolves to HTTPS by default; `--ssh` resolves shorthand to an SSH clone URL.
-
-Ktesio updates `skills.json` and `skills.lock` only after the repo is fetched and installable content is copied successfully. A bad target, failed clone, missing published skill, cancelled fallback, or missing fallback skill directory leaves those files unchanged.
-
-The single-skill install flow uses the same progress bar and quiet git output as bulk install.
-
-## `kt install <repo>`
-
-Install one or more published skills from a source repository without naming the package first.
-
-```bash
-kt install https://github.com/example/agent-docs.git
-kt install example/agent-docs
-kt install example/agent-docs/review
-kt install example/agent-docs --skill review
-kt install --all https://github.com/example/agent-docs.git
-```
-
-Behavior:
-
-- Reads the source repo's `skills.json` `publish` list and derives destination names from published skill names.
-- Prompts when multiple published skills are available.
-- `--all` installs every published skill without prompting.
-- `--skill <name>` installs one matching published or fallback-discovered skill.
-- `--yes` accepts safe defaults, such as a single obvious fallback skill.
-- `--no-input` fails instead of prompting when a choice is required.
-- Repos without `skills.json` can use fallback discovery from `.md` files or directories under `skills/`, `SKILLS/`, or `.agents/skills/`.
-
-## `kt publish`
-
-Publish local skills from this repo.
-
-```bash
-kt publish
-```
-
-Behavior:
-
-- Selects local path dependencies or directories under `.agents/skills/`.
-- Writes selected skill names to the `publish` list.
-- If an untracked `.agents/skills/<name>` directory is selected, first records it as a local path dependency.
-- Does not publish remote dependencies.
-- Creates a manifest if needed.
-
-## `kt publish add <name> <path>`
-
-Add or update one published local skill in `skills.json`.
-
-```bash
-kt publish add docs skills/docs
-```
-
-Behavior:
-
-- Creates `skills.json` if needed.
-- Preserves existing dependencies and publish entries.
-- Fails if the name is invalid, the path does not exist, or the path is outside the project.
-
-## `kt upgrade`
-
-Fetch latest commits for installed skills.
-
-```bash
-kt upgrade
-```
-
-Behavior:
-
-- Uses `skills.lock` when present, otherwise falls back to `skills.json`.
-- Runs git fetch and checks out the resolved default branch behind a progress bar.
-- Updates `skills.lock` for successful upgrades.
-- Reports per-skill errors without stopping the whole command.
-- Suppresses raw git fetch and checkout output unless a failure needs a short git error summary.
-
-## `kt list`
-
-Show all known skills.
-
-```bash
-kt list
-```
-
-Statuses:
-
-- `installed`: manifest or lockfile entry exists and files are present.
-- `missing`: lockfile entry exists but files are missing.
-- `not locked`: manifest entry exists but no lock entry exists.
-- `orphaned`: lockfile entry exists but no manifest entry exists.
-
-The table uses icons and color-coded status labels when the terminal supports them.
-
-Use `kt list --json` for machine-readable output. JSON entries include `name`, `repo`, `commit`, `path`, and `status`.
-
-## `kt show <name>`
-
-Show one skill.
-
-```bash
-kt show docs
-```
-
-Output includes name, repo, commit, local path, and status.
-
-Status is color-coded the same way as `kt list`.
-
-Use `kt show <name> --json` for machine-readable output with `name`, `repo`, `commit`, `path`, and `status`.
-
-## `kt doctor`
-
-Validate project skill state.
-
-```bash
-kt doctor
-```
-
-Behavior:
-
-- Checks `skills.json`, `skills.lock`, `.agents/skills/`, published local paths, orphaned lock entries, missing installed directories, and git availability.
-- Exits successfully when no errors are found.
-- Prints actionable warnings and errors for repairable project state.
-
-## `kt uninstall <name>`
-
-Remove a skill from manifest, lockfile, and disk.
-
-```bash
-kt uninstall docs
-```
-
-## `kt remove <name>`
-
-Alias for `kt uninstall <name>`.
-
-```bash
-kt remove docs
 ```

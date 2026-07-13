@@ -38,6 +38,19 @@
 //!   `running`, so the supervisor's reaper detects the later `Exited` as a crash
 //!   and the Restart Policy fires. The `--heartbeat-ms` line count proves a
 //!   RESTARTED instance is alive again. Pure `std`, NO OS-cfg.
+//! * `--crash-times <N>` (+ `--crash-state <path>`)  BOUND the self-crash to the
+//!   first `<N>` LAUNCHES of the instance, so a restarted process eventually STOPS
+//!   crashing and stays up. Because each restart is a FRESH process (an in-memory
+//!   counter cannot survive it), the count is kept in a tiny `--crash-state` file
+//!   the engine's Agent Home persists across restarts: on each launch the process
+//!   reads the integer there (default 0); while it is `< N` it increments+persists
+//!   and crashes (after `--crash-after-ms`), and once it reaches `N` it does NOT
+//!   crash — it lingers normally. This makes an `on-failure` restart test
+//!   DETERMINISTIC: with `--crash-times 1` the instance crashes exactly once, is
+//!   restarted once, then stays `running` (its restart count is stably 1 and a
+//!   clean stop cannot race a second crash). ABSENT (or without `--crash-state`),
+//!   the self-crash is UNBOUNDED (every launch crashes) — the existing crash-loop
+//!   behavior is unchanged. Pure `std`, NO OS-cfg (a plain file read/write).
 //!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
@@ -50,9 +63,43 @@
 //!   var in the environment — WITHOUT racing on stdout capture. Pure `std`, NO
 //!   OS-cfg. (A FILE-target mapping is observed directly as a rendered file in the
 //!   Agent Home, so it needs no dump.)
+//! * `--emit-usage <N>` (story 3-1)  after announcing readiness, emit `<N>`
+//!   self-reported usage sentinel lines — `KTESIO_USAGE {json}` — on stdout, with
+//!   monotonic `sequence` 0..N and FIXED token sentinels (`input_tokens = 10`,
+//!   `output_tokens = 20` per event), spaced across the loop so the engine's reaper
+//!   ingests them into the Usage Ledger. This is the `self-reported` half of FR-19:
+//!   the engine parses these captured lines into UsageEvents. Determinism: the test
+//!   waits for the KNOWN number of committed rows (the DB is the source of truth),
+//!   NOT a wall-clock sleep. Pure `std`, NO OS-cfg (the parser + this emitter share
+//!   the documented convention; the OS-cfg gate covers this crate).
+//! * `--replay-usage` (story 3-1)  after the `--emit-usage` batch, re-emit
+//!   `sequence 0` ONCE (a DELAYED/replayed batch). The engine's ledger dedup must
+//!   recognize it and NOT double-count — the AC-A no-double-count proof.
+//! * `--usage-input-tokens <N>` / `--usage-output-tokens <N>` (story 3-1)  override
+//!   the FIXED per-event token sentinels so a test can emit an arbitrary value —
+//!   notably `u64::MAX` — to prove the storage boundary SATURATE-CLAMPS the `u64`
+//!   into SQLite's signed `i64` column (a positive `i64::MAX`) rather than a raw
+//!   `as i64` that bit-wraps NEGATIVE and poisons the billing SUM (the C1/C2
+//!   boundary). Default to the fixed sentinels when absent.
+//! * `--final-usage-no-newline` (story 3-1)  after the batch (+ any replay), emit
+//!   ONE more usage line WITHOUT a trailing newline (`sequence = emit_usage`), then
+//!   exit immediately. The process dies with a half-line in the log, so ONLY the
+//!   engine's TERMINAL drain-on-reap can rescue it — the H1 under-count proof (a
+//!   mid-run drain, which stops at the last newline, would strand it forever).
+//! * `--observed-calls <N>` (story 3-4)  ENGINE-OBSERVED mode: after announcing
+//!   readiness, make `<N>` OpenAI-compatible completion requests to the `base_url`
+//!   the engine INJECTED into this process's environment (`OPENAI_BASE_URL` — the
+//!   env var an `engine-observed` manifest maps `metering.base_url` onto). Each is a
+//!   minimal `POST <base_url>/v1/chat/completions`; the engine's loopback forward
+//!   listener relays it to a test upstream stub and skims the `usage` out of the
+//!   response into the ledger. This is the `engine-observed` half of FR-19: the
+//!   agent reports NOTHING itself — the engine OBSERVES its model traffic. A tiny
+//!   pure-`std` HTTP/1.1 client (a raw `TcpStream` — NO dependency, NO OS-cfg) makes
+//!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
+//!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -80,6 +127,62 @@ struct Opts {
     crash_after: Option<Duration>,
     /// The exit code the `--crash-after-ms` self-crash uses (default 1).
     crash_with: i32,
+    /// BOUND the self-crash to the first `<N>` launches (see the module docs).
+    /// `None` = unbounded (every launch crashes — the existing behavior). Only has
+    /// an effect together with `--crash-state` (the cross-restart counter file).
+    crash_times: Option<u64>,
+    /// The tiny file that carries the launch-crash counter ACROSS restarts (each
+    /// restart is a fresh process), so `--crash-times` can stop crashing after the
+    /// bound. `None` = no persisted counter (the bound cannot be enforced).
+    crash_state: Option<PathBuf>,
+    /// Emit this many self-reported usage sentinel lines (story 3-1). `0` = none.
+    emit_usage: u64,
+    /// After the usage batch, re-emit `sequence 0` once — a replayed batch for the
+    /// no-double-count proof (story 3-1). Ignored unless `emit_usage > 0`.
+    replay_usage: bool,
+    /// Override the per-event input-token sentinel (story 3-1 C1/C2 boundary test).
+    /// `None` = the fixed [`USAGE_INPUT_TOKENS`]. Lets a test emit a huge value (e.g.
+    /// `u64::MAX`) to prove the storage boundary saturate-clamps rather than wraps.
+    usage_input_tokens: Option<u64>,
+    /// Override the per-event output-token sentinel (see `usage_input_tokens`).
+    usage_output_tokens: Option<u64>,
+    /// Emit ONE final usage sentinel line WITHOUT a trailing newline, then exit
+    /// promptly (story 3-1 H1 under-count test). Its `sequence` is `emit_usage` (one
+    /// past the batch), so the TERMINAL drain-on-reap must consume the newline-less
+    /// tail or that event is stranded and lost.
+    final_usage_no_newline: bool,
+    /// ENGINE-OBSERVED mode (story 3-4): after announcing readiness, make `<N>`
+    /// OpenAI-compatible completion requests to the `base_url` the engine injected
+    /// into this process's environment (read from `OPENAI_BASE_URL` — the env var an
+    /// `engine-observed` manifest maps `metering.base_url` onto). Each POST goes to
+    /// `<base_url>/v1/chat/completions`; the engine's loopback listener forwards it
+    /// to the test upstream stub and skims the `usage` out of the response. `0` =
+    /// no observed calls (the default; existing self-reported tests unaffected).
+    observed_calls: u64,
+    /// The `Authorization: Bearer <value>` the observed calls carry (story 3-4
+    /// no-leak test): a sentinel API key the proxy must relay UPSTREAM faithfully but
+    /// leak into NONE of ktesio's surfaces. `None` = no auth header sent.
+    observed_auth: Option<String>,
+}
+
+/// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
+/// test asserting the ledger total is an exact-match (`N * INPUT` etc.), never a
+/// fuzzy range. Kept small + memorable.
+const USAGE_INPUT_TOKENS: u64 = 10;
+const USAGE_OUTPUT_TOKENS: u64 = 20;
+
+/// Format ONE `KTESIO_USAGE {json}` self-reported usage sentinel line (story 3-1).
+///
+/// MUST match the engine's `ktesio_engine::ports::parse_usage_line` convention:
+/// the prefix `KTESIO_USAGE ` + a JSON object with snake_case `sequence`,
+/// `input_tokens`, `output_tokens`. This binary cannot depend on the engine, so it
+/// re-implements the shared shape in pure `std`; the engine's
+/// `format_and_parse_round_trip_agree_on_the_convention` test guards the two
+/// against drift. NO OS-cfg — the line is identical text on every OS.
+fn usage_line(sequence: u64, input_tokens: u64, output_tokens: u64) -> String {
+    format!(
+        "KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens}}}"
+    )
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -95,6 +198,15 @@ fn parse() -> Opts {
     let mut heartbeat = None;
     let mut crash_after = None;
     let mut crash_with = 1;
+    let mut crash_times = None;
+    let mut crash_state = None;
+    let mut emit_usage = 0;
+    let mut replay_usage = false;
+    let mut usage_input_tokens = None;
+    let mut usage_output_tokens = None;
+    let mut final_usage_no_newline = false;
+    let mut observed_calls = 0;
+    let mut observed_auth = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -102,6 +214,33 @@ fn parse() -> Opts {
             "--exit-fast" => {
                 let code = args.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
                 exit_fast = Some(code);
+            }
+            "--emit-usage" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    emit_usage = n;
+                }
+            }
+            "--replay-usage" => replay_usage = true,
+            "--usage-input-tokens" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    usage_input_tokens = Some(n);
+                }
+            }
+            "--usage-output-tokens" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    usage_output_tokens = Some(n);
+                }
+            }
+            "--final-usage-no-newline" => final_usage_no_newline = true,
+            "--observed-calls" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    observed_calls = n;
+                }
+            }
+            "--observed-auth" => {
+                if let Some(v) = args.next() {
+                    observed_auth = Some(v);
+                }
             }
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
@@ -124,6 +263,16 @@ fn parse() -> Opts {
                     crash_with = code;
                 }
             }
+            "--crash-times" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    crash_times = Some(n);
+                }
+            }
+            "--crash-state" => {
+                if let Some(path) = args.next() {
+                    crash_state = Some(PathBuf::from(path));
+                }
+            }
             "--marker" => {
                 if let Some(path) = args.next() {
                     marker = Some(PathBuf::from(path));
@@ -139,6 +288,18 @@ fn parse() -> Opts {
         }
     }
 
+    // Story 3-4 no-leak refinement: prefer an ENV-delivered observed auth over the
+    // `--observed-auth` flag. Delivering the key as a `secret:` config leaf (mapped
+    // onto this env var) keeps the sentinel OUT of the persisted registration
+    // snapshot — the resolved cleartext reaches this process only in its START-time
+    // environment — so the no-leak sweep can cover the WHOLE Agent Home (the
+    // registration snapshot `adapter.json` included). The flag stays a fallback for
+    // any caller that still passes it literally (e.g. a manifest `[lifecycle.start]`
+    // arg).
+    if let Ok(env_auth) = std::env::var("FAKE_AGENT_OBSERVED_AUTH") {
+        observed_auth = Some(env_auth);
+    }
+
     Opts {
         exit_fast,
         spawn_child,
@@ -148,6 +309,15 @@ fn parse() -> Opts {
         heartbeat,
         crash_after,
         crash_with,
+        crash_times,
+        crash_state,
+        emit_usage,
+        replay_usage,
+        usage_input_tokens,
+        usage_output_tokens,
+        final_usage_no_newline,
+        observed_calls,
+        observed_auth,
     }
 }
 
@@ -161,6 +331,32 @@ fn main() {
         write_marker(&opts.marker, "exit-fast");
         std::process::exit(code);
     }
+
+    // Resolve whether THIS launch should self-crash. Default: honor
+    // `--crash-after-ms` on EVERY launch (the unbounded crash-loop behavior). When
+    // BOTH `--crash-times <N>` and `--crash-state <path>` are set, the self-crash is
+    // BOUNDED to the first N launches via a tiny persisted counter that survives the
+    // restart (a fresh process): read the count, and if it is already `>= N` clear
+    // the crash so this (restarted) launch stays up; otherwise increment+persist and
+    // keep the crash armed. This makes an `on-failure` restart test deterministic —
+    // `--crash-times 1` crashes exactly once, then the restarted process lingers.
+    let effective_crash_after = match (
+        opts.crash_after,
+        opts.crash_times,
+        opts.crash_state.as_ref(),
+    ) {
+        (Some(after), Some(limit), Some(state_path)) => {
+            let prior = read_crash_count(state_path);
+            if prior >= limit {
+                None // bound reached — this launch does not crash
+            } else {
+                write_crash_count(state_path, prior + 1);
+                Some(after)
+            }
+        }
+        // No bound (or no state file to persist it): crash on every launch.
+        (other, _, _) => other,
+    };
 
     // Optionally spawn a looping child in the same process group / Job (it
     // inherits both), to prove the no-survivor kill catches the whole tree.
@@ -196,6 +392,79 @@ fn main() {
     // or ENV var (in the environment), without racing on stdout capture.
     write_dump(&opts.dump);
 
+    // Story 3-1: emit self-reported usage sentinel lines (readiness-gated — AFTER
+    // the ready line, so the instance has reached `running` and the engine's reaper
+    // is ingesting). Monotonic `sequence` 0..N with fixed token sentinels; a small
+    // pause between lines lets the ~250ms reaper cadence drain them. If asked, then
+    // re-emit `sequence 0` once — a DELAYED/replayed batch the ledger must dedup
+    // (AC-A no-double-count). The test waits for the KNOWN committed row count in the
+    // DB, so this schedule is a nudge, not a timing dependency. Pure `std`, NO OS-cfg.
+    let input_tokens = opts.usage_input_tokens.unwrap_or(USAGE_INPUT_TOKENS);
+    let output_tokens = opts.usage_output_tokens.unwrap_or(USAGE_OUTPUT_TOKENS);
+    for sequence in 0..opts.emit_usage {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            usage_line(sequence, input_tokens, output_tokens)
+        );
+        let _ = stdout.flush();
+        sleep(Duration::from_millis(20));
+    }
+    if opts.emit_usage > 0 && opts.replay_usage {
+        let _ = writeln!(stdout, "{}", usage_line(0, input_tokens, output_tokens));
+        let _ = stdout.flush();
+    }
+
+    // Story 3-4 (ENGINE-OBSERVED): make `observed_calls` OpenAI-compatible completion
+    // requests to the injected `base_url` (read from OPENAI_BASE_URL — the env var the
+    // engine-observed manifest maps `metering.base_url` onto). The engine's loopback
+    // forward listener relays each to the upstream stub and skims `usage` into the
+    // ledger. Readiness-gated (AFTER the ready line) + count-bounded, so the test waits
+    // for the KNOWN committed observed-row count, not a wall clock. Pure `std` HTTP.
+    if opts.observed_calls > 0 {
+        // The base_url the engine injected. Absent → nothing to call (a
+        // misconfiguration the test would catch as zero committed rows); announce it
+        // to stderr as a diagnostic and skip (never crash).
+        match std::env::var("OPENAI_BASE_URL") {
+            Ok(base_url) if !base_url.trim().is_empty() => {
+                for _ in 0..opts.observed_calls {
+                    // Best-effort per call: a transport hiccup is skipped (the test
+                    // asserts on committed rows, not on this loop). A small pause lets
+                    // the ~250ms reaper drain the observed queue between calls.
+                    let _ = post_completion(base_url.trim(), opts.observed_auth.as_deref());
+                    sleep(Duration::from_millis(20));
+                }
+            }
+            _ => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fake_agent: --observed-calls set but OPENAI_BASE_URL is unset/empty"
+                );
+            }
+        }
+    }
+
+    // Story 3-1 (H1): a Run's FINAL usage line, flushed WITHOUT a trailing newline,
+    // must not be stranded when the process exits. First stay alive PAST the engine's
+    // ~300ms startup readiness window (so `start` confirms `running` — an immediate
+    // exit would instead be read as a launch failure and never reach the reaper).
+    // Then emit ONE usage line WITHOUT a newline (`sequence = emit_usage`, one past
+    // the batch, so the test counts it distinctly) and exit. Because the process then
+    // dies with a half-line in the log, ONLY the engine's TERMINAL drain-on-reap can
+    // rescue it — a MidRun drain (which stops at the last newline) would strand it.
+    // `write!` (not `writeln!`) leaves NO trailing newline; flush so the bytes reach
+    // the captured log before exit.
+    if opts.final_usage_no_newline {
+        sleep(Duration::from_millis(500));
+        let _ = write!(
+            stdout,
+            "{}",
+            usage_line(opts.emit_usage, input_tokens, output_tokens)
+        );
+        let _ = stdout.flush();
+        std::process::exit(0);
+    }
+
     // Loop until we are killed, until the crash-after window elapses (story 1-6:
     // a simulated UNREQUESTED crash → non-zero exit), or until the linger window
     // elapses (the clean self-exit fallback). When a heartbeat interval is set,
@@ -206,7 +475,7 @@ fn main() {
     // short poll keeps the process responsive to signals in all modes.
     let start = Instant::now();
     let deadline = start + opts.linger;
-    let crash_deadline = opts.crash_after.map(|d| start + d);
+    let crash_deadline = effective_crash_after.map(|d| start + d);
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     while Instant::now() < deadline {
@@ -234,6 +503,26 @@ fn main() {
     std::process::exit(0);
 }
 
+/// Read the cross-restart launch-crash counter (see `--crash-times`). A missing,
+/// empty, or unparsable file reads as `0` (this is the first launch) — best-effort,
+/// never a panic, so a filesystem hiccup degrades to "crash on this launch" rather
+/// than crashing the harness. Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn read_crash_count(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the cross-restart launch-crash counter (see `--crash-times`).
+/// Best-effort: a write failure just means the next launch re-reads the old value,
+/// so the bound might crash one extra time — never a panic. Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn write_crash_count(path: &Path, count: u64) {
+    let _ = std::fs::write(path, count.to_string());
+}
+
 /// Best-effort write of a one-line marker file so tests can confirm startup
 /// without racing on stdout capture.
 #[cfg(not(tarpaulin_include))]
@@ -244,6 +533,66 @@ fn write_marker(path: &Option<PathBuf>, phase: &str) {
             format!("fake_agent {phase} pid={}\n", std::process::id()),
         );
     }
+}
+
+/// Make ONE minimal OpenAI-compatible completion POST to `<base_url>/v1/chat/completions`
+/// (story 3-4 engine-observed mode). Pure `std` HTTP/1.1 over a raw `TcpStream` — NO
+/// dependency, NO OS-cfg. Sends a tiny JSON body, reads (and discards) the response.
+/// Best-effort: any error is returned to the caller which skips it (the test asserts
+/// on committed ledger rows, not on this call succeeding byte-for-byte). The `base_url`
+/// is `http://127.0.0.1:<port>` (the engine's loopback listener); we parse the
+/// host:port out of it, connect, and speak the minimal HTTP/1.1 a proxy relays.
+#[cfg(not(tarpaulin_include))]
+fn post_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    // Parse `http://<host>:<port>` → the `host:port` authority (v1 the injected URL
+    // is always http loopback with an explicit port). Strip the scheme + any path.
+    let authority = base_url
+        .strip_prefix("http://")
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty authority",
+        ));
+    }
+
+    let body = br#"{"model":"gpt-observed","messages":[{"role":"user","content":"hi"}]}"#;
+    // An optional `Authorization: Bearer <key>` header (the no-leak sentinel): the
+    // proxy must relay it UPSTREAM faithfully but leak it into none of ktesio's
+    // surfaces. Included verbatim in the request head when set.
+    let auth_header = match auth {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    // A minimal, correct HTTP/1.1 request: the path the OpenAI client uses, Host, a
+    // JSON content-type, an explicit content-length, and Connection: close so the
+    // upstream/proxy closes the socket after one response (simplest read loop).
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         {auth_header}\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        len = body.len(),
+    );
+
+    let mut stream = TcpStream::connect(authority)?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    // Read the whole response and discard it (the engine skims `usage` on its side;
+    // the agent just needs a faithful response, which we do not inspect here).
+    let mut sink = Vec::new();
+    let _ = stream.read_to_end(&mut sink);
+    Ok(())
 }
 
 /// Best-effort write of the received argv + environment to the `--dump` file

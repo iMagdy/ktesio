@@ -18,7 +18,7 @@ use ktesio_adapter_api::{
     Capability, CapabilityDeclaration, EffectiveCapabilities, OsId, SupportLevel,
 };
 
-use crate::adapter::{self, AdapterRef, ResolvedAdapter};
+use crate::adapter::{self, AdapterRef, ResolvedAdapter, StartLaunch};
 use crate::paths::EnginePaths;
 use crate::ports::{CompositeSecretResolver, SecretError, SpawnRecord, StateStore, StoreError};
 use crate::store::SqliteStore;
@@ -102,6 +102,60 @@ struct AdapterSnapshot {
     manifest_path: Option<String>,
     /// The full per-OS Capability Declaration (projected at read time).
     declaration: CapabilityDeclaration,
+    /// The resolved `start` launch (exec + args + env) captured at REGISTRATION,
+    /// present only for a manifest adapter that declares a `[lifecycle.start]`
+    /// template. The supervisor USES this at start instead of re-reading the
+    /// manifest — removing a fragile start-time re-read (a hosted-runner
+    /// filesystem quirk dropped the re-read `args`, so the agent spawned with the
+    /// right binary but ZERO args). Persisted via the dedicated [`LaunchSnapshot`]
+    /// DTO — the live [`StartLaunch`] is intentionally non-`Serialize` (AD-10:
+    /// a post-`apply_config_mapping` launch can hold resolved secret cleartext).
+    /// `#[serde(default)]` for backward compat: a snapshot written before this
+    /// field existed (or a native adapter) has no `launch` key, deserializes to
+    /// `None`, and the start path falls back to the existing manifest re-read
+    /// (`resolve_start_launch`).
+    #[serde(default)]
+    launch: Option<LaunchSnapshot>,
+}
+
+/// The persisted form of a resolved [`StartLaunch`] inside the adapter snapshot.
+///
+/// A DEDICATED serialize-only DTO — NOT the live [`StartLaunch`], which is
+/// deliberately non-`Serialize` (spine AD-10): a post-[`apply_config_mapping`](crate::adapter::apply_config_mapping)
+/// launch can hold resolved secret cleartext in its plain-`String` `args`/`env`,
+/// so the live type must never be serializable. Only the REGISTRATION-time launch
+/// (no resolved secrets — just the manifest's `[lifecycle.start]` exec/args/env)
+/// is snapshotted, and it rides through this DTO. Mirrors the
+/// [`EffectiveConfigSnapshot`] precedent one function away: serialize a dedicated
+/// DTO, keep the live domain type decoupled from the on-disk schema.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct LaunchSnapshot {
+    /// The executable to run (program name or path).
+    exec: String,
+    /// Positional arguments.
+    args: Vec<String>,
+    /// Environment overrides.
+    env: std::collections::BTreeMap<String, String>,
+}
+
+impl From<&StartLaunch> for LaunchSnapshot {
+    fn from(launch: &StartLaunch) -> Self {
+        Self {
+            exec: launch.exec.clone(),
+            args: launch.args.clone(),
+            env: launch.env.clone(),
+        }
+    }
+}
+
+impl From<LaunchSnapshot> for StartLaunch {
+    fn from(snapshot: LaunchSnapshot) -> Self {
+        Self {
+            exec: snapshot.exec,
+            args: snapshot.args,
+            env: snapshot.env,
+        }
+    }
 }
 
 /// The schema version stamped on the persisted [`EffectiveConfigSnapshot`]
@@ -421,6 +475,11 @@ impl Registry {
                 .manifest_path()
                 .map(|p| p.to_string_lossy().into_owned()),
             declaration: resolved.declaration().clone(),
+            // Snapshot the resolved launch (captured from the same manifest parse
+            // as the declaration) so the start path uses it instead of re-reading
+            // the manifest. Persisted through the `LaunchSnapshot` DTO (the live
+            // `StartLaunch` is non-`Serialize`, AD-10). `None` for a native adapter.
+            launch: resolved.launch().map(LaunchSnapshot::from),
         };
         let snapshot_path = self.adapter_snapshot_path(name);
         let json = serde_json::to_string_pretty(&snapshot).map_err(|e| RegistryError::Io {
@@ -541,14 +600,39 @@ impl Registry {
     }
 
     /// The persisted adapter facts the supervisor needs to launch an instance:
-    /// its kind and (for a manifest adapter) the manifest path 1-3 recorded.
+    /// its kind, (for a manifest adapter) the manifest path 1-3 recorded, and the
+    /// `start` launch (exec + args + env) SNAPSHOTTED at registration.
+    ///
+    /// The snapshotted launch is the supervisor's PRIMARY start-spec source —
+    /// using it removes the fragile start-time manifest re-read (a hosted-runner
+    /// filesystem quirk returned empty `args` on re-read, so the agent spawned
+    /// with no args). It is `None` for a native adapter (no launch command) OR a
+    /// snapshot written before the launch was persisted; in that case the
+    /// supervisor falls back to [`crate::adapter::resolve_start_launch`] using the
+    /// kind + manifest path (which keeps erroring `NativeHasNoLaunch` for a
+    /// native adapter, and re-reads the manifest for a legacy snapshot).
     pub(crate) fn adapter_launch_facts(
         &self,
         name: &InstanceName,
-    ) -> Result<(String, Option<std::path::PathBuf>), RegistryError> {
+    ) -> Result<(String, Option<std::path::PathBuf>, Option<StartLaunch>), RegistryError> {
         let snapshot = self.read_adapter_snapshot(name)?;
         let manifest_path = snapshot.manifest_path.map(std::path::PathBuf::from);
-        Ok((snapshot.kind, manifest_path))
+        // Convert the persisted DTO back into the live `StartLaunch` the start path
+        // consumes (so `apply_config_mapping` still runs on a `StartLaunch`).
+        Ok((
+            snapshot.kind,
+            manifest_path,
+            snapshot.launch.map(StartLaunch::from),
+        ))
+    }
+
+    /// The instance's declared Metering Source as its wire string (story 3-1, AD-7):
+    /// read from the persisted adapter snapshot (`self-reported` / `engine-observed`).
+    /// The supervisor stamps this on every ingested `UsageEvent` during the Run, and
+    /// the Fleet read surfaces it (AC-C). A corrupt/missing snapshot surfaces the same
+    /// [`RegistryError::Io`] as the other snapshot reads.
+    pub(crate) fn metering_source(&self, name: &InstanceName) -> Result<String, RegistryError> {
+        Ok(self.read_adapter_snapshot(name)?.metering_source)
     }
 
     /// The effective (current-OS) [`SupportLevel`] for `capability` on an
@@ -902,9 +986,79 @@ impl Registry {
         self.instance_log_dir(name).join("agent.log")
     }
 
-    /// Count Usage Ledger events for an instance (used to prove empty ledgers).
+    /// The per-instance BUDGET-BREACH log FILE — the JSON-Lines
+    /// [`crate::domain::BudgetBreachEvent`] log (story 3-2, AD-14). Engine-owned,
+    /// SEPARATE from the transition log so the ALWAYS-recorded breach event is a
+    /// durable fact independent of any lifecycle transition (FR-21 "breaches are
+    /// always recorded as events regardless of action") — a `warn` breach (no
+    /// transition) still lands here, and a breach whose pause/stop fails is still
+    /// recorded here. Full subscription delivery is 7-2's; this is the durable
+    /// record + the seed the future bus reads.
+    pub(crate) fn instance_breach_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("breaches.log")
+    }
+
+    /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;
+    /// story 3-1 populates the table so this returns a real count).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {
         Ok(self.store.count_usage_events(name)?)
+    }
+
+    // ---- Usage Ledger writes + reads (story 3-1, spine AD-6/AD-7) ----
+    //
+    // Thin `pub(crate)` pass-throughs to the store's Usage-Ledger methods (same
+    // pattern as `set_state` → `store.set_state`). The commit choke point in the
+    // supervisor is the SOLE caller of `record_usage_event` (the AD-7 single-writer
+    // invariant); the Fleet read is the sole caller of the total reads.
+
+    /// Append ONE [`UsageEvent`] to the Usage Ledger in its own transaction (AD-6),
+    /// returning whether it was inserted or was a recognized replay (AC-A dedup).
+    /// The supervisor's ingestion choke point is the only caller.
+    pub(crate) fn record_usage_event(
+        &self,
+        event: &crate::domain::UsageEvent,
+        rate: Option<crate::domain::Rate>,
+    ) -> Result<crate::domain::RecordOutcome, RegistryError> {
+        Ok(self.store.record_usage_event(event, rate)?)
+    }
+
+    /// The CUMULATIVE token totals for an instance (sum over all its Runs) — the
+    /// Fleet-detail `usage` read (AC-C/AC11). An absent instance totals zero.
+    pub(crate) fn usage_totals(
+        &self,
+        name: &InstanceName,
+    ) -> Result<crate::domain::UsageTotals, RegistryError> {
+        Ok(self.store.usage_totals(name)?)
+    }
+
+    /// The PER-RUN token totals for an instance scoped to one Run (AC-B). An absent
+    /// instance / unknown Run totals zero.
+    pub(crate) fn run_usage_totals(
+        &self,
+        name: &InstanceName,
+        run_id: &crate::domain::RunId,
+    ) -> Result<crate::domain::UsageTotals, RegistryError> {
+        Ok(self.store.run_usage_totals(name, run_id)?)
+    }
+
+    /// The CUMULATIVE derived DOLLAR cost for an instance (story 3-3, AC-A) — each
+    /// row priced at its own persisted Rate (no retro-repricing). An absent instance
+    /// totals `$0`.
+    pub(crate) fn cost_totals(
+        &self,
+        name: &InstanceName,
+    ) -> Result<crate::domain::Micros, RegistryError> {
+        Ok(self.store.cost_totals(name)?)
+    }
+
+    /// The PER-RUN derived DOLLAR cost for an instance scoped to one Run (story
+    /// 3-3). An absent instance / unknown Run totals `$0`.
+    pub(crate) fn run_cost_totals(
+        &self,
+        name: &InstanceName,
+        run_id: &crate::domain::RunId,
+    ) -> Result<crate::domain::Micros, RegistryError> {
+        Ok(self.store.run_cost_totals(name, run_id)?)
     }
 
     /// Test-only escape hatch to seed an instance in an arbitrary Lifecycle
@@ -1580,11 +1734,19 @@ source = "self-reported"
                 OsId::Macos,
                 SupportLevel::Guaranteed,
             );
+        // The resolved `start` launch is snapshotted alongside the declaration.
+        let launch = StartLaunch {
+            exec: "the-agent".to_string(),
+            args: vec!["--serve".to_string(), "--port".to_string(), "0".to_string()],
+            env: std::collections::BTreeMap::from([("MODE".to_string(), "test".to_string())]),
+        };
         let snapshot = AdapterSnapshot {
             kind: "demo".to_string(),
             metering_source: "self-reported".to_string(),
             manifest_path: Some("/some/adapter.toml".to_string()),
             declaration: declaration.clone(),
+            // Persisted through the DTO (the live StartLaunch is non-Serialize).
+            launch: Some(LaunchSnapshot::from(&launch)),
         };
         let json = serde_json::to_string_pretty(&snapshot).unwrap();
         let back: AdapterSnapshot = serde_json::from_str(&json).unwrap();
@@ -1596,6 +1758,42 @@ source = "self-reported"
         assert_eq!(
             back.declaration.support(Capability::Pause, OsId::Windows),
             SupportLevel::BestEffort
+        );
+        // The launch (exec + args + env) survives the full StartLaunch → DTO →
+        // JSON → DTO → StartLaunch round-trip.
+        assert_eq!(back.launch.map(StartLaunch::from), Some(launch));
+    }
+
+    #[test]
+    fn adapter_snapshot_without_launch_field_deserializes_to_none() {
+        // Backward compat: a snapshot written BEFORE the `launch` field existed has
+        // no `launch` key. It must deserialize to `None` (never a hard parse error)
+        // so the start path falls back to re-reading the manifest, exactly as it
+        // did before this change. Simulate a legacy file by serializing a snapshot
+        // and dropping the `launch` key.
+        let declaration = CapabilityDeclaration::new().with(
+            Capability::Pause,
+            OsId::Linux,
+            SupportLevel::Guaranteed,
+        );
+        let snapshot = AdapterSnapshot {
+            kind: "demo".to_string(),
+            metering_source: "self-reported".to_string(),
+            manifest_path: Some("/some/adapter.toml".to_string()),
+            declaration,
+            launch: Some(LaunchSnapshot {
+                exec: "x".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            }),
+        };
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value.as_object_mut().unwrap().remove("launch");
+        let back: AdapterSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(back.kind, "demo");
+        assert!(
+            back.launch.is_none(),
+            "an absent launch key must deserialize to None (fallback to re-read)"
         );
     }
 
@@ -1622,6 +1820,7 @@ source = "self-reported"
             metering_source: "self-reported".to_string(),
             manifest_path: None,
             declaration,
+            launch: None,
         };
         let snap_path = reg.adapter_snapshot_path(&name);
         std::fs::write(&snap_path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
@@ -1669,6 +1868,7 @@ source = "self-reported"
             metering_source: "self-reported".to_string(),
             manifest_path: None,
             declaration,
+            launch: None,
         };
         std::fs::write(
             reg.adapter_snapshot_path(&name),
@@ -1705,6 +1905,7 @@ source = "self-reported"
             metering_source: "self-reported".to_string(),
             manifest_path: None,
             declaration,
+            launch: None,
         };
         std::fs::write(
             reg.adapter_snapshot_path(&name),
