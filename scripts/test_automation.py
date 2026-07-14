@@ -120,7 +120,36 @@ class ReleaseDocsTests(unittest.TestCase):
         # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), so these jobs
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
         # (asserted in test_ci_enforces_msrv_floor) still proves the 1.96.1 floor.
-        self.assertIn("cargo +stable test --workspace --all-targets", ci)
+        #
+        # The `test` job runs the suite via cargo-nextest (#106): nextest gives a
+        # per-test kill-timeout so a hung/slow engine integration test becomes a
+        # NAMED, time-boxed failure instead of a silent job-level cancel whose
+        # logs GitHub discards (the ubuntu symptom), and its retries absorb the
+        # windows-latest per-test timing flake. Doctests run separately because
+        # nextest does not execute them. nextest is installed with the repo's
+        # standard `cargo install --locked` idiom (same as the semver / tarpaulin
+        # gates), not a third-party install action, so the SHA-pinned-actions
+        # posture is preserved. Assert the whole shape so a regression back to the
+        # hang-prone plain `cargo test` suite run — or a dropped doctest pass — is
+        # caught.
+        self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
+        self.assertIn("cargo +stable test --workspace --doc", ci)
+        # nextest (unlike `cargo test --all-targets`) does not hardlink the
+        # fake_agent bin to target/debug/fake_agent, so the test job rebuilds it
+        # explicitly between the stale-bin `rm` and the nextest run — otherwise the
+        # process-spawning tests race on the lib's on-demand build fallback. Guard
+        # both the `rm` and the explicit rebuild so neither is dropped.
+        self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
+        self.assertIn("cargo +stable build -p ktesio-conformance --bin fake_agent", ci)
+        self.assertIn(
+            "command -v cargo-nextest >/dev/null 2>&1 "
+            "|| cargo +stable install cargo-nextest --locked",
+            ci,
+        )
+        self.assertIn("${{ runner.os }}-cargo-nextest-bin", ci)
+        # The old plain-`cargo test` suite command must be GONE — the only
+        # remaining `cargo +stable test` in the test job is the `--doc` pass.
+        self.assertNotIn("cargo +stable test --workspace --all-targets", ci)
         # Coverage runs tarpaulin ONCE PER CRATE (#101), not one --workspace pass:
         # the --workspace instrumented run OOM'd the 7 GB runner even after the
         # AI-23 fixes. Each per-crate run keeps its resident set small; the UNION of
@@ -221,6 +250,47 @@ class ReleaseDocsTests(unittest.TestCase):
         # coverage job still stays Linux-only (now a per-crate tarpaulin split
         # merged into one aggregate, #101 — still Linux, still one job).
         self.assertIn("name: coverage", ci)
+
+    def test_ci_test_job_single_run_with_serialized_engine_integration(self) -> None:
+        # #106: a per-binary CI bisect pinned the x86-ubuntu hang to the `adoption`
+        # engine integration binary (its heavy re-exec + surviving-orphan harness
+        # wedged the genuine 2-core runner into an uninterruptible D-state under
+        # nextest's concurrency). The fix is SOURCE-side — serialize the engine
+        # integration tests via a nextest test-group (max-threads=1) — so the CI
+        # `test` job is back to a SINGLE clean run for all OSes. Lock that clean
+        # shape and assert the serialization exists; guard that the temporary
+        # per-binary bisect scaffold AND the earlier watchdog/off-pipe machinery are
+        # gone (so a future edit that reintroduces per-OS hang hacks is caught).
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        nextest = (release_docs.ROOT / ".config" / "nextest.toml").read_text(
+            encoding="utf-8"
+        )
+        # Clean shape: build test binaries once (--no-run), ONE unified run for all
+        # OSes, doctests separate.
+        self.assertIn(
+            "cargo +stable nextest run --workspace --all-targets --no-run", ci
+        )
+        self.assertIn("- name: Run tests (nextest)", ci)
+        self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
+        self.assertIn("cargo +stable test --workspace --doc", ci)
+        # The SOURCE fix: a max-threads=1 test-group over exactly the engine
+        # integration binaries, with the existing retries + slow-timeout untouched.
+        self.assertIn("[test-groups.engine-integration-serial]", nextest)
+        self.assertIn("max-threads = 1", nextest)
+        self.assertIn('filter = "kind(test) & package(ktesio-engine)"', nextest)
+        self.assertIn('test-group = "engine-integration-serial"', nextest)
+        self.assertIn("retries = 2", nextest)
+        self.assertIn("slow-timeout = ", nextest)
+        # The temporary bisect scaffold and the watchdog/off-pipe machinery are GONE
+        # (no per-OS special-casing, no per-binary steps, no in-step capture hacks).
+        self.assertNotIn("ubuntu bisect:", ci)
+        self.assertNotIn("binary_id(=ktesio-engine::", ci)
+        self.assertNotIn("RUNLOG", ci)
+        self.assertNotIn("kill -USR1 $$", ci)
+        self.assertNotIn("matrix.os == 'ubuntu-latest'", ci)
+        self.assertNotIn("matrix.os != 'ubuntu-latest'", ci)
 
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(

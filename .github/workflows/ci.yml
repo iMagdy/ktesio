@@ -68,7 +68,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows + bundled-SQLite + tokio first build is slower than Linux; bump.
+    # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
+    # build is slow; this job builds test binaries, runs the suite, and runs the
+    # doctest pass. 25 gives headroom now that the heavy ktesio-engine integration
+    # tests are SERIALIZED (the `engine-integration-serial` max-threads=1 test-group
+    # in .config/nextest.toml) — the source fix for the x86-ubuntu `adoption` hang
+    # (#106), where concurrent heavy process-spawning wedged the 2-core runner into
+    # an uninterruptible D-state. nextest's per-test kill-timeout (see
+    # .config/nextest.toml) remains the cross-OS per-test hang guard.
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -85,29 +92,85 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Run tests
-        # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable
-        # on each OS; the pin governs only local bare cargo. MSRV floor: `msrv` job.
+      - name: Cache cargo-nextest binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-nextest so it is not rebuilt on
+          # every fresh runner — mirrors the semver / tarpaulin binary caches
+          # (AI-1/AI-23). runner.os keys it per-OS. restore-keys lets a partial
+          # match seed ~/.cargo/bin so the install guard below finds it warm.
+          key: ${{ runner.os }}-cargo-nextest-bin
+          path: |
+            ~/.cargo/bin
+          restore-keys: ${{ runner.os }}-cargo-nextest-bin
+      - name: Install cargo-nextest
+        # Repo-consistent install idiom (same as the semver / tarpaulin gates):
+        # `cargo install --locked`, guarded by `command -v` so a cache hit skips
+        # the rebuild. Deliberately NOT a third-party install action — this repo
+        # SHA-pins its actions and installs its cargo tooling from source, so a
+        # tag-pinned install-action would be an inconsistent supply-chain surface.
+        # Explicit +stable (see fmt job): install under the same toolchain the
+        # matrix legs test with.
+        shell: bash
+        run: command -v cargo-nextest >/dev/null 2>&1 || cargo +stable install cargo-nextest --locked
+      - name: Build test binaries (nextest --no-run)
+        # SPLIT build from run (#106): the fused compile+run step could not
+        # attribute a stall to build-vs-run, and a job-timeout cancel discards the
+        # whole job-log blob (BlobNotFound) — so when the 40-min ubuntu leg was
+        # cancelled we were blind to WHERE it stalled. GitHub preserves per-STEP
+        # status even when the job-log blob is lost, so building the test binaries
+        # in their OWN step reveals whether a future stall is in compile or in run.
+        #
+        # nextest replaces `cargo test` for the suite (#106): a slow or hung engine
+        # integration test becomes a NAMED, time-boxed failure with captured logs
+        # (see .config/nextest.toml — slow-timeout terminates a stuck test at
+        # ~4 min) instead of silently burning the job budget. Explicit +stable (see
+        # fmt job): the 3-OS matrix exercises latest stable per OS; the root pin
+        # governs only local bare cargo. MSRV floor: the `msrv` job.
         #
         # `rm -f target/debug/fake_agent*` FORCES a fresh rebuild of the `fake_agent`
-        # test helper. The per-OS `target/` cache can restore a STALE fake_agent whose
-        # newer `--emit-usage`/`--dump` args are silently ignored (older `--linger-ms`/
-        # `--heartbeat-ms` still work) — failing ONLY the metering integration tests on
-        # macOS/Windows while Ubuntu + local pass. `fake_agent_bin()` reuses an existing
-        # binary, so deleting the output makes cargo rebuild it fresh in the
-        # `--all-targets` build below. The engine passes the launch args correctly;
-        # this is a test-harness cache artifact, not a product bug. `shell: bash` so
-        # `rm` works on the Windows runner too.
+        # test helper (kept from the earlier fix). The per-OS `target/` cache can
+        # restore a STALE fake_agent whose newer `--emit-usage`/`--dump` args are
+        # silently ignored (older `--linger-ms`/`--heartbeat-ms` still work) —
+        # failing ONLY the metering integration tests on macOS/Windows while Ubuntu
+        # + local pass. The engine passes the launch args correctly; this is a
+        # test-harness cache artifact, not a product bug. `shell: bash` so `rm` works
+        # on the Windows runner too.
         #
-        # Tests run PARALLEL (the harness default). The one real flake seen here was a
-        # read-consistency race in cost.rs (fixed deterministically — pause the agent +
-        # settle before sampling), NOT oversubscription; serializing the whole workspace
-        # was both unnecessary and harmful — its serial wall-clock overran the ubuntu
-        # leg's 25-min timeout. Fast + deterministic beats masking a race with serial.
+        # Then EXPLICITLY rebuild the bin: unlike `cargo test --all-targets` (which
+        # hardlinks the bin to target/debug/fake_agent), `cargo nextest run
+        # --all-targets` only compiles it for its own unit tests and does NOT place
+        # that top-level hardlink. The process-spawning tests resolve the helper at
+        # target/debug/fake_agent (`ktesio_conformance::fake_agent_bin`), so without
+        # this build the first such tests race on the lib's on-demand `cargo build`
+        # fallback (concurrent cargo invocations contend on the build-dir lock —
+        # observed as a flake). The explicit build makes the path deterministic.
+        # `--no-run` compiles every test binary without executing; the run steps
+        # below reuse these artifacts (no double build).
         shell: bash
         run: |
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
-          cargo +stable test --workspace --all-targets
+          cargo +stable build -p ktesio-conformance --bin fake_agent
+          cargo +stable nextest run --workspace --all-targets --no-run
+      - name: Run tests (nextest)
+        # Single unified run for all three OSes (#106). The x86-ubuntu `adoption`
+        # hang — concurrent heavy re-exec'd process-spawning wedging the genuine
+        # 2-core runner into an uninterruptible D-state — is fixed AT THE SOURCE by
+        # the `engine-integration-serial` test-group in .config/nextest.toml
+        # (max-threads=1 over `kind(test) & package(ktesio-engine)`), which caps the
+        # heavy engine integration binaries to one at a time WITHOUT skipping any
+        # test (full Linux coverage retained). So no per-OS special-casing, watchdog,
+        # or bisect is needed — a per-binary CI bisect had pinned the hang to the
+        # `adoption` binary. `retries` + `slow-timeout` in that same config still
+        # absorb the windows-latest timing flake and time-box a genuinely stuck test.
+        # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable per
+        # OS; the root pin governs only local bare cargo. MSRV floor: the `msrv` job.
+        run: cargo +stable nextest run --workspace --all-targets
+      - name: Run doctests
+        # nextest does not run doctests, so run them separately to keep the doc
+        # examples gated (`--doc` and `--all-targets` cannot combine in one cargo
+        # invocation). Explicit +stable (see fmt job).
+        run: cargo +stable test --workspace --doc
 
   build:
     name: build

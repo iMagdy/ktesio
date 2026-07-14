@@ -919,12 +919,36 @@ mod tests {
 
     /// Whether a pid is still alive (Unix): `kill(pid, 0)` succeeds while it
     /// lives, fails with ESRCH once it is gone. Test-only liveness probe.
+    ///
+    /// A ZOMBIE (defunct) process still answers `kill(pid, 0)` — it occupies its
+    /// pid until reaped — so a bare `kill(0)` probe reports a just-SIGKILLed
+    /// child as alive when there is no reaping PID1 (e.g. a bare CI container),
+    /// false-failing the group-kill assertions. On Linux, after `kill(0)` says
+    /// the pid exists, read `/proc/<pid>/stat` and treat process state `Z` as NOT
+    /// alive. macOS keeps the plain `kill(0)` semantics (no /proc; its callers
+    /// run under a reaping launchd). This is a non-destructive read — it never
+    /// `waitpid`s, so the backend keeps sole ownership of reaping its children.
     fn pid_alive(pid: u32) -> bool {
         use nix::sys::signal::kill;
-        !matches!(
+        let exists = !matches!(
             kill(Pid::from_raw(pid as i32), None),
             Err(nix::errno::Errno::ESRCH)
-        )
+        );
+        #[cfg(target_os = "linux")]
+        if exists {
+            // /proc/<pid>/stat is "pid (comm) state ...". `comm` may contain
+            // spaces or ')', so the state code is the first token AFTER the
+            // final ')'. A missing/unreadable stat (already reaped) is not a
+            // zombie, so fall through to `exists`.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some((_, rest)) = stat.rsplit_once(')') {
+                    if rest.split_whitespace().next() == Some("Z") {
+                        return false;
+                    }
+                }
+            }
+        }
+        exists
     }
 
     #[test]
