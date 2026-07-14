@@ -252,19 +252,19 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("name: coverage", ci)
 
     def test_ci_test_job_splits_build_from_run_with_ubuntu_hang_dump(self) -> None:
-        # #106: the `test` job SPLITS build from run so a future stall is
-        # attributable to compile-vs-run (GitHub keeps per-STEP status even when a
-        # job-timeout cancel discards the whole job-log blob) — the fresh run
-        # proved the build SUCCEEDS and the hang is in the RUN. The ubuntu run then
-        # runs nextest under an 18m WATCHDOG that force-EXITS THE SHELL: a prior GNU
-        # `timeout` wrapper was DEFEATED because the hung run process is unkillable
-        # D-state (uninterruptible sleep) — SIGKILL cannot reap it and `timeout`
-        # itself blocked in wait(), so the step never returned and the job-cancel
-        # discarded the log again. Signalling our own shell via USR1 makes bash
-        # interrupt `wait`, dump diagnostics, and exit — so the STEP FAILS, the job
-        # completes, and the log is ARCHIVED without depending on killing the
-        # unkillable run. Lock the whole shape so a regression back to the fused —
-        # or to the defeated `timeout` wrapper — is caught.
+        # #106: the `test` job SPLITS build from run (a fresh run proved the build
+        # SUCCEEDS; the hang is in the RUN), and the ubuntu run runs nextest under a
+        # 15m WATCHDOG that force-EXITS THE SHELL. The root cause is a run process in
+        # UNINTERRUPTIBLE D-state (uninterruptible sleep) that SIGKILL cannot reap:
+        # it first defeated a GNU `timeout` wrapper (which blocked in wait() on the
+        # unkillable child), then defeated a first watchdog whose dump() BLOCKED
+        # reading the D-state task's command-line / kernel-backtrace /proc files
+        # before it could `exit`. So the dump is now D-STATE-SAFE: it reads ONLY
+        # non-blocking /proc fields (`stat` for state/comm/ppid, `wchan` for the
+        # stuck syscall) plus a comm-only `ps -eo` forest (comm is stat-derived; the
+        # args/cmd column, which reads the command-line, is OMITTED). Lock the whole
+        # shape so a regression that reintroduces a BLOCKING read — or the defeated
+        # `timeout` wrapper — is caught.
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
@@ -275,29 +275,36 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn(
             "cargo +stable nextest run --workspace --all-targets --no-run", ci
         )
-        # (2) The ubuntu run is gated and runs nextest in the BACKGROUND under an
-        # 18-min (1080s) watchdog subshell that signals THIS shell (`kill -USR1 $$`);
+        # (2) The ubuntu run is gated and runs nextest in the BACKGROUND under a
+        # 15-min (900s) watchdog subshell that signals THIS shell (`kill -USR1 $$`);
         # the USR1 trap dumps diagnostics and `exit 124`s so an UNKILLABLE D-state
         # run still fails the step (we never depend on killing the run process).
         self.assertIn("if: matrix.os == 'ubuntu-latest'", ci)
         self.assertIn("cargo +stable nextest run --workspace --all-targets &", ci)
         self.assertIn('wait "$NEXT"', ci)
-        self.assertIn("sleep 1080", ci)
+        self.assertIn("sleep 900", ci)
         self.assertIn("kill -USR1 $$", ci)
         self.assertIn("exit 124' USR1", ci)  # the trap: dump then exit, bound to USR1
-        # The dump names the stuck test(s) and their stuck syscall: ps auxf (nextest
-        # re-invokes each test as `<bin> --exact <name>`, so cmdlines NAME the hung
-        # tests), per-pid state/wchan/cmdline, and the KERNEL STACK of every D-state
-        # pid.
-        self.assertIn("ps auxf", ci)
+        # (2a) The dump is D-STATE-SAFE: ONLY non-blocking /proc reads — the stat
+        # file (state, comm, ppid) and wchan (the stuck syscall) — plus a comm-only
+        # `ps -eo` forest. `comm` (stat-derived, <=15 chars) names the test FILE and
+        # the ppid forest shows the test-binary -> fake_agent tree; that is enough to
+        # diagnose without the args column.
+        self.assertIn("ps -eo pid,ppid,stat,wchan:32,comm --forest", ci)
         self.assertIn("for p in /proc/[0-9]*; do", ci)
-        self.assertIn("state / wchan / cmdline", ci)
-        self.assertIn("kernel stacks of D-state pids", ci)
-        self.assertIn('[ "${r%% *}" = "D" ]', ci)
-        self.assertIn('cat "$p/stack"', ci)
-        # The defeated `timeout`-wrapper form must be GONE (an unkillable D-state run
-        # blocks `timeout` in wait(), so it never fails the step — the whole reason
-        # for the watchdog).
+        self.assertIn("state / wchan / comm", ci)
+        self.assertIn("D-STATE pids (the culprits)", ci)
+        self.assertIn('[ "${rest%% *}" = "D" ]', ci)
+        self.assertIn('cat "$p/stat"', ci)
+        self.assertIn('cat "$p/wchan"', ci)
+        # (2b) The BLOCKING reads that hung the prior dump MUST be gone — reading any
+        # of these /proc files blocks uninterruptibly on a D-state pid, so the trap
+        # would never reach `exit`: `ps auxf` (reads each pid's cmdline for the CMD
+        # column), the `< "$p/cmdline"` redirect, and `cat "$p/stack"`. The defeated
+        # `timeout` wrapper must be gone too.
+        self.assertNotIn("ps auxf", ci)
+        self.assertNotIn('< "$p/cmdline"', ci)
+        self.assertNotIn('cat "$p/stack"', ci)
         self.assertNotIn("timeout --kill-after=60s 28m", ci)
         # (3) macOS/Windows legs stay a plain, fast run (GNU tools + /proc are
         # Linux-only); their green legs need no instrumentation.
