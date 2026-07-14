@@ -1315,6 +1315,137 @@ fn send_on_registered_instance_is_not_running() {
     );
 }
 
+// ---- Fix pass (review of #79): M1 (hyphen-safe text / --help interception)
+// and M2 (paused-instance remediation) ----
+
+#[test]
+fn send_text_that_looks_like_help_flag_is_sent_literally_not_intercepted_as_cli_help() {
+    // M1 fix: `text` is hyphen-safe (`allow_hyphen_values`) and `send`'s own
+    // `--help`/`-h` is disabled (`disable_help_flag`), so a text value of
+    // "--help" is delivered as literal input, never silently intercepted as
+    // the CLI's OWN help — which used to print help and exit 0 WITHOUT
+    // sending anything, so a caller checking only the exit code would
+    // wrongly believe the send succeeded.
+    //
+    // No instance named "ghost" is registered, so the real send logic must
+    // reach the ordinary NotFound diagnostic — proving "--help" was routed
+    // as the TEXT value into the real command, not consumed as a help
+    // request (which would have printed clap's usage/help text and exited
+    // 0 with nothing attempted).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let sent = run_kt_agent(
+        &["agent", "send", "ghost", "--help"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "must NOT silently exit 0 via help interception; stdout={}",
+        sent.stdout
+    );
+    assert!(
+        !sent.stdout.contains("Usage:") && !sent.stderr.contains("Usage:"),
+        "must not print clap's help/usage text; stdout={} stderr={}",
+        sent.stdout,
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("ghost"),
+        "must surface the ordinary NotFound diagnostic naming the instance \
+         (proving --help was treated as literal text, not a help request); stderr={}",
+        sent.stderr
+    );
+
+    // The hyphen-value parse problem (`kt agent send x "-5 degrees"` used to
+    // be a clap parse error) is likewise fixed: a leading-hyphen text value
+    // reaches the ordinary send logic instead of a clap "unexpected
+    // argument" failure.
+    let sent2 = run_kt_agent(
+        &["agent", "send", "ghost", "-5 degrees"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        sent2.stderr.contains("ghost"),
+        "a hyphen-leading text value must reach the ordinary NotFound diagnostic, \
+         not a clap parse error; stderr={}",
+        sent2.stderr
+    );
+    assert!(
+        !sent2.stderr.contains("unexpected argument") && !sent2.stderr.contains("Usage:"),
+        "must not be rejected as a clap parse error; stderr={}",
+        sent2.stderr
+    );
+}
+
+/// Seed a `paused` state onto an already-registered instance directly in the
+/// engine's SQLite DB (mirrors `force_state_running`) — `send`'s `NotRunning`
+/// check fires purely from the persisted state, before any capability read or
+/// live-process need, so this lighter DB-seed harness suffices (no real
+/// process required).
+fn force_state_paused(state_dir: &Path, name: &str) {
+    let conn = rusqlite::Connection::open(state_db(state_dir)).expect("open state db");
+    let affected = conn
+        .execute(
+            "UPDATE agent_instances SET state = 'paused' WHERE name = ?1",
+            [name],
+        )
+        .expect("update state");
+    assert_eq!(affected, 1, "expected to update exactly one row");
+}
+
+#[test]
+fn send_on_a_paused_instance_is_not_running_with_resume_remediation_not_start() {
+    // M2 fix: `NotRunning`'s remediation must match the instance's ACTUAL
+    // state. Before the fix, the message UNCONDITIONALLY said "start it
+    // first with: kt agent start <name>" even for a `paused` instance —
+    // but `start` on a paused instance hits `InvalidTransition` (a SECOND,
+    // confusing error), since the correct remediation is `kt agent resume`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "pz", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    force_state_paused(state_dir, "pz");
+
+    let sent = run_kt_agent(
+        &["agent", "send", "pz", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "send on a paused instance must exit non-zero"
+    );
+    assert!(
+        sent.stderr.contains("not running"),
+        "stderr should name the not-running state; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("current state: paused"),
+        "stderr should name the ACTUAL current state (paused); stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("kt agent resume pz"),
+        "the remediation must point at resume for a paused instance; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        !sent.stderr.contains("kt agent start pz"),
+        "must NOT suggest start (which would hit a second, confusing \
+         InvalidTransition error on a paused instance); stderr={}",
+        sent.stderr
+    );
+}
+
 // ---- Story 1-6: restart count / failed cause / policy surface (AC9) + restart ----
 
 /// Seed a `failed` instance with an `agent_runtime` record carrying a Restart

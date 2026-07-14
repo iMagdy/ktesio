@@ -339,8 +339,12 @@ pub enum EngineError {
     /// [`EngineError::CapabilityUnsupported`]: it is this engine session's
     /// REACH that is limited, never the adapter's declared capability, so
     /// this must NEVER be misattributed to `CapabilityUnsupported` and must
-    /// NEVER resolve to a silent success. Names the instance + the honest
-    /// underlying cause.
+    /// NEVER resolve to a silent success. Also distinct from
+    /// [`EngineError::InteractionTimedOut`]: THIS variant means "no pipe was
+    /// EVER recoverable in this session" (no handle held at all, or an
+    /// adopted/never-piped handle); that one means "we HAD a live pipe,
+    /// attempted the write, and it did not come back in time." Names the
+    /// instance + the honest underlying cause.
     #[error("Agent Instance '{name}' cannot receive input right now: {detail}")]
     InteractionUnavailable {
         /// The instance `send` targeted.
@@ -349,6 +353,37 @@ pub enum EngineError {
         /// engine session) — never a misattribution to the adapter's
         /// Capability Declaration.
         detail: String,
+    },
+
+    /// A [`Supervisor::send_input`](super::supervisor::Supervisor::send_input)
+    /// write did not complete within the bounded stdin-write timeout (story
+    /// 4.1 fix pass — the CRITICAL finding, review of #79: a genuinely stuck
+    /// agent that never drains its input could otherwise block the write
+    /// forever, freezing the ENTIRE engine — every instance shares ONE
+    /// supervisor lock, so no other `start`/`stop`/`pause`/`send`/the
+    /// crash-detection reaper could proceed until the write returned; an
+    /// adversarial audit reproduced this empirically against the original
+    /// unbounded `write_all`). Distinct from
+    /// [`EngineError::InteractionUnavailable`] (that variant means "no pipe
+    /// was EVER recoverable" — no handle held, an adopted instance, or one
+    /// whose declared interaction is unsupported); this means "we HAD a live
+    /// pipe, attempted the write, and it did not come back in time." The
+    /// instance's interaction channel is now PERMANENTLY broken for the
+    /// remainder of this engine session (until it is stopped and started
+    /// again, which opens an entirely fresh pipe) — every SUBSEQUENT `send`
+    /// on the same instance returns this immediately, without attempting
+    /// another doomed write (a cheap check, no new I/O). Names the instance +
+    /// the bound that elapsed.
+    #[error(
+        "Agent Instance '{name}' is not draining its input within {timeout_secs}s (it may be \
+         stuck); this engine session's interaction channel for it is now unavailable — stop and \
+         start it again for a fresh one"
+    )]
+    InteractionTimedOut {
+        /// The instance `send` targeted.
+        name: String,
+        /// The bound (seconds) that elapsed before the write was abandoned.
+        timeout_secs: u64,
     },
 
     /// A [`StateStore`](crate::ports::StateStore) operation failed.

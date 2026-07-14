@@ -140,3 +140,10 @@ pub struct AgentNotRunning {
 pub struct AgentInteractionUnavailable {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::interaction_timed_out))]
+pub struct AgentInteractionTimedOut {
+    pub message: String,
+}

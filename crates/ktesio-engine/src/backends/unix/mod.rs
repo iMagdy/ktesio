@@ -28,9 +28,9 @@
 //! and the OS/init reaps the non-child on exit). An adopted process is supervised
 //! for the new engine's lifetime exactly like a freshly spawned one.
 
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -38,8 +38,8 @@ use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::{setsid, Pid};
 
 use crate::ports::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec,
-    StopOutcome,
+    write_stdin_bounded, BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus,
+    SecretError, SpawnSpec, StdinState, StopOutcome, STDIN_WRITE_TIMEOUT,
 };
 
 /// How often the graceful-stop wait polls for the process to exit.
@@ -88,14 +88,20 @@ pub struct UnixProcess {
     /// a bare `kill(pid, 0)` alone cannot tell an adopted agent's crash from the OS
     /// recycling its PID to an unrelated process within a reaper interval (AI-10).
     start_time: u64,
-    /// The child's stdin pipe (story 4.1, spine AD-12), captured at spawn time
-    /// for a FRESHLY SPAWNED process. `None` for an ADOPTED process: a pipe
-    /// file descriptor cannot be recovered from a bare PID on any OS without an
-    /// undocumented hack this project's conventions already reject (parity with
-    /// the Windows-pause `[ASSUMPTION]`); `send_input` on an adopted instance
-    /// must therefore fail honestly (`EngineError::InteractionUnavailable`),
-    /// never silently succeed.
-    stdin: Option<ChildStdin>,
+    /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
+    /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
+    /// SPAWNED process whose declared `Capability::Interaction` was
+    /// `Guaranteed`/`BestEffort` on this OS (`SpawnSpec::pipe_stdin`);
+    /// `NoPipe` for an ADOPTED process (a pipe fd cannot be recovered from a
+    /// bare PID on any OS without an undocumented hack this project's
+    /// conventions already reject — parity with the Windows-pause
+    /// `[ASSUMPTION]`) or a freshly spawned one that was never piped
+    /// (interaction `Unsupported`); `TimedOut` once a bounded write on this
+    /// handle has exceeded [`STDIN_WRITE_TIMEOUT`] and can never be safely
+    /// retried. `send_input` on anything but a `Live` state must therefore
+    /// fail honestly (`EngineError::InteractionUnavailable` /
+    /// `EngineError::InteractionTimedOut`), never silently succeed.
+    stdin: StdinState,
 }
 
 /// The Unix process backend (AD-4).
@@ -147,12 +153,23 @@ impl ProcessBackend for UnixBackend {
                 command.stderr(Stdio::null());
             }
         }
-        // Piped UNCONDITIONALLY (story 4.1, spine AD-12): v1 pipes stdin for
-        // every spawned process regardless of the declared Capability — the
-        // Capability Declaration gates only whether `send_input` is *callable*,
-        // not whether the pipe exists. Decoupling spawn construction from
-        // capability data keeps this file free of capability lookups.
-        command.stdin(Stdio::piped());
+        // Piped ONLY when the caller (the supervisor, at spawn time) resolved
+        // the declared Capability::Interaction level to Guaranteed/BestEffort
+        // on this OS (story 4.1 fix pass, HIGH finding — review of #79;
+        // supersedes the story's original unconditional `Stdio::piped()`).
+        // An adapter that declares no interaction support gets Stdio::null()
+        // — the pre-story-4.1 safe default — so a process that blocks
+        // reading stdin at startup (a common "sniff for piped input" real-CLI
+        // idiom) sees immediate EOF instead of hanging forever on a pipe
+        // whose write end this engine holds open for its whole supervised
+        // lifetime. This file stays free of capability LOOKUPS (the
+        // supervisor already resolved the bool into `spec.pipe_stdin`); it
+        // only branches on the resolved value.
+        command.stdin(if spec.pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         // Put the child in its OWN session+process group BEFORE exec, so a later
         // killpg reaches the whole tree. `setsid` fails only if the caller is
@@ -181,9 +198,16 @@ impl ProcessBackend for UnixBackend {
         // handle reaps via its owned Child, so it never relies on this for the
         // PID-reuse guard; a read failure degrades to 0, an honest pid-only form).
         let start_time = process_start_time(pid).unwrap_or(0);
-        // Capture the piped stdin now, for a FRESHLY SPAWNED handle only (story
-        // 4.1) — an adopted handle never has one (see `adopt` below).
-        let stdin = child.stdin.take();
+        // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
+        // (story 4.1) — `child.stdin` is `Some` exactly when `spec.pipe_stdin`
+        // was true above (Stdio::piped() populates it; Stdio::null() never
+        // does), so branching on std's own answer is simpler and more robust
+        // than re-deriving it from `spec.pipe_stdin` a second time. An
+        // adopted handle never has one (see `adopt` below).
+        let stdin = match child.stdin.take() {
+            Some(s) => StdinState::Live(s),
+            None => StdinState::NoPipe,
+        };
         Ok(UnixProcess {
             child: Some(child),
             pgid,
@@ -331,41 +355,37 @@ impl ProcessBackend for UnixBackend {
         // `live_start` on every poll (AI-10), so a later PID reuse cannot mask a
         // crash of this adopted process.
         //
-        // `stdin: None` (story 4.1): an adopted handle has no recoverable pipe —
-        // there is no OS-portable, documented way to reopen a `ChildStdin` from a
-        // bare pid. `send_input` against this handle fails with
-        // `EngineError::InteractionUnavailable`, never silently succeeding.
+        // `stdin: StdinState::NoPipe` (story 4.1): an adopted handle has no
+        // recoverable pipe — there is no OS-portable, documented way to
+        // reopen a `ChildStdin` from a bare pid. `send_input` against this
+        // handle fails with `EngineError::InteractionUnavailable`, never
+        // silently succeeding.
         Ok(Some(UnixProcess {
             child: None,
             pgid: Pid::from_raw(fingerprint.pid as i32),
             pid: fingerprint.pid,
             start_time: live_start,
-            stdin: None,
+            stdin: StdinState::NoPipe,
         }))
     }
 
     fn has_stdin(&self, handle: &Self::Handle) -> bool {
-        handle.stdin.is_some()
+        handle.stdin.is_live()
+    }
+
+    fn stdin_timed_out(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_timed_out()
     }
 
     fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError> {
-        match handle.stdin.as_mut() {
-            Some(stdin) => {
-                stdin.write_all(data).map_err(|e| BackendError::Control {
-                    op: "stdin",
-                    detail: e.to_string(),
-                })?;
-                stdin.flush().map_err(|e| BackendError::Control {
-                    op: "stdin",
-                    detail: e.to_string(),
-                })?;
-                Ok(())
-            }
-            None => Err(BackendError::Control {
-                op: "stdin",
-                detail: "no stdin pipe held for this handle".to_string(),
-            }),
-        }
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): bounded via
+        // the shared, portable thread+channel+recv_timeout mechanism — see
+        // `write_stdin_bounded`'s docs. Identical to the Windows backend's
+        // body (this file and `backends/windows/mod.rs` intentionally share
+        // ONE implementation via this call, rather than two separate OS
+        // timeout implementations, since the mechanism has no OS-specific
+        // part: a `ChildStdin` write is portable `std` on both).
+        write_stdin_bounded(&mut handle.stdin, data, STDIN_WRITE_TIMEOUT)
     }
 }
 
@@ -614,6 +634,11 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: std::env::temp_dir(),
             log_file: None,
+            // Preserves this shared helper's pre-fix behavior (piping was
+            // unconditional before the HIGH fix): every test using this
+            // helper spawns with a live stdin pipe, matching what they
+            // already assumed.
+            pipe_stdin: true,
         }
     }
 
@@ -860,7 +885,7 @@ mod tests {
             pgid: Pid::from_raw(fp.pid as i32),
             pid: fp.pid,
             start_time: fp.start_time.wrapping_add(1),
-            stdin: None,
+            stdin: StdinState::NoPipe,
         };
         assert_eq!(
             backend.poll(&mut recycled).unwrap(),
@@ -892,7 +917,7 @@ mod tests {
             pgid: Pid::from_raw(pid as i32),
             pid,
             start_time: 0, // no recorded token → bare-liveness fallback
-            stdin: None,
+            stdin: StdinState::NoPipe,
         };
         assert_eq!(
             backend.poll(&mut degraded).unwrap(),
@@ -1020,6 +1045,7 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             log_file: Some(agent_log.clone()),
+            pipe_stdin: true,
         };
         s.env.clear();
 
@@ -1113,6 +1139,7 @@ mod tests {
             ],
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
+            pipe_stdin: true,
             log_file: Some(agent_log.clone()),
         };
         s.env.clear();
@@ -1211,6 +1238,7 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             log_file: Some(log.clone()),
+            pipe_stdin: true,
         };
         s.env.insert("KT_TEST".to_string(), "applied".to_string());
         let backend = UnixBackend::new();
@@ -1251,6 +1279,7 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             log_file: Some(agent_log.clone()),
+            pipe_stdin: true,
         };
         s.env.clear();
 
@@ -1259,6 +1288,10 @@ mod tests {
         assert!(
             backend.has_stdin(&proc),
             "a freshly spawned handle has a live stdin pipe"
+        );
+        assert!(
+            !backend.stdin_timed_out(&proc),
+            "a freshly spawned handle has not timed out"
         );
 
         backend
@@ -1292,6 +1325,7 @@ mod tests {
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn sleep");
         assert!(backend.has_stdin(&proc), "freshly spawned handle has stdin");
+        assert!(!backend.stdin_timed_out(&proc), "not timed out yet");
 
         let fp = backend.fingerprint(&proc);
         let adopter = UnixBackend::new();
@@ -1302,6 +1336,11 @@ mod tests {
         assert!(
             !adopter.has_stdin(&adopted),
             "an adopted handle has no recoverable stdin pipe"
+        );
+        assert!(
+            !adopter.stdin_timed_out(&adopted),
+            "an adopted handle never had a pipe, so it never timed out either — \
+             distinct from a handle that HAD a live pipe and timed out"
         );
 
         let _ = backend.stop(&mut proc, Duration::from_secs(2));
@@ -1326,5 +1365,122 @@ mod tests {
             other => panic!("expected Control, got {other}"),
         }
         let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    // ---- Story 4.1 fix pass (CRITICAL finding, review of #79): the bounded
+    // stdin write. These call `write_stdin_bounded` DIRECTLY with a short,
+    // custom timeout (rather than through the `ProcessBackend::write_stdin`
+    // trait method, which hardcodes the real production `STDIN_WRITE_TIMEOUT`
+    // of 5s) so the MECHANISM is proven fast here; the full production
+    // dispatch through `Supervisor::send_input` using the real 5s constant is
+    // proven end-to-end (including the "a different instance is not blocked
+    // beyond the bound" property, which needs the engine's actual shared
+    // lock) by `crates/ktesio-engine/tests/interaction.rs`. ----
+
+    #[test]
+    fn write_stdin_bounded_times_out_on_a_non_draining_pipe_and_marks_the_handle_timed_out() {
+        // A process that never reads its stdin (no --echo-stdin) and a
+        // payload that comfortably exceeds any OS pipe buffer (Linux
+        // defaults to 64KiB; even a generously tuned buffer is nowhere near
+        // 8MB) — so the write blocks once the buffer fills, exactly the
+        // adversarial audit's reproduction. A short 150ms custom timeout
+        // (NOT the production 5s constant) keeps this test fast while still
+        // exercising the real mechanism end to end.
+        let backend = UnixBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_agent_path();
+        let s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec!["--linger-ms".to_string(), "600000".to_string()],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(dir.path().join("agent.log")),
+            pipe_stdin: true,
+        };
+        let mut proc = backend
+            .spawn(&s)
+            .expect("spawn fake_agent (no --echo-stdin: never reads stdin)");
+        assert!(backend.has_stdin(&proc), "freshly spawned handle has stdin");
+
+        let huge_payload = vec![b'x'; 8 * 1024 * 1024]; // 8MB, far past any pipe buffer
+        let start = Instant::now();
+        let err = write_stdin_bounded(&mut proc.stdin, &huge_payload, Duration::from_millis(150))
+            .expect_err("a write to a non-draining pipe past its buffer must time out");
+        let elapsed = start.elapsed();
+        match err {
+            BackendError::StdinTimedOut { timeout_secs } => assert_eq!(timeout_secs, 0), // 150ms rounds to 0s
+            other => panic!("expected StdinTimedOut, got {other}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the bounded write must return promptly after its OWN short timeout, not hang: {elapsed:?}"
+        );
+
+        // The handle is now durably marked TimedOut: has_stdin is false, and
+        // stdin_timed_out distinguishes this from "never had a pipe".
+        assert!(!backend.has_stdin(&proc), "no longer reports a live pipe");
+        assert!(
+            backend.stdin_timed_out(&proc),
+            "must be distinguishably TimedOut, not merely NoPipe"
+        );
+
+        // Teardown: killing the group unblocks the abandoned write thread
+        // (its blocked write() call gets EPIPE once the reader is gone), so
+        // it cleans itself up in the background; the test does not wait for
+        // it (there is no safe way to join it — see write_stdin_bounded's
+        // docs — and it is harmless to leave running briefly).
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn write_stdin_after_a_timeout_is_a_defensive_control_error_with_no_new_write_attempted() {
+        // Once a handle is TimedOut, a caller that (incorrectly) tries to
+        // write again must get an IMMEDIATE defensive Control error — never
+        // another attempted write, and never a second wait. This is the
+        // backend-level safety net; `Supervisor::send_input` additionally
+        // short-circuits via `stdin_timed_out` before ever reaching here
+        // (proven at the engine level in interaction.rs), but this backend
+        // method must be safe even if called directly.
+        let backend = UnixBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_agent_path();
+        let s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec!["--linger-ms".to_string(), "600000".to_string()],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(dir.path().join("agent.log")),
+            pipe_stdin: true,
+        };
+        let mut proc = backend.spawn(&s).expect("spawn fake_agent");
+
+        // Force a fast timeout (150ms, not the production 5s) to reach the
+        // TimedOut state quickly.
+        let huge_payload = vec![b'x'; 8 * 1024 * 1024];
+        let first = write_stdin_bounded(&mut proc.stdin, &huge_payload, Duration::from_millis(150));
+        assert!(matches!(first, Err(BackendError::StdinTimedOut { .. })));
+        assert!(backend.stdin_timed_out(&proc));
+
+        // A second attempt (via the PUBLIC trait method this time, which
+        // internally would use the real 5s bound if it attempted a write —
+        // it must not) returns instantly.
+        let start = Instant::now();
+        let second = backend.write_stdin(&mut proc, b"more\n");
+        let elapsed = start.elapsed();
+        match second {
+            Err(BackendError::Control { op, .. }) => assert_eq!(op, "stdin"),
+            other => panic!("expected a defensive Control error, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a write on an already-TimedOut handle must return immediately, not attempt \
+             (and wait out) another doomed write: {elapsed:?}"
+        );
+        assert!(
+            backend.stdin_timed_out(&proc),
+            "must remain TimedOut, not be reset by the defensive no-op"
+        );
+
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
     }
 }

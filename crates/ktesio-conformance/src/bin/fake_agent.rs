@@ -105,6 +105,18 @@
 //!   pure-`std` HTTP/1.1 client (a raw `TcpStream` — NO dependency, NO OS-cfg) makes
 //!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
 //!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
+//! * `--sniff-stdin-at-startup` (story 4-1 fix pass, HIGH finding, review of
+//!   #79)  BEFORE announcing readiness (before the ready line, before
+//!   `--marker`, before anything else), synchronously BLOCK reading ONE line
+//!   from stdin (`io::stdin().read_line(..)`). This mimics a common real-CLI
+//!   "sniff for piped input at startup" idiom — NOT the `--echo-stdin`
+//!   background-thread mechanism (which runs independent of startup and
+//!   never blocks it). Under `Stdio::null()` (an adapter that declares no
+//!   interaction support) this returns immediately (EOF) and startup
+//!   proceeds normally; under an unconditionally-piped stdin whose write end
+//!   nothing ever closes, this call would hang forever — the regression this
+//!   flag exists to prove does NOT happen once piping is gated on the
+//!   declared Capability. Pure `std`, NO OS-cfg.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -175,6 +187,10 @@ struct Opts {
     /// no echo thread (the default; existing tests that never write to stdin
     /// are unaffected).
     echo_stdin: bool,
+    /// Synchronously block reading ONE stdin line BEFORE announcing
+    /// readiness (story 4-1 fix pass, HIGH finding). `false` = no sniff (the
+    /// default; existing tests are unaffected).
+    sniff_stdin_at_startup: bool,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -220,6 +236,7 @@ fn parse() -> Opts {
     let mut observed_calls = 0;
     let mut observed_auth = None;
     let mut echo_stdin = false;
+    let mut sniff_stdin_at_startup = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -256,6 +273,7 @@ fn parse() -> Opts {
                 }
             }
             "--echo-stdin" => echo_stdin = true,
+            "--sniff-stdin-at-startup" => sniff_stdin_at_startup = true,
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -333,12 +351,28 @@ fn parse() -> Opts {
         observed_calls,
         observed_auth,
         echo_stdin,
+        sniff_stdin_at_startup,
     }
 }
 
 #[cfg(not(tarpaulin_include))]
 fn main() {
     let opts = parse();
+
+    // Story 4-1 fix pass (HIGH finding, review of #79): BEFORE anything else
+    // (before the exit-fast path, before announcing readiness), mimic a
+    // common real-CLI "sniff for piped input at startup" idiom by
+    // synchronously blocking on ONE stdin line. Under the fixed engine
+    // behavior (stdin piped only when the declared Capability::Interaction
+    // is Guaranteed/BestEffort), an adapter that declares no interaction
+    // support gets Stdio::null() here, so this read returns immediately
+    // (EOF) and startup proceeds normally; under the OLD unconditional-pipe
+    // regression this would hang forever, since nothing would ever close or
+    // write to the pipe.
+    if opts.sniff_stdin_at_startup {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
 
     // Immediate-exit path (AC2): exit before doing anything else.
     if let Some(code) = opts.exit_fast {

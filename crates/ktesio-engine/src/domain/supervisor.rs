@@ -383,6 +383,31 @@ impl Supervisor {
             .metering_source(&name)
             .map_err(registry_to_engine)?;
 
+        // Read the effective (current-OS) Capability::Interaction level (story
+        // 4.1 fix pass, HIGH finding — review of #79) to decide whether THIS
+        // spawn should pipe stdin at all. The story's original implementation
+        // piped UNCONDITIONALLY for every process; an adversarial audit showed
+        // this can hang an adapter that declares no interaction support: a
+        // process that blocks reading stdin at startup (a common "sniff for
+        // piped input" real-CLI idiom) never sees EOF, because the engine
+        // holds the pipe's write end open for the process's whole supervised
+        // lifetime and nothing ever writes to it unless `send` is called — the
+        // child hangs forever yet is reported `running` (readiness here is
+        // just "the process didn't exit immediately"), a silent deadlock with
+        // no error signal anywhere. Mirrors how the rest of this codebase
+        // gates BEHAVIOR (not just callability) on declared capabilities
+        // (e.g. pause's SIGSTOP-vs-noop branching). Read here (a pure
+        // snapshot read, mirroring `metering_source` above) before any side
+        // effect, so a corrupt snapshot rejects the start cleanly like every
+        // other pre-transition read.
+        let interaction_level = registry
+            .effective_support(&name, Capability::Interaction)
+            .map_err(registry_to_engine)?;
+        let pipe_stdin = matches!(
+            interaction_level,
+            SupportLevel::Guaranteed | SupportLevel::BestEffort
+        );
+
         // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
         // (story 2-2, FR-12) — still before any persisted state change, so a
         // config/mapping failure rejects the start cleanly (no spurious state
@@ -501,6 +526,7 @@ impl Supervisor {
             env: launch.env,
             working_dir: home,
             log_file: Some(agent_log_path),
+            pipe_stdin,
         };
 
         // (4) Spawn. A spawn failure lands the instance in `failed` with the
@@ -972,12 +998,21 @@ impl Supervisor {
     ///    for text that was never delivered — a silent success would violate
     ///    FR-24's "honest failure" framing, and this must NEVER be
     ///    misattributed to `CapabilityUnsupported` (the declaration is
-    ///    truthful; it is this engine session's reach that is limited),
+    ///    truthful; it is this engine session's reach that is limited).
+    ///    **Fix pass addition (review of #79):** a handle whose PRIOR write
+    ///    already timed out ([`crate::ports::ProcessBackend::stdin_timed_out`])
+    ///    fails fast with [`EngineError::InteractionTimedOut`] here too — a
+    ///    cheap, no-I/O check, never a repeat doomed write.
     /// 5. **AC-F**: append exactly one trailing `\n` if `text` doesn't
     ///    already end with one, then write + flush via
-    ///    [`crate::ports::ProcessBackend::write_stdin`], mapping any
-    ///    [`BackendError`] to [`EngineError::Backend`] — the SAME generic
-    ///    mapping `signal_backend` already uses for pause/resume.
+    ///    [`crate::ports::ProcessBackend::write_stdin`] — BOUNDED to
+    ///    [`crate::ports::STDIN_WRITE_TIMEOUT`] (fix pass, the CRITICAL
+    ///    finding: the original unbounded write could freeze the ENTIRE
+    ///    engine, since this call runs while the caller already holds the
+    ///    single, engine-wide supervisor lock — see `write_stdin`'s docs). A
+    ///    timeout maps to [`EngineError::InteractionTimedOut`]; any OTHER
+    ///    [`BackendError`] maps to [`EngineError::Backend`] — the SAME
+    ///    generic mapping `signal_backend` already uses for pause/resume.
     pub fn send_input(
         &mut self,
         registry: &Registry,
@@ -1024,6 +1059,21 @@ impl Supervisor {
                 detail: "no live process handle is held in this engine session".to_string(),
             });
         };
+        // Fix pass (CRITICAL finding, review of #79): a cheap, no-I/O check
+        // FIRST — a handle whose prior write already exceeded the bounded
+        // timeout is PERMANENTLY broken for the rest of this engine session
+        // (see `write_stdin`'s docs). Checked before `has_stdin` (which would
+        // also read `false` here) so the more precise, honest diagnostic
+        // wins: "we had a pipe and it stopped draining" is a materially
+        // different fact from "no pipe was ever recoverable", and the CLI's
+        // remediation differs (restart to get a fresh channel either way, but
+        // the cause is not the same).
+        if self.backend.stdin_timed_out(&supervised.handle) {
+            return Err(EngineError::InteractionTimedOut {
+                name: name.as_str().to_string(),
+                timeout_secs: crate::ports::STDIN_WRITE_TIMEOUT.as_secs(),
+            });
+        }
         if !self.backend.has_stdin(&supervised.handle) {
             return Err(EngineError::InteractionUnavailable {
                 name: name.as_str().to_string(),
@@ -1041,12 +1091,26 @@ impl Supervisor {
         if !text.ends_with('\n') {
             bytes.push(b'\n');
         }
-        self.backend
-            .write_stdin(&mut supervised.handle, &bytes)
-            .map_err(|source| EngineError::Backend {
+        // Fix pass (CRITICAL finding): this write is now BOUNDED to
+        // `STDIN_WRITE_TIMEOUT` (`write_stdin`'s new contract) rather than
+        // the story's original unbounded `write_all` — still runs while
+        // `self` (the supervisor) is held under the caller's lock, exactly
+        // like `stop`'s existing bounded graceful-window wait; a deliberate,
+        // ACCEPTED, BOUNDED tradeoff, not the unbounded-freeze problem this
+        // fix closes.
+        match self.backend.write_stdin(&mut supervised.handle, &bytes) {
+            Ok(()) => Ok(()),
+            Err(BackendError::StdinTimedOut { timeout_secs }) => {
+                Err(EngineError::InteractionTimedOut {
+                    name: name.as_str().to_string(),
+                    timeout_secs,
+                })
+            }
+            Err(source) => Err(EngineError::Backend {
                 name: name.as_str().to_string(),
                 source,
-            })
+            }),
+        }
     }
 
     /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if

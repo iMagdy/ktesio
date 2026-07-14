@@ -233,11 +233,34 @@ impl Manifest {
             // variant `x`, expected ..." without naming the section; attribute
             // it to the right section so the diagnostic names it (AC2/AC4),
             // matching every other rejection.
-            let detail = if message.starts_with("unknown variant")
-                && (message.contains("self-reported") || message.contains("engine-observed"))
+            //
+            // M3 fix (review of #79): disambiguate using the message's
+            // "expected ..." clause — the FAILING FIELD's own valid values —
+            // never by whether the OFFENDING value happens to ALSO be a
+            // valid variant name of the OTHER enum. The original logic
+            // string-matched the whole message against both enums' variant
+            // names, so `[interaction] channel = "self-reported"` (an
+            // INVALID channel — the only valid one is "stdio" — that also
+            // happens to be a valid MeteringSource variant NAME) produced
+            // the message `unknown variant \`self-reported\`, expected
+            // \`stdio\`` and was misattributed to `[metering]`, because
+            // "self-reported" appears in the message (as the REJECTED
+            // value), even though `[metering]`'s own valid values
+            // ("self-reported" / "engine-observed") are never what's
+            // "expected" here. Splitting on "expected" and checking only
+            // the tail (the field's own valid-values clause) makes this
+            // robust regardless of what the offending value happens to spell.
+            let expected_clause = message
+                .split_once("expected")
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+            let detail = if !message.starts_with("unknown variant") {
+                message
+            } else if expected_clause.contains("self-reported")
+                || expected_clause.contains("engine-observed")
             {
                 format!("the `[metering]` section has an invalid `source`: {message}")
-            } else if message.starts_with("unknown variant") && message.contains("stdio") {
+            } else if expected_clause.contains("stdio") {
                 format!("the `[interaction]` section has an invalid `channel`: {message}")
             } else {
                 message
@@ -659,6 +682,85 @@ channel = "stdio"
         assert!(err.to_string().contains("[interaction]"), "got {err}");
         assert!(err.to_string().contains("http"), "got {err}");
         assert!(err.to_string().contains("channel"), "got {err}");
+    }
+
+    #[test]
+    fn invalid_interaction_channel_that_is_a_valid_metering_source_name_still_names_interaction() {
+        // M3 fix (review of #79): `[interaction].channel = "self-reported"`
+        // is an INVALID channel value (the only valid one is "stdio") that
+        // ALSO happens to be a valid `MeteringSource` variant NAME. The
+        // original section-naming logic disambiguated by matching the
+        // OFFENDING VALUE against both enums' known variants, so this
+        // specific value was misattributed to `[metering]` even though the
+        // field that actually failed to parse is `[interaction].channel` —
+        // `[metering].source` was never touched by this edit. The fix
+        // disambiguates using the message's "expected ..." clause (the
+        // FAILING FIELD's own valid values) instead of the rejected value.
+        let toml = VALID.replace("channel = \"stdio\"", "channel = \"self-reported\"");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(
+            err.to_string().contains("[interaction]"),
+            "must name [interaction] (the field that actually failed to parse), got {err}"
+        );
+        assert!(
+            !err.to_string().contains("[metering]"),
+            "must NOT be misattributed to [metering] merely because the offending value \
+             is also a valid MeteringSource variant name, got {err}"
+        );
+        assert!(err.to_string().contains("self-reported"), "got {err}");
+        assert!(err.to_string().contains("channel"), "got {err}");
+    }
+
+    #[test]
+    fn invalid_metering_source_that_is_a_valid_interaction_channel_name_still_names_metering() {
+        // The mirror direction of the M3 fix: `[metering].source = "stdio"`
+        // is an INVALID source (only "self-reported"/"engine-observed" are
+        // valid) that ALSO happens to be the one valid
+        // `InteractionChannelKind` variant name. Must still name
+        // `[metering]`, never `[interaction]` — confirms the "expected ..."
+        // clause disambiguation is symmetric, not merely patched for the
+        // one direction M3 called out.
+        let toml = VALID.replace("source = \"self-reported\"", "source = \"stdio\"");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(err.to_string().contains("[metering]"), "got {err}");
+        assert!(
+            !err.to_string().contains("[interaction]"),
+            "must NOT be misattributed to [interaction], got {err}"
+        );
+        assert!(err.to_string().contains("stdio"), "got {err}");
+        assert!(err.to_string().contains("source"), "got {err}");
+    }
+
+    #[test]
+    fn unknown_variant_error_from_an_unrelated_enum_is_passed_through_unattributed() {
+        // Coverage-closing (fix pass, review of #79): `from_toml_str`'s
+        // section-naming only recognizes TWO specific "unknown variant"
+        // shapes (`[metering].source` / `[interaction].channel`). A THIRD
+        // enum in the schema — `SupportLevel` (`[capabilities.*]`'s
+        // guaranteed/best-effort/unsupported) — can ALSO produce an "unknown
+        // variant" message (e.g. a typo'd support level), and its valid
+        // values overlap with NEITHER metering's nor interaction's. This
+        // must fall through to the raw, UNMODIFIED message (never crash,
+        // never be misattributed to either section) — the fallback branch
+        // the M3 restructuring's `if/else if/else if/else` chain still needs
+        // reachable and correct.
+        let toml = VALID.replace(
+            "linux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"best-effort\"",
+            "linux = \"sometimes\"\nmacos = \"guaranteed\"\nwindows = \"best-effort\"",
+        );
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(
+            !err.to_string().contains("[metering]"),
+            "an unrelated enum's bad value must not be misattributed to [metering], got {err}"
+        );
+        assert!(
+            !err.to_string().contains("[interaction]"),
+            "an unrelated enum's bad value must not be misattributed to [interaction], got {err}"
+        );
+        assert!(err.to_string().contains("sometimes"), "got {err}");
     }
 
     #[test]

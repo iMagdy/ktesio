@@ -26,7 +26,11 @@
 //! dynamic dispatch, and the port stays free of OS types.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::ChildStdin;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -48,6 +52,30 @@ pub struct SpawnSpec {
     /// seed (AD-12). `None` inherits the engine's streams (used only in tests
     /// that do not assert captured output).
     pub log_file: Option<PathBuf>,
+    /// Whether to pipe the child's stdin (story 4.1 fix pass, HIGH finding —
+    /// review of #79).
+    ///
+    /// `true` only when the instance's declared `Capability::Interaction`
+    /// level on the CURRENT OS is `Guaranteed` or `BestEffort` — the caller
+    /// (the supervisor, at spawn time) reads the effective Capability
+    /// Declaration and sets this field; the backends themselves stay
+    /// capability-agnostic (dumb process executors), mirroring how this
+    /// codebase already gates BEHAVIOR (not just callability) on declared
+    /// capabilities elsewhere (e.g. pause's SIGSTOP-vs-noop branching).
+    ///
+    /// `false` uses the pre-story-4.1 safe default (`Stdio::null()`): an
+    /// adapter that declares no interaction support behaves EXACTLY as
+    /// before spawn ever piped anything. This matters because the story's
+    /// original implementation piped stdin UNCONDITIONALLY for every
+    /// spawned process: a process that does a blocking read of stdin at
+    /// startup (a common "sniff for piped input" real-CLI idiom) then hangs
+    /// forever, because the engine holds the pipe's write end open for the
+    /// process's entire supervised lifetime and nothing ever writes to it
+    /// unless `send` is called — the child never sees EOF and never
+    /// unblocks, yet is reported `running` (readiness here is just "the
+    /// process didn't exit immediately"), a silent deadlock with no error
+    /// signal anywhere.
+    pub pipe_stdin: bool,
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).
@@ -164,6 +192,193 @@ pub enum BackendError {
         /// The underlying detail.
         detail: String,
     },
+
+    /// A [`ProcessBackend::write_stdin`] call did not complete within
+    /// [`STDIN_WRITE_TIMEOUT`] (story 4.1 fix pass, the CRITICAL finding —
+    /// review of #79). See [`write_stdin_bounded`]'s docs for the full
+    /// mechanism. The instance's interaction channel is now PERMANENTLY
+    /// broken for the remainder of this engine session (a stop/start builds
+    /// an entirely fresh handle/pipe).
+    #[error(
+        "stdin write did not complete within {timeout_secs}s — the agent may not be draining its input"
+    )]
+    StdinTimedOut {
+        /// The bound (seconds) that elapsed before the write was abandoned.
+        timeout_secs: u64,
+    },
+}
+
+/// How long a [`ProcessBackend::write_stdin`] call may block before the
+/// instance's interaction channel is declared permanently broken for the rest
+/// of this engine session (story 4.1 fix pass — the CRITICAL finding: the
+/// ENTIRE engine shares ONE supervisor lock — `EngineInner::supervisor` in
+/// `engine.rs` — so an unbounded blocking write to one instance's stdin pipe
+/// could freeze every other instance's `start`/`stop`/`pause`/`send` AND the
+/// crash-detection reaper forever, since none of them can acquire the lock
+/// until the write returns; an adversarial audit reproduced this empirically
+/// against the story's original unbounded `write_all`).
+///
+/// 5 seconds is a conservative, deliberately non-configurable bound (this is
+/// an internal resilience bound, not a user-facing setting — no new CLI
+/// flag/config surface is warranted, since neither `epics.md` nor the story
+/// calls for one): a healthy agent draining the realistic operator payload
+/// (`send`'s `text` argument — a line or a short paragraph of interactive
+/// input) completes in low-single-digit milliseconds even on a loaded CI
+/// runner, so 5s leaves generous headroom for scheduler jitter while still
+/// keeping a genuinely stuck agent from wedging the engine for anything
+/// beyond a human-noticeable pause. It intentionally mirrors the order of
+/// magnitude of [`crate::domain::DEFAULT_STOP_WINDOW`]'s sibling bounded-wait
+/// (30s) scaled down for a much smaller, interactive-sized payload rather
+/// than a whole graceful-shutdown grace period.
+pub const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The state of a spawned process's stdin channel (story 4.1 fix pass — the
+/// CRITICAL and HIGH findings, review of #79).
+///
+/// Deliberately not a bare `Option<ChildStdin>` (as the story originally
+/// shipped it): a bounded write timeout ([`STDIN_WRITE_TIMEOUT`]) introduces
+/// a THIRD possibility beyond "has a pipe" / "never had one" — "had one, but
+/// a write to it never came back in time, so it can never be safely touched
+/// again". [`StdinState::TimedOut`] must stay clearly distinguishable from
+/// both [`StdinState::NoPipe`] and [`StdinState::Live`].
+#[derive(Debug)]
+pub enum StdinState {
+    /// No pipe is held for this handle. Covers BOTH: an ADOPTED process (no
+    /// OS-portable, documented way to recover a pipe file descriptor from a
+    /// bare PID; see [`ProcessBackend::adopt`]'s docs) and a FRESHLY SPAWNED
+    /// process whose declared `Capability::Interaction` level was
+    /// `Unsupported` on this OS, so [`SpawnSpec::pipe_stdin`] was `false` and
+    /// the child's stdin was never piped at all (the HIGH finding's fix —
+    /// `Stdio::null()`, the pre-story-4.1 safe default).
+    NoPipe,
+    /// A live pipe this handle can write to right now.
+    Live(ChildStdin),
+    /// A write to this pipe exceeded [`STDIN_WRITE_TIMEOUT`]. The spawned
+    /// write thread (see [`write_stdin_bounded`]) may STILL be running,
+    /// blocked on the OS write syscall — there is no safe, portable way to
+    /// cancel a running [`std::thread`] or reclaim a `ChildStdin` it may
+    /// still hold, so this state is PERMANENT for the remainder of this
+    /// handle's life (until the instance is stopped and started again, which
+    /// builds an entirely fresh handle/pipe). Every SUBSEQUENT `send` on this
+    /// instance must fail fast on this state, never attempting another
+    /// doomed write.
+    TimedOut,
+}
+
+impl StdinState {
+    /// Whether this state holds a live pipe that can be written to right now.
+    pub fn is_live(&self) -> bool {
+        matches!(self, StdinState::Live(_))
+    }
+
+    /// Whether a PRIOR write on this state exceeded [`STDIN_WRITE_TIMEOUT`]
+    /// (see [`StdinState::TimedOut`]).
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, StdinState::TimedOut)
+    }
+}
+
+/// Write `data` to `state`'s pipe and flush it, bounded to `timeout` (story
+/// 4.1 fix pass — the CRITICAL finding, review of #79).
+///
+/// A portable, `std`-only bounded-write pattern that needs no raw
+/// non-blocking I/O or fd manipulation (which would need different,
+/// error-prone implementations per OS, unlike this function which is called
+/// identically from both backends): TAKES OWNERSHIP of the `ChildStdin` out
+/// of `state` (via [`std::mem::replace`], so nothing else can observe or
+/// touch it while a write may be in-flight), moves it onto a spawned
+/// [`std::thread`] that performs the actual `write_all` + `flush`, and blocks
+/// the CALLER (only — never the child thread) up to `timeout` on an
+/// [`mpsc::channel`]'s [`mpsc::Receiver::recv_timeout`].
+///
+/// Outcomes:
+/// * **Success within `timeout`**: the spawned thread's `(ChildStdin,
+///   io::Result<()>)` comes back on the channel. The `ChildStdin` is put BACK
+///   into `state` (`Live`) so a LATER write on the same handle can reuse the
+///   same pipe — safe because the thread has already finished with it (its
+///   `write_all`/`flush` calls returned before sending, and ownership moved
+///   back through the channel, so there is no concurrent access).
+/// * **A genuine I/O failure within `timeout`** (e.g. `EPIPE` — the agent
+///   exited between the caller's liveness check and this write): reported as
+///   [`BackendError::Control`], exactly like every other backend op. The
+///   `ChildStdin` is likewise put back (an I/O error means the thread
+///   returned, not that it is stuck).
+/// * **Timeout**: the thread may still be blocked on the write syscall.
+///   Reclaiming the `ChildStdin` would race a write that could complete at
+///   any moment on a handle nothing else should concurrently touch, so
+///   `state` is set to [`StdinState::TimedOut`] and this returns
+///   [`BackendError::StdinTimedOut`]. The thread is intentionally NEITHER
+///   joined NOR aborted (there is no safe, portable way to cancel a blocked
+///   `std::thread`); it is simply abandoned. If the write eventually
+///   completes or fails, its result is sent to a receiver nobody is
+///   listening to anymore (a harmless dropped `Err(SendError)`) and the
+///   thread exits normally, dropping its `ChildStdin` (closing the pipe).
+///   This leaks the thread until the write unblocks (the agent starts
+///   draining, the pipe breaks, or the process exits) or the whole engine
+///   process exits; acceptable because a stuck agent is already an
+///   operator-actionable failure (the diagnostic says to restart the
+///   instance), not a steady-state occurrence.
+///
+/// Called when `state` is NOT [`StdinState::Live`] (no live pipe: `NoPipe` or
+/// already `TimedOut`) is a defensive misuse the caller must check for first
+/// via [`StdinState::is_live`] / [`ProcessBackend::has_stdin`] — `state` is
+/// left UNCHANGED (never fabricating a timeout on a handle that never had, or
+/// already lost, a pipe) and this returns [`BackendError::Control`], mirroring
+/// the pre-fix defensive-misuse contract.
+pub(crate) fn write_stdin_bounded(
+    state: &mut StdinState,
+    data: &[u8],
+    timeout: Duration,
+) -> Result<(), BackendError> {
+    let stdin = match std::mem::replace(state, StdinState::TimedOut) {
+        StdinState::Live(stdin) => stdin,
+        other => {
+            // Defensive misuse: restore the ORIGINAL state unchanged.
+            *state = other;
+            return Err(BackendError::Control {
+                op: "stdin",
+                detail: "no stdin pipe held for this handle".to_string(),
+            });
+        }
+    };
+    // `state` is now provisionally `TimedOut` for the duration of the write —
+    // the honest, conservative default if this function returns early (e.g. a
+    // future refactor introduces an early return) without reaching the result
+    // handling below: a handle must never look reusable when we are not sure
+    // it is.
+    let (tx, rx) = mpsc::channel();
+    let payload = data.to_vec();
+    thread::spawn(move || {
+        let mut stdin = stdin;
+        let result = stdin.write_all(&payload).and_then(|()| stdin.flush());
+        // The receiver may already be gone (the caller timed out) — a send
+        // error just means nobody is listening anymore; either way the
+        // thread exits normally here, dropping `stdin` on the tuple's drop
+        // (closing the pipe) if nobody claimed it.
+        let _ = tx.send((stdin, result));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok((stdin, Ok(()))) => {
+            *state = StdinState::Live(stdin);
+            Ok(())
+        }
+        Ok((stdin, Err(e))) => {
+            *state = StdinState::Live(stdin);
+            Err(BackendError::Control {
+                op: "stdin",
+                detail: e.to_string(),
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Timeout, or the thread panicked before sending (defensive —
+            // write_all/flush do not panic in practice). `state` is already
+            // TimedOut (set above); the thread may still be running/blocked,
+            // so the ChildStdin can never be safely reclaimed.
+            Err(BackendError::StdinTimedOut {
+                timeout_secs: timeout.as_secs(),
+            })
+        }
+    }
 }
 
 /// The process-control port (spine AD-1 side port; AD-4 per-OS).
@@ -270,24 +485,57 @@ pub trait ProcessBackend {
     fn adopt(&self, fingerprint: &ProcessFingerprint)
         -> Result<Option<Self::Handle>, BackendError>;
 
-    /// Whether this handle holds a live stdin pipe it can write to (story 4.1,
-    /// AC-D). `true` only for a FRESHLY SPAWNED handle whose `ChildStdin` was
-    /// captured at spawn time; always `false` for an ADOPTED handle — there is
-    /// no OS-portable, documented way to recover a pipe file descriptor from a
-    /// bare `{pid, start-time}` fingerprint (the same "no undocumented API"
-    /// convention already established for Windows pause). A cheap accessor,
-    /// mirroring [`ProcessBackend::pid`]'s style. Callers MUST check this
-    /// before calling [`ProcessBackend::write_stdin`].
+    /// Whether this handle holds a live stdin pipe it can write to right now
+    /// (story 4.1, AC-D). `true` only for a FRESHLY SPAWNED handle whose
+    /// `ChildStdin` was captured at spawn time AND whose declared
+    /// `Capability::Interaction` level was `Guaranteed`/`BestEffort` on this
+    /// OS (see [`SpawnSpec::pipe_stdin`], story 4.1 fix pass HIGH finding);
+    /// `false` for an ADOPTED handle (no OS-portable way to recover a pipe fd
+    /// from a bare `{pid, start-time}` fingerprint — the same "no
+    /// undocumented API" convention already established for Windows pause),
+    /// a handle that was never piped (interaction `Unsupported`), OR a handle
+    /// whose write previously timed out (see
+    /// [`ProcessBackend::stdin_timed_out`] to distinguish that case). A
+    /// cheap, no-I/O accessor, mirroring [`ProcessBackend::pid`]'s style.
+    /// Callers MUST check this before calling [`ProcessBackend::write_stdin`].
     fn has_stdin(&self, handle: &Self::Handle) -> bool;
 
+    /// Whether a PRIOR [`ProcessBackend::write_stdin`] call on this handle
+    /// exceeded the bounded timeout (story 4.1 fix pass, the CRITICAL
+    /// finding, review of #79) — see
+    /// [`StdinState::TimedOut`](crate::ports::StdinState::TimedOut). Distinct
+    /// from [`ProcessBackend::has_stdin`] returning `false` for an ADOPTED or
+    /// never-piped handle (which never had a pipe at all): this means "had a
+    /// live pipe, attempted a write, and it never came back in time". A
+    /// cheap, no-I/O accessor so a caller can short-circuit a doomed repeat
+    /// write without attempting it. Once `true`, stays `true` for the
+    /// remainder of this handle's life (a stop/start builds an entirely
+    /// fresh handle).
+    fn stdin_timed_out(&self, handle: &Self::Handle) -> bool;
+
     /// Write `data` to the process's stdin pipe and flush it — the v1
-    /// interaction channel (spine AD-12). Callers MUST check
-    /// [`ProcessBackend::has_stdin`] first: called with no live pipe, this is
-    /// a defensive [`BackendError::Control`] naming the situation, not a
-    /// normal path. A genuine OS-level write failure (e.g. the agent exited
+    /// interaction channel (spine AD-12) — bounded to
+    /// [`STDIN_WRITE_TIMEOUT`](crate::ports::STDIN_WRITE_TIMEOUT) (story 4.1
+    /// fix pass, the CRITICAL finding, review of #79: the ORIGINAL
+    /// unbounded `write_all` could freeze the entire engine forever, since
+    /// every instance shares one supervisor lock — see
+    /// [`write_stdin_bounded`](crate::ports::write_stdin_bounded)'s docs for
+    /// the full mechanism and its timeout/success/error outcomes). Callers
+    /// MUST check [`ProcessBackend::has_stdin`] first: called with no live
+    /// pipe, this is a defensive [`BackendError::Control`] naming the
+    /// situation, not a normal path — and MUST check
+    /// [`ProcessBackend::stdin_timed_out`] first too, to avoid attempting
+    /// another doomed write on an already-broken channel (this method itself
+    /// also defensively refuses in that case, as a safety net). A genuine
+    /// OS-level write failure within the bound (e.g. the agent exited
     /// between the caller's state check and this write — `EPIPE`) maps to
-    /// [`BackendError::Control`], exactly like every other backend op. Sync
-    /// (called via `spawn_blocking`, like every other method on this trait).
+    /// [`BackendError::Control`], exactly like every other backend op; a
+    /// write that does not return within the bound maps to
+    /// [`BackendError::StdinTimedOut`]. Sync (called via `spawn_blocking`,
+    /// like every other method on this trait) — the bounded wait itself
+    /// happens on the calling (blocking-pool) thread, mirroring how
+    /// [`ProcessBackend::stop`]'s graceful-window wait already blocks its
+    /// caller for a bounded duration.
     fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError>;
 }
 
@@ -352,8 +600,55 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: PathBuf::from("/home"),
             log_file: None,
+            pipe_stdin: true,
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stdin_timed_out_error_message_names_the_bound() {
+        let e = BackendError::StdinTimedOut { timeout_secs: 5 };
+        let msg = e.to_string();
+        assert!(msg.contains('5'), "{msg}");
+        assert!(msg.contains("draining"), "{msg}");
+    }
+
+    #[test]
+    fn stdin_state_is_live_and_is_timed_out_agree_with_the_variant() {
+        // A pure-logic sanity check on the three-state predicate pair (no
+        // process needed) — the process-backed proofs of the ACTUAL bounded
+        // write mechanism (write_stdin_bounded's timeout/success/misuse
+        // outcomes) live in backends/unix/mod.rs's test module, which has the
+        // real ChildStdin-spawning infrastructure this cfg-free module does
+        // not.
+        assert!(!StdinState::NoPipe.is_live());
+        assert!(!StdinState::NoPipe.is_timed_out());
+        assert!(!StdinState::TimedOut.is_live());
+        assert!(StdinState::TimedOut.is_timed_out());
+    }
+
+    #[test]
+    fn write_stdin_bounded_on_a_non_live_state_is_a_defensive_control_error_and_leaves_state_unchanged(
+    ) {
+        // Misuse guard: calling write_stdin_bounded on NoPipe/TimedOut must
+        // NEVER fabricate a timeout — it must restore the ORIGINAL state
+        // unchanged and return a defensive Control error. This is pure logic
+        // (no real ChildStdin needed since the Live branch is never reached).
+        let mut state = StdinState::NoPipe;
+        let err = write_stdin_bounded(&mut state, b"x", Duration::from_millis(50)).unwrap_err();
+        assert!(matches!(err, BackendError::Control { op: "stdin", .. }));
+        assert!(
+            matches!(state, StdinState::NoPipe),
+            "state must be unchanged"
+        );
+
+        let mut state = StdinState::TimedOut;
+        let err = write_stdin_bounded(&mut state, b"x", Duration::from_millis(50)).unwrap_err();
+        assert!(matches!(err, BackendError::Control { op: "stdin", .. }));
+        assert!(
+            matches!(state, StdinState::TimedOut),
+            "an already-TimedOut state must stay TimedOut, not be reinterpreted"
+        );
     }
 }

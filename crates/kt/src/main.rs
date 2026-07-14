@@ -158,10 +158,24 @@ enum AgentCommands {
         name: String,
     },
     /// Send text input to a running Agent Instance's native input channel
+    ///
+    /// M1 fix (review of #79): `--help`/`-h` are DISABLED on this subcommand
+    /// specifically, and `text` accepts leading-hyphen values, so a `text`
+    /// payload that happens to look like a flag (`"-5 degrees"`, `"--help"`)
+    /// is delivered LITERALLY rather than either failing to parse or being
+    /// silently intercepted as this CLI's own help (which used to print
+    /// help and exit 0 without sending anything — a caller checking only
+    /// the exit code would wrongly believe the send succeeded). A caller
+    /// that genuinely wants help for `send` gets it from `kt agent --help`
+    /// or `kt agent send` with a missing argument's error text.
+    #[command(disable_help_flag = true)]
     Send {
         /// Name of the Agent Instance to send input to
         name: String,
-        /// The text to send (a trailing newline is appended if absent)
+        /// The text to send (a trailing newline is appended if absent).
+        /// Accepts a value starting with `-`/`--` (e.g. `"-5 degrees"`)
+        /// literally, instead of clap trying to parse it as a flag.
+        #[arg(allow_hyphen_values = true)]
         text: String,
     },
     /// List every Agent Instance in the Fleet
@@ -446,6 +460,50 @@ mod tests {
         // Missing text, or missing both, is a clap error.
         assert!(Cli::try_parse_from(["kt", "agent", "send", "svc"]).is_err());
         assert!(Cli::try_parse_from(["kt", "agent", "send"]).is_err());
+    }
+
+    #[test]
+    fn test_agent_send_text_is_hyphen_safe_and_help_is_not_intercepted() {
+        // M1 fix (review of #79): a `text` value starting with a hyphen must
+        // parse as a LITERAL value, not be rejected as an unrecognized flag
+        // and not be silently swallowed as this CLI's own `--help`/`-h`.
+        let parsed = Cli::try_parse_from(["kt", "agent", "send", "x", "-5 degrees"])
+            .expect("a hyphen-leading text value must parse, not error");
+        let Some(Commands::Agent {
+            command: AgentCommands::Send { name, text },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Send)");
+        };
+        assert_eq!(name, "x");
+        assert_eq!(text, "-5 degrees");
+
+        // The specific silent-success bug: `text == "--help"` used to be
+        // intercepted as a request for CLI help (Err(DisplayHelp), which
+        // `Parser::parse()` renders by printing help and exiting 0 — NOTHING
+        // sent, yet a caller checking only the exit code believed it
+        // succeeded). It must now parse OK with the literal value retained.
+        let parsed = Cli::try_parse_from(["kt", "agent", "send", "x", "--help"])
+            .expect("--help as a text value must not be intercepted as CLI help");
+        let Some(Commands::Agent {
+            command: AgentCommands::Send { name, text },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Send)");
+        };
+        assert_eq!(name, "x");
+        assert_eq!(text, "--help");
+
+        // `-h` (the short form) must be treated identically.
+        let parsed = Cli::try_parse_from(["kt", "agent", "send", "x", "-h"])
+            .expect("-h as a text value must not be intercepted as CLI help");
+        let Some(Commands::Agent {
+            command: AgentCommands::Send { text, .. },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Send)");
+        };
+        assert_eq!(text, "-h");
     }
 
     #[test]

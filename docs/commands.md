@@ -98,6 +98,10 @@ The same three-way honesty as `pause`, with one difference: a **guaranteed** and
 
 `send` requires the instance to be genuinely `running`, and it inherits the same single-lifetime caveat as `start` (above): a standalone `kt agent start` supervises a process only for that command's lifetime, so a process adopted after an engine restart has no recoverable input channel in the new session — `send` on such an instance fails honestly (naming the cause) rather than silently dropping the input.
 
+Stdin is piped only for adapters that declare interaction support (`guaranteed` or `best-effort`); an adapter that doesn't declare interaction sees stdin exactly as before this command existed (`/dev/null`-equivalent), so it never blocks waiting on input that will never arrive.
+
+If an agent stops draining its input (a stuck/deadlocked process), `send`'s write is bounded — it fails with a distinct diagnostic naming the timeout rather than hanging, and the instance's interaction channel stays unavailable for the rest of that session until it is stopped and started again.
+
 ## `kt agent remove <name> [--delete | --retain] [--force]`
 
 Remove an Agent Instance from the Fleet.

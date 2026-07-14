@@ -23,11 +23,11 @@ use ktesio_engine::{
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionUnavailable,
-    AgentInvalidName, AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
-    AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource,
-    AgentNotFound, AgentNotRunning, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey,
-    AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionTimedOut,
+    AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentIo,
+    AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable,
+    AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
+    AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -1500,13 +1500,28 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         // Story 4.1 AC-C: `send` targeted an instance that is not `running`.
         // Not a transition error (there is no transition table entry for
         // `send`), so it gets its own remediation naming the current state.
-        EngineError::NotRunning { name, state } => AgentNotRunning {
-            message: format!(
-                "Agent Instance '{name}' is not running (current state: {state}); start it \
-                 first with: kt agent start {name}. List the Fleet with: kt agent list"
-            ),
+        //
+        // M2 fix (review of #79): the remediation VERB must match the
+        // instance's ACTUAL state. A `paused` instance's correct remediation
+        // is `kt agent resume` — suggesting `kt agent start` there hits a
+        // SECOND, confusing `InvalidTransition` error (start only accepts
+        // registered/stopped/failed), not a helpful fix. Every other
+        // NOT-running state (registered/starting/stopping/stopped/failed)
+        // keeps the original `start` remediation.
+        EngineError::NotRunning { name, state } => {
+            let remediation = if state == "paused" {
+                format!("resume it with: kt agent resume {name}")
+            } else {
+                format!("start it first with: kt agent start {name}")
+            };
+            AgentNotRunning {
+                message: format!(
+                    "Agent Instance '{name}' is not running (current state: {state}); \
+                     {remediation}. List the Fleet with: kt agent list"
+                ),
+            }
+            .into()
         }
-        .into(),
         // Story 4.1 AC-D: the instance IS running, but this engine session
         // holds no live stdin pipe for it (most commonly an instance ADOPTED
         // from a prior engine session). Distinct from CapabilityUnsupported —
@@ -1518,6 +1533,22 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
                 "Agent Instance '{name}' cannot receive input right now: {detail}. Durable \
                  cross-invocation interaction needs a persistent engine session (planned for a \
                  future release); within a single `kt` process/embedding session this works."
+            ),
+        }
+        .into(),
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): `send`'s
+        // write to this instance's stdin did not complete within the bounded
+        // timeout — the agent may be stuck (not draining its input).
+        // Distinct from InteractionUnavailable: this engine session DID hold
+        // a live pipe and attempted the write; it simply never came back.
+        // The instance's interaction channel is now permanently unusable for
+        // the rest of this session, so the remediation is a fresh start.
+        EngineError::InteractionTimedOut { name, timeout_secs } => AgentInteractionTimedOut {
+            message: format!(
+                "Agent Instance '{name}' is not draining its input within {timeout_secs}s and \
+                 may be stuck. Its interaction channel is now unavailable for the rest of this \
+                 session; restart it for a fresh one: kt agent stop {name} && kt agent start \
+                 {name}"
             ),
         }
         .into(),
@@ -1628,6 +1659,40 @@ mod tests {
             ktesio_engine::ports::StoreError::Backend("db gone".into()),
         ));
         assert!(store.to_string().contains("State store error"));
+    }
+
+    #[test]
+    fn map_engine_error_renders_the_interaction_timed_out_diagnostic() {
+        // Fix pass (CRITICAL finding, review of #79) coverage-closer: unlike
+        // every OTHER `map_engine_error` arm (all reached only indirectly
+        // through full CLI-process-spawning tests in `agent_cli.rs`),
+        // `EngineError::InteractionTimedOut`'s CLI rendering CANNOT be
+        // exercised that way at all — a genuinely stuck write needs a LIVE
+        // pipe, which only exists within the SAME engine session that
+        // spawned it, but a single `kt agent send` invocation opens its OWN
+        // fresh `Engine` and exits after one call; a SEPARATE `kt agent
+        // send` reaching an instance a prior invocation started can only do
+        // so via `adopt_orphans`, which NEVER carries a live pipe (mirrors
+        // the story's OWN Task 8 Deviation 1 finding for
+        // `InteractionUnavailable`'s happy path — the same structural
+        // constraint, one variant further). So this diagnostic's rendering
+        // is unit-tested directly here, mirroring `map_error_includes_
+        // remediation_hints`'s existing direct-call pattern for `map_error`.
+        let err = map_engine_error(EngineError::InteractionTimedOut {
+            name: "stuck".to_string(),
+            timeout_secs: 5,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("stuck"), "names the instance: {msg}");
+        assert!(msg.contains('5'), "names the bound: {msg}");
+        assert!(
+            msg.contains("kt agent stop stuck") && msg.contains("kt agent start stuck"),
+            "points at a restart for a fresh channel: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported") && !msg.contains("declares"),
+            "must never be misattributed to CapabilityUnsupported: {msg}"
+        );
     }
 
     #[test]

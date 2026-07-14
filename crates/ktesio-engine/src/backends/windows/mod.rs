@@ -67,10 +67,9 @@
 //! undocumented API. Behavior-verified on the `windows-latest` CI leg;
 //! compile-checked on Unix.
 
-use std::io::Write;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -86,8 +85,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::ports::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec,
-    StopOutcome,
+    write_stdin_bounded, BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus,
+    SecretError, SpawnSpec, StdinState, StopOutcome, STDIN_WRITE_TIMEOUT,
 };
 
 /// `STILL_ACTIVE` (259): the exit code a process reports while still running.
@@ -117,14 +116,20 @@ pub struct WindowsProcess {
     adopted: HANDLE,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
-    /// The child's stdin pipe (story 4.1, spine AD-12), captured at spawn time
-    /// for a FRESHLY SPAWNED process. `None` for an ADOPTED process — a pipe
-    /// handle cannot be recovered from a bare PID (no undocumented API; parity
-    /// with the Unix backend and this module's own pause `[ASSUMPTION]`
-    /// precedent); `send_input` on an adopted instance must therefore fail
-    /// honestly (`EngineError::InteractionUnavailable`), never silently
-    /// succeed.
-    stdin: Option<ChildStdin>,
+    /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
+    /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
+    /// SPAWNED process whose declared `Capability::Interaction` was
+    /// `Guaranteed`/`BestEffort` on this OS (`SpawnSpec::pipe_stdin`);
+    /// `NoPipe` for an ADOPTED process (a pipe handle cannot be recovered
+    /// from a bare PID — no undocumented API; parity with the Unix backend
+    /// and this module's own pause `[ASSUMPTION]` precedent) or a freshly
+    /// spawned one that was never piped (interaction `Unsupported`);
+    /// `TimedOut` once a bounded write on this handle has exceeded
+    /// [`STDIN_WRITE_TIMEOUT`] and can never be safely retried. `send_input`
+    /// on anything but a `Live` state must therefore fail honestly
+    /// (`EngineError::InteractionUnavailable` /
+    /// `EngineError::InteractionTimedOut`), never silently succeed.
+    stdin: StdinState,
 }
 
 // The raw Job / process HANDLEs are owned OS resources this struct is solely
@@ -229,11 +234,21 @@ impl ProcessBackend for WindowsBackend {
                 command.stderr(Stdio::null());
             }
         }
-        // Piped UNCONDITIONALLY (story 4.1, spine AD-12): v1 pipes stdin for
-        // every spawned process regardless of the declared Capability — the
-        // Capability Declaration gates only whether `send_input` is *callable*,
-        // not whether the pipe exists.
-        command.stdin(Stdio::piped());
+        // Piped ONLY when the caller (the supervisor, at spawn time) resolved
+        // the declared Capability::Interaction level to Guaranteed/BestEffort
+        // on this OS (story 4.1 fix pass, HIGH finding — review of #79;
+        // supersedes the story's original unconditional `Stdio::piped()`).
+        // An adapter that declares no interaction support gets Stdio::null()
+        // — the pre-story-4.1 safe default — so a process that blocks
+        // reading stdin at startup (a common "sniff for piped input" real-CLI
+        // idiom) sees immediate EOF instead of hanging forever on a pipe
+        // whose write end this engine holds open for its whole supervised
+        // lifetime. Mirrors the Unix backend's identical branch.
+        command.stdin(if spec.pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         // A new process group isolates console signals (so a stray Ctrl-C to the
         // engine's console does not hit the agent). We do NOT create the child
         // suspended: std does not expose the main-thread handle needed to resume
@@ -270,8 +285,15 @@ impl ProcessBackend for WindowsBackend {
         // Assignment succeeded — hand the job handle to the process struct.
         let job = job_guard.into_inner();
         // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
-        // (story 4.1) — an adopted handle never has one (see `adopt` below).
-        let stdin = child.stdin.take();
+        // (story 4.1) — `child.stdin` is `Some` exactly when `spec.pipe_stdin`
+        // was true above (Stdio::piped() populates it; Stdio::null() never
+        // does), so branching on std's own answer is simpler and more robust
+        // than re-deriving it from `spec.pipe_stdin` a second time. An
+        // adopted handle never has one (see `adopt` below).
+        let stdin = match child.stdin.take() {
+            Some(s) => StdinState::Live(s),
+            None => StdinState::NoPipe,
+        };
         Ok(WindowsProcess {
             child: Some(child),
             job,
@@ -402,42 +424,37 @@ impl ProcessBackend for WindowsBackend {
         // Same process. Hold the opened handle for liveness + TerminateProcess
         // (no Job — the process is already running and may be in one already).
         //
-        // `stdin: None` (story 4.1): an adopted handle has no recoverable
-        // pipe — there is no OS-portable, documented way to reopen a
-        // `ChildStdin` from a bare pid. `send_input` against this handle
-        // fails with `EngineError::InteractionUnavailable`, never silently
-        // succeeding.
+        // `stdin: StdinState::NoPipe` (story 4.1): an adopted handle has no
+        // recoverable pipe — there is no OS-portable, documented way to
+        // reopen a `ChildStdin` from a bare pid. `send_input` against this
+        // handle fails with `EngineError::InteractionUnavailable`, never
+        // silently succeeding.
         Ok(Some(WindowsProcess {
             child: None,
             job: std::ptr::null_mut(),
             adopted: h,
             pid: fingerprint.pid,
-            stdin: None,
+            stdin: StdinState::NoPipe,
         }))
     }
 
     fn has_stdin(&self, handle: &Self::Handle) -> bool {
-        handle.stdin.is_some()
+        handle.stdin.is_live()
+    }
+
+    fn stdin_timed_out(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_timed_out()
     }
 
     fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError> {
-        match handle.stdin.as_mut() {
-            Some(stdin) => {
-                stdin.write_all(data).map_err(|e| BackendError::Control {
-                    op: "stdin",
-                    detail: e.to_string(),
-                })?;
-                stdin.flush().map_err(|e| BackendError::Control {
-                    op: "stdin",
-                    detail: e.to_string(),
-                })?;
-                Ok(())
-            }
-            None => Err(BackendError::Control {
-                op: "stdin",
-                detail: "no stdin pipe held for this handle".to_string(),
-            }),
-        }
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): bounded via
+        // the shared, portable thread+channel+recv_timeout mechanism — see
+        // `write_stdin_bounded`'s docs. Identical to the Unix backend's body
+        // (this file and `backends/unix/mod.rs` intentionally share ONE
+        // implementation via this call, rather than two separate OS timeout
+        // implementations, since the mechanism has no OS-specific part: a
+        // `ChildStdin` write is portable `std` on both).
+        write_stdin_bounded(&mut handle.stdin, data, STDIN_WRITE_TIMEOUT)
     }
 }
 

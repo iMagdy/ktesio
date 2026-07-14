@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ktesio_engine::{
@@ -606,4 +607,256 @@ fn send_input_on_an_adopted_instance_is_interaction_unavailable() {
     // Teardown: stop the adopted process so no orphan remains.
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the adopted process");
+}
+
+// ---- Fix pass (review of #79): the CRITICAL bounded-write-timeout finding
+// and the HIGH conditional-piping finding. ----
+
+#[test]
+fn unsupported_interaction_agent_that_sniffs_stdin_at_startup_reaches_running_promptly() {
+    // HIGH finding fix: the story's ORIGINAL implementation piped stdin
+    // UNCONDITIONALLY for every spawned process, including adapters that
+    // declare `interaction: unsupported`. An adversarial audit showed this
+    // hangs a process that does a common "sniff for piped input at startup"
+    // idiom (a blocking read of one stdin line before its normal ready
+    // loop): the engine holds the pipe's write end open for the process's
+    // whole supervised lifetime, so the child never sees EOF and never
+    // unblocks — yet is reported `running` regardless (readiness here is
+    // just "the process didn't exit immediately"), a silent deadlock with no
+    // error signal anywhere. The fix gates piping on the declared
+    // Capability::Interaction level: `unsupported` now gets `Stdio::null()`
+    // (the pre-story-4.1 safe default), so the sniff read sees immediate EOF
+    // and startup proceeds normally.
+    //
+    // Merely asserting `state == Running` would NOT catch a regression here
+    // (a process blocked on a stdin read has not EXITED, so the engine's
+    // ~300ms "didn't die immediately" readiness watch would still call it
+    // `running` even if genuinely deadlocked). The real proof is that the
+    // agent's OWN "ready pid=" line — printed only AFTER the sniff read
+    // returns — actually appears in the captured log within a bound FAR
+    // shorter than "never" (10s; the old bug would hang forever, not merely
+    // slowly).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let other_os = match OsId::current() {
+        OsId::Linux => "windows",
+        OsId::Macos => "windows",
+        OsId::Windows => "linux",
+        OsId::Other => "linux",
+    };
+    let bin = ktesio_conformance::fake_agent_bin();
+    // Declares interaction only for a DIFFERENT os (mirrors
+    // send_input_on_unsupported_interaction_fails_fast_with_no_io) so the
+    // CURRENT-os effective level honestly projects to Unsupported (the
+    // registration-time has_any_support() bar is satisfied by the OTHER os's
+    // entry; the per-OS projection this test cares about is unaffected).
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "sniffer"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--sniff-stdin-at-startup", "--linger-ms", "600000"]
+
+[capabilities.interaction]
+{other} = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        other = other_os,
+    );
+    std::fs::write(manifest.path().join("adapter.toml"), body).unwrap();
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "sniffer",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    // Sanity: the effective level on THIS os really is Unsupported (so this
+    // test is honestly exercising the `pipe_stdin == false` path, not some
+    // other configuration).
+    let caps = facade.effective_capabilities("sniffer").unwrap();
+    let interaction_level = caps
+        .entries
+        .iter()
+        .find(|(c, _)| *c == Capability::Interaction)
+        .map(|(_, level)| *level);
+    assert_eq!(interaction_level, Some(SupportLevel::Unsupported));
+
+    let started = facade.start("sniffer").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let agent_log = agent_log_path(state.path(), "sniffer");
+    // Asserts internally (within a 10s bound) if the ready line never
+    // appears — the regression-catching proof.
+    let _pid = wait_for_agent_pid(&agent_log);
+
+    facade
+        .stop("sniffer", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_stuck_instances_send_times_out_and_does_not_block_a_different_instances_send_beyond_the_bound()
+{
+    // CRITICAL finding fix: the engine has ONE global `Mutex<Supervisor>`
+    // guarding EVERY instance (`EngineInner::supervisor` in `engine.rs`),
+    // and `send_input`'s write used to be a bare, UNBOUNDED `write_all`
+    // performed WHILE that lock was held — so a genuinely stuck agent (one
+    // that never drains its stdin) could freeze the ENTIRE engine forever:
+    // no other instance's `start`/`stop`/`pause`/`send`, and not even the
+    // crash-detection reaper, could proceed until the stuck write returned
+    // (which, for a truly non-exiting agent, is never). An adversarial audit
+    // reproduced this empirically: a large payload to a non-draining `stuck`
+    // instance blocked an unrelated `healthy` instance's send on a SEPARATE
+    // thread, unblocking only once `stuck` itself happened to self-exit.
+    //
+    // This test proves THREE properties of the fix in ONE flow (sharing the
+    // one expensive real-timeout wait — `STDIN_WRITE_TIMEOUT` = 5s — rather
+    // than paying it three times over):
+    //   1. a send to a non-draining agent times out within roughly the
+    //      bound (`Err(InteractionTimedOut)`), not indefinitely;
+    //   2. WHILE that write is stuck, a DIFFERENT, unrelated instance's send
+    //      still completes, bounded to roughly the FIRST instance's timeout
+    //      — the stall is bounded, not unbounded;
+    //   3. a SUBSEQUENT send to the SAME (now-timed-out) instance returns
+    //      `InteractionTimedOut` immediately, with no new wait (the cheap,
+    //      no-I/O fast path).
+    let state = TempDir::new().unwrap();
+    let stuck_manifest = TempDir::new().unwrap();
+    let healthy_manifest = TempDir::new().unwrap();
+    // `stuck`: NO --echo-stdin, so nothing ever reads its piped stdin —
+    // exactly the adversarial audit's reproduction vehicle.
+    write_interaction_manifest(
+        stuck_manifest.path(),
+        "stuck",
+        &["--linger-ms", "600000"],
+        "guaranteed",
+    );
+    // `healthy`: --echo-stdin, so ITS writes complete near-instantly and are
+    // independently verifiable as genuinely delivered.
+    write_interaction_manifest(
+        healthy_manifest.path(),
+        "healthy",
+        &["--echo-stdin", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "stuck",
+            &AdapterRef::Manifest(stuck_manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .register_with_adapter(
+            "healthy",
+            &AdapterRef::Manifest(healthy_manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade.start("stuck").unwrap();
+    facade.start("healthy").unwrap();
+
+    // Far larger than any realistic OS pipe buffer (Linux defaults to
+    // 64KiB) — `stuck` never reads its stdin, so a write of this size WILL
+    // block once the buffer fills.
+    let huge_payload = "x".repeat(8 * 1024 * 1024);
+
+    // Two REAL OS threads contending for the SAME engine's ONE supervisor
+    // lock: the scoped child thread drives `stuck`'s send (which will block
+    // for the full bound), while THIS (the scope's own) thread drives
+    // `healthy`'s send concurrently, after a short head start to ensure
+    // `stuck` has genuinely acquired the lock first.
+    let (stuck_result, stuck_elapsed) = thread::scope(|scope| {
+        let stuck_handle = scope.spawn(|| {
+            let start = Instant::now();
+            let result = engine.blocking().send_input("stuck", &huge_payload);
+            (result, start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(300));
+
+        // Property #2: healthy's send, through the SAME engine (SAME
+        // Mutex<Supervisor>), must still complete — bounded to roughly the
+        // stuck call's timeout, never indefinitely.
+        let healthy_start = Instant::now();
+        let healthy_result = engine.blocking().send_input("healthy", "hi");
+        let healthy_elapsed = healthy_start.elapsed();
+        assert!(
+            healthy_result.is_ok(),
+            "a different, unrelated instance's send must still succeed once the stuck \
+             instance's bounded wait elapses: {healthy_result:?}"
+        );
+        assert!(
+            healthy_elapsed < Duration::from_secs(9),
+            "healthy's send must be bounded to roughly the stuck call's timeout (5s), \
+             never blocked indefinitely by an unrelated instance: {healthy_elapsed:?}"
+        );
+
+        stuck_handle.join().expect("stuck thread must not panic")
+    });
+
+    // Property #1: the stuck call itself must time out (not hang forever,
+    // not silently succeed), within roughly 2x its own bound.
+    match stuck_result {
+        Err(EngineError::InteractionTimedOut { name, timeout_secs }) => {
+            assert_eq!(name, "stuck");
+            assert_eq!(timeout_secs, 5);
+        }
+        other => panic!("expected InteractionTimedOut, got {other:?}"),
+    }
+    assert!(
+        stuck_elapsed < Duration::from_secs(9),
+        "the stuck send must return within roughly 2x its bound (5s), not indefinitely: \
+         {stuck_elapsed:?}"
+    );
+
+    // Property #3: a SUBSEQUENT send to the SAME (now-permanently-timed-out)
+    // instance fails IMMEDIATELY — a cheap check, no new attempted write, no
+    // new wait through another full timeout.
+    let retry_start = Instant::now();
+    let retry_result = engine.blocking().send_input("stuck", "second attempt");
+    let retry_elapsed = retry_start.elapsed();
+    match retry_result {
+        Err(EngineError::InteractionTimedOut { name, .. }) => assert_eq!(name, "stuck"),
+        other => panic!("expected InteractionTimedOut again, got {other:?}"),
+    }
+    assert!(
+        retry_elapsed < Duration::from_secs(1),
+        "a subsequent send on an already-timed-out instance must fail IMMEDIATELY (a \
+         cheap check, no new attempted write), not wait out another timeout: {retry_elapsed:?}"
+    );
+
+    // Confirm `healthy` genuinely delivered (a real write completed, not a
+    // coincidentally-fast failure).
+    wait_for_stdin_line(&agent_log_path(state.path(), "healthy"), "stdin: hi");
+    // Confirm `stuck` genuinely received NOTHING (the timed-out write, and
+    // the immediately-rejected retry, both delivered no bytes).
+    let stuck_log =
+        std::fs::read_to_string(agent_log_path(state.path(), "stuck")).unwrap_or_default();
+    assert!(
+        !stuck_log.contains("stdin:"),
+        "stuck never echoes (no --echo-stdin), but sanity-confirm no stray output: {stuck_log:?}"
+    );
+
+    // Teardown. `stuck`'s abandoned write thread (see `write_stdin_bounded`'s
+    // docs — it is intentionally never joined/aborted) unblocks once the
+    // process is killed below (its blocked write() call gets EPIPE once the
+    // reader is gone) and cleans itself up in the background; the test does
+    // not wait for it.
+    facade.stop("stuck", Some(Duration::from_secs(5))).unwrap();
+    facade
+        .stop("healthy", Some(Duration::from_secs(5)))
+        .unwrap();
 }
