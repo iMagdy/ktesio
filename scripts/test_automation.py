@@ -254,17 +254,21 @@ class ReleaseDocsTests(unittest.TestCase):
     def test_ci_test_job_splits_build_from_run_with_ubuntu_hang_dump(self) -> None:
         # #106: the `test` job SPLITS build from run (a fresh run proved the build
         # SUCCEEDS; the hang is in the RUN), and the ubuntu run runs nextest under a
-        # 15m WATCHDOG that force-EXITS THE SHELL. The root cause is a run process in
-        # UNINTERRUPTIBLE D-state (uninterruptible sleep) that SIGKILL cannot reap:
-        # it first defeated a GNU `timeout` wrapper (which blocked in wait() on the
-        # unkillable child), then defeated a first watchdog whose dump() BLOCKED
-        # reading the D-state task's command-line / kernel-backtrace /proc files
-        # before it could `exit`. So the dump is now D-STATE-SAFE: it reads ONLY
-        # non-blocking /proc fields (`stat` for state/comm/ppid, `wchan` for the
-        # stuck syscall) plus a comm-only `ps -eo` forest (comm is stat-derived; the
-        # args/cmd column, which reads the command-line, is OMITTED). Lock the whole
-        # shape so a regression that reintroduces a BLOCKING read — or the defeated
-        # `timeout` wrapper — is caught.
+        # 15m WATCHDOG that force-EXITS THE SHELL, with the run REDIRECTED OFF the
+        # step's stdout/stderr pipe. Root cause of every capture failure: an
+        # unkillable D-state (uninterruptible-sleep) run process. It defeated, in
+        # turn, (1) a GNU `timeout` wrapper (blocked in wait()); (2) a watchdog whose
+        # dump() BLOCKED reading the D-state task's command-line/backtrace /proc
+        # files; and (3) a non-blocking-dump watchdog whose background `nextest &`
+        # still held the STEP's stdout pipe — the unkillable child kept it open past
+        # the shell `exit`, so the runner never saw EOF and the step rode to the 40m
+        # job-cancel (the log discarded each time). The decisive fix: redirect the
+        # run's stdio to a FILE ($RUNLOG) + detach stdin so it never holds the step
+        # pipe (the shell's exit then truly ENDS the step), a SIGKILL-the-shell
+        # fallback if the trap ever blocks, and a cat of $RUNLOG so nextest's own
+        # progress lands in the archived log. Lock the whole shape so a regression
+        # (a blocking /proc read, an unredirected run, the defeated `timeout`) is
+        # caught.
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
@@ -275,16 +279,26 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn(
             "cargo +stable nextest run --workspace --all-targets --no-run", ci
         )
-        # (2) The ubuntu run is gated and runs nextest in the BACKGROUND under a
-        # 15-min (900s) watchdog subshell that signals THIS shell (`kill -USR1 $$`);
-        # the USR1 trap dumps diagnostics and `exit 124`s so an UNKILLABLE D-state
-        # run still fails the step (we never depend on killing the run process).
+        # (2) The ubuntu run is gated; nextest runs in the BACKGROUND REDIRECTED to
+        # $RUNLOG with stdin detached (so it never holds the step's stdout pipe — the
+        # capture-failure cause), under a 15-min (900s) watchdog subshell that
+        # signals THIS shell (`kill -USR1 $$`) and, if the trap is ever blocked,
+        # SIGKILLs it (`kill -KILL $$`) so the step ALWAYS ends (fail, not
+        # job-cancel). The USR1 trap dumps + `exit 124`s; $RUNLOG is cat'd so
+        # nextest's own output is archived.
         self.assertIn("if: matrix.os == 'ubuntu-latest'", ci)
-        self.assertIn("cargo +stable nextest run --workspace --all-targets &", ci)
+        self.assertIn('RUNLOG="${RUNNER_TEMP:-/tmp}/nextest-ubuntu.log"', ci)
+        self.assertIn(
+            "cargo +stable nextest run --workspace --all-targets "
+            '> "$RUNLOG" 2>&1 < /dev/null &',
+            ci,
+        )
         self.assertIn('wait "$NEXT"', ci)
         self.assertIn("sleep 900", ci)
         self.assertIn("kill -USR1 $$", ci)
+        self.assertIn("kill -KILL $$", ci)  # SIGKILL-the-shell fallback if the trap blocks
         self.assertIn("exit 124' USR1", ci)  # the trap: dump then exit, bound to USR1
+        self.assertIn('cat "$RUNLOG"', ci)  # nextest runlog surfaced into the archived log
         # (2a) The dump is D-STATE-SAFE: ONLY non-blocking /proc reads — the stat
         # file (state, comm, ppid) and wchan (the stuck syscall) — plus a comm-only
         # `ps -eo` forest. `comm` (stat-derived, <=15 chars) names the test FILE and
