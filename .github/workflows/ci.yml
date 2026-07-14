@@ -70,12 +70,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
-    # doctest pass. 40 is a COARSE BACKSTOP only: the ubuntu run step now wraps the
-    # nextest run in a 28m GNU `timeout` (#106) so a stall FAILS THE STEP — the job
-    # completes normally and its logs are archived — instead of being cancelled on
-    # this 40m cap, whose cancelled-job logs GitHub discards (the ubuntu symptom
-    # that hid the original cause). nextest's per-test kill-timeout (see
-    # .config/nextest.toml) remains the cross-OS per-test hang guard.
+    # doctest pass. 40 is a LAST-DITCH BACKSTOP only: the ubuntu run step now runs
+    # nextest under an 18m WATCHDOG that force-EXITS THE SHELL on a stall (#106) —
+    # a `timeout` wrapper was defeated because the hung run process is unkillable
+    # D-state, so we signal our own shell instead of the process — making a stall
+    # FAIL THE STEP so the job completes normally and its logs are archived, rather
+    # than being cancelled on this 40m cap (whose cancelled-job logs GitHub
+    # discards; the ubuntu symptom that hid the original cause). nextest's per-test
+    # kill-timeout (see .config/nextest.toml) remains the cross-OS per-test guard.
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -152,40 +154,61 @@ jobs:
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
           cargo +stable build -p ktesio-conformance --bin fake_agent
           cargo +stable nextest run --workspace --all-targets --no-run
-      - name: Run tests (nextest, ubuntu — in-step timeout + on-hang process dump)
+      - name: Run tests (nextest, ubuntu — watchdog + on-hang process/stack dump)
         if: matrix.os == 'ubuntu-latest'
-        # Make the NEXT ubuntu stall DIAGNOSABLE (#106). GNU `timeout` (Linux-only)
-        # bounds the run at 28m — well under the 40m job cap — so a stall FAILS THIS
-        # STEP and the job COMPLETES NORMALLY (its logs are then archived) instead
-        # of being cancelled on the job timeout, which discards the log blob (the
-        # ubuntu symptom that left us blind). `--kill-after=60s` escalates to
-        # SIGKILL 60s after the graceful SIGTERM. On timeout (124, or 137 if the
-        # kill-after SIGKILL was needed) dump the process tree — `ps auxf` plus, for
-        # every /proc/[0-9]* pid, its state / wchan / cmdline — then exit non-zero.
-        # This does NOT claim to fix the 40-min hang; it captures the evidence the
-        # discarded log denied us. `retries = 2` in .config/nextest.toml still
+        # Make the NEXT ubuntu stall DIAGNOSABLE (#106). A prior GNU `timeout`
+        # wrapper here was DEFEATED: the fresh run proved the hung run process sits
+        # in UNINTERRUPTIBLE D-state (uninterruptible sleep), so even the SIGKILL
+        # `timeout` sends could not reap it and `timeout` ITSELF blocked in wait() —
+        # the step never returned, the job hit its 40m cap and was CANCELLED, and
+        # GitHub discarded the log blob AGAIN (BlobNotFound). This also explains why
+        # nextest's own per-test kill-timeout never fired. So do NOT depend on
+        # killing the run. Run nextest in the BACKGROUND and arm an 18-min watchdog
+        # subshell that signals THIS shell (`kill -USR1 $$`); the USR1 trap
+        # interrupts bash's `wait`, dumps diagnostics, and `exit`s the SHELL — so the
+        # STEP FAILS, the job COMPLETES NORMALLY, and the log (with the dump) is
+        # ARCHIVED, even though the run process is unkillable (left for GitHub's
+        # post-job teardown). 18m (1080s) is safe headroom: the healthy suite is
+        # 1–3 min (arm64 ran the whole suite in 49s), far below the 40m backstop.
+        #
+        # The dump is the payoff: nextest runs each test by RE-INVOKING the test
+        # binary as `<bin> --exact <test_name>`, so `ps auxf` NAMES the exact hung
+        # test(s); per-pid state/wchan and the /proc/<pid>/stack of every D-state pid
+        # reveal the stuck syscall. `retries = 2` in .config/nextest.toml still
         # absorbs the windows-latest flake (that leg runs the plain step below).
+        #
+        # `code=0; wait "$NEXT" || code=$?` (not a bare `wait; code=$?`): GitHub runs
+        # `shell: bash` with `-eo pipefail`, so a bare `wait` returning non-zero on a
+        # real test failure would errexit BEFORE capturing the code / stopping the
+        # watchdog; the `|| code=$?` guard keeps the real exit code and cleanup.
         shell: bash
         run: |
           set -uo pipefail
-          code=0
-          timeout --kill-after=60s 28m cargo +stable nextest run --workspace --all-targets || code=$?
-          if [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then
-            echo "::error::nextest exceeded the 28m in-step timeout (#106); dumping the process tree, then failing the step so the job completes and its logs are preserved."
-            echo "===== ps auxf ====="
-            ps auxf || true
-            echo "===== per-pid state / wchan / cmdline (/proc) ====="
+          dump() {
+            echo "===== loadavg / free / df ====="; cat /proc/loadavg || true; free -m || true; df -h || true
+            echo "===== ps auxf (forest — the test-binary cmdlines name the in-flight tests) ====="; ps auxf || true
+            echo "===== per-pid state / wchan / cmdline ====="
             for p in /proc/[0-9]*; do
-              pid=${p#/proc/}
-              stat=$(cat "$p/stat" 2>/dev/null) || continue
-              rest=${stat##*) }
-              state=${rest%% *}
-              wchan=$(cat "$p/wchan" 2>/dev/null || echo '?')
-              cmdline=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || echo '?')
-              echo "pid=$pid state=$state wchan=$wchan cmd=$cmdline"
+              pid=${p#/proc/}; st=$(cat "$p/stat" 2>/dev/null) || continue
+              rest=${st##*') '}; state=${rest%% *}
+              wchan=$(cat "$p/wchan" 2>/dev/null || echo '?'); cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || echo '?')
+              echo "pid=$pid state=$state wchan=$wchan cmd=$cmd"
             done
-            exit 1
-          fi
+            echo "===== kernel stacks of D-state pids (the stuck syscall) ====="
+            for p in /proc/[0-9]*; do
+              st=$(cat "$p/stat" 2>/dev/null) || continue; r=${st##*') '}; [ "${r%% *}" = "D" ] || continue
+              echo "-- $p --"; cat "$p/stack" 2>/dev/null || echo '(stack unreadable)'; cat "$p/status" 2>/dev/null | head -5 || true
+            done
+            echo "===== dmesg tail (hung-task / OOM / IO errors — best effort) ====="; dmesg 2>/dev/null | tail -60 || echo '(dmesg denied)'
+          }
+          trap 'echo "::error::watchdog fired — the ubuntu run exceeded the budget; dumping diagnostics and abandoning the (unkillable) run so the STEP fails and the job log is ARCHIVED (#106)"; dump; exit 124' USR1
+          cargo +stable nextest run --workspace --all-targets &
+          NEXT=$!
+          ( sleep 1080; kill -USR1 $$ 2>/dev/null ) &   # 18-min watchdog signals THIS shell ($$)
+          WATCH=$!
+          code=0
+          wait "$NEXT" || code=$?
+          kill "$WATCH" 2>/dev/null || true
           exit "$code"
       - name: Run tests (nextest, macOS/Windows)
         if: matrix.os != 'ubuntu-latest'

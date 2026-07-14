@@ -254,13 +254,17 @@ class ReleaseDocsTests(unittest.TestCase):
     def test_ci_test_job_splits_build_from_run_with_ubuntu_hang_dump(self) -> None:
         # #106: the `test` job SPLITS build from run so a future stall is
         # attributable to compile-vs-run (GitHub keeps per-STEP status even when a
-        # job-timeout cancel discards the whole job-log blob), and the ubuntu run
-        # is wrapped in a GNU `timeout` well under the 40m job cap so a stall FAILS
-        # THE STEP — the job completes and its logs are archived — instead of being
-        # cancelled on the job timeout (whose logs GitHub discards; the ubuntu
-        # symptom). Lock the whole shape so a regression back to the fused,
-        # undiagnosable single run is caught. This does NOT claim to fix the 40-min
-        # hang; it captures the evidence the discarded log denied us.
+        # job-timeout cancel discards the whole job-log blob) — the fresh run
+        # proved the build SUCCEEDS and the hang is in the RUN. The ubuntu run then
+        # runs nextest under an 18m WATCHDOG that force-EXITS THE SHELL: a prior GNU
+        # `timeout` wrapper was DEFEATED because the hung run process is unkillable
+        # D-state (uninterruptible sleep) — SIGKILL cannot reap it and `timeout`
+        # itself blocked in wait(), so the step never returned and the job-cancel
+        # discarded the log again. Signalling our own shell via USR1 makes bash
+        # interrupt `wait`, dump diagnostics, and exit — so the STEP FAILS, the job
+        # completes, and the log is ARCHIVED without depending on killing the
+        # unkillable run. Lock the whole shape so a regression back to the fused —
+        # or to the defeated `timeout` wrapper — is caught.
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
@@ -271,28 +275,36 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn(
             "cargo +stable nextest run --workspace --all-targets --no-run", ci
         )
-        # (2) The ubuntu run is gated and wrapped in GNU `timeout` at 28m (< the 40m
-        # job cap) with a 60s SIGKILL escalation, so a stall fails the step.
+        # (2) The ubuntu run is gated and runs nextest in the BACKGROUND under an
+        # 18-min (1080s) watchdog subshell that signals THIS shell (`kill -USR1 $$`);
+        # the USR1 trap dumps diagnostics and `exit 124`s so an UNKILLABLE D-state
+        # run still fails the step (we never depend on killing the run process).
         self.assertIn("if: matrix.os == 'ubuntu-latest'", ci)
-        self.assertIn(
-            "timeout --kill-after=60s 28m "
-            "cargo +stable nextest run --workspace --all-targets",
-            ci,
-        )
-        # On timeout (124, or 137 after the kill-after SIGKILL) dump the process
-        # tree — `ps auxf` plus per-pid state / wchan / cmdline from /proc — then
-        # exit non-zero so the job completes and its logs are preserved.
-        self.assertIn('[ "$code" -eq 124 ]', ci)
+        self.assertIn("cargo +stable nextest run --workspace --all-targets &", ci)
+        self.assertIn('wait "$NEXT"', ci)
+        self.assertIn("sleep 1080", ci)
+        self.assertIn("kill -USR1 $$", ci)
+        self.assertIn("exit 124' USR1", ci)  # the trap: dump then exit, bound to USR1
+        # The dump names the stuck test(s) and their stuck syscall: ps auxf (nextest
+        # re-invokes each test as `<bin> --exact <name>`, so cmdlines NAME the hung
+        # tests), per-pid state/wchan/cmdline, and the KERNEL STACK of every D-state
+        # pid.
         self.assertIn("ps auxf", ci)
         self.assertIn("for p in /proc/[0-9]*; do", ci)
-        self.assertIn("wchan", ci)
-        self.assertIn("cmdline", ci)
-        # (3) macOS/Windows legs stay a plain, fast run (GNU `timeout` + /proc are
+        self.assertIn("state / wchan / cmdline", ci)
+        self.assertIn("kernel stacks of D-state pids", ci)
+        self.assertIn('[ "${r%% *}" = "D" ]', ci)
+        self.assertIn('cat "$p/stack"', ci)
+        # The defeated `timeout`-wrapper form must be GONE (an unkillable D-state run
+        # blocks `timeout` in wait(), so it never fails the step — the whole reason
+        # for the watchdog).
+        self.assertNotIn("timeout --kill-after=60s 28m", ci)
+        # (3) macOS/Windows legs stay a plain, fast run (GNU tools + /proc are
         # Linux-only); their green legs need no instrumentation.
         self.assertIn("if: matrix.os != 'ubuntu-latest'", ci)
         # (4) The doctest pass still runs separately (nextest does not run doctests).
         self.assertIn("cargo +stable test --workspace --doc", ci)
-        # (5) The 40m job cap stays as a COARSE BACKSTOP behind the in-step timeout.
+        # (5) The 40m job cap stays as a LAST-DITCH BACKSTOP behind the watchdog.
         self.assertIn("timeout-minutes: 40", ci)
 
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
