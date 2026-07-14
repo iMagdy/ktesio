@@ -68,17 +68,17 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
-    # build is slow; this job builds test binaries, runs the suite, and runs the
-    # doctest pass. 40 is a LAST-DITCH BACKSTOP only: the ubuntu run step now runs
-    # nextest under a 15m WATCHDOG that force-EXITS THE SHELL on a stall (#106) —
-    # a `timeout` wrapper was defeated because the hung run process is unkillable
-    # D-state, so we signal our own shell instead of the process — making a stall
-    # FAIL THE STEP so the job completes normally and its logs are archived, rather
-    # than being cancelled on this 40m cap (whose cancelled-job logs GitHub
-    # discards; the ubuntu symptom that hid the original cause). nextest's per-test
-    # kill-timeout (see .config/nextest.toml) remains the cross-OS per-test guard.
-    timeout-minutes: 40
+    # TEMPORARY diagnostic scaffold (#106): the ubuntu leg is split into per-binary
+    # BISECT steps (below) to NAME the hanging engine integration test via per-STEP
+    # attribution. In-step log capture proved impossible — an unkillable D-state run
+    # process makes GitHub's post-step process-tree cleanup block, so the ubuntu job
+    # always rides to the timeout-cancel that DISCARDS the log (no in-step timeout /
+    # watchdog / off-pipe redirect could end the step). But per-STEP status SURVIVES
+    # a job-cancel, so the lone `in_progress` bisect step at cancel is the culprit.
+    # 20 is a DIAGNOSTIC cap: macOS/Windows finish well under it and the ubuntu hang
+    # cancels sooner than at 40. Revert to a single run + 40m once the culprit is
+    # named. nextest's per-test kill-timeout (.config/nextest.toml) is unchanged.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -154,93 +154,57 @@ jobs:
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
           cargo +stable build -p ktesio-conformance --bin fake_agent
           cargo +stable nextest run --workspace --all-targets --no-run
-      - name: Run tests (nextest, ubuntu — watchdog + off-pipe run + D-state-safe dump)
+      # ── TEMPORARY diagnostic scaffold (#106), ubuntu leg only — TO BE REVERTED ──
+      # In-step hang CAPTURE proved impossible: an unkillable D-state run process
+      # makes GitHub's post-step process-tree cleanup block, so the ubuntu job ALWAYS
+      # rides to the timeout-cancel that DISCARDS the log (BlobNotFound) — no in-step
+      # timeout, watchdog, or off-pipe redirect could end the step. But per-STEP
+      # status SURVIVES a job-cancel (the build/run split proved it). So BISECT by
+      # attribution: run each engine integration test binary in its OWN step. The
+      # passing binaries finish in seconds; the culprit's step hangs and is the lone
+      # `in_progress` step when the job cancels (later steps stay `pending`) — that
+      # step's name IS the hanging binary. Filtersets verified locally with
+      # `cargo nextest list -E …`: the exact `binary_id(=…)` form avoids any
+      # cross-match (metering vs observed_metering, adoption vs adoption_cli), and the
+      # step-1 complement selects the engine LIB unit tests + kt + adapter-api +
+      # conformance but NONE of the 10 integration binaries. Revert to a single run
+      # once the culprit is named.
+      - name: "ubuntu bisect: non-engine-integration"
         if: matrix.os == 'ubuntu-latest'
-        # Make the NEXT ubuntu stall DIAGNOSABLE (#106). THREE attempts were defeated
-        # by the SAME unkillable D-state (uninterruptible-sleep) run process, each a
-        # layer deeper:
-        #   (1) a GNU `timeout` wrapper blocked in wait() on the unkillable child, so
-        #       the step never returned;
-        #   (2) a watchdog fired but its dump() BLOCKED reading the D-state task's
-        #       command-line / backtrace /proc files before it could `exit`; and
-        #   (3) the dump was made non-blocking and the shell DID `exit` — but the
-        #       background `nextest &` had inherited the STEP's stdout/stderr pipe, so
-        #       the unkillable child kept that pipe OPEN after the shell exited, the
-        #       runner never saw EOF, and the step rode to the 40m job-cancel.
-        # Each cancel DISCARDED the log (BlobNotFound). The decisive fix: redirect the
-        # background run's stdio to a FILE ($RUNLOG) + detach stdin, so it never holds
-        # the step pipe — then the shell's `exit` truly ENDS the step (EOF) as a
-        # FAILURE, the job COMPLETES (not cancels), and GitHub ARCHIVES the log (with
-        # the D-state-safe dump AND the nextest runlog). A SIGKILL-the-shell fallback
-        # ends the step even if the trap is ever blocked. We never depend on killing
-        # the orphaned run (left for GitHub's post-job teardown). 15m (900s) watchdog
-        # is safe headroom — healthy suite 1–3 min (arm64 ran it in 49s) — below 40m.
-        #
-        # D-STATE-SAFE dump: read ONLY non-blocking /proc fields — the `stat` file
-        # (state, comm, ppid) and `wchan` (the kernel function the task sleeps in =
-        # the stuck syscall). NEVER read a task's command-line or kernel backtrace
-        # (those reads block UNINTERRUPTIBLY on a D-state pid — exactly what hung the
-        # prior dump before it could `exit`). `comm` (<=15 chars, e.g.
-        # `observed_meteri`) names the test FILE, and the ps forest + ppid show the
-        # test-binary -> fake_agent tree; losing the `--exact <test>` args (a
-        # command-line read) is an acceptable trade for a dump that ALWAYS completes.
-        # `retries = 2` in .config/nextest.toml still absorbs the windows flake.
-        #
-        # `code=0; wait "$NEXT" || code=$?` (not a bare `wait; code=$?`): GitHub runs
-        # `shell: bash` with `-eo pipefail`, so a bare `wait` returning non-zero on a
-        # real test failure would errexit BEFORE capturing the code / stopping the
-        # watchdog; the `|| code=$?` guard keeps the real exit code and cleanup.
-        shell: bash
-        run: |
-          set -uo pipefail
-          RUNLOG="${RUNNER_TEMP:-/tmp}/nextest-ubuntu.log"
-          dump() {
-            echo "===== loadavg / free ====="; cat /proc/loadavg || true; free -m || true
-            # comm comes from the stat file (non-blocking); OMIT the args/cmd column —
-            # it would read each task's command-line, which BLOCKS on a D-state pid.
-            echo "===== ps (state/wchan/comm forest — NON-blocking; no command-line) ====="
-            ps -eo pid,ppid,stat,wchan:32,comm --forest || ps -eo pid,ppid,stat,wchan,comm || true
-            # Per-pid: read ONLY the stat file (state,comm,ppid) + wchan — both
-            # non-blocking. Never read a task's command-line or its kernel backtrace.
-            echo "===== per-pid state / wchan / comm (from stat; non-blocking) ====="
-            for p in /proc/[0-9]*; do
-              st=$(cat "$p/stat" 2>/dev/null) || continue
-              pid=${st%% *}
-              comm=${st#*\(}; comm=${comm%%\)*}
-              rest=${st##*') '}; state=${rest%% *}
-              wchan=$(cat "$p/wchan" 2>/dev/null || echo '?')
-              echo "pid=$pid state=$state wchan=$wchan comm=$comm"
-            done
-            echo "===== D-STATE pids (the culprits) ====="
-            for p in /proc/[0-9]*; do
-              st=$(cat "$p/stat" 2>/dev/null) || continue
-              rest=${st##*') '}; [ "${rest%% *}" = "D" ] || continue
-              comm=${st#*\(}; comm=${comm%%\)*}
-              echo "D-state pid=${st%% *} comm=$comm wchan=$(cat "$p/wchan" 2>/dev/null || echo '?')"
-            done
-            echo "===== dmesg tail (best effort) ====="; dmesg 2>/dev/null | tail -40 || echo '(dmesg denied)'
-            # $RUNLOG is a regular file (not /proc), so this read never blocks — it
-            # surfaces nextest's own progress/results: the last-started / last-passed
-            # test is a second culprit signal alongside comm/wchan.
-            echo "===== nextest runlog (progress/results) ====="; cat "$RUNLOG" 2>/dev/null || true
-          }
-          trap 'echo "::error::watchdog fired — dumping D-state-safe diagnostics + runlog, then failing the step so the job log is ARCHIVED (#106)"; dump; exit 124' USR1
-          # Redirect stdout+stderr to a FILE and detach stdin: the background run must
-          # NOT hold the step's stdout/stderr pipe, or an unkillable (D-state) child
-          # keeps the STEP alive past the shell `exit` (no EOF) -> job-cancel -> log
-          # lost. With the run off-pipe, the shell's exit truly ends the step.
-          cargo +stable nextest run --workspace --all-targets > "$RUNLOG" 2>&1 < /dev/null &
-          NEXT=$!
-          # Watchdog: at 900s signal THIS shell (USR1 trap dumps + exits); if the
-          # shell is somehow still alive 8s later (trap blocked), SIGKILL it so the
-          # step ENDS (fail, not cancel) and the log is archived regardless.
-          ( sleep 900; kill -USR1 $$ 2>/dev/null; sleep 8; kill -KILL $$ 2>/dev/null ) &
-          WATCH=$!
-          code=0
-          wait "$NEXT" || code=$?
-          kill "$WATCH" 2>/dev/null || true
-          cat "$RUNLOG" 2>/dev/null || true    # surface nextest output on the normal (healthy/fail) path
-          exit "$code"
+        # Everything EXCEPT the 10 engine integration binaries (engine lib unit tests
+        # ~467, all kt tests + the kt bin, adapter-api, conformance). Should pass in
+        # seconds; if THIS hangs, the culprit is outside the engine integration suite.
+        run: cargo +stable nextest run --workspace -E 'not (kind(test) & package(ktesio-engine))'
+      - name: "ubuntu bisect: adoption"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::adoption)'
+      - name: "ubuntu bisect: budget"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::budget)'
+      - name: "ubuntu bisect: cost"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::cost)'
+      - name: "ubuntu bisect: crash"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::crash)'
+      - name: "ubuntu bisect: fleet_totals"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::fleet_totals)'
+      - name: "ubuntu bisect: lifecycle"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::lifecycle)'
+      - name: "ubuntu bisect: metering"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::metering)'
+      - name: "ubuntu bisect: observed_metering"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::observed_metering)'
+      - name: "ubuntu bisect: pause"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::pause)'
+      - name: "ubuntu bisect: registration"
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +stable nextest run --workspace -E 'binary_id(=ktesio-engine::registration)'
       - name: Run tests (nextest, macOS/Windows)
         if: matrix.os != 'ubuntu-latest'
         # The macOS and Windows legs are green under nextest (retries absorb the

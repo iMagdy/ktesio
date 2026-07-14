@@ -251,82 +251,52 @@ class ReleaseDocsTests(unittest.TestCase):
         # merged into one aggregate, #101 — still Linux, still one job).
         self.assertIn("name: coverage", ci)
 
-    def test_ci_test_job_splits_build_from_run_with_ubuntu_hang_dump(self) -> None:
-        # #106: the `test` job SPLITS build from run (a fresh run proved the build
-        # SUCCEEDS; the hang is in the RUN), and the ubuntu run runs nextest under a
-        # 15m WATCHDOG that force-EXITS THE SHELL, with the run REDIRECTED OFF the
-        # step's stdout/stderr pipe. Root cause of every capture failure: an
-        # unkillable D-state (uninterruptible-sleep) run process. It defeated, in
-        # turn, (1) a GNU `timeout` wrapper (blocked in wait()); (2) a watchdog whose
-        # dump() BLOCKED reading the D-state task's command-line/backtrace /proc
-        # files; and (3) a non-blocking-dump watchdog whose background `nextest &`
-        # still held the STEP's stdout pipe — the unkillable child kept it open past
-        # the shell `exit`, so the runner never saw EOF and the step rode to the 40m
-        # job-cancel (the log discarded each time). The decisive fix: redirect the
-        # run's stdio to a FILE ($RUNLOG) + detach stdin so it never holds the step
-        # pipe (the shell's exit then truly ENDS the step), a SIGKILL-the-shell
-        # fallback if the trap ever blocks, and a cat of $RUNLOG so nextest's own
-        # progress lands in the archived log. Lock the whole shape so a regression
-        # (a blocking /proc read, an unredirected run, the defeated `timeout`) is
-        # caught.
+    def test_ci_test_job_ubuntu_per_binary_bisect_scaffold_temporary(self) -> None:
+        # TEMPORARY diagnostic scaffold (#106) — TO BE REVERTED once the hanging
+        # engine integration binary is named. In-step hang capture proved impossible
+        # (an unkillable D-state run blocks GitHub's post-step process-tree cleanup,
+        # so the ubuntu job always rides to the timeout-cancel that discards the
+        # log). Per-STEP status SURVIVES a job-cancel, so the ubuntu leg is split
+        # into ONE step per engine integration binary; the lone `in_progress` step
+        # at cancel names the culprit. These asserts just keep the scaffold shape
+        # green; relax/remove them when the scaffold is reverted to a single run.
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
-
-        # (1) Build test binaries in a SEPARATE step (`--no-run`), keeping the
-        # stale-fake_agent `rm` + explicit rebuild ahead of it (asserted in
-        # test_ci_runs_coverage_after_primary_gates).
+        # Build test binaries once (shared by every bisect step; the per-binary run
+        # steps reuse the artifacts — see test_ci_runs_coverage_after_primary_gates
+        # for the stale-fake_agent rm + explicit rebuild that precede it).
         self.assertIn(
             "cargo +stable nextest run --workspace --all-targets --no-run", ci
         )
-        # (2) The ubuntu run is gated; nextest runs in the BACKGROUND REDIRECTED to
-        # $RUNLOG with stdin detached (so it never holds the step's stdout pipe — the
-        # capture-failure cause), under a 15-min (900s) watchdog subshell that
-        # signals THIS shell (`kill -USR1 $$`) and, if the trap is ever blocked,
-        # SIGKILLs it (`kill -KILL $$`) so the step ALWAYS ends (fail, not
-        # job-cancel). The USR1 trap dumps + `exit 124`s; $RUNLOG is cat'd so
-        # nextest's own output is archived.
-        self.assertIn("if: matrix.os == 'ubuntu-latest'", ci)
-        self.assertIn('RUNLOG="${RUNNER_TEMP:-/tmp}/nextest-ubuntu.log"', ci)
+        # Step 1: everything EXCEPT the 10 engine integration binaries (engine lib
+        # unit tests + kt + adapter-api + conformance).
         self.assertIn(
-            "cargo +stable nextest run --workspace --all-targets "
-            '> "$RUNLOG" 2>&1 < /dev/null &',
+            "cargo +stable nextest run --workspace "
+            "-E 'not (kind(test) & package(ktesio-engine))'",
             ci,
         )
-        self.assertIn('wait "$NEXT"', ci)
-        self.assertIn("sleep 900", ci)
-        self.assertIn("kill -USR1 $$", ci)
-        self.assertIn("kill -KILL $$", ci)  # SIGKILL-the-shell fallback if the trap blocks
-        self.assertIn("exit 124' USR1", ci)  # the trap: dump then exit, bound to USR1
-        self.assertIn('cat "$RUNLOG"', ci)  # nextest runlog surfaced into the archived log
-        # (2a) The dump is D-STATE-SAFE: ONLY non-blocking /proc reads — the stat
-        # file (state, comm, ppid) and wchan (the stuck syscall) — plus a comm-only
-        # `ps -eo` forest. `comm` (stat-derived, <=15 chars) names the test FILE and
-        # the ppid forest shows the test-binary -> fake_agent tree; that is enough to
-        # diagnose without the args column.
-        self.assertIn("ps -eo pid,ppid,stat,wchan:32,comm --forest", ci)
-        self.assertIn("for p in /proc/[0-9]*; do", ci)
-        self.assertIn("state / wchan / comm", ci)
-        self.assertIn("D-STATE pids (the culprits)", ci)
-        self.assertIn('[ "${rest%% *}" = "D" ]', ci)
-        self.assertIn('cat "$p/stat"', ci)
-        self.assertIn('cat "$p/wchan"', ci)
-        # (2b) The BLOCKING reads that hung the prior dump MUST be gone — reading any
-        # of these /proc files blocks uninterruptibly on a D-state pid, so the trap
-        # would never reach `exit`: `ps auxf` (reads each pid's cmdline for the CMD
-        # column), the `< "$p/cmdline"` redirect, and `cat "$p/stack"`. The defeated
-        # `timeout` wrapper must be gone too.
-        self.assertNotIn("ps auxf", ci)
-        self.assertNotIn('< "$p/cmdline"', ci)
-        self.assertNotIn('cat "$p/stack"', ci)
-        self.assertNotIn("timeout --kill-after=60s 28m", ci)
-        # (3) macOS/Windows legs stay a plain, fast run (GNU tools + /proc are
-        # Linux-only); their green legs need no instrumentation.
+        # One ubuntu-gated step per engine integration binary, EXACT binary_id form
+        # (`=…` — no metering/observed_metering or adoption/adoption_cli cross-match),
+        # in the fixed order the orchestrator specified for attribution.
+        for b in [
+            "adoption", "budget", "cost", "crash", "fleet_totals",
+            "lifecycle", "metering", "observed_metering", "pause", "registration",
+        ]:
+            self.assertIn('- name: "ubuntu bisect: %s"' % b, ci)
+            self.assertIn(
+                "cargo +stable nextest run --workspace "
+                "-E 'binary_id(=ktesio-engine::%s)'" % b,
+                ci,
+            )
+        # macOS/Windows keep the SINGLE plain full run; doctests still run separately.
+        self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
         self.assertIn("if: matrix.os != 'ubuntu-latest'", ci)
-        # (4) The doctest pass still runs separately (nextest does not run doctests).
         self.assertIn("cargo +stable test --workspace --doc", ci)
-        # (5) The 40m job cap stays as a LAST-DITCH BACKSTOP behind the watchdog.
-        self.assertIn("timeout-minutes: 40", ci)
+        # The in-step-capture machinery is GONE (the scaffold replaced it); guarding
+        # this makes the eventual revert obvious if it forgets to restore a run step.
+        self.assertNotIn("kill -USR1 $$", ci)
+        self.assertNotIn('> "$RUNLOG" 2>&1 < /dev/null', ci)
 
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
