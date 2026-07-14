@@ -65,6 +65,14 @@ source = "self-reported"
 
 /// Whether a pid is alive. NO OS-cfg here (the gate allowlists only `backends/`);
 /// branch on the runtime OS id and shell out (`kill -0` / `tasklist`).
+///
+/// A ZOMBIE (defunct) child still answers `kill -0` — it holds its pid until
+/// reaped — so without a reaping PID1 (e.g. a bare CI container) a just-killed
+/// process reads as alive and the "process gone" assertions false-fail. After
+/// `kill -0` succeeds, discount a process whose `/proc/<pid>/stat` state is `Z`.
+/// Reading /proc needs no OS-cfg: the path is absent off Linux, so the check
+/// no-ops there (those callers run under a reaping init/launchd), preserving the
+/// plain `kill -0` semantics.
 fn pid_alive(pid: u32) -> bool {
     match ktesio_engine::OsId::current() {
         ktesio_engine::OsId::Windows => {
@@ -76,16 +84,34 @@ fn pid_alive(pid: u32) -> bool {
                 Err(_) => false,
             }
         }
-        _ => Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            // Silence the "No such process" stderr once the pid is gone — the
-            // exit status is what we read.
-            .stderr(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
+        _ => {
+            let exists = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                // Silence the "No such process" stderr once the pid is gone — the
+                // exit status is what we read.
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            exists && !proc_pid_is_zombie(pid)
+        }
     }
+}
+
+/// Whether `/proc/<pid>/stat` reports process state `Z` (zombie). No OS-cfg (the
+/// gate allowlists only `backends/`): the read simply fails on non-Linux, so
+/// this returns `false` there and [`pid_alive`] keeps its `kill -0` semantics.
+fn proc_pid_is_zombie(pid: u32) -> bool {
+    // /proc/<pid>/stat is "pid (comm) state ...". `comm` may contain spaces or
+    // ')', so the state code is the first token AFTER the final ')'.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+        })
+        .unwrap_or(false)
 }
 
 fn wait_until_gone(pid: u32, what: &str) {

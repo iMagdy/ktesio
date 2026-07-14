@@ -251,6 +251,50 @@ class ReleaseDocsTests(unittest.TestCase):
         # merged into one aggregate, #101 — still Linux, still one job).
         self.assertIn("name: coverage", ci)
 
+    def test_ci_test_job_splits_build_from_run_with_ubuntu_hang_dump(self) -> None:
+        # #106: the `test` job SPLITS build from run so a future stall is
+        # attributable to compile-vs-run (GitHub keeps per-STEP status even when a
+        # job-timeout cancel discards the whole job-log blob), and the ubuntu run
+        # is wrapped in a GNU `timeout` well under the 40m job cap so a stall FAILS
+        # THE STEP — the job completes and its logs are archived — instead of being
+        # cancelled on the job timeout (whose logs GitHub discards; the ubuntu
+        # symptom). Lock the whole shape so a regression back to the fused,
+        # undiagnosable single run is caught. This does NOT claim to fix the 40-min
+        # hang; it captures the evidence the discarded log denied us.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        # (1) Build test binaries in a SEPARATE step (`--no-run`), keeping the
+        # stale-fake_agent `rm` + explicit rebuild ahead of it (asserted in
+        # test_ci_runs_coverage_after_primary_gates).
+        self.assertIn(
+            "cargo +stable nextest run --workspace --all-targets --no-run", ci
+        )
+        # (2) The ubuntu run is gated and wrapped in GNU `timeout` at 28m (< the 40m
+        # job cap) with a 60s SIGKILL escalation, so a stall fails the step.
+        self.assertIn("if: matrix.os == 'ubuntu-latest'", ci)
+        self.assertIn(
+            "timeout --kill-after=60s 28m "
+            "cargo +stable nextest run --workspace --all-targets",
+            ci,
+        )
+        # On timeout (124, or 137 after the kill-after SIGKILL) dump the process
+        # tree — `ps auxf` plus per-pid state / wchan / cmdline from /proc — then
+        # exit non-zero so the job completes and its logs are preserved.
+        self.assertIn('[ "$code" -eq 124 ]', ci)
+        self.assertIn("ps auxf", ci)
+        self.assertIn("for p in /proc/[0-9]*; do", ci)
+        self.assertIn("wchan", ci)
+        self.assertIn("cmdline", ci)
+        # (3) macOS/Windows legs stay a plain, fast run (GNU `timeout` + /proc are
+        # Linux-only); their green legs need no instrumentation.
+        self.assertIn("if: matrix.os != 'ubuntu-latest'", ci)
+        # (4) The doctest pass still runs separately (nextest does not run doctests).
+        self.assertIn("cargo +stable test --workspace --doc", ci)
+        # (5) The 40m job cap stays as a COARSE BACKSTOP behind the in-step timeout.
+        self.assertIn("timeout-minutes: 40", ci)
+
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
