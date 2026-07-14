@@ -23,10 +23,11 @@ use ktesio_engine::{
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInvalidName,
-    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionUnavailable,
+    AgentInvalidName, AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
     AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource,
-    AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
+    AgentNotFound, AgentNotRunning, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey,
+    AgentUnknownKind,
 };
 use crate::ui;
 
@@ -851,6 +852,32 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `kt agent send <name> <text>` — send text input to a running Agent
+/// Instance's native input channel (story 4.1, FR-24).
+///
+/// Drives `send_input` through the blocking facade. Unlike `pause`/`resume`,
+/// `send` is not a lifecycle transition, so there is no new Lifecycle State to
+/// print — on success only a confirmation goes to stdout. Failure modes,
+/// mapped by [`map_engine_error`]: the instance is not `running`
+/// ([`AgentNotRunning`]); interaction is `unsupported` on this OS, quoting the
+/// Capability Declaration ([`AgentCapabilityUnsupported`]); or the instance is
+/// running but this engine session holds no live stdin pipe for it, e.g. an
+/// ADOPTED instance ([`AgentInteractionUnavailable`]).
+pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+    match facade.send_input(name, text) {
+        Ok(()) => {
+            ui::success(format!(
+                "Sent input to Agent Instance {}",
+                ui::skill_name(name)
+            ));
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
 /// After a successful best-effort-eligible pause/resume, re-read the effective
 /// Capability Declaration and, if pause is [`SupportLevel::BestEffort`] on the
 /// current OS, print a one-line qualifier NOTE to STDERR (AD-12: notices →
@@ -1468,6 +1495,30 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         .into(),
         EngineError::Backend { name, source } => AgentIo {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
+        }
+        .into(),
+        // Story 4.1 AC-C: `send` targeted an instance that is not `running`.
+        // Not a transition error (there is no transition table entry for
+        // `send`), so it gets its own remediation naming the current state.
+        EngineError::NotRunning { name, state } => AgentNotRunning {
+            message: format!(
+                "Agent Instance '{name}' is not running (current state: {state}); start it \
+                 first with: kt agent start {name}. List the Fleet with: kt agent list"
+            ),
+        }
+        .into(),
+        // Story 4.1 AC-D: the instance IS running, but this engine session
+        // holds no live stdin pipe for it (most commonly an instance ADOPTED
+        // from a prior engine session). Distinct from CapabilityUnsupported —
+        // the adapter's declaration may truthfully say `interaction:
+        // guaranteed`; it is this session's reach that is limited. State the
+        // single-lifetime boundary honestly rather than implying a bug.
+        EngineError::InteractionUnavailable { name, detail } => AgentInteractionUnavailable {
+            message: format!(
+                "Agent Instance '{name}' cannot receive input right now: {detail}. Durable \
+                 cross-invocation interaction needs a persistent engine session (planned for a \
+                 future release); within a single `kt` process/embedding session this works."
+            ),
         }
         .into(),
         EngineError::Store(inner) => AgentStore {

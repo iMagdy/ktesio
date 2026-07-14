@@ -1018,6 +1018,303 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
     );
 }
 
+// ---- Story 4-1: `kt agent send <name> <text>` (AC-A, AC-B, AC-C) ----
+
+/// Write a `fake_agent` manifest whose CURRENT-OS interaction level is
+/// `interaction_level` (mirrors `fake_agent_manifest_with_pause`).
+fn fake_agent_manifest_with_interaction(
+    dir: &Path,
+    args: &[&str],
+    interaction_level: &str,
+) -> std::path::PathBuf {
+    let m = dir.join("send-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fake"
+
+[lifecycle.start]
+exec = {exec:?}
+args = [{args_toml}]
+
+[capabilities.interaction]
+{os} = "{interaction_level}"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        os = current_os_pause_key(),
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+/// The agent.log path inside an instance's Agent Home.
+fn agent_log_path(state_dir: &Path, name: &str) -> std::path::PathBuf {
+    state_dir
+        .join("agents")
+        .join(name)
+        .join("logs")
+        .join("agent.log")
+}
+
+#[test]
+fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable() {
+    // DEVIATION FROM THE STORY FILE (documented; see the story's Dev Agent
+    // Record / Completion Notes and the PR description for the full
+    // rationale): Task 8's first bullet describes this test asserting exit 0
+    // + delivered input, mirroring
+    // `pause_prints_paused_state_and_exits_zero_guaranteed_unix` via
+    // `start_via_surviving_engine`. That harness works for pause (guaranteed
+    // pause only needs the pgid/PID, which adoption fully restores), but for
+    // `send` it is structurally impossible to succeed: `start_via_surviving_engine`
+    // starts the agent in a SEPARATE helper subprocess that exits without
+    // dropping its engine, so the SEPARATE `kt agent send` invocation this
+    // test drives NECESSARILY reaches the instance only via `adopt_orphans`
+    // — and an adopted handle NEVER carries a recoverable stdin pipe (AC-D,
+    // Task 1's `adopt()`), on Unix or Windows alike (this is not an OS
+    // difference; a pipe file descriptor is process-local and cannot survive
+    // a re-parent to init the way a bare pid/pgid does). Running the test AS
+    // LITERALLY DESCRIBED reproducibly fails with EXACTLY the
+    // `InteractionUnavailable` error AC-D mandates — confirming the
+    // implementation is correct and the story's test-outcome description
+    // does not account for send's pipe-vs-pid distinction (spelled out in
+    // the story's OWN Dev Notes: "pause/stop/poll do not have this problem
+    // ... while send needs an actual open file descriptor this engine
+    // session holds"). So this test instead proves the CLI-level surfacing
+    // of AC-D's honest failure (genuinely new coverage: the
+    // `AgentInteractionUnavailable` diagnostic's rendering through the real
+    // `kt` binary, which no other test exercises) — never
+    // `CapabilityUnsupported`, never a silent success, and NO input
+    // delivered. AC-A's single-session happy path (exit 0 + delivered input)
+    // is fully proven at the engine level by
+    // `send_input_delivers_text_to_a_running_manifest_adapter_agent` in
+    // `crates/ktesio-engine/tests/interaction.rs`, which does not cross a
+    // process boundary.
+    //
+    // Runtime-skip on Windows: `start_via_surviving_engine`'s cross-lifetime
+    // survival needs Unix re-parenting to init (`JOB_OBJECT_LIMIT_KILL_ON_
+    // JOB_CLOSE` kills the child on Windows when the helper exits) — the SAME
+    // reason the pause CLI tests skip Windows. NO `#[cfg]` (data-driven; this
+    // file is outside the backends allowlist).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--echo-stdin", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Start via a surviving (crashed-engine) subprocess so the process is
+    // genuinely LIVE when the send command's SEPARATE engine adopts it.
+    start_via_surviving_engine(state_dir, "svc");
+
+    let sent = run_kt_agent(
+        &["agent", "send", "svc", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "send on an adopted instance must exit non-zero (no recoverable pipe); stdout={}",
+        sent.stdout
+    );
+    assert!(
+        sent.stderr.contains("cannot receive input"),
+        "stderr must state the honest InteractionUnavailable cause; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("svc"),
+        "stderr must name the instance; stderr={}",
+        sent.stderr
+    );
+    // Never misattributed to CapabilityUnsupported — the adapter's
+    // declaration is truthful; it is this session's reach that is limited.
+    assert!(
+        !sent.stderr.contains("unsupported") && !sent.stderr.contains("declares"),
+        "must never be misattributed to CapabilityUnsupported: stderr={}",
+        sent.stderr
+    );
+
+    // Confirm this genuinely exercised the ADOPTED-and-running path (not some
+    // other failure): the persisted row is `running`.
+    let conn = rusqlite::Connection::open(state_db(state_dir)).unwrap();
+    let persisted_state: String = conn
+        .query_row(
+            "SELECT state FROM agent_instances WHERE name = 'svc'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_state, "running",
+        "the instance must genuinely be adopted as running for this to be AC-D, not some other failure"
+    );
+    drop(conn);
+
+    // No input was delivered (a failed send must deliver NOTHING).
+    let contents = std::fs::read_to_string(agent_log_path(state_dir, "svc")).unwrap_or_default();
+    assert!(
+        !contents.lines().any(|l| l.starts_with("stdin:")),
+        "a failed send must deliver no input: {contents:?}"
+    );
+
+    // Teardown: stop the adopted process so no orphan remains.
+    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn send_unsupported_exits_nonzero_quoting_the_declaration() {
+    // AC-B at the CLI: `send` on an instance whose interaction is
+    // `unsupported` on this OS fails fast with a non-zero exit and a
+    // diagnostic (stderr) quoting the declaration. Same
+    // `start_via_surviving_engine` requirement as pause's identical test — an
+    // unsupported-but-DB-hacked `force_state_running` would not survive
+    // `adopt_orphans`' reconciliation (see that test's own comment on why the
+    // heavier harness is required even for the fail-fast path).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // Declare interaction only for an OS that is NOT the current one → the
+    // current-OS projection is Unsupported.
+    let other = if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--echo-stdin", "--linger-ms", "600000"],
+        "ignored",
+    );
+    // Overwrite the manifest so interaction is declared ONLY for the other OS.
+    let bin = fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "fake"
+[lifecycle.start]
+exec = {exec:?}
+args = ["--echo-stdin", "--linger-ms", "600000"]
+[capabilities.interaction]
+{other} = "guaranteed"
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        other = other,
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+
+    run_kt_agent(
+        &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Start via a surviving (crashed-engine) subprocess so the instance is
+    // genuinely `running` (adopted) when send runs — so send fails fast with
+    // the UNSUPPORTED diagnostic, not a reconciled-to-failed transition error.
+    start_via_surviving_engine(state_dir, "un");
+
+    let sent = run_kt_agent(
+        &["agent", "send", "un", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "unsupported send must exit non-zero; stdout={}",
+        sent.stdout
+    );
+    assert!(
+        sent.stderr.contains("cannot interaction"),
+        "stderr must quote the declaration; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("unsupported"),
+        "stderr must name the level; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("kt agent show un"),
+        "stderr must point at kt agent show; stderr={}",
+        sent.stderr
+    );
+
+    // Fail-fast attempted NO I/O: the captured log gained no `stdin:` line.
+    let contents = std::fs::read_to_string(agent_log_path(state_dir, "un")).unwrap_or_default();
+    assert!(
+        !contents.lines().any(|l| l.starts_with("stdin:")),
+        "no I/O may be attempted on the Unsupported fail-fast path: {contents:?}"
+    );
+
+    // Teardown.
+    run_kt_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn send_on_registered_instance_is_not_running() {
+    // AC-C at the CLI: `send` on a registered (never started) instance fails
+    // with a non-zero exit and a diagnostic naming the current state — the
+    // LIGHTER path suffices here (no live process needed at all): the
+    // `NotRunning` check fires before anything process-related, mirroring
+    // `pause_on_registered_returns_uniform_invalid_transition`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "nat", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(
+        &["agent", "send", "nat", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!run.success, "send on registered should exit non-zero");
+    assert!(
+        run.stderr.contains("not running"),
+        "stderr should name the not-running state; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("nat"),
+        "stderr should name the instance; stderr={}",
+        run.stderr
+    );
+}
+
 // ---- Story 1-6: restart count / failed cause / policy surface (AC9) + restart ----
 
 /// Seed a `failed` instance with an `agent_runtime` record carrying a Restart

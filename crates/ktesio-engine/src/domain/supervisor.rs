@@ -937,6 +937,118 @@ impl Supervisor {
         })
     }
 
+    /// Send text input to a running Agent Instance's native input channel
+    /// (story 4.1, FR-24, spine AD-12) — the v1 interaction surface. For
+    /// every adapter that can actually run today (native mock or manifest),
+    /// "the native input channel" is the spawned child's OS stdin pipe (both
+    /// backends pipe it unconditionally at spawn, Task 1); this needs ZERO
+    /// per-kind branching, so one method serves both (AC-A).
+    ///
+    /// Unlike [`Supervisor::suspend_or_resume`], `send` is NOT itself a state
+    /// transition (AD-15's transition table has no `send` entry): no
+    /// `next_state` call, no [`TransitionEvent`]. The dispatch order:
+    ///
+    /// 1. name-resolve (`NotFound` unchanged),
+    /// 2. **AC-C**: the instance MUST be [`LifecycleState::Running`] —
+    ///    anything else fails with [`EngineError::NotRunning`], checked
+    ///    BEFORE the capability read (mirrors "transition gate before any
+    ///    side effect"),
+    /// 3. **AC-B**: read the effective (current-OS) `Capability::Interaction`
+    ///    level — `Unsupported` FAILS FAST with
+    ///    [`EngineError::CapabilityUnsupported`] (the already-generic
+    ///    machinery, reused verbatim — same shape pause already produces),
+    ///    no I/O attempted,
+    /// 4. **AC-D**: `Guaranteed` and `BestEffort` take the IDENTICAL action —
+    ///    unlike pause/resume there is no OS-conditional difference in
+    ///    writing bytes to a pipe, so a declared `best-effort` is purely an
+    ///    adapter-author honesty signal, not a different code path. A
+    ///    missing handle, or one with no live stdin pipe (an ADOPTED
+    ///    instance has no recoverable pipe — see
+    ///    [`crate::ports::ProcessBackend::has_stdin`]'s docs), is a HARD
+    ///    ERROR ([`EngineError::InteractionUnavailable`]): unlike
+    ///    [`Supervisor::signal_backend`]'s "no handle = harmless no-op" (a
+    ///    suspend/resume of an already-gone process trivially satisfies its
+    ///    own desired end state), there is no equivalent "desired end state"
+    ///    for text that was never delivered — a silent success would violate
+    ///    FR-24's "honest failure" framing, and this must NEVER be
+    ///    misattributed to `CapabilityUnsupported` (the declaration is
+    ///    truthful; it is this engine session's reach that is limited),
+    /// 5. **AC-F**: append exactly one trailing `\n` if `text` doesn't
+    ///    already end with one, then write + flush via
+    ///    [`crate::ports::ProcessBackend::write_stdin`], mapping any
+    ///    [`BackendError`] to [`EngineError::Backend`] — the SAME generic
+    ///    mapping `signal_backend` already uses for pause/resume.
+    pub fn send_input(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        text: &str,
+    ) -> Result<(), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let instance = registry.lookup(&name).map_err(registry_to_engine)?;
+
+        // (1) AC-C: send is not a transition, so this is a dedicated
+        // pre-flight state check — before any capability read or I/O.
+        if instance.state != LifecycleState::Running {
+            return Err(EngineError::NotRunning {
+                name: name.as_str().to_string(),
+                state: instance.state.as_str().to_string(),
+            });
+        }
+
+        // (2) AC-B: reuse the already-generic capability-unsupported
+        // fail-fast machinery verbatim.
+        let level = registry
+            .effective_support(&name, Capability::Interaction)
+            .map_err(registry_to_engine)?;
+        let os = OsId::current();
+        if level == SupportLevel::Unsupported {
+            return Err(EngineError::CapabilityUnsupported {
+                name: name.as_str().to_string(),
+                capability: Capability::Interaction.as_str().to_string(),
+                os: os.as_str().to_string(),
+                level: level.as_str().to_string(),
+            });
+        }
+
+        // (3) AC-D: Guaranteed and BestEffort collapse to the SAME action
+        // below (no OS-conditional difference in delivering bytes to a
+        // pipe). A missing handle, or one with no live stdin pipe (an
+        // adopted instance), is a HARD error — never a silent success.
+        let Some(supervised) = self.running.get_mut(&name) else {
+            return Err(EngineError::InteractionUnavailable {
+                name: name.as_str().to_string(),
+                detail: "no live process handle is held in this engine session".to_string(),
+            });
+        };
+        if !self.backend.has_stdin(&supervised.handle) {
+            return Err(EngineError::InteractionUnavailable {
+                name: name.as_str().to_string(),
+                detail: "no live stdin pipe is held for this instance in this engine session \
+                         (an adopted instance has no recoverable pipe; durable cross-invocation \
+                         interaction needs a persistent engine session, planned for Epic 7/v1.x)"
+                    .to_string(),
+            });
+        }
+
+        // (4) AC-F: append exactly one trailing newline if absent, so a
+        // line-oriented agent (`BufRead::read_line`) receives a complete
+        // line.
+        let mut bytes = text.as_bytes().to_vec();
+        if !text.ends_with('\n') {
+            bytes.push(b'\n');
+        }
+        self.backend
+            .write_stdin(&mut supervised.handle, &bytes)
+            .map_err(|source| EngineError::Backend {
+                name: name.as_str().to_string(),
+                source,
+            })
+    }
+
     /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if
     /// this engine holds no live handle for it (never started this lifetime, or
     /// already stopped/crashed). The Fleet read uses it to scope the current-Run
@@ -3592,6 +3704,73 @@ mod tests {
         assert!(
             err.to_string().contains("runtime"),
             "names the cause: {err}"
+        );
+    }
+
+    // ---- Story 4-1: `send_input` — narrow branches best exercised as
+    // Supervisor-level unit tests (no reaper/Engine involved), complementing
+    // the AC-level proofs in `crates/ktesio-engine/tests/interaction.rs`. ----
+
+    #[test]
+    fn send_input_on_invalid_name_is_rejected() {
+        // The name-resolve step: an invalid name is rejected with
+        // EngineError::InvalidName, BEFORE any registry lookup.
+        let (_state, _manifest, registry) = setup_fake("x", &["--linger-ms", "1000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.send_input(&registry, "Bad Name", "hi").unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidName { .. }),
+            "expected InvalidName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn send_input_after_the_process_exits_on_its_own_is_a_backend_error() {
+        // A genuine BackendError write failure (Testing Notes: "a genuine
+        // BackendError write failure if practically triggerable"). The
+        // process exits ON ITS OWN (a short --linger-ms) but nothing has yet
+        // reaped/transitioned the persisted row (deliberately no
+        // `poll_once` call here — that would reap the handle and transition
+        // to `failed`, which is exactly the race this test avoids so the
+        // write is genuinely attempted). `send_input`'s write to the now
+        // read-end-closed pipe fails at the OS level (EPIPE/BrokenPipe on
+        // Unix), mapped to `EngineError::Backend` — the SAME generic mapping
+        // every other backend op uses — never silently swallowed, never
+        // misreported as `InteractionUnavailable`.
+        //
+        // Unix-only (EPIPE-on-closed-pipe semantics + a portable "is this pid
+        // still alive" probe both need a real Unix liveness check); runtime
+        // skip on Windows, NO `#[cfg]` (this file is outside the `backends`
+        // allowlist) — mirrors the rest of the codebase's data-driven OS skip
+        // convention.
+        if OsId::current() == OsId::Windows {
+            return;
+        }
+        // --linger-ms must comfortably EXCEED READINESS_WINDOW (300ms) or the
+        // process looks like an immediate-exit launch failure (AC2) instead
+        // of a clean start reaching `running`.
+        let (_state, _manifest, registry) =
+            setup_fake("exiter", &["--echo-stdin", "--linger-ms", "500"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "exiter").unwrap();
+
+        // Wait past the KNOWN, self-configured linger deadline (a FIXED timer
+        // this test itself set, not a guess at some other operation's
+        // duration — the AI-35/38 "never guess" lesson is about polling
+        // unknown async completion, which this is not). A liveness-probing
+        // poll loop (`kill -0`) cannot substitute here: since nothing in this
+        // test reaps the child (deliberately, so the persisted row stays
+        // `running`), the process becomes a defunct zombie on exit, and a
+        // zombie still answers `kill -0` as "alive" — the probe would never
+        // observe the exit and the loop would spin until its own timeout.
+        std::thread::sleep(Duration::from_millis(800));
+
+        // The persisted row is STILL `running` (nothing has reaped it yet) —
+        // send_input reaches the write, which fails at the OS level.
+        let err = sup.send_input(&registry, "exiter", "hello").unwrap_err();
+        assert!(
+            matches!(err, EngineError::Backend { .. }),
+            "expected Backend, got {err:?}"
         );
     }
 }

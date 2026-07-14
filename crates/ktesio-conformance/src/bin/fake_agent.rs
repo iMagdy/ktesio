@@ -86,6 +86,14 @@
 //!   exit immediately. The process dies with a half-line in the log, so ONLY the
 //!   engine's TERMINAL drain-on-reap can rescue it — the H1 under-count proof (a
 //!   mid-run drain, which stops at the last newline, would strand it forever).
+//! * `--echo-stdin` (story 4-1)  spawn a dedicated thread that reads stdin
+//!   line-by-line and echoes each as `stdin: <line>` to stdout (flushed),
+//!   captured into `agent.log` exactly like `heartbeat <n>` lines. Runs
+//!   independent of the main loop — coexists with `--heartbeat-ms` /
+//!   `--linger-ms`. This is the deterministic observation vehicle for
+//!   `send_input`: a test writes a known line via the engine's stdin pipe,
+//!   then polls the captured log for `stdin: <line>` (never a wall-clock
+//!   sleep). Pure `std`, NO OS-cfg.
 //! * `--observed-calls <N>` (story 3-4)  ENGINE-OBSERVED mode: after announcing
 //!   readiness, make `<N>` OpenAI-compatible completion requests to the `base_url`
 //!   the engine INJECTED into this process's environment (`OPENAI_BASE_URL` — the
@@ -98,10 +106,10 @@
 //!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
 //!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 // This whole binary runs only as a SPAWNED SUBPROCESS of the supervision tests,
@@ -163,6 +171,10 @@ struct Opts {
     /// no-leak test): a sentinel API key the proxy must relay UPSTREAM faithfully but
     /// leak into NONE of ktesio's surfaces. `None` = no auth header sent.
     observed_auth: Option<String>,
+    /// Echo each stdin line to stdout as `stdin: <line>` (story 4-1). `false` =
+    /// no echo thread (the default; existing tests that never write to stdin
+    /// are unaffected).
+    echo_stdin: bool,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -207,6 +219,7 @@ fn parse() -> Opts {
     let mut final_usage_no_newline = false;
     let mut observed_calls = 0;
     let mut observed_auth = None;
+    let mut echo_stdin = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -242,6 +255,7 @@ fn parse() -> Opts {
                     observed_auth = Some(v);
                 }
             }
+            "--echo-stdin" => echo_stdin = true,
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -318,6 +332,7 @@ fn parse() -> Opts {
         final_usage_no_newline,
         observed_calls,
         observed_auth,
+        echo_stdin,
     }
 }
 
@@ -391,6 +406,27 @@ fn main() {
     // can observe a mapped unified key that landed as a native FLAG (in the args)
     // or ENV var (in the environment), without racing on stdout capture.
     write_dump(&opts.dump);
+
+    // Story 4-1: a dedicated thread reads stdin line-by-line and echoes each as
+    // `stdin: <line>` to the captured log — the deterministic vehicle a test
+    // polls after writing a known line via the engine's `send_input`. Runs
+    // independent of the main loop/heartbeat; ends naturally on stdin EOF (the
+    // pipe closes when the engine drops/closes it) or process exit.
+    if opts.echo_stdin {
+        thread::spawn(|| {
+            let stdin = std::io::stdin();
+            let mut out = std::io::stdout();
+            for line in BufReader::new(stdin).lines() {
+                match line {
+                    Ok(line) => {
+                        let _ = writeln!(out, "stdin: {line}");
+                        let _ = out.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     // Story 3-1: emit self-reported usage sentinel lines (readiness-gated — AFTER
     // the ready line, so the instance has reached `running` and the engine's reaper

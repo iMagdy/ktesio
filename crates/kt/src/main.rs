@@ -157,6 +157,13 @@ enum AgentCommands {
         /// Name of the Agent Instance to resume
         name: String,
     },
+    /// Send text input to a running Agent Instance's native input channel
+    Send {
+        /// Name of the Agent Instance to send input to
+        name: String,
+        /// The text to send (a trailing newline is appended if absent)
+        text: String,
+    },
     /// List every Agent Instance in the Fleet
     List {
         /// Emit the Fleet as a machine-readable JSON document (FR-4 / AD-14)
@@ -252,6 +259,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),
+            AgentCommands::Send { name, text } => cli::agent::send(&name, &text),
             AgentCommands::List { json } => cli::agent::list(json),
             AgentCommands::Show { name, json } => cli::agent::show(&name, json),
             AgentCommands::Config { command } => match command {
@@ -364,6 +372,7 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "stop"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "pause"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "resume"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "send"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
@@ -425,6 +434,18 @@ mod tests {
         // Both require a name.
         assert!(Cli::try_parse_from(["kt", "agent", "pause"]).is_err());
         assert!(Cli::try_parse_from(["kt", "agent", "resume"]).is_err());
+    }
+
+    #[test]
+    fn test_agent_send_parse() {
+        // `send <name> <text>` parses (story 4-1); a multi-word text is a
+        // single quoted positional, mirroring `config set`'s per-value
+        // positional convention.
+        assert!(Cli::try_parse_from(["kt", "agent", "send", "svc", "hi"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "send", "svc", "hello there"]).is_ok());
+        // Missing text, or missing both, is a clap error.
+        assert!(Cli::try_parse_from(["kt", "agent", "send", "svc"]).is_err());
+        assert!(Cli::try_parse_from(["kt", "agent", "send"]).is_err());
     }
 
     #[test]

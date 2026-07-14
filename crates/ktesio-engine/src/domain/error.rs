@@ -312,6 +312,45 @@ pub enum EngineError {
         source: BackendError,
     },
 
+    /// `send` was targeted at an instance NOT in [`LifecycleState::Running`]
+    /// (story 4.1, AC-C). Unlike a lifecycle verb, `send` is not itself a
+    /// state transition, so this is a dedicated pre-flight check rather than
+    /// [`EngineError::InvalidTransition`] — there is no transition being
+    /// attempted. Checked BEFORE the capability-support read (mirrors the
+    /// "transition gate before any side effect" convention). Names the
+    /// instance + its current state.
+    ///
+    /// [`LifecycleState::Running`]: super::lifecycle::LifecycleState::Running
+    #[error("Agent Instance '{name}' is not running (current state: {state}); start it first")]
+    NotRunning {
+        /// The instance `send` targeted.
+        name: String,
+        /// The instance's current Lifecycle State (wire form, e.g. `"paused"`).
+        state: String,
+    },
+
+    /// `send` was targeted at an instance that IS genuinely
+    /// [`LifecycleState::Running`](super::lifecycle::LifecycleState::Running)
+    /// (its Capability Declaration may truthfully say `interaction:
+    /// guaranteed`) but this engine session holds no live stdin pipe for it
+    /// (story 4.1, AC-D) — most notably an instance ADOPTED from a prior
+    /// engine session (AD-5), which has no OS-portable, documented way to
+    /// recover a pipe file descriptor from a bare PID. Distinct from
+    /// [`EngineError::CapabilityUnsupported`]: it is this engine session's
+    /// REACH that is limited, never the adapter's declared capability, so
+    /// this must NEVER be misattributed to `CapabilityUnsupported` and must
+    /// NEVER resolve to a silent success. Names the instance + the honest
+    /// underlying cause.
+    #[error("Agent Instance '{name}' cannot receive input right now: {detail}")]
+    InteractionUnavailable {
+        /// The instance `send` targeted.
+        name: String,
+        /// The honest underlying reason (e.g. no live pipe held in this
+        /// engine session) — never a misattribution to the adapter's
+        /// Capability Declaration.
+        detail: String,
+    },
+
     /// A [`StateStore`](crate::ports::StateStore) operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

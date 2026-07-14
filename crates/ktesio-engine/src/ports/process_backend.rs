@@ -269,6 +269,26 @@ pub trait ProcessBackend {
     /// match" is `Ok(None)`, not an error.
     fn adopt(&self, fingerprint: &ProcessFingerprint)
         -> Result<Option<Self::Handle>, BackendError>;
+
+    /// Whether this handle holds a live stdin pipe it can write to (story 4.1,
+    /// AC-D). `true` only for a FRESHLY SPAWNED handle whose `ChildStdin` was
+    /// captured at spawn time; always `false` for an ADOPTED handle — there is
+    /// no OS-portable, documented way to recover a pipe file descriptor from a
+    /// bare `{pid, start-time}` fingerprint (the same "no undocumented API"
+    /// convention already established for Windows pause). A cheap accessor,
+    /// mirroring [`ProcessBackend::pid`]'s style. Callers MUST check this
+    /// before calling [`ProcessBackend::write_stdin`].
+    fn has_stdin(&self, handle: &Self::Handle) -> bool;
+
+    /// Write `data` to the process's stdin pipe and flush it — the v1
+    /// interaction channel (spine AD-12). Callers MUST check
+    /// [`ProcessBackend::has_stdin`] first: called with no live pipe, this is
+    /// a defensive [`BackendError::Control`] naming the situation, not a
+    /// normal path. A genuine OS-level write failure (e.g. the agent exited
+    /// between the caller's state check and this write — `EPIPE`) maps to
+    /// [`BackendError::Control`], exactly like every other backend op. Sync
+    /// (called via `spawn_blocking`, like every other method on this trait).
+    fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError>;
 }
 
 #[cfg(test)]

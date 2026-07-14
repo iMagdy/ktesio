@@ -84,6 +84,20 @@ kt agent resume my-agent
 
 A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration.
 
+## `kt agent send <name> <text>`
+
+Send text input to a running Agent Instance's native input channel (v1: the spawned child's OS stdin pipe).
+
+```bash
+kt agent send my-agent "hello there"
+```
+
+A trailing newline is appended to `<text>` if it does not already end with one. Unlike `pause`/`resume`, `send` is not a lifecycle transition: the instance's state is unchanged, and only a confirmation prints to stdout.
+
+The same three-way honesty as `pause`, with one difference: a **guaranteed** and a **best-effort** interaction level both deliver the input identically (there is no OS-conditional difference in writing to a pipe — best-effort is purely an adapter-author signal), while an **unsupported** interaction level fails fast, quoting the Capability Declaration.
+
+`send` requires the instance to be genuinely `running`, and it inherits the same single-lifetime caveat as `start` (above): a standalone `kt agent start` supervises a process only for that command's lifetime, so a process adopted after an engine restart has no recoverable input channel in the new session — `send` on such an instance fails honestly (naming the cause) rather than silently dropping the input.
+
 ## `kt agent remove <name> [--delete | --retain] [--force]`
 
 Remove an Agent Instance from the Fleet.

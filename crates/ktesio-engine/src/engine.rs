@@ -655,6 +655,32 @@ impl Engine {
         .await
     }
 
+    /// Send text input to a running Agent Instance's native input channel
+    /// (story 4.1, FR-24, spine AD-12). Drives
+    /// [`Supervisor::send_input`](crate::domain::Supervisor::send_input)'s
+    /// dispatch: `NotRunning` if the instance is not
+    /// [`LifecycleState`](crate::domain::LifecycleState)`::Running`;
+    /// [`EngineError::CapabilityUnsupported`] if the effective
+    /// `Capability::Interaction` level is `unsupported` on this OS (fails
+    /// fast, no I/O); [`EngineError::InteractionUnavailable`] if the instance
+    /// is running but this engine session holds no live stdin pipe for it
+    /// (e.g. an ADOPTED instance — see the method's docs); otherwise appends
+    /// a trailing `\n` if absent and writes the bytes to the child's stdin.
+    /// This is the FIRST interaction-shaped method on the public Embedding
+    /// Interface (AD-2/AD-13): a Host embedding the engine gets `send_input`
+    /// for free, no CLI required.
+    pub async fn send_input(&self, name: &str, text: &str) -> Result<(), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        let text = text.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.send_input(&registry, &name, &text)
+        })
+        .await
+    }
+
     /// The per-instance runtime status (story 1-6, AC9): Lifecycle State +
     /// effective Restart Policy + restart count + (for `failed`) the last-known
     /// cause. This is the read `kt agent list`/`show` uses to surface the restart
@@ -948,6 +974,11 @@ impl Blocking<'_> {
     /// Blocking [`Engine::resume`].
     pub fn resume(&self, name: &str) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.resume(name))
+    }
+
+    /// Blocking [`Engine::send_input`].
+    pub fn send_input(&self, name: &str, text: &str) -> Result<(), EngineError> {
+        self.engine.rt.block_on(self.engine.send_input(name, text))
     }
 
     /// Blocking [`Engine::transition_events`].

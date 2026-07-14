@@ -67,9 +67,10 @@
 //! undocumented API. Behavior-verified on the `windows-latest` CI leg;
 //! compile-checked on Unix.
 
+use std::io::Write;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -116,6 +117,14 @@ pub struct WindowsProcess {
     adopted: HANDLE,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
+    /// The child's stdin pipe (story 4.1, spine AD-12), captured at spawn time
+    /// for a FRESHLY SPAWNED process. `None` for an ADOPTED process — a pipe
+    /// handle cannot be recovered from a bare PID (no undocumented API; parity
+    /// with the Unix backend and this module's own pause `[ASSUMPTION]`
+    /// precedent); `send_input` on an adopted instance must therefore fail
+    /// honestly (`EngineError::InteractionUnavailable`), never silently
+    /// succeed.
+    stdin: Option<ChildStdin>,
 }
 
 // The raw Job / process HANDLEs are owned OS resources this struct is solely
@@ -220,7 +229,11 @@ impl ProcessBackend for WindowsBackend {
                 command.stderr(Stdio::null());
             }
         }
-        command.stdin(Stdio::null());
+        // Piped UNCONDITIONALLY (story 4.1, spine AD-12): v1 pipes stdin for
+        // every spawned process regardless of the declared Capability — the
+        // Capability Declaration gates only whether `send_input` is *callable*,
+        // not whether the pipe exists.
+        command.stdin(Stdio::piped());
         // A new process group isolates console signals (so a stray Ctrl-C to the
         // engine's console does not hit the agent). We do NOT create the child
         // suspended: std does not expose the main-thread handle needed to resume
@@ -228,7 +241,7 @@ impl ProcessBackend for WindowsBackend {
         // module docs on the sub-millisecond assign-after-spawn window).
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
-        let child = command.spawn().map_err(|e| BackendError::Spawn {
+        let mut child = command.spawn().map_err(|e| BackendError::Spawn {
             exec: spec.exec.clone(),
             detail: e.to_string(),
         })?;
@@ -256,11 +269,15 @@ impl ProcessBackend for WindowsBackend {
 
         // Assignment succeeded — hand the job handle to the process struct.
         let job = job_guard.into_inner();
+        // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
+        // (story 4.1) — an adopted handle never has one (see `adopt` below).
+        let stdin = child.stdin.take();
         Ok(WindowsProcess {
             child: Some(child),
             job,
             adopted: std::ptr::null_mut(),
             pid,
+            stdin,
         })
     }
 
@@ -384,12 +401,43 @@ impl ProcessBackend for WindowsBackend {
         }
         // Same process. Hold the opened handle for liveness + TerminateProcess
         // (no Job — the process is already running and may be in one already).
+        //
+        // `stdin: None` (story 4.1): an adopted handle has no recoverable
+        // pipe — there is no OS-portable, documented way to reopen a
+        // `ChildStdin` from a bare pid. `send_input` against this handle
+        // fails with `EngineError::InteractionUnavailable`, never silently
+        // succeeding.
         Ok(Some(WindowsProcess {
             child: None,
             job: std::ptr::null_mut(),
             adopted: h,
             pid: fingerprint.pid,
+            stdin: None,
         }))
+    }
+
+    fn has_stdin(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_some()
+    }
+
+    fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError> {
+        match handle.stdin.as_mut() {
+            Some(stdin) => {
+                stdin.write_all(data).map_err(|e| BackendError::Control {
+                    op: "stdin",
+                    detail: e.to_string(),
+                })?;
+                stdin.flush().map_err(|e| BackendError::Control {
+                    op: "stdin",
+                    detail: e.to_string(),
+                })?;
+                Ok(())
+            }
+            None => Err(BackendError::Control {
+                op: "stdin",
+                detail: "no stdin pipe held for this handle".to_string(),
+            }),
+        }
     }
 }
 

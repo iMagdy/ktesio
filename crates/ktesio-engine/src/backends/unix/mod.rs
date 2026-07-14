@@ -28,9 +28,9 @@
 //! and the OS/init reaps the non-child on exit). An adopted process is supervised
 //! for the new engine's lifetime exactly like a freshly spawned one.
 
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -88,6 +88,14 @@ pub struct UnixProcess {
     /// a bare `kill(pid, 0)` alone cannot tell an adopted agent's crash from the OS
     /// recycling its PID to an unrelated process within a reaper interval (AI-10).
     start_time: u64,
+    /// The child's stdin pipe (story 4.1, spine AD-12), captured at spawn time
+    /// for a FRESHLY SPAWNED process. `None` for an ADOPTED process: a pipe
+    /// file descriptor cannot be recovered from a bare PID on any OS without an
+    /// undocumented hack this project's conventions already reject (parity with
+    /// the Windows-pause `[ASSUMPTION]`); `send_input` on an adopted instance
+    /// must therefore fail honestly (`EngineError::InteractionUnavailable`),
+    /// never silently succeed.
+    stdin: Option<ChildStdin>,
 }
 
 /// The Unix process backend (AD-4).
@@ -139,7 +147,12 @@ impl ProcessBackend for UnixBackend {
                 command.stderr(Stdio::null());
             }
         }
-        command.stdin(Stdio::null());
+        // Piped UNCONDITIONALLY (story 4.1, spine AD-12): v1 pipes stdin for
+        // every spawned process regardless of the declared Capability — the
+        // Capability Declaration gates only whether `send_input` is *callable*,
+        // not whether the pipe exists. Decoupling spawn construction from
+        // capability data keeps this file free of capability lookups.
+        command.stdin(Stdio::piped());
 
         // Put the child in its OWN session+process group BEFORE exec, so a later
         // killpg reaches the whole tree. `setsid` fails only if the caller is
@@ -157,7 +170,7 @@ impl ProcessBackend for UnixBackend {
             });
         }
 
-        let child = command.spawn().map_err(|e| BackendError::Spawn {
+        let mut child = command.spawn().map_err(|e| BackendError::Spawn {
             exec: spec.exec.clone(),
             detail: e.to_string(),
         })?;
@@ -168,11 +181,15 @@ impl ProcessBackend for UnixBackend {
         // handle reaps via its owned Child, so it never relies on this for the
         // PID-reuse guard; a read failure degrades to 0, an honest pid-only form).
         let start_time = process_start_time(pid).unwrap_or(0);
+        // Capture the piped stdin now, for a FRESHLY SPAWNED handle only (story
+        // 4.1) — an adopted handle never has one (see `adopt` below).
+        let stdin = child.stdin.take();
         Ok(UnixProcess {
             child: Some(child),
             pgid,
             pid,
             start_time,
+            stdin,
         })
     }
 
@@ -313,12 +330,42 @@ impl ProcessBackend for UnixBackend {
         // signal/stop the whole tree. Liveness is kill(pid, 0) RE-checked against
         // `live_start` on every poll (AI-10), so a later PID reuse cannot mask a
         // crash of this adopted process.
+        //
+        // `stdin: None` (story 4.1): an adopted handle has no recoverable pipe —
+        // there is no OS-portable, documented way to reopen a `ChildStdin` from a
+        // bare pid. `send_input` against this handle fails with
+        // `EngineError::InteractionUnavailable`, never silently succeeding.
         Ok(Some(UnixProcess {
             child: None,
             pgid: Pid::from_raw(fingerprint.pid as i32),
             pid: fingerprint.pid,
             start_time: live_start,
+            stdin: None,
         }))
+    }
+
+    fn has_stdin(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_some()
+    }
+
+    fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError> {
+        match handle.stdin.as_mut() {
+            Some(stdin) => {
+                stdin.write_all(data).map_err(|e| BackendError::Control {
+                    op: "stdin",
+                    detail: e.to_string(),
+                })?;
+                stdin.flush().map_err(|e| BackendError::Control {
+                    op: "stdin",
+                    detail: e.to_string(),
+                })?;
+                Ok(())
+            }
+            None => Err(BackendError::Control {
+                op: "stdin",
+                detail: "no stdin pipe held for this handle".to_string(),
+            }),
+        }
     }
 }
 
@@ -813,6 +860,7 @@ mod tests {
             pgid: Pid::from_raw(fp.pid as i32),
             pid: fp.pid,
             start_time: fp.start_time.wrapping_add(1),
+            stdin: None,
         };
         assert_eq!(
             backend.poll(&mut recycled).unwrap(),
@@ -844,6 +892,7 @@ mod tests {
             pgid: Pid::from_raw(pid as i32),
             pid,
             start_time: 0, // no recorded token → bare-liveness fallback
+            stdin: None,
         };
         assert_eq!(
             backend.poll(&mut degraded).unwrap(),
@@ -1181,5 +1230,101 @@ mod tests {
             "log={contents:?} want pwd={}",
             want.display()
         );
+    }
+
+    #[test]
+    fn write_stdin_delivers_a_line_that_is_echoed_into_the_captured_log() {
+        // Story 4.1 Task 1: spawning `fake_agent --echo-stdin` and writing a
+        // line via `write_stdin` produces the echoed `stdin: <line>` in the
+        // captured log — the OS-level plumbing `Supervisor::send_input` relies
+        // on.
+        let dir = tempfile::tempdir().unwrap();
+        let agent_log = dir.path().join("agent.log");
+        let bin = fake_agent_path();
+        let mut s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--echo-stdin".to_string(),
+                "--linger-ms".to_string(),
+                "600000".to_string(),
+            ],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(agent_log.clone()),
+        };
+        s.env.clear();
+
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&s).expect("spawn fake_agent --echo-stdin");
+        assert!(
+            backend.has_stdin(&proc),
+            "a freshly spawned handle has a live stdin pipe"
+        );
+
+        backend
+            .write_stdin(&mut proc, b"hello-stdin\n")
+            .expect("write_stdin");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&agent_log) {
+                if contents.lines().any(|l| l == "stdin: hello-stdin") {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "echoed stdin line never appeared"
+            );
+            sleep(Duration::from_millis(20));
+        }
+
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn has_stdin_is_true_when_spawned_and_false_once_adopted() {
+        // Story 4.1 AC-D: a freshly spawned handle holds a live stdin pipe;
+        // once re-acquired via `adopt` (simulating a DIFFERENT engine session
+        // after a crash+restart), the pipe cannot be recovered — the adopted
+        // handle must report `has_stdin() == false` so `send_input` fails
+        // honestly (`InteractionUnavailable`) instead of silently succeeding.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn sleep");
+        assert!(backend.has_stdin(&proc), "freshly spawned handle has stdin");
+
+        let fp = backend.fingerprint(&proc);
+        let adopter = UnixBackend::new();
+        let adopted = adopter
+            .adopt(&fp)
+            .expect("adopt call ok")
+            .expect("a live matching process must be adopted");
+        assert!(
+            !adopter.has_stdin(&adopted),
+            "an adopted handle has no recoverable stdin pipe"
+        );
+
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn write_stdin_without_a_live_pipe_is_a_control_error() {
+        // Defensive path (callers MUST check `has_stdin` first): writing to a
+        // handle with no live pipe (e.g. an adopted handle) is a
+        // `BackendError::Control`, never a panic and never a silent success.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn");
+        let fp = backend.fingerprint(&proc);
+        let adopter = UnixBackend::new();
+        let mut adopted = adopter
+            .adopt(&fp)
+            .expect("adopt call ok")
+            .expect("a live matching process must be adopted");
+        let err = adopter.write_stdin(&mut adopted, b"x\n").unwrap_err();
+        match err {
+            BackendError::Control { op, .. } => assert_eq!(op, "stdin"),
+            other => panic!("expected Control, got {other}"),
+        }
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
     }
 }

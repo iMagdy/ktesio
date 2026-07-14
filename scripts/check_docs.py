@@ -41,6 +41,7 @@ AGENT_COMMANDS = {
     "stop",
     "pause",
     "resume",
+    "send",
     "list",
     "show",
     "config",
