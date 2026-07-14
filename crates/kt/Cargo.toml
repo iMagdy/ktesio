@@ -5,12 +5,12 @@ name = "ktesio"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Agentic skills package manager"
+description = "Run AI agents like services: supervise their lifecycle, meter real token usage, and enforce dollar budgets."
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-keywords = ["agentic", "skills", "package-manager", "cli"]
+keywords = ["agent", "ai", "supervisor", "metering", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]

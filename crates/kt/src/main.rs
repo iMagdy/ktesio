@@ -74,7 +74,7 @@ Examples:
 #[command(
     name = "kt",
     version,
-    about = "Agentic skills package manager",
+    about = "Run AI agents like services — supervise, meter, and budget them",
     after_help = HELP_FOOTER
 )]
 struct Cli {
@@ -290,8 +290,66 @@ mod tests {
     #[test]
     fn test_cli_subcommands_exist() {
         let cmd = Cli::command();
+        // The two agent-runner-relevant top-level commands are PRESENT.
         assert!(cmd.find_subcommand("self-update").is_some());
         assert!(cmd.find_subcommand("agent").is_some());
+        // Single canonical Fleet surface (Epic 9): every retired skill-manager
+        // command is ABSENT at the TOP LEVEL, so `kt agent list`/`show` is the one
+        // canonical way to list/show the Fleet. These are top-level lookups on
+        // `Cli::command()`, which only sees `agent` + `self-update`; `list`/`show`/
+        // `remove` remain valid `kt agent` SUBcommands, so this MUST stay a
+        // top-level check — never a recursive/agent-tree search (that would
+        // false-fail against the live `kt agent list`/`show`/`remove`).
+        for retired in [
+            "init",
+            "install",
+            "search",
+            "upgrade",
+            "publish",
+            "list",
+            "show",
+            "doctor",
+            "uninstall",
+            "remove",
+        ] {
+            assert!(
+                cmd.find_subcommand(retired).is_none(),
+                "retired command `{retired}` must not exist at the top level",
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_identity_is_agent_framed_not_skills() {
+        // Epic 9 rebrand: the top-level clap identity and the crate description
+        // present Ktesio as the agent runner, with no skills-package-manager
+        // framing (mirrors `test_cli_help_includes_license_and_repository`).
+        let about = Cli::command()
+            .get_about()
+            .expect("about should be set")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            !about.contains("agentic")
+                && !about.contains("skills package manager")
+                && !about.contains("package manager"),
+            "about still carries skills/package-manager framing: {about}",
+        );
+        assert!(
+            about.contains("agent"),
+            "about is not agent-framed: {about}"
+        );
+
+        let description = env!("CARGO_PKG_DESCRIPTION").to_lowercase();
+        assert!(
+            !description.contains("skills package manager")
+                && !description.contains("package manager"),
+            "description still carries package-manager framing: {description}",
+        );
+        assert!(
+            description.contains("agent"),
+            "description is not agent-framed: {description}",
+        );
     }
 
     #[test]
