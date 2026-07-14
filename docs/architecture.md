@@ -137,86 +137,33 @@ Pause and resume are honest about what they can guarantee for a given agent on t
 
 ```text
 crates/kt/src/
-├── main.rs          # clap command parsing and dispatch
-├── cli/             # command handlers
-├── discovery.rs     # fallback local skill discovery
-├── error.rs         # miette/thiserror diagnostics
-├── git.rs           # git CLI wrapper functions
-├── install_channel.rs # detection of how kt was installed (cargo, Homebrew, manual)
-├── install_target.rs # git URL, local path, and GitHub shorthand resolution
-├── lockfile.rs      # skills.lock load/save/validation
-├── manifest.rs      # skills.json load/save/validation
-├── skills_sh.rs     # skills.sh search client, normalization, and retries
-├── skill.rs         # copy and remove skill files
-├── ui.rs            # shared terminal colors, icons, statuses, and progress bars
-└── update_check.rs  # cached latest-release check for update notices
+├── main.rs             # clap command parsing and dispatch: `Commands::Agent` / `Commands::SelfUpdate`
+├── cli/
+│   ├── mod.rs
+│   ├── agent.rs        # `kt agent` subcommand tree — register/start/stop/pause/resume/list/show/remove/config
+│   └── self_update.rs  # `kt self-update`: binary self-maintenance
+├── error.rs            # miette/thiserror diagnostics: the `Agent*` family + `SelfUpdateFailed`
+├── install_channel.rs  # detects how `kt` was installed (cargo, Homebrew, manual) for self-update
+├── ui.rs               # shared terminal colors, icons, statuses, and progress bars
+└── update_check.rs     # cached hourly check for a newer GitHub Release
 ```
 
-## Command Flow
+`kt` is a thin, synchronous frontend over the engine's `blocking()` facade (AD-13): `main.rs` parses arguments into exactly two top-level commands — `agent` (an `AgentCommands` subtree: `register`, `start`, `stop`, `pause`, `resume`, `list`, `show`, `remove`, `config get`/`config set`) and `self-update` — and dispatches. Every `agent` subcommand handler in `cli/agent.rs` calls straight into `ktesio-engine`'s public API through that facade; `kt` never touches the engine's SQLite store or computes a path itself (the engine is the sole path authority — see "Engine modules" above). Results print to stdout; diagnostics, deprecation/update notices, and best-effort qualifiers print to stderr, so `--json` output is always the only thing on stdout (mirrored end-to-end in `crates/kt/tests/agent_cli.rs`).
 
-### Install
+`error.rs` holds small dedicated diagnostic structs (`thiserror` + `miette::Diagnostic`, each carrying one `message` and its own `#[diagnostic(code(...))]`) rather than one large enum: the `Agent*` family (`AgentDuplicateName`, `AgentInvalidName`, `AgentNotFound`, `AgentRunningRequiresForce`, `AgentIo`, `AgentStore`, `AgentUnknownKind`, `AgentManifestNotFound`/`AgentManifestInvalid`/`AgentManifestUnreadable` for the `adapter.toml` manifest, `AgentNoMeteringSource`, `AgentNoCapabilities`, `AgentInvalidTransition`, `AgentLaunchFailed`, `AgentCapabilityUnsupported`, `AgentUnknownConfigKey`, `AgentConfig`) plus `SelfUpdateFailed`. The `AgentManifest*` variants describe the current `adapter.toml` manifest — they are unrelated to the retired skill-manager's own `skills.json` manifest, which no longer exists in this crate.
 
-```text
-read skills.json
-for each dependency:
-  clone repo into a temporary workspace with quiet git output and progress updates
-  apply rev selector when present
-  read source skills.json
-  copy only selected published paths into a staged install directory
-  if source skills.json is missing:
-    ask before discovering directories under skills/, SKILLS/, or .agents/skills/
-    copy selected directories into the staged install directory
-  move staged content into .agents/skills/<name>/
-  record HEAD commit in skills.lock after successful copy
-write skills.lock only when entries changed
-```
-
-When no manifest is present, `kt install` looks for a local `skills/`, `SKILLS/`, or `.agents/skills/` directory and installs a discovered skill as a fallback.
-
-GitHub shorthand such as `owner/repo` is resolved before cloning. For manifest dependencies, the dependency key is the source repo's published skill name.
-
-### Search
-
-```text
-read query and limit
-use authenticated skills.sh API when KTESIO_SKILLS_SH_API_KEY exists
-otherwise use the public skills.sh search endpoint
-retry 429, 503, and transient transport errors up to 3 total attempts
-normalize results into GitHub install targets when possible
-optionally install the selected result through the normal install flow
-```
-
-### Publish
-
-```text
-load existing skills.json or create an empty manifest
-select local path dependencies or repo-local skill paths
-write selected entries to publish
-save skills.json
-```
-
-### Upgrade
-
-```text
-read skills.lock or skills.json
-for each skill directory:
-  git fetch origin with quiet git output
-  resolve default branch
-  checkout origin/<default-branch>
-  update commit in skills.lock
-write skills.lock
-```
+`kt self-update` is deliberately independent of the agent runner: `install_channel.rs` detects whether the binary was installed via Cargo, Homebrew, or a manual release download, and `update_check.rs` performs a cached, hourly, opt-out (`KTESIO_NO_UPDATE_CHECK=1`, or automatically under `CI=true`) check against the latest GitHub Release so users get a one-line stderr nudge without a network call on every invocation. Both modules predate the agent-runner pivot and are kept as binary-maintenance concerns, not skill management.
 
 ## Design Choices
 
-- Ktesio shells out to `git` instead of using libgit2 so user SSH keys, credential helpers, proxies, and platform git config work normally.
-- Git clone, fetch, and checkout output is captured so users see Ktesio progress bars instead of raw git progress. Failure messages include the useful git summary line.
-- The manifest and lockfile are JSON because they are easy to inspect, diff, and repair.
-- Partial failures are collected and reported after a command finishes processing remaining skills.
-- Tests use local temporary git repositories instead of network fixtures.
+- `kt` is a thin frontend: every `agent` command handler delegates to the engine's blocking facade and renders the result; no business rule (lifecycle, config precedence, budget/cost math) is duplicated in the CLI (AD-1).
+- Errors use `thiserror` inside the engine and are wrapped into `miette` diagnostics with remediation hints in `kt` (ADOPTED pattern), so a rejected transition, an unresolved secret, or a validation failure always names the problem and a next step.
+- Output discipline is uniform across every command: results go to stdout, notices and diagnostics go to stderr, so scripting against `--json` is always safe (FR-26, NFR-5).
+- `ui.rs` centralizes terminal rendering (colors, icons, table layout, progress) so command handlers stay declarative about *what* to show, not *how* to render it.
+- `kt agent list` / `kt agent show` are the single canonical way to read the Fleet — there is no separate top-level `list`/`show`.
 
 ## See Also
 
-- [Manifest format](manifest.md)
-- [Lockfile format](lockfile.md)
-- [Testing](testing.md)
+- [Command reference](commands.md) — every `kt agent` command, its arguments, and the unified config keys.
+- [Adapter manifest](manifest.md) — the `adapter.toml` shape for registering an agent.
+- [Testing](testing.md) — required checks, fixtures, and coverage gates.

@@ -27,17 +27,7 @@ LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 JSON_FENCE_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 BASH_FENCE_RE = re.compile(r"```(?:bash|sh|shell)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 KT_COMMANDS = {
-    "init",
-    "search",
-    "install",
-    "upgrade",
     "self-update",
-    "publish",
-    "list",
-    "show",
-    "doctor",
-    "uninstall",
-    "remove",
     "help",
     "agent",
 }
