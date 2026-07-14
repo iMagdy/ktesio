@@ -251,52 +251,46 @@ class ReleaseDocsTests(unittest.TestCase):
         # merged into one aggregate, #101 — still Linux, still one job).
         self.assertIn("name: coverage", ci)
 
-    def test_ci_test_job_ubuntu_per_binary_bisect_scaffold_temporary(self) -> None:
-        # TEMPORARY diagnostic scaffold (#106) — TO BE REVERTED once the hanging
-        # engine integration binary is named. In-step hang capture proved impossible
-        # (an unkillable D-state run blocks GitHub's post-step process-tree cleanup,
-        # so the ubuntu job always rides to the timeout-cancel that discards the
-        # log). Per-STEP status SURVIVES a job-cancel, so the ubuntu leg is split
-        # into ONE step per engine integration binary; the lone `in_progress` step
-        # at cancel names the culprit. These asserts just keep the scaffold shape
-        # green; relax/remove them when the scaffold is reverted to a single run.
+    def test_ci_test_job_single_run_with_serialized_engine_integration(self) -> None:
+        # #106: a per-binary CI bisect pinned the x86-ubuntu hang to the `adoption`
+        # engine integration binary (its heavy re-exec + surviving-orphan harness
+        # wedged the genuine 2-core runner into an uninterruptible D-state under
+        # nextest's concurrency). The fix is SOURCE-side — serialize the engine
+        # integration tests via a nextest test-group (max-threads=1) — so the CI
+        # `test` job is back to a SINGLE clean run for all OSes. Lock that clean
+        # shape and assert the serialization exists; guard that the temporary
+        # per-binary bisect scaffold AND the earlier watchdog/off-pipe machinery are
+        # gone (so a future edit that reintroduces per-OS hang hacks is caught).
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
-        # Build test binaries once (shared by every bisect step; the per-binary run
-        # steps reuse the artifacts — see test_ci_runs_coverage_after_primary_gates
-        # for the stale-fake_agent rm + explicit rebuild that precede it).
+        nextest = (release_docs.ROOT / ".config" / "nextest.toml").read_text(
+            encoding="utf-8"
+        )
+        # Clean shape: build test binaries once (--no-run), ONE unified run for all
+        # OSes, doctests separate.
         self.assertIn(
             "cargo +stable nextest run --workspace --all-targets --no-run", ci
         )
-        # Step 1: everything EXCEPT the 10 engine integration binaries (engine lib
-        # unit tests + kt + adapter-api + conformance).
-        self.assertIn(
-            "cargo +stable nextest run --workspace "
-            "-E 'not (kind(test) & package(ktesio-engine))'",
-            ci,
-        )
-        # One ubuntu-gated step per engine integration binary, EXACT binary_id form
-        # (`=…` — no metering/observed_metering or adoption/adoption_cli cross-match),
-        # in the fixed order the orchestrator specified for attribution.
-        for b in [
-            "adoption", "budget", "cost", "crash", "fleet_totals",
-            "lifecycle", "metering", "observed_metering", "pause", "registration",
-        ]:
-            self.assertIn('- name: "ubuntu bisect: %s"' % b, ci)
-            self.assertIn(
-                "cargo +stable nextest run --workspace "
-                "-E 'binary_id(=ktesio-engine::%s)'" % b,
-                ci,
-            )
-        # macOS/Windows keep the SINGLE plain full run; doctests still run separately.
+        self.assertIn("- name: Run tests (nextest)", ci)
         self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
-        self.assertIn("if: matrix.os != 'ubuntu-latest'", ci)
         self.assertIn("cargo +stable test --workspace --doc", ci)
-        # The in-step-capture machinery is GONE (the scaffold replaced it); guarding
-        # this makes the eventual revert obvious if it forgets to restore a run step.
+        # The SOURCE fix: a max-threads=1 test-group over exactly the engine
+        # integration binaries, with the existing retries + slow-timeout untouched.
+        self.assertIn("[test-groups.engine-integration-serial]", nextest)
+        self.assertIn("max-threads = 1", nextest)
+        self.assertIn('filter = "kind(test) & package(ktesio-engine)"', nextest)
+        self.assertIn('test-group = "engine-integration-serial"', nextest)
+        self.assertIn("retries = 2", nextest)
+        self.assertIn("slow-timeout = ", nextest)
+        # The temporary bisect scaffold and the watchdog/off-pipe machinery are GONE
+        # (no per-OS special-casing, no per-binary steps, no in-step capture hacks).
+        self.assertNotIn("ubuntu bisect:", ci)
+        self.assertNotIn("binary_id(=ktesio-engine::", ci)
+        self.assertNotIn("RUNLOG", ci)
         self.assertNotIn("kill -USR1 $$", ci)
-        self.assertNotIn('> "$RUNLOG" 2>&1 < /dev/null', ci)
+        self.assertNotIn("matrix.os == 'ubuntu-latest'", ci)
+        self.assertNotIn("matrix.os != 'ubuntu-latest'", ci)
 
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
