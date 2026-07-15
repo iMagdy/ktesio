@@ -30,6 +30,14 @@
 //!   OBSERVABLE suspension proof for the guaranteed pause path. With no
 //!   `--heartbeat-ms` the loop is a quiet sleep (existing 1-4 tests that only
 //!   assert `ready`/lifecycle are unaffected). Pure `std`, NO OS-cfg.
+//! * `--heartbeat-stderr-ms <ms>` (story 4-2)  print an incrementing
+//!   `stderr-heartbeat <n>` line to STDERR every `<ms>` and flush — the STDERR
+//!   counterpart of `--heartbeat-ms`, independent of it (its own counter, own
+//!   interval) so a test can combine BOTH flags to produce known, deterministic,
+//!   simultaneously-attributable content on stdout AND stderr without racing —
+//!   the vehicle the log-capture-attribution tests (`agent-out`/`agent-err`)
+//!   need. With no `--heartbeat-stderr-ms` nothing is written to stderr by this
+//!   mechanism (existing tests unaffected). Pure `std`, NO OS-cfg.
 //! * `--crash-after-ms <ms>` (+ optional `--crash-with <code>`)  run normally
 //!   (announcing readiness, heartbeating if asked) for `<ms>`, THEN exit with
 //!   `<code>` (default 1) — simulating an UNREQUESTED crash AFTER the readiness
@@ -142,6 +150,9 @@ struct Opts {
     dump: Option<PathBuf>,
     /// Heartbeat interval (story 1-5). `None` = no heartbeat (quiet sleep loop).
     heartbeat: Option<Duration>,
+    /// STDERR heartbeat interval (story 4-2) — independent of `heartbeat`
+    /// (its own counter, own interval). `None` = nothing written to stderr.
+    heartbeat_stderr: Option<Duration>,
     /// Crash AFTER this interval (story 1-6): run normally, then exit non-zero.
     /// `None` = no self-crash (the linger loop governs exit).
     crash_after: Option<Duration>,
@@ -224,6 +235,7 @@ fn parse() -> Opts {
     let mut marker = None;
     let mut dump = None;
     let mut heartbeat = None;
+    let mut heartbeat_stderr = None;
     let mut crash_after = None;
     let mut crash_with = 1;
     let mut crash_times = None;
@@ -285,6 +297,11 @@ fn parse() -> Opts {
                     heartbeat = Some(Duration::from_millis(ms));
                 }
             }
+            "--heartbeat-stderr-ms" => {
+                if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    heartbeat_stderr = Some(Duration::from_millis(ms));
+                }
+            }
             "--crash-after-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
                     crash_after = Some(Duration::from_millis(ms));
@@ -339,6 +356,7 @@ fn parse() -> Opts {
         marker,
         dump,
         heartbeat,
+        heartbeat_stderr,
         crash_after,
         crash_with,
         crash_times,
@@ -548,6 +566,15 @@ fn main() {
     let crash_deadline = effective_crash_after.map(|d| start + d);
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
+    // Story 4-2: an INDEPENDENT stderr counter/interval (own `beats`, own
+    // `next_beat`) so both streams can heartbeat simultaneously without
+    // sharing state — a test combining both flags gets deterministic,
+    // independently-countable content on stdout AND stderr.
+    let mut stderr = std::io::stderr();
+    let mut stderr_beats: u64 = 0;
+    let mut next_stderr_beat = opts
+        .heartbeat_stderr
+        .map(|interval| Instant::now() + interval);
     while Instant::now() < deadline {
         // Story 1-6: after the crash-after window, exit non-zero (a crash the
         // supervisor's reaper detects, firing the Restart Policy). Checked after
@@ -565,6 +592,14 @@ fn main() {
                 let _ = stdout.flush();
                 beats += 1;
                 next_beat = Some(due + interval);
+            }
+        }
+        if let (Some(interval), Some(due)) = (opts.heartbeat_stderr, next_stderr_beat) {
+            if Instant::now() >= due {
+                let _ = writeln!(stderr, "stderr-heartbeat {stderr_beats}");
+                let _ = stderr.flush();
+                stderr_beats += 1;
+                next_stderr_beat = Some(due + interval);
             }
         }
         sleep(Duration::from_millis(25));

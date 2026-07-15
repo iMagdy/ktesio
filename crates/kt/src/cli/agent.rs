@@ -17,8 +17,8 @@ use std::time::Duration;
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, Micros, RegistryError, RemoveDisposition, SupportLevel,
-    UsageView, FLEET_SCHEMA_VERSION,
+    FleetEntry, FleetListing, FleetTotals, LifecycleState, LogLine, Micros, RegistryError,
+    RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -875,6 +875,108 @@ pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// How often `kt agent logs --follow` polls for new output (story 4-2,
+/// Assumption 7) — a reasonable default left unspecified by any source
+/// document, mirroring `STOP_POLL_INTERVAL`'s existing precedent
+/// (`backends/unix/mod.rs`) of a hardcoded short interval rather than a
+/// configurable one.
+const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// `kt agent logs <name> [--follow]` — read retained logs, optionally
+/// following live output (story 4-2, FR-25, spine AD-12).
+///
+/// One-shot: dumps every currently-retained [`LogLine`] to stdout (this IS
+/// the command's result — AD-12's "stdout of kt is command output"
+/// convention) and returns. `--follow` (AC-B/AC-C): after that initial dump
+/// (mirroring `docker logs -f`'s "show existing, then keep streaming"
+/// convention), loops on [`LOGS_FOLLOW_POLL_INTERVAL`] calling
+/// `read_agent_log_since`, printing new lines as they arrive, and
+/// periodically checking `instance_status`. On a detected rotation (the
+/// engine's returned cursor snaps BELOW the one just passed in), prints one
+/// honest notice rather than silently claiming completeness. On a non-
+/// `running` state, performs one FINAL drain (so no line emitted before the
+/// transition is lost) and exits cleanly with a state-appropriate note — a
+/// `paused` instance is not "gone", so it gets an honest "paused" note, not
+/// an error. No special Ctrl-C handling is needed: this is a read-only
+/// command holding no supervising handle, so a SIGINT exit is always safe.
+pub fn logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+
+    let lines = facade.read_agent_log(name).map_err(map_engine_error)?;
+    print_log_lines(&lines);
+    if !follow {
+        return Ok(());
+    }
+
+    // Prime the cursor to the CURRENT generation's present end so the
+    // follow loop below only ever prints lines NEWER than the one-shot dump
+    // above (`read_agent_log`'s concatenated multi-generation view has no
+    // cursor of its own to resume from — a read at cursor 0 discovers the
+    // current length without printing anything, since we deliberately
+    // discard the lines it returns here).
+    let (_already_shown, mut cursor) = facade
+        .read_agent_log_since(name, 0)
+        .map_err(map_engine_error)?;
+
+    loop {
+        std::thread::sleep(LOGS_FOLLOW_POLL_INTERVAL);
+        let (new_lines, next_cursor) = facade
+            .read_agent_log_since(name, cursor)
+            .map_err(map_engine_error)?;
+        note_if_rotated(next_cursor, cursor, name);
+        print_log_lines(&new_lines);
+        cursor = next_cursor;
+
+        let status = facade.instance_status(name).map_err(map_engine_error)?;
+        if status.instance.state != LifecycleState::Running {
+            // AC-C: one final drain so nothing emitted right up to the
+            // transition is lost, THEN the honest exit note.
+            let (final_lines, final_cursor) = facade
+                .read_agent_log_since(name, cursor)
+                .map_err(map_engine_error)?;
+            note_if_rotated(final_cursor, cursor, name);
+            print_log_lines(&final_lines);
+            ui::note(follow_exit_note(name, status.instance.state));
+            return Ok(());
+        }
+    }
+}
+
+/// Render each [`LogLine`] to stdout as `<at> [<stream>] <text>`, in the
+/// order given (AC-G: the caller is responsible for never re-sorting).
+fn print_log_lines(lines: &[LogLine]) {
+    for line in lines {
+        println!("{} [{}] {}", line.at, line.stream, line.text);
+    }
+}
+
+/// If `next_cursor` snapped BELOW `prior_cursor`, a rotation happened since
+/// the last poll (story 4-2, AC-D/AC-H) — print the one honest notice rather
+/// than silently claim completeness. This is how the CLI detects the
+/// signal `Supervisor::read_agent_log_since` returns via the plain
+/// `(Vec<LogLine>, u64)` shape (no separate boolean field).
+fn note_if_rotated(next_cursor: u64, prior_cursor: u64, name: &str) {
+    if next_cursor < prior_cursor {
+        ui::note(format!(
+            "output rotated; a small window may be missing from the live tail — `kt agent logs {name}` \
+             (without --follow) re-reads everything currently retained"
+        ));
+    }
+}
+
+/// The honest `--follow` exit note for a non-`running` state (AC-C) — a
+/// `paused` instance is not "gone" (so it gets its own wording, never an
+/// error), while every other non-running state gets a generic "no further
+/// output will arrive" note.
+fn follow_exit_note(name: &str, state: LifecycleState) -> String {
+    if state == LifecycleState::Paused {
+        format!("Agent Instance '{name}' is paused; no further output until it is resumed.")
+    } else {
+        format!("Agent Instance '{name}' is {state}; no further output will arrive.")
     }
 }
 

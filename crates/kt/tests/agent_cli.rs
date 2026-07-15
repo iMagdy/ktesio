@@ -3665,3 +3665,244 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
         list.stdout
     );
 }
+
+// ---- Story 4-2: `kt agent logs <name> [--follow]` (AC-A, AC-B, AC-H) ----
+
+#[test]
+fn logs_reads_retained_output_after_the_instance_stops() {
+    // AC-A: register, start via the surviving-engine harness (so real
+    // content genuinely accrues before that starting session exits), stop
+    // it via a SEPARATE `kt agent stop` invocation (which must first adopt
+    // the still-live orphan), then a THIRD, separate `kt agent logs`
+    // invocation reads the complete retained history — the common case,
+    // and (unlike 4.1's `send`) expected to succeed even across a clean
+    // process boundary, since a stopped instance's log file needs no live
+    // handle at all.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--heartbeat-ms", "40", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        stopped.success,
+        "stop of the adopted instance should exit 0; stderr={}",
+        stopped.stderr
+    );
+
+    let logs = run_kt_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
+    assert!(logs.success, "logs should exit 0; stderr={}", logs.stderr);
+    assert!(
+        logs.stdout.contains("[agent-out]"),
+        "attributed agent-out lines must be present; stdout={}",
+        logs.stdout
+    );
+    assert!(
+        logs.stdout.contains("heartbeat"),
+        "the retained heartbeat output must be readable; stdout={}",
+        logs.stdout
+    );
+    assert!(
+        logs.stdout.contains("[engine]"),
+        "an engine-attributed transition line must be present; stdout={}",
+        logs.stdout
+    );
+}
+
+#[test]
+fn logs_follow_on_an_adopted_running_instance_streams_new_output() {
+    // AC-H at the CLI layer — the mirror image of 4.1's AC-D CLI test
+    // (`send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable`):
+    // THERE, `send` on this SAME kind of instance exits non-zero
+    // (`InteractionUnavailable`); HERE, `kt agent logs --follow` reads the
+    // pre-crash captured history with NO error and exits CLEANLY once the
+    // instance transitions out of running — proving AC-H (no live
+    // handle/daemon needed to read/follow an adopted instance) together
+    // with AC-C (a clean, non-hanging exit) through the real `kt` binary.
+    //
+    // DEVIATION FROM THE STORY FILE (documented, mirrors 4.1 Task 8's own
+    // precedent of a test-outcome correction once verified against the
+    // real system): Task 9's bullet literally describes this test
+    // asserting NEW output appears "after the follow command starts."
+    // Verified empirically — both here and at the engine level in
+    // `ktesio-engine/tests/logs.rs`'s
+    // `adopted_instance_can_be_followed_from_a_fresh_engine_session` — that
+    // this is NOT achievable: `start_via_surviving_engine`'s starting
+    // session EXITS (the crash simulation) before this test's `--follow`
+    // ever runs, and a process exit terminates EVERY thread in it,
+    // including the output-capture reader/writer threads — there is no
+    // "the old capture keeps running in the background" outcome, matching
+    // the story's OWN Dev Notes qualifier ("...capture threads running...
+    // in WHICHEVER engine session... has NOT YET EXITED"). So no further
+    // bytes ever reach either capture file once the starting session is
+    // gone — `fake_agent` itself survives (re-parented to init), but its
+    // stdout/stderr pipes have no reader on the other end. This test
+    // instead proves the actual, honest, achievable AC-H claim: the
+    // pre-crash history is followable with no error, and follow exits
+    // cleanly (never hanging) once the instance is stopped by a THIRD,
+    // separate command.
+    //
+    // Runtime-skip on Windows: the SAME cross-lifetime-survival limitation
+    // `start_via_surviving_engine`'s other CLI tests document
+    // (`agent_cli.rs:906-918`) — inherited, not new. NO `#[cfg]`
+    // (data-driven; this file is outside the backends allowlist).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--heartbeat-ms", "40", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    // Spawn `kt agent logs svc --follow` in the BACKGROUND (not
+    // `run_kt_agent`, which blocks for full completion) so the main thread
+    // can stop the instance concurrently and observe the follow process
+    // exit cleanly on its own.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(["agent", "logs", "svc", "--follow"])
+        .current_dir(&ctx.project_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kt agent logs --follow");
+
+    // Give follow a moment to complete its initial one-shot dump and enter
+    // its poll loop, then stop the instance from a SEPARATE process.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        stopped.success,
+        "stop of the adopted instance should exit 0; stderr={}",
+        stopped.stderr
+    );
+
+    // The follow process must exit on its own within a bounded time —
+    // never hang — once it observes the non-running state (AC-C).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "kt agent logs --follow must not hang after the instance stops"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "follow must exit 0 on a clean stop-triggered end"
+    );
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    {
+        use std::io::Read;
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+    }
+
+    assert!(
+        stdout.contains("[agent-out]"),
+        "the pre-crash captured history must be readable via follow's initial dump; stdout={stdout}"
+    );
+    assert!(stdout.contains("heartbeat"), "stdout={stdout}");
+    assert!(
+        stderr.contains("no further output"),
+        "an honest exit note must be printed once the instance stops; stderr={stderr}"
+    );
+}
+
+#[test]
+fn logs_on_a_never_started_instance_is_empty_not_an_error() {
+    // AC-A negative-space case: a registered-but-never-started instance
+    // returns an honest empty result, not an error.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "nat", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
+    assert!(
+        run.success,
+        "logs on a never-started instance should exit 0; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stdout.trim().is_empty(),
+        "no output should be retained yet; stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn logs_on_an_unregistered_name_is_not_found() {
+    // The deliberate-improvement check from Task 5's second bullet: unlike
+    // `transition_events`/`budget_breach_events`'s precedent (which never
+    // check the registry at all), `read_agent_log` is the first CLI-facing
+    // consumer of this shape, so a truly unregistered name is a NotFound
+    // diagnostic, not a silently-empty result.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let run = run_kt_agent(&["agent", "logs", "ghost"], &ctx.project_dir, state_dir);
+    assert!(
+        !run.success,
+        "logs on an unregistered name should exit non-zero"
+    );
+    assert!(
+        run.stderr.contains("No Agent Instance named 'ghost'"),
+        "stderr should name the missing instance; stderr={}",
+        run.stderr
+    );
+}

@@ -998,6 +998,35 @@ impl Registry {
         self.instance_log_dir(name).join("breaches.log")
     }
 
+    /// The per-instance ATTRIBUTED, ROTATED output-capture FILE — the
+    /// CURRENT generation (story 4-2, AD-12). A timestamped, per-stream-
+    /// attributed (`agent-out`/`agent-err`/`engine`) JSON-Lines view of the
+    /// spawned process's output, distinct from [`Self::agent_output_log_path`]
+    /// (`agent.log`): that legacy file stays raw, unattributed, and
+    /// BYTE-IDENTICAL to before this story (CRITICAL SCOPING #3 — Epic 3's
+    /// `drain_usage_for` keeps reading it exactly as today). Bounded to
+    /// [`crate::ports::LOG_ROTATE_MAX_BYTES`] per generation before rotating
+    /// (see [`Self::attributed_output_log_generation_path`]).
+    pub(crate) fn attributed_output_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("output.log")
+    }
+
+    /// A ROTATED generation of the attributed output log (story 4-2, AD-12) —
+    /// `generation` `1` is the most-recently-rotated predecessor, `2` the
+    /// oldest still retained (AD-12's fixed "10MB × 3": current +
+    /// [`Self::attributed_output_log_path`] + generations `1` and `2`).
+    /// Mirrors `ports::process_backend`'s internal rotation naming exactly
+    /// (`output.log.<n>`) so the read side and the write side agree on
+    /// every generation's path without either depending on the other.
+    pub(crate) fn attributed_output_log_generation_path(
+        &self,
+        name: &InstanceName,
+        generation: u8,
+    ) -> std::path::PathBuf {
+        self.instance_log_dir(name)
+            .join(format!("output.log.{generation}"))
+    }
+
     /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;
     /// story 3-1 populates the table so this returns a real count).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {

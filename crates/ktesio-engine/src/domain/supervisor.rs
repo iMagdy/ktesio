@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use ktesio_adapter_api::{Capability, OsId, SupportLevel};
@@ -51,6 +52,7 @@ use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
     assemble_usage_event, BackendError, ObservedUsageSource, ParsedUsage, ProcessBackend,
     ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+    LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -58,7 +60,9 @@ use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
 use super::config::{self, ConfigLayer};
 use super::cost::{CostEvaluator, EstimateLabel, Micros};
 use super::error::EngineError;
-use super::event::{BreachDimension, BudgetBreachEvent, TransitionCause, TransitionEvent};
+use super::event::{
+    BreachDimension, BudgetBreachEvent, LogLine, LogStream, TransitionCause, TransitionEvent,
+};
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
@@ -173,6 +177,52 @@ fn plan_drain(bytes: &[u8], cursor: u64, mode: DrainMode) -> DrainPlan {
         return DrainPlan::Nothing;
     }
     DrainPlan::Consume {
+        range: start..start + consumable,
+        new_cursor: cursor + consumable as u64,
+    }
+}
+
+/// What one `Supervisor::read_agent_log_since` poll should do, decided purely
+/// from `(bytes, cursor)` (story 4-2, Task 5, AC-D/AC-H/AC-G). MIRRORS (does
+/// NOT literally reuse) [`plan_drain`]'s shrink-guard + "consume only up to
+/// the last complete newline" shape — deliberately kept as an INDEPENDENT
+/// pure function rather than a shared generalization: this is Epic 4's READ
+/// path, `plan_drain` is Epic 3's adversarially-reviewed BILLING ingestion
+/// path (story 3-1/AD-7), and coupling them would put a change to one at risk
+/// of silently affecting the other's already-hardened behavior (a
+/// genericization was evaluated and deliberately NOT taken — Task 1's Dev
+/// Notes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FollowPlan {
+    /// The file is SHORTER than the cursor — a rotation happened since the
+    /// last poll. Snap the cursor to `new_cursor` (the file's new length) and
+    /// deliver nothing new THIS pass; the caller detects the snap-back
+    /// (`new_cursor < cursor`) and prints the one-line rotation notice
+    /// (Task 6) — never a claim of completeness across the boundary.
+    Shrunk { new_cursor: u64 },
+    /// Consume `bytes[range]` (a whole number of COMPLETE lines only — a
+    /// trailing partial line, if any, waits for the next poll, exactly like
+    /// `plan_drain`'s MidRun tail rule) and advance the cursor to
+    /// `new_cursor`.
+    Consume {
+        range: std::ops::Range<usize>,
+        new_cursor: u64,
+    },
+}
+
+/// Decide what one `read_agent_log_since` poll reads. Pure — no I/O.
+fn plan_follow(bytes: &[u8], cursor: u64) -> FollowPlan {
+    let len = bytes.len() as u64;
+    if cursor > len {
+        return FollowPlan::Shrunk { new_cursor: len };
+    }
+    let start = cursor as usize;
+    let tail = &bytes[start..];
+    let consumable = match tail.iter().rposition(|b| *b == b'\n') {
+        Some(pos) => pos + 1,
+        None => 0,
+    };
+    FollowPlan::Consume {
         range: start..start + consumable,
         new_cursor: cursor + consumable as u64,
     }
@@ -526,6 +576,12 @@ impl Supervisor {
             env: launch.env,
             working_dir: home,
             log_file: Some(agent_log_path),
+            // Story 4-2 (AC-E): capture is unconditional, computed from the
+            // SAME Registry path authority as `log_file` (never gated on
+            // `pipe_stdin`/`Capability::Interaction` — that gate governs only
+            // the stdin *write* direction).
+            attributed_log_path: Some(registry.attributed_output_log_path(&name)),
+            instance_name: name.as_str().to_string(),
             pipe_stdin,
         };
 
@@ -581,12 +637,19 @@ impl Supervisor {
             }
             None => TransitionCause::AdapterReady,
         };
-        self.transition(
+        // Story 4-2, Task 4: `handle` already exists (spawned above) and
+        // carries a live `log_sender` (capture is unconditional, AC-E), but
+        // it is not YET in `self.running` (inserted below) — so the default
+        // `self.transition(...)`'s `self.running`-based lookup would miss
+        // it. Pass the sender explicitly so the `starting → running` line
+        // lands in the attributed capture too.
+        self.transition_with_log_sender(
             registry,
             &name,
             starting,
             LifecycleState::Running,
             ready_cause,
+            self.backend.log_sender(&handle),
         )?;
         // Mint the fresh Run id for this `starting`→terminal span (spine AD-7). Each
         // `starting` — operator start OR restart (story 1-6) — mints a distinct id
@@ -738,16 +801,26 @@ impl Supervisor {
         // stop. With story 1-6 adoption, a handle for a still-live process
         // started by a PRIOR engine IS re-held (via `adopt_orphans`), so a
         // cross-restart stop now really terminates it.
-        let outcome = match self.running.get_mut(&name) {
+        // Story 4-2, Task 4: capture the log_sender HERE, before `running.remove`
+        // drops the handle below — the default `self.transition(...)` lookup
+        // (via `self.running`) would find NOTHING by the time the terminal
+        // transition below runs, even though the writer/reader threads
+        // themselves stay alive a little longer still (until the killed
+        // process's pipes actually EOF), so the line lands correctly ordered
+        // relative to the last agent-out/err lines.
+        let (outcome, log_sender) = match self.running.get_mut(&name) {
             Some(supervised) => {
-                self.backend
-                    .stop(&mut supervised.handle, window)
-                    .map_err(|source| EngineError::Backend {
-                        name: name.as_str().to_string(),
-                        source,
-                    })?
+                let log_sender = self.backend.log_sender(&supervised.handle);
+                let outcome =
+                    self.backend
+                        .stop(&mut supervised.handle, window)
+                        .map_err(|source| EngineError::Backend {
+                            name: name.as_str().to_string(),
+                            source,
+                        })?;
+                (outcome, log_sender)
             }
-            None => crate::ports::StopOutcome { forced: false },
+            None => (crate::ports::StopOutcome { forced: false }, None),
         };
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
@@ -769,7 +842,14 @@ impl Supervisor {
         } else {
             TransitionCause::StopGraceful
         };
-        self.transition(registry, &name, stopping, LifecycleState::Stopped, cause)?;
+        self.transition_with_log_sender(
+            registry,
+            &name,
+            stopping,
+            LifecycleState::Stopped,
+            cause,
+            log_sender,
+        )?;
 
         registry.lookup(&name).map_err(registry_to_engine)
     }
@@ -1141,6 +1221,116 @@ impl Supervisor {
         })
     }
 
+    /// One-shot full read of every currently-retained ATTRIBUTED output line
+    /// for an instance (story 4-2, AC-A/AC-G) — reads the rotated generations
+    /// OLDEST-to-newest (`.2`, `.1`, current — skipping any that do not exist
+    /// yet), concatenates, and parses each JSON-Lines [`LogLine`] record in
+    /// ON-DISK APPEND ORDER (the sole ordering authority; NEVER re-sorted by
+    /// `at` — AC-G, since `now_rfc3339`'s whole-second resolution makes
+    /// same-second lines common). This reads the NEW, SEPARATE
+    /// `logs/output.log[.N]` file (CRITICAL SCOPING #3) — never `agent.log`,
+    /// which stays byte-identical and untouched for Epic 3's
+    /// `drain_usage_for`.
+    ///
+    /// DELIBERATE IMPROVEMENT over the `read_events`/`read_breach_events`
+    /// precedent above (which never check the registry for the instance's
+    /// existence at all — harmless there, since neither is exposed via any
+    /// `kt` command): `read_agent_log` is the FIRST CLI-facing consumer of
+    /// this shape (`kt agent logs`, Task 6), where silently showing "no
+    /// output" for a mistyped name would be genuinely confusing UX
+    /// (indistinguishable from "the agent just hasn't said anything yet").
+    /// So this DOES check the registry first: a truly UNREGISTERED name
+    /// fails [`EngineError::NotFound`] (matching every other CLI-facing
+    /// command — `show`/`send`/`pause` all do this); a REGISTERED-but-never-
+    /// started instance still falls through to an honest empty vec (mirrors
+    /// `read_events_from`'s "missing file → empty" precedent).
+    pub fn read_agent_log(registry: &Registry, name: &str) -> Result<Vec<LogLine>, EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let mut lines = Vec::new();
+        // Oldest generation first (LOG_ROTATE_GENERATIONS - 1 down to 1),
+        // then the current generation last — append order overall.
+        for generation in (1..LOG_ROTATE_GENERATIONS).rev() {
+            let path = registry.attributed_output_log_generation_path(&name, generation);
+            read_log_lines_from(&path, &mut lines).map_err(|detail| EngineError::Log {
+                name: name.as_str().to_string(),
+                path: path.to_string_lossy().into_owned(),
+                detail,
+            })?;
+        }
+        let current = registry.attributed_output_log_path(&name);
+        read_log_lines_from(&current, &mut lines).map_err(|detail| EngineError::Log {
+            name: name.as_str().to_string(),
+            path: current.to_string_lossy().into_owned(),
+            detail,
+        })?;
+        Ok(lines)
+    }
+
+    /// A CURSOR-based follow read for `kt agent logs --follow`'s poll loop
+    /// (story 4-2, AC-B/AC-C/AC-H, AD-13). `cursor` is a byte offset into the
+    /// CURRENT generation ONLY (mirrors `agent_log_len`/`plan_drain`'s
+    /// existing cursor shape) — distinct from `read_agent_log`'s
+    /// concatenated multi-generation view, so a caller must not mix cursors
+    /// from the two methods. Returns `(new_lines, next_cursor)` — plain
+    /// request/response (AD-13), never a `Stream`-typed API (see the story's
+    /// Dev Notes on why: this keeps the existing async/blocking pairing with
+    /// zero new API shape).
+    ///
+    /// On a detected SHRINK (the current generation's length is now LESS
+    /// than `cursor` — a rotation happened since the last poll), the cursor
+    /// snaps to the new length and this returns `(vec![], new_len)` — the
+    /// CALLER detects the signal itself by comparing the returned cursor to
+    /// the one it just passed in (`next_cursor < cursor`) and prints one
+    /// honest notice (Task 6); `read_agent_log` WITHOUT `--follow` always
+    /// re-reads everything currently retained, so this never loses data
+    /// permanently — only a possible (rare) live-tail gap at the rotation
+    /// boundary.
+    pub fn read_agent_log_since(
+        registry: &Registry,
+        name: &str,
+        cursor: u64,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let path = registry.attributed_output_log_path(&name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        match plan_follow(&bytes, cursor) {
+            FollowPlan::Shrunk { new_cursor } => Ok((Vec::new(), new_cursor)),
+            FollowPlan::Consume { range, new_cursor } => {
+                let mut lines = Vec::new();
+                if !range.is_empty() {
+                    parse_log_lines(&String::from_utf8_lossy(&bytes[range]), &mut lines).map_err(
+                        |detail| EngineError::Log {
+                            name: name.as_str().to_string(),
+                            path: path.to_string_lossy().into_owned(),
+                            detail,
+                        },
+                    )?;
+                }
+                Ok((lines, new_cursor))
+            }
+        }
+    }
+
     /// The crash-detection reaper pass (story 1-6, AC-A / AC3 / AC5).
     ///
     /// Polls every held handle via the EXISTING `backend.poll` and reacts to an
@@ -1223,6 +1413,15 @@ impl Supervisor {
             // A crash. Consult the Restart Policy FIRST (so a terminal outcome —
             // `never` or crash-loop — can enrich the recorded crash cause), then
             // apply running/paused → failed with that detail (AC5).
+            //
+            // Story 4-2, Task 4: capture the log_sender BEFORE removing the
+            // entry below — same reasoning as `stop_inner`'s terminal
+            // transition (the default `self.transition(...)` lookup would
+            // otherwise miss it).
+            let crash_log_sender = self
+                .running
+                .get(&name)
+                .and_then(|s| self.backend.log_sender(&s.handle));
             self.running.remove(&name);
             let base_detail = match code {
                 Some(c) => format!("process exited unexpectedly with code {c}"),
@@ -1239,12 +1438,13 @@ impl Supervisor {
             // falls back to for the failed cause once the terminal record is
             // cleared (AC9).
             if self
-                .transition(
+                .transition_with_log_sender(
                     registry,
                     &name,
                     state,
                     LifecycleState::Failed,
                     TransitionCause::crashed(decision.crash_cause.clone()),
+                    crash_log_sender,
                 )
                 .is_err()
             {
@@ -1492,6 +1692,13 @@ impl Supervisor {
     /// Apply one transition: persist the new state, then append the event to the
     /// per-instance log. Persist-before-log so the durable state leads; a log
     /// append failure surfaces (the escalation record is load-bearing for AC3).
+    ///
+    /// Story 4-2, Task 4: ALSO best-effort-projects the transition into the
+    /// unified attributed-output stream as an `engine`-attributed [`LogLine`]
+    /// — a human-readable mirror of the SAME fact `instance.log` (above,
+    /// unchanged, machine-authoritative) just recorded. The writer-thread
+    /// `Sender` is looked up via [`Supervisor::log_sender_for`] (the
+    /// instance's CURRENT `self.running` entry, when one exists).
     fn transition(
         &self,
         registry: &Registry,
@@ -1499,6 +1706,28 @@ impl Supervisor {
         prior: LifecycleState,
         new: LifecycleState,
         cause: TransitionCause,
+    ) -> Result<TransitionEvent, EngineError> {
+        let log_sender = self.log_sender_for(name);
+        self.transition_with_log_sender(registry, name, prior, new, cause, log_sender)
+    }
+
+    /// Like [`Supervisor::transition`], but the `engine`-attributed writer
+    /// `Sender` is supplied EXPLICITLY rather than looked up via
+    /// `self.running` — needed at the two call sites (`start_inner`'s
+    /// `starting → running`, `stop_inner`'s `stopping → stopped`, and
+    /// `poll_once`'s crash `→ failed`) where the just-spawned/about-to-be-
+    /// torn-down handle is not (or no longer) present in `self.running` at
+    /// the exact moment of the call, even though a live writer thread still
+    /// exists (captured by the caller a few lines earlier, before the
+    /// map mutation that would otherwise hide it).
+    fn transition_with_log_sender(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        cause: TransitionCause,
+        log_sender: Option<mpsc::Sender<LogLine>>,
     ) -> Result<TransitionEvent, EngineError> {
         registry.set_state(name, new).map_err(registry_to_engine)?;
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
@@ -1512,7 +1741,26 @@ impl Supervisor {
                 detail,
             }
         })?;
+        if let Some(sender) = log_sender {
+            let text = engine_transition_line_text(&event);
+            let _ = sender.send(LogLine::new(
+                name.as_str(),
+                LogStream::Engine,
+                text,
+                event.at.clone(),
+            ));
+        }
         Ok(event)
+    }
+
+    /// The writer-thread `Sender` this engine session currently holds for
+    /// `name`, if any (story 4-2, Task 4) — `None` when the instance has no
+    /// `self.running` entry (not started this session, already torn down, or
+    /// adopted with no recoverable capture threads).
+    fn log_sender_for(&self, name: &InstanceName) -> Option<mpsc::Sender<LogLine>> {
+        self.running
+            .get(name)
+            .and_then(|s| self.backend.log_sender(&s.handle))
     }
 
     /// Land a spawn failure in `failed` with the backend diagnostic preserved
@@ -2293,6 +2541,44 @@ fn base_url_override(base_url: &str) -> ConfigLayer {
     ConfigLayer::from_table(table)
 }
 
+/// A best-effort, HUMAN-READABLE one-line rendering of a [`TransitionEvent`]
+/// for the `engine`-attributed capture line (story 4-2, Task 4) — the
+/// RECOMMENDED default: mirror every `TransitionEvent` (start/stop/pause/
+/// resume/crash/restart/breach-driven), the SAME set `instance.log` already
+/// records, so this is a projection of IDENTICAL facts, not a second,
+/// divergent notion of "notable". `instance.log` stays the structured,
+/// machine-authoritative record; this text is NEVER parsed back — a wording
+/// change here is not a wire-format change.
+fn engine_transition_line_text(event: &TransitionEvent) -> String {
+    format!(
+        "engine: {} -> {}{}",
+        event.prior_state,
+        event.new_state,
+        cause_suffix(&event.cause)
+    )
+}
+
+/// The parenthetical detail suffix for [`engine_transition_line_text`], keyed
+/// on the transition's [`TransitionCause`].
+fn cause_suffix(cause: &TransitionCause) -> String {
+    match cause {
+        TransitionCause::Command { command } => format!(" ({command})"),
+        TransitionCause::AdapterReady => String::new(),
+        TransitionCause::LaunchError { detail } => format!(" (launch error: {detail})"),
+        TransitionCause::StopGraceful => String::new(),
+        TransitionCause::StopForced { detail } => format!(" (forced: {detail})"),
+        TransitionCause::PauseBestEffort { detail } => format!(" (best-effort: {detail})"),
+        TransitionCause::ResumeBestEffort { detail } => format!(" (best-effort: {detail})"),
+        TransitionCause::Crashed { detail } => format!(" (crashed: {detail})"),
+        TransitionCause::Restarted { count, waited_ms } => {
+            format!(" (restart #{count}, waited {waited_ms}ms)")
+        }
+        TransitionCause::BudgetExceeded {
+            scope, dimension, ..
+        } => format!(" (breach: {scope} {dimension})"),
+    }
+}
+
 /// Append one transition event as a single JSON line to the instance log.
 ///
 /// One event per line (JSON Lines) so [`read_events_from`] can parse them back
@@ -2329,6 +2615,37 @@ fn read_events_from(path: &Path) -> Result<Vec<TransitionEvent>, String> {
         events.push(event);
     }
     Ok(events)
+}
+
+/// Parse JSON-Lines [`LogLine`] records from `text`, APPENDING them to `out`
+/// in encounter order (story 4-2, AC-G — append order is the sole ordering
+/// authority; callers must never re-sort the result). Blank lines are
+/// skipped; a malformed line is an error naming it (a corrupt capture is
+/// worth surfacing, mirroring [`read_events_from`]'s convention).
+fn parse_log_lines(text: &str, out: &mut Vec<LogLine>) -> Result<(), String> {
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: LogLine = serde_json::from_str(line)
+            .map_err(|e| format!("corrupt output-log line {}: {e}", idx + 1))?;
+        out.push(parsed);
+    }
+    Ok(())
+}
+
+/// Read back one attributed-output-log FILE (one generation) and append its
+/// parsed [`LogLine`]s to `out` — a missing generation (not every generation
+/// exists yet) is a silent no-op, mirroring [`read_events_from`]'s "missing
+/// file → empty" precedent, so [`Supervisor::read_agent_log`]'s
+/// oldest-to-newest loop can unconditionally probe every generation.
+fn read_log_lines_from(path: &Path, out: &mut Vec<LogLine>) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    parse_log_lines(&text, out)
 }
 
 /// Append one [`BudgetBreachEvent`] as a single JSON line to the per-instance
@@ -3666,6 +3983,320 @@ mod tests {
             plan_drain(bytes, 4, DrainMode::Terminal),
             DrainPlan::Nothing
         );
+    }
+
+    // ---- Story 4-2: read_agent_log_since's follow-cursor planning (AC-D/AC-H) ----
+
+    #[test]
+    fn plan_follow_consumes_only_complete_lines_leaving_a_partial_tail() {
+        let bytes = b"a\nb\nhalf-written";
+        assert_eq!(
+            plan_follow(bytes, 0),
+            FollowPlan::Consume {
+                range: 0..4,
+                new_cursor: 4
+            }
+        );
+    }
+
+    #[test]
+    fn plan_follow_with_no_newline_yet_consumes_nothing() {
+        assert_eq!(
+            plan_follow(b"no newline yet", 0),
+            FollowPlan::Consume {
+                range: 0..0,
+                new_cursor: 0
+            }
+        );
+    }
+
+    #[test]
+    fn plan_follow_from_a_cursor_consumes_only_the_new_tail() {
+        let bytes = b"old\nnew-tail\n";
+        assert_eq!(
+            plan_follow(bytes, 4),
+            FollowPlan::Consume {
+                range: 4..bytes.len(),
+                new_cursor: bytes.len() as u64
+            }
+        );
+    }
+
+    #[test]
+    fn plan_follow_shrink_snaps_the_cursor_and_delivers_nothing() {
+        // AC-D/AC-H rotation-notice path: the file is shorter than the
+        // cursor (a rotation happened since the last poll). Snap, deliver
+        // nothing this pass — the caller detects the snap-back itself.
+        let bytes = b"short"; // len 5
+        assert_eq!(
+            plan_follow(bytes, 100),
+            FollowPlan::Shrunk { new_cursor: 5 }
+        );
+    }
+
+    #[test]
+    fn plan_follow_at_end_of_log_consumes_nothing() {
+        let bytes = b"a\nb\n";
+        assert_eq!(
+            plan_follow(bytes, 4),
+            FollowPlan::Consume {
+                range: 4..4,
+                new_cursor: 4
+            }
+        );
+    }
+
+    // ---- Story 4-2: engine-attributed line rendering (Task 4) ----
+
+    #[test]
+    fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
+        // A direct, pure-function proof of the RENDERER's own completeness,
+        // independent of which causes the current supervisor wiring happens
+        // to route a live log_sender through (e.g. a launch-failure never
+        // gets a log_sender today — see the Dev Agent Record) — the match
+        // itself must stay exhaustive and correct for every variant.
+        let cases: Vec<(TransitionCause, &str)> = vec![
+            (TransitionCause::command("start"), " (start)"),
+            (TransitionCause::AdapterReady, ""),
+            (
+                TransitionCause::launch_error("boom"),
+                " (launch error: boom)",
+            ),
+            (TransitionCause::StopGraceful, ""),
+            (
+                TransitionCause::stop_forced("escalated"),
+                " (forced: escalated)",
+            ),
+            (
+                TransitionCause::pause_best_effort("windows"),
+                " (best-effort: windows)",
+            ),
+            (
+                TransitionCause::resume_best_effort("windows"),
+                " (best-effort: windows)",
+            ),
+            (
+                TransitionCause::crashed("exit code 1"),
+                " (crashed: exit code 1)",
+            ),
+            (
+                TransitionCause::restarted(2, 500),
+                " (restart #2, waited 500ms)",
+            ),
+            (
+                TransitionCause::budget_exceeded(BreachScope::PerRun, 1000, 1200),
+                " (breach: per-run tokens)",
+            ),
+            (
+                TransitionCause::cost_cap_exceeded(
+                    BreachScope::Cumulative,
+                    Micros(5_000_000),
+                    Micros(5_250_000),
+                    EstimateLabel::Estimated,
+                ),
+                " (breach: cumulative dollars)",
+            ),
+        ];
+        for (cause, want_suffix) in cases {
+            assert_eq!(cause_suffix(&cause), want_suffix, "{cause:?}");
+        }
+
+        // engine_transition_line_text wraps the suffix into the full "engine:
+        // A -> B(...)" sentence.
+        let event = TransitionEvent::new(
+            "svc",
+            LifecycleState::Running,
+            LifecycleState::Paused,
+            TransitionCause::pause_best_effort("windows"),
+            "2026-07-15T00:00:00Z",
+        );
+        assert_eq!(
+            engine_transition_line_text(&event),
+            "engine: running -> paused (best-effort: windows)"
+        );
+    }
+
+    // ---- Story 4-2: Supervisor::read_agent_log / read_agent_log_since ----
+
+    fn log_line(instance: &str, stream: LogStream, text: &str, at: &str) -> LogLine {
+        LogLine::new(instance, stream, text, at)
+    }
+
+    #[test]
+    fn read_agent_log_on_an_unregistered_name_is_not_found() {
+        // The deliberate improvement over read_events/read_breach_events'
+        // precedent: an unregistered name is NotFound, not a silent empty.
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log(&registry, "ghost").unwrap_err();
+        assert!(matches!(err, EngineError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_on_a_registered_but_never_started_instance_is_empty_not_an_error() {
+        let (_state, _manifest, registry) = setup_fake("neverstarted", &["--linger-ms", "600000"]);
+        let lines = Supervisor::read_agent_log(&registry, "neverstarted").unwrap();
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_agent_log_concatenates_generations_oldest_to_newest() {
+        // AC-A/AC-G: hand-craft the 3 generations directly (deterministic,
+        // no real rotation/process needed) and assert the read order is
+        // oldest-generation-first, current-generation-last — append order,
+        // never a timestamp re-sort.
+        let (_state, _manifest, registry) = setup_fake("gens", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("gens").unwrap();
+        std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+
+        let write_line = |path: &Path, l: &LogLine| {
+            std::fs::write(path, format!("{}\n", serde_json::to_string(l).unwrap())).unwrap();
+        };
+        write_line(
+            &registry.attributed_output_log_generation_path(&name, 2),
+            &log_line(
+                "gens",
+                LogStream::AgentOut,
+                "oldest",
+                "2026-07-15T00:00:00Z",
+            ),
+        );
+        write_line(
+            &registry.attributed_output_log_generation_path(&name, 1),
+            &log_line(
+                "gens",
+                LogStream::AgentErr,
+                "middle",
+                "2026-07-15T00:00:01Z",
+            ),
+        );
+        write_line(
+            &registry.attributed_output_log_path(&name),
+            &log_line("gens", LogStream::Engine, "newest", "2026-07-15T00:00:02Z"),
+        );
+
+        let lines = Supervisor::read_agent_log(&registry, "gens").unwrap();
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["oldest", "middle", "newest"]);
+        let streams: Vec<LogStream> = lines.iter().map(|l| l.stream).collect();
+        assert_eq!(
+            streams,
+            vec![LogStream::AgentOut, LogStream::AgentErr, LogStream::Engine]
+        );
+    }
+
+    #[test]
+    fn read_agent_log_since_on_an_unregistered_name_is_not_found() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log_since(&registry, "ghost", 0).unwrap_err();
+        assert!(matches!(err, EngineError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_since_happy_path_reads_only_the_new_tail() {
+        let (_state, _manifest, registry) = setup_fake("since", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("since").unwrap();
+        std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+        let path = registry.attributed_output_log_path(&name);
+
+        let l1 = log_line("since", LogStream::AgentOut, "one", "2026-07-15T00:00:00Z");
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&l1).unwrap())).unwrap();
+        let (first, cursor1) = Supervisor::read_agent_log_since(&registry, "since", 0).unwrap();
+        assert_eq!(first, vec![l1]);
+        assert!(cursor1 > 0);
+
+        // No new bytes yet: an empty read at the same cursor.
+        let (none, cursor_same) =
+            Supervisor::read_agent_log_since(&registry, "since", cursor1).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(cursor_same, cursor1);
+
+        // Append a second line; read_agent_log_since(cursor1) returns ONLY it.
+        let l2 = log_line("since", LogStream::AgentErr, "two", "2026-07-15T00:00:01Z");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", serde_json::to_string(&l2).unwrap()).unwrap();
+        drop(f);
+        let (second, cursor2) =
+            Supervisor::read_agent_log_since(&registry, "since", cursor1).unwrap();
+        assert_eq!(second, vec![l2]);
+        assert!(cursor2 > cursor1);
+    }
+
+    #[test]
+    fn read_agent_log_since_detects_a_rotation_shrink_and_snaps_the_cursor() {
+        // AC-D/AC-H: simulate a rotation having happened between two polls by
+        // shrinking the current-generation file below the previously
+        // returned cursor. The caller (Task 6's CLI) detects this by
+        // comparing `next_cursor < cursor` — assert that property holds.
+        let (_state, _manifest, registry) = setup_fake("rot", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("rot").unwrap();
+        std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+        let path = registry.attributed_output_log_path(&name);
+
+        let l1 = log_line(
+            "rot",
+            LogStream::AgentOut,
+            "before-rotation",
+            "2026-07-15T00:00:00Z",
+        );
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&l1).unwrap())).unwrap();
+        let (_lines, cursor) = Supervisor::read_agent_log_since(&registry, "rot", 0).unwrap();
+        assert!(cursor > 0);
+
+        // Simulate rotation: the current generation is now a FRESH, SHORTER
+        // file (as if it had just been rotated and a new line appended).
+        let l2 = log_line(
+            "rot",
+            LogStream::AgentOut,
+            "after-rotation",
+            "2026-07-15T00:00:05Z",
+        );
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&l2).unwrap())).unwrap();
+        let new_len = std::fs::metadata(&path).unwrap().len();
+        assert!(new_len < cursor, "the fixture must genuinely shrink");
+
+        let (lines, next_cursor) =
+            Supervisor::read_agent_log_since(&registry, "rot", cursor).unwrap();
+        assert!(lines.is_empty(), "nothing delivered on the shrink pass");
+        assert!(
+            next_cursor < cursor,
+            "the returned cursor must snap BELOW the one just passed in — the \
+             caller's rotation-notice signal"
+        );
+        assert_eq!(next_cursor, new_len);
+    }
+
+    #[test]
+    fn read_agent_log_on_an_invalid_name_is_invalid_name() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log(&registry, "Not Valid!").unwrap_err();
+        assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_since_on_an_invalid_name_is_invalid_name() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log_since(&registry, "Not Valid!", 0).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_since_on_a_registered_but_never_started_instance_is_empty() {
+        // The current-generation file does not exist yet at all (the
+        // instance was registered but never started) — an honest empty
+        // read (Vec::new fallback for a NotFound file), never an error.
+        let (_state, _manifest, registry) = setup_fake("neverstarted2", &["--linger-ms", "600000"]);
+        let (lines, cursor) =
+            Supervisor::read_agent_log_since(&registry, "neverstarted2", 0).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(cursor, 0);
     }
 
     // ---- Story 3-4: engine-observed base_url injection + source selection ----

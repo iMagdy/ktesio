@@ -19,7 +19,9 @@ mod secret_resolver;
 mod state_store;
 mod usage_source;
 
-pub(crate) use process_backend::write_stdin_bounded;
+pub(crate) use process_backend::{
+    spawn_output_capture, write_stdin_bounded, LOG_ROTATE_GENERATIONS,
+};
 pub use process_backend::{
     BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StdinState,
     StopOutcome, STDIN_WRITE_TIMEOUT,

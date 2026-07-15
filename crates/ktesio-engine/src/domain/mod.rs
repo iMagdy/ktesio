@@ -42,8 +42,8 @@ pub use cost::{
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{
-    BreachDimension, BudgetBreachEvent, TransitionCause, TransitionEvent, BUDGET_SCHEMA_VERSION,
-    EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
+    BreachDimension, BudgetBreachEvent, LogLine, LogStream, TransitionCause, TransitionEvent,
+    BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION,
 };
 pub use fleet::{BudgetView, FleetEntry, FleetListing, FleetTotals, UsageView};
 pub use instance::AgentInstance;

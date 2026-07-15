@@ -102,6 +102,23 @@ Stdin is piped only for adapters that declare interaction support (`guaranteed` 
 
 If an agent stops draining its input (a stuck/deadlocked process), `send`'s write is bounded — it fails with a distinct diagnostic naming the timeout rather than hanging, and the instance's interaction channel stays unavailable for the rest of that session until it is stopped and started again.
 
+## `kt agent logs <name> [--follow]`
+
+Read an Agent Instance's retained output, optionally following live output.
+
+```bash
+kt agent logs my-agent
+kt agent logs my-agent --follow
+```
+
+Every currently-retained line is printed to stdout as `<at> [<stream>] <text>`, in the order it was captured (append order — never re-sorted by timestamp, since same-second lines are common). `<stream>` is one of `agent-out`, `agent-err`, or `engine`: the spawned process's stdout and stderr are captured separately (so you can tell them apart), and a best-effort `engine` line is added at each lifecycle transition (start, stop, pause, resume, crash, restart), mirroring the same facts the structured transition log already records.
+
+Log capture is **unconditional and capability-independent** — unlike `send`, it does not depend on the adapter's declared `interaction` support. Reading an instance's output always works, even for an adapter that declares `interaction: unsupported`; only writing to a process (`send`) is gated on that capability.
+
+The captured output is bounded: each generation caps at 10MB, with the current generation plus its 2 most recent rotated predecessors retained (10MB × 3 total, fixed and non-configurable). `kt agent logs` never errors due to rotation — a read that spans a rotation boundary returns whatever is currently retained, not a claim of the instance's entire lifetime history.
+
+`--follow` (`-f`) prints the retained lines first, then keeps polling for new output and printing it as it arrives — exiting cleanly with a note once the instance stops or pauses (never hanging). This works identically whether or not the current `kt` process is the one that originally started the instance: reading only needs the instance's log file, not a live process handle, so `kt agent logs --follow` also works against an instance recovered by crash adoption in a different `kt agent start` session.
+
 ## `kt agent remove <name> [--delete | --retain] [--force]`
 
 Remove an Agent Instance from the Fleet.

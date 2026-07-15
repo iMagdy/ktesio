@@ -178,6 +178,15 @@ enum AgentCommands {
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
+    /// Read an Agent Instance's retained output, optionally following live output
+    Logs {
+        /// Name of the Agent Instance to read logs for
+        name: String,
+        /// After the one-shot dump, keep polling and print new lines as they
+        /// arrive; exits cleanly (with a note) once the instance stops or pauses
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     /// List every Agent Instance in the Fleet
     List {
         /// Emit the Fleet as a machine-readable JSON document (FR-4 / AD-14)
@@ -274,6 +283,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),
             AgentCommands::Send { name, text } => cli::agent::send(&name, &text),
+            AgentCommands::Logs { name, follow } => cli::agent::logs(&name, follow),
             AgentCommands::List { json } => cli::agent::list(json),
             AgentCommands::Show { name, json } => cli::agent::show(&name, json),
             AgentCommands::Config { command } => match command {
@@ -387,6 +397,7 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "pause"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "resume"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "send"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "logs"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
@@ -504,6 +515,36 @@ mod tests {
             panic!("expected Agent(Send)");
         };
         assert_eq!(text, "-h");
+    }
+
+    #[test]
+    fn test_agent_logs_parse() {
+        // `logs <name>` and `logs <name> --follow`/`-f` parse (story 4-2).
+        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--follow"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "-f"]).is_ok());
+        // Missing name is a clap error.
+        assert!(Cli::try_parse_from(["kt", "agent", "logs"]).is_err());
+
+        // The bare form defaults follow to false; --follow/-f sets it true.
+        let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc"]).unwrap();
+        let Some(Commands::Agent {
+            command: AgentCommands::Logs { name, follow },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Logs)");
+        };
+        assert_eq!(name, "svc");
+        assert!(!follow);
+
+        let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc", "-f"]).unwrap();
+        let Some(Commands::Agent {
+            command: AgentCommands::Logs { follow, .. },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Logs)");
+        };
+        assert!(follow);
     }
 
     #[test]

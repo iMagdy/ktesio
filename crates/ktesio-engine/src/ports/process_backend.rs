@@ -26,14 +26,17 @@
 //! dynamic dispatch, and the port stays free of OS types.
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ChildStdin;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use thiserror::Error;
+
+use crate::domain::{LogLine, LogStream};
+use crate::time::now_rfc3339;
 
 /// The resolved launch of an Agent Instance (built from a manifest `OpTemplate`
 /// or a native adapter). Everything the backend needs to spawn the process, in
@@ -52,6 +55,21 @@ pub struct SpawnSpec {
     /// seed (AD-12). `None` inherits the engine's streams (used only in tests
     /// that do not assert captured output).
     pub log_file: Option<PathBuf>,
+    /// Where the ATTRIBUTED, rotated capture (`agent-out`/`agent-err`/`engine`
+    /// lines) should be written — the CURRENT generation file (story 4-2,
+    /// AD-12). `Some` in every PRODUCTION spawn, paired 1:1 with
+    /// `log_file: Some(..)` (the supervisor computes both from the SAME
+    /// `Registry` path authority in the same breath) — capture is
+    /// UNCONDITIONAL and capability-independent (AC-E), never gated on
+    /// `Capability::Interaction` the way [`SpawnSpec::pipe_stdin`] gates the
+    /// stdin *write* direction. `None` only alongside `log_file: None`, the
+    /// small set of unit tests that assert nothing about captured output —
+    /// this pairing is a narrow test-fixture convenience, not a capability
+    /// gate: reading FROM a process is never gated, only writing TO it is.
+    pub attributed_log_path: Option<PathBuf>,
+    /// The Agent Instance name, stamped on every captured [`LogLine`]
+    /// (`LogLine.instance`) — paired with [`SpawnSpec::attributed_log_path`].
+    pub instance_name: String,
     /// Whether to pipe the child's stdin (story 4.1 fix pass, HIGH finding —
     /// review of #79).
     ///
@@ -232,6 +250,33 @@ pub enum BackendError {
 /// than a whole graceful-shutdown grace period.
 pub const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The per-generation byte cap for the attributed output capture (story 4-2,
+/// AD-12, epics.md's literal "10MB × 3"). A FIXED, non-configurable engine
+/// resilience bound (no unified-config key this story) — mirrors
+/// [`STDIN_WRITE_TIMEOUT`]'s precedent of a hardcoded bound rather than a
+/// user setting. Checked BEFORE each append ([`should_rotate`]), so a single
+/// generation may end up a little over this exact byte count (the cost of a
+/// cheap check-before-write rather than a mid-line truncation); this is an
+/// accepted approximation, not an exact ceiling.
+pub const LOG_ROTATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// How many generations of the attributed capture are retained: the CURRENT
+/// file plus this many minus one rotated predecessors (`.1`, `.2`, …) — AD-12's
+/// "10MB × 3" (current + `.1` + `.2`). A read that spans a rotation boundary
+/// honestly returns whatever these retained generations hold; `kt agent logs`
+/// never errors due to rotation.
+pub const LOG_ROTATE_GENERATIONS: u8 = 3;
+
+/// Whether the attributed capture's CURRENT generation should be rotated
+/// BEFORE the next append, given its current byte length (story 4-2, Task 1).
+/// Pure, no I/O — unit-testable at the exact boundary. Uses `>=` (the `≥`
+/// boundary convention this codebase uses everywhere else, e.g.
+/// `BudgetEvaluator`): a generation that has JUST reached the cap rotates on
+/// its NEXT append, rather than growing past it first.
+fn should_rotate(current_len: u64) -> bool {
+    current_len >= LOG_ROTATE_MAX_BYTES
+}
+
 /// The state of a spawned process's stdin channel (story 4.1 fix pass — the
 /// CRITICAL and HIGH findings, review of #79).
 ///
@@ -379,6 +424,240 @@ pub(crate) fn write_stdin_bounded(
             })
         }
     }
+}
+
+// ---- Story 4-2 (AD-12): the shared output-capture reader/writer threads ----
+//
+// Three distinct sources can produce a `LogLine` for the same instance: the
+// stdout reader thread, the stderr reader thread, and (Task 4) the
+// supervisor's own transition-time `engine`-attributed sends — potentially
+// from three different OS threads. Rather than a shared `Mutex` guarding a
+// rotate-then-append sequence, ONE background writer thread owns the current-
+// generation file handle and performs every rotation-check-then-append
+// SERIALLY, fed by a single `mpsc::Sender<LogLine>` every source clones —
+// eliminating the lock entirely (no two threads ever touch the file) and
+// mirroring `write_stdin_bounded`'s established `std::thread` + `mpsc`
+// continuous-I/O convention (the SAME pattern, not a new one). The writer
+// thread exits naturally when every `Sender` clone is dropped (the channel
+// closes, `recv()` returns `Err`) — no explicit shutdown signal needed.
+
+/// Append ONE [`LogLine`] to the attributed capture at `path`, rotating FIRST
+/// if the file's CURRENT size has already reached [`LOG_ROTATE_MAX_BYTES`]
+/// ([`should_rotate`]) — so no line ever spans a rotation boundary. One
+/// JSON-Lines record per call.
+///
+/// A free function (not a method) so it is directly unit-testable in a tight
+/// loop with no thread/channel synchronization needed (the writer thread
+/// below is a thin loop around this). Best-effort: there is no caller to
+/// propagate a failure to (fed by a channel, from a background thread with no
+/// return path) — a write hiccup here must never crash the engine over a
+/// captured-log line, mirroring this codebase's existing best-effort
+/// discipline for background capture (e.g. `drain_usage_for`'s read-failure
+/// skip).
+fn append_attributed_line(path: &Path, line: &LogLine) {
+    let current_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if should_rotate(current_len) {
+        rotate_generations(path, LOG_ROTATE_GENERATIONS);
+    }
+    let Ok(json) = serde_json::to_string(line) else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{json}");
+    }
+}
+
+/// The rotated-generation sibling of `base` (story 4-2) — `base` with `.N`
+/// appended to its raw [`std::ffi::OsStr`] (not a lossy `Display`
+/// concatenation, so a non-UTF8 path stays exact). `n == 1` is the most-
+/// recently-rotated generation; higher `n` is older. Mirrors
+/// [`crate::domain::Registry::attributed_output_log_generation_path`]'s
+/// naming exactly (`output.log.<n>`) so the read side and the write side
+/// agree on every generation's path without either depending on the other.
+fn generation_path(base: &Path, n: u8) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(format!(".{n}"));
+    PathBuf::from(os)
+}
+
+/// Rotate `base`'s generations (story 4-2, Task 2): discard the oldest
+/// retained generation, shift every remaining generation up by one, then
+/// rename `base` itself (the current generation) to `.1`. The caller opens a
+/// FRESH `base` on its next append (this function never creates one) — an
+/// open `File` handle held across a rename keeps writing to the RENAMED
+/// inode, not the new path, which is exactly why [`append_attributed_line`]
+/// reopens the path fresh on every call rather than holding a handle.
+///
+/// `generations` is [`LOG_ROTATE_GENERATIONS`] in production (current, `.1`,
+/// and `.2`); a missing source file/generation is a silent no-op (`rename`
+/// and `remove_file` errors are ignored) — rotation is best-effort
+/// resilience, never a hard failure.
+fn rotate_generations(base: &Path, generations: u8) {
+    if generations <= 1 {
+        // No history retained: defensive-only in production (the constant is
+        // fixed at 3), but stay correct — just drop the current generation.
+        let _ = std::fs::remove_file(base);
+        return;
+    }
+    let oldest = generations - 1;
+    let _ = std::fs::remove_file(generation_path(base, oldest));
+    for gen in (1..oldest).rev() {
+        let _ = std::fs::rename(generation_path(base, gen), generation_path(base, gen + 1));
+    }
+    let _ = std::fs::rename(base, generation_path(base, 1));
+}
+
+/// Spawn the SINGLE background writer thread for one instance's attributed
+/// capture (story 4-2, Task 2), returning the `Sender` every capture source
+/// (both reader threads, and the supervisor's own transition-time sends,
+/// Task 4) clones. `pub(crate)` and separate from [`spawn_output_capture`] so
+/// tests can drive + `join` it directly (send lines, drop every `Sender`
+/// clone, join, THEN assert on disk — a deterministic synchronization, no
+/// wall-clock polling) without needing a real spawned process.
+pub(crate) fn spawn_log_writer(
+    attributed_log_path: PathBuf,
+) -> (mpsc::Sender<LogLine>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<LogLine>();
+    let handle = thread::spawn(move || {
+        while let Ok(line) = rx.recv() {
+            append_attributed_line(&attributed_log_path, &line);
+        }
+    });
+    (tx, handle)
+}
+
+/// Strip a trailing `\n` (and a preceding `\r`, if present) from a raw line
+/// buffer, lossily decoding the remainder as UTF-8 (never a panic on
+/// non-UTF8 agent output — the SAME defensive stance this codebase takes
+/// everywhere text crosses a process boundary). Used only for the
+/// ATTRIBUTED [`LogLine::text`] — the legacy `agent.log` write uses the raw
+/// bytes verbatim, delimiter included, completely independently (CRITICAL
+/// SCOPING #3).
+fn strip_trailing_newline(buf: &[u8]) -> String {
+    let mut bytes = buf;
+    if bytes.last() == Some(&b'\n') {
+        bytes = &bytes[..bytes.len() - 1];
+        if bytes.last() == Some(&b'\r') {
+            bytes = &bytes[..bytes.len() - 1];
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Spawn ONE reader thread that drains `pipe` (the child's stdout or stderr)
+/// line-by-line via [`BufRead::read_until`] (story 4-2, Task 2) — NOT
+/// `BufRead::lines()`, deliberately: `read_until(b'\n', ..)` returns the raw
+/// bytes INCLUDING the delimiter when found (or the exact trailing bytes with
+/// NO synthesized delimiter at EOF), which is what makes the legacy-log write
+/// below byte-identical to today's kernel passthrough even for a final line
+/// with no trailing newline (`lines()` strips the delimiter from every
+/// yielded item, which would silently ADD a `\n` back on re-write that the
+/// original raw stream never had).
+///
+/// For each line read, this thread does BOTH, independently:
+/// 1. Appends the RAW bytes VERBATIM to `legacy_log_path` (CRITICAL SCOPING
+///    #3 — same bytes, same file, same format as today; only the writer
+///    changed from "the OS kernel" to this thread). Opening the file in
+///    APPEND mode on every write mirrors the existing dual
+///    `Stdio::from(file)`/`try_clone()` atomicity this replaces: an
+///    append-mode write is atomically placed at the file's current end by
+///    the OS, so two independently-opened handles (this reader + its stderr
+///    sibling) can safely interleave without corrupting either line.
+/// 2. Sends an attributed, timestamped, newline-stripped [`LogLine`]
+///    (`stream`) to the writer thread via `sender`.
+///
+/// Exits naturally on EOF (the pipe closes when the child exits and its fd
+/// closes) or a read error. Unlike the stdin *write* direction, a *read*
+/// cannot hang indefinitely on backpressure — it only ever yields data, EOF,
+/// or an error — so, deliberately, NO timeout is used here; a reviewer should
+/// not expect a mechanism symmetrical to [`write_stdin_bounded`].
+fn spawn_reader_thread<R>(
+    pipe: R,
+    stream: LogStream,
+    legacy_log_path: PathBuf,
+    instance: String,
+    sender: mpsc::Sender<LogLine>,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        loop {
+            let mut buf: Vec<u8> = Vec::new();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // true EOF: nothing read.
+                Ok(_) => {
+                    // (1) Legacy capture: the raw bytes, unmodified.
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&legacy_log_path)
+                    {
+                        let _ = file.write_all(&buf);
+                    }
+                    // (2) Attributed capture: the same content, attributed +
+                    // timestamped, sent to the writer thread. Best-effort —
+                    // a closed receiver (the writer thread already gone)
+                    // just means nobody is listening anymore; this thread
+                    // must keep draining the pipe regardless (so the child
+                    // never blocks on a full pipe buffer), not stop here.
+                    let text = strip_trailing_newline(&buf);
+                    let _ =
+                        sender.send(LogLine::new(instance.clone(), stream, text, now_rfc3339()));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Wire the shared output-capture primitive into a freshly spawned process
+/// (story 4-2, Task 2/3): starts the ONE writer thread plus TWO reader
+/// threads (stdout, stderr — separately, so attribution can tell them apart;
+/// never a single interleaved reader), and returns the writer's `Sender` so
+/// the caller (a backend's `spawn()`) can store it on the process handle —
+/// the supervisor later clones it to send `Engine`-attributed lines through
+/// the SAME channel (Task 4).
+///
+/// Called identically from both backends (mirrors `write_stdin_bounded`'s
+/// "ONE shared implementation called identically from both `backends/unix`
+/// and `backends/windows`" precedent). An ADOPTED handle never calls this —
+/// there is no OS-portable way to recover a pipe fd from a bare PID, so it
+/// gets no capture threads at all (mirrors `stdin`'s `None`-on-adoption
+/// precedent); this is not a functional gap for reading/following (AC-H),
+/// since reading only ever needs the FILE these threads keep writing to,
+/// never a live handle.
+pub(crate) fn spawn_output_capture(
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+    legacy_log_path: PathBuf,
+    attributed_log_path: PathBuf,
+    instance: String,
+) -> mpsc::Sender<LogLine> {
+    let (tx, _writer_handle) = spawn_log_writer(attributed_log_path);
+    // The writer thread is intentionally never joined here: it runs for the
+    // process's whole supervised lifetime and exits naturally once every
+    // `Sender` clone (this one, plus the two reader threads' clones below,
+    // plus whatever the supervisor holds/clones — Task 3/4) is dropped.
+    spawn_reader_thread(
+        stdout,
+        LogStream::AgentOut,
+        legacy_log_path.clone(),
+        instance.clone(),
+        tx.clone(),
+    );
+    spawn_reader_thread(
+        stderr,
+        LogStream::AgentErr,
+        legacy_log_path,
+        instance,
+        tx.clone(),
+    );
+    tx
 }
 
 /// The process-control port (spine AD-1 side port; AD-4 per-OS).
@@ -537,6 +816,18 @@ pub trait ProcessBackend {
     /// [`ProcessBackend::stop`]'s graceful-window wait already blocks its
     /// caller for a bounded duration.
     fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError>;
+
+    /// A clone of this handle's output-capture writer-thread `Sender`, if it
+    /// has one (story 4-2, AD-12) — `Some` for a FRESHLY SPAWNED handle
+    /// (capture is unconditional and capability-independent, AC-E: every
+    /// spawn calls [`spawn_output_capture`] whenever it has somewhere to
+    /// write, independent of any declared `Capability`); `None` for an
+    /// ADOPTED handle (no capture threads were ever started for it — see
+    /// [`ProcessBackend::adopt`]'s docs). A cheap accessor (an `mpsc::Sender`
+    /// clone is a refcount bump, no I/O) mirroring [`ProcessBackend::has_stdin`]'s
+    /// style; used by the supervisor to send `Engine`-attributed lines
+    /// (Task 4) through the SAME channel the reader threads feed.
+    fn log_sender(&self, handle: &Self::Handle) -> Option<mpsc::Sender<LogLine>>;
 }
 
 #[cfg(test)]
@@ -600,6 +891,8 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: PathBuf::from("/home"),
             log_file: None,
+            attributed_log_path: None,
+            instance_name: "x".to_string(),
             pipe_stdin: true,
         };
         let b = a.clone();
@@ -650,5 +943,185 @@ mod tests {
             matches!(state, StdinState::TimedOut),
             "an already-TimedOut state must stay TimedOut, not be reinterpreted"
         );
+    }
+
+    // ---- Story 4-2: rotation-decision logic + the reader/writer threads ----
+
+    #[test]
+    fn should_rotate_at_the_exact_boundary() {
+        // The >= convention this codebase uses everywhere else (BudgetEvaluator).
+        assert!(
+            !should_rotate(LOG_ROTATE_MAX_BYTES - 1),
+            "one under: no rotate"
+        );
+        assert!(should_rotate(LOG_ROTATE_MAX_BYTES), "exactly at: rotate");
+        assert!(should_rotate(LOG_ROTATE_MAX_BYTES + 1), "one over: rotate");
+    }
+
+    #[test]
+    fn strip_trailing_newline_handles_lf_crlf_and_no_newline() {
+        assert_eq!(strip_trailing_newline(b"hello\n"), "hello");
+        assert_eq!(strip_trailing_newline(b"hello\r\n"), "hello");
+        assert_eq!(strip_trailing_newline(b"hello"), "hello");
+        assert_eq!(strip_trailing_newline(b""), "");
+        // Lossy on non-UTF8 — never a panic.
+        assert_eq!(strip_trailing_newline(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+    }
+
+    #[test]
+    fn generation_path_appends_the_generation_suffix() {
+        let base = PathBuf::from("/tmp/agents/svc/logs/output.log");
+        assert_eq!(
+            generation_path(&base, 1),
+            PathBuf::from("/tmp/agents/svc/logs/output.log.1")
+        );
+        assert_eq!(
+            generation_path(&base, 2),
+            PathBuf::from("/tmp/agents/svc/logs/output.log.2")
+        );
+    }
+
+    fn line(text: &str) -> LogLine {
+        LogLine::new("svc", LogStream::AgentOut, text, now_rfc3339())
+    }
+
+    #[test]
+    fn append_attributed_line_rotates_at_the_byte_bound_keeping_exactly_3_generations() {
+        // Task 2: a LogLine sequence through the writer-thread primitive
+        // rotates at the REAL LOG_ROTATE_MAX_BYTES bound and produces exactly
+        // 3 generations with the oldest discarded — driven directly (no real
+        // process, no wall-clock dependency), per the Testing Notes'
+        // guidance. should_rotate is checked on size BEFORE each append, so
+        // writing three ~4MB lines crosses the 10MB bound on the THIRD
+        // append's pre-check (~8MB < 10MB, so it lands, leaving the
+        // generation ~12MB) — the FOURTH append then rotates. Six lines total
+        // exercises exactly one rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        let big_text = "x".repeat(4 * 1024 * 1024); // 4MB text per line
+        for i in 0..6 {
+            append_attributed_line(&base, &line(&format!("{big_text}-{i}")));
+        }
+        assert!(base.exists(), "current generation must exist");
+        assert!(
+            generation_path(&base, 1).exists(),
+            "at least one rotation must have produced a .1 generation"
+        );
+        // Never more than LOG_ROTATE_GENERATIONS - 1 rotated predecessors.
+        assert!(
+            !generation_path(&base, LOG_ROTATE_GENERATIONS).exists(),
+            "no generation beyond LOG_ROTATE_GENERATIONS - 1 may survive"
+        );
+    }
+
+    #[test]
+    fn rotate_generations_discards_the_oldest_and_shifts_the_rest() {
+        // A focused, deterministic proof of the rotation SEQUENCE itself
+        // (independent of should_rotate's byte-bound timing): current -> .1,
+        // .1 -> .2, prior .2 discarded.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        std::fs::write(&base, "current").unwrap();
+        std::fs::write(generation_path(&base, 1), "gen1").unwrap();
+        std::fs::write(generation_path(&base, 2), "gen2-oldest").unwrap();
+
+        rotate_generations(&base, LOG_ROTATE_GENERATIONS);
+
+        assert!(!base.exists(), "current was renamed away");
+        assert_eq!(
+            std::fs::read_to_string(generation_path(&base, 1)).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(generation_path(&base, 2)).unwrap(),
+            "gen1"
+        );
+        // The prior .2 ("gen2-oldest") is gone — discarded, not shifted to a
+        // nonexistent .3.
+        assert!(!generation_path(&base, 3).exists());
+    }
+
+    #[test]
+    fn rotate_generations_on_missing_predecessors_is_a_harmless_no_op() {
+        // The FIRST-ever rotation: no `.1`/`.2` exist yet. Must not error or
+        // panic on the missing rename/remove sources.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        std::fs::write(&base, "current").unwrap();
+        rotate_generations(&base, LOG_ROTATE_GENERATIONS);
+        assert!(!base.exists());
+        assert_eq!(
+            std::fs::read_to_string(generation_path(&base, 1)).unwrap(),
+            "current"
+        );
+    }
+
+    #[test]
+    fn rotate_generations_with_a_degenerate_generation_count_just_drops_current() {
+        // Defensive-only in production (LOG_ROTATE_GENERATIONS is a fixed 3),
+        // but `rotate_generations` is a plain, directly-callable pure-ish
+        // function, so its `generations <= 1` branch is exercised directly
+        // here rather than left as dead code.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        std::fs::write(&base, "current").unwrap();
+        rotate_generations(&base, 1);
+        assert!(!base.exists(), "the only generation is simply dropped");
+        assert!(!generation_path(&base, 1).exists());
+
+        let base2 = dir.path().join("output2.log");
+        std::fs::write(&base2, "current2").unwrap();
+        rotate_generations(&base2, 0);
+        assert!(!base2.exists());
+    }
+
+    #[test]
+    fn writer_thread_preserves_send_order_for_a_burst_of_same_second_lines() {
+        // AC-G: multiple lines sent within one wall-clock second (the SAME
+        // `at` value, since now_rfc3339 has whole-second resolution) must
+        // land on disk in SEND order — never re-sorted. Deterministic: no
+        // wall-clock dependency, driven entirely through the channel, then
+        // synchronized via `join` (not a sleep-poll).
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        let (tx, handle) = spawn_log_writer(base.clone());
+        let same_at = "2026-07-15T00:00:00Z";
+        for i in 0..20 {
+            tx.send(LogLine::new(
+                "svc",
+                LogStream::AgentOut,
+                format!("line-{i}"),
+                same_at,
+            ))
+            .unwrap();
+        }
+        drop(tx); // close the channel so the writer thread's recv() loop ends
+        handle.join().expect("writer thread must not panic");
+
+        let contents = std::fs::read_to_string(&base).unwrap();
+        let texts: Vec<String> = contents
+            .lines()
+            .map(|l| {
+                let parsed: LogLine = serde_json::from_str(l).unwrap();
+                assert_eq!(parsed.at, same_at, "every line shares the same second");
+                parsed.text
+            })
+            .collect();
+        let want: Vec<String> = (0..20).map(|i| format!("line-{i}")).collect();
+        assert_eq!(texts, want, "append order must equal send order");
+    }
+
+    #[test]
+    fn spawn_log_writer_exits_naturally_once_every_sender_clone_is_dropped() {
+        // No explicit shutdown signal is needed: the writer thread's recv()
+        // loop ends (and the thread returns) once the channel closes.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        let (tx, handle) = spawn_log_writer(base);
+        let tx2 = tx.clone();
+        drop(tx);
+        drop(tx2);
+        // The thread must terminate promptly; join() blocks until it does.
+        handle.join().expect("writer thread must not panic");
     }
 }

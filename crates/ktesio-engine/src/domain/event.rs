@@ -327,6 +327,104 @@ impl TransitionCause {
     }
 }
 
+/// The schema version stamped on every emitted [`LogLine`] (story 4-2, spine
+/// AD-12/AD-14).
+///
+/// AD-14's "one event schema, two consumers" rule extends to the unified
+/// attributed-output stream: [`LogLine`] joins [`TransitionEvent`] /
+/// [`BudgetBreachEvent`] as a versioned serde struct so `kt agent logs` and
+/// any future 7-2 Host stream negotiate on the SAME shape. Starts at 1,
+/// aligned with its siblings. Bumped only on an INCOMPATIBLE change; adding a
+/// field is backward-additive and does NOT bump it.
+pub const LOG_SCHEMA_VERSION: u32 = 1;
+
+/// Which captured stream produced a [`LogLine`] (story 4-2, AD-12) — the
+/// per-line attribution AC-A requires.
+///
+/// A small closed vocabulary, mirroring [`SupportLevel`](ktesio_adapter_api::SupportLevel)'s
+/// seed-enum pattern exactly: kebab-case on the wire, `as_str()`/`Display`
+/// pair. The wire tokens (`agent-out` / `agent-err` / `engine`) are AD-12's
+/// own literal attribution labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogStream {
+    /// The spawned agent process's stdout.
+    AgentOut,
+    /// The spawned agent process's stderr.
+    AgentErr,
+    /// A best-effort, human-readable projection of an engine
+    /// [`TransitionEvent`] into the unified stream (story 4-2, Task 4) — NOT
+    /// a replacement for `instance.log`, which remains the machine-
+    /// authoritative record.
+    Engine,
+}
+
+impl LogStream {
+    /// The stable kebab-case wire/label form, matching the serde form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogStream::AgentOut => "agent-out",
+            LogStream::AgentErr => "agent-err",
+            LogStream::Engine => "engine",
+        }
+    }
+}
+
+impl std::fmt::Display for LogStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One captured, attributed, timestamped line of unified output (story 4-2,
+/// spine AD-12/AD-14) — the record `kt agent logs` reads and the writer
+/// thread (`ports::process_backend`) appends, JSON-Lines, to the rotated
+/// attributed capture (`logs/output.log[.N]`). Distinct from `agent.log`
+/// (CRITICAL SCOPING #3): that legacy file stays raw and unattributed,
+/// byte-identical to before this story, for Epic 3's `drain_usage_for`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// The schema version ([`LOG_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The Agent Instance this line was captured from.
+    pub instance: String,
+    /// Which stream produced it (AC-A's attribution label).
+    pub stream: LogStream,
+    /// RFC 3339 UTC timestamp the engine stamped when it observed the line.
+    /// Whole-second resolution ([`crate::time::now_rfc3339`]) — same-second
+    /// lines are common and must never be re-sorted (AC-G); on-disk append
+    /// order is the sole ordering authority everywhere this is read.
+    pub at: String,
+    /// The line's text, with any trailing `\n`/`\r\n` stripped (the raw,
+    /// UNSTRIPPED bytes are what `agent.log` keeps, separately and
+    /// unmodified — this field is the attributed VIEW, not the legacy
+    /// capture).
+    pub text: String,
+}
+
+impl LogLine {
+    /// Build a log line, stamping the current schema version.
+    ///
+    /// `at` is an RFC 3339 UTC timestamp (the caller passes
+    /// [`crate::time::now_rfc3339`] — kept a parameter so the struct stays
+    /// pure and unit-testable with a fixed clock, exactly like
+    /// [`TransitionEvent::new`]).
+    pub fn new(
+        instance: impl Into<String>,
+        stream: LogStream,
+        text: impl Into<String>,
+        at: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: LOG_SCHEMA_VERSION,
+            instance: instance.into(),
+            stream,
+            at: at.into(),
+            text: text.into(),
+        }
+    }
+}
+
 /// A recorded lifecycle state transition (spine AD-14 seed).
 ///
 /// Emitted on every transition the supervisor applies, carrying everything AC1
@@ -820,5 +918,44 @@ mod tests {
             }
             other => panic!("expected StopForced, got {other:?}"),
         }
+    }
+
+    // ---- Story 4-2: LogStream / LogLine (AD-12 attribution seed) ----
+
+    #[test]
+    fn log_stream_as_str_and_display_agree_with_the_kebab_wire_form() {
+        // Mirrors interaction_channel_kind_as_str_and_display_agree (4.1): the
+        // closed AD-12 attribution vocabulary uses stable kebab-case tags.
+        for (variant, wire) in [
+            (LogStream::AgentOut, "agent-out"),
+            (LogStream::AgentErr, "agent-err"),
+            (LogStream::Engine, "engine"),
+        ] {
+            assert_eq!(variant.as_str(), wire);
+            assert_eq!(variant.to_string(), wire);
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{wire}\"")
+            );
+            let back: LogStream = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn log_line_carries_schema_version_and_all_fields_and_round_trips() {
+        let line = LogLine::new("demo", LogStream::AgentOut, "hello", "2026-07-15T00:00:00Z");
+        assert_eq!(line.schema_version, LOG_SCHEMA_VERSION);
+        assert_eq!(line.instance, "demo");
+        assert_eq!(line.stream, LogStream::AgentOut);
+        assert_eq!(line.text, "hello");
+        assert_eq!(line.at, "2026-07-15T00:00:00Z");
+
+        let json = serde_json::to_string(&line).unwrap();
+        let back: LogLine = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, line);
+        // The wire attribution token is the literal AD-12 label, not a
+        // Rust-derived variant name.
+        assert!(json.contains("\"stream\":\"agent-out\""), "{json}");
     }
 }
