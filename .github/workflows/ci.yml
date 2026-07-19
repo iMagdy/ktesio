@@ -563,8 +563,12 @@ jobs:
           # one needing a real child-process round trip, never one on a
           # fast-fail path with no I/O; a local repro under the identical
           # tarpaulin/instrumentation config passed instantly. That signature
-          # is runner contention, not a product bug. Retrying the WHOLE
-          # attempt once (never a PER-TEST retry, e.g. nextest's `retries`,
+          # is runner contention, not a product bug. 3 TOTAL ATTEMPTS (2
+          # retries), bumped from an initial 2 after that first retry still
+          # failed once in practice (a DIFFERENT real-IO test than attempt 1,
+          # not a new bug — the same signature, just unlucky twice on the
+          # SAME runner instance, which a same-job retry does not refresh).
+          # Retrying the WHOLE attempt (never a PER-TEST retry, e.g. nextest's `retries`,
           # which this repo has already seen silently absorb a real,
           # reproducible data-loss race — see the 4-2 H1 fix) keeps the gate
           # meaningful: a genuine coverage regression or a genuine test bug
@@ -629,7 +633,16 @@ jobs:
             fi
           )
 
-          if ! run_coverage_attempt; then
-            echo "::warning::coverage attempt 1/2 failed — retrying the whole job once (see the comment above this step's script: PR #117 found this job's real-time child-process waits can transiently stall on this runner; a genuine failure reproduces on the retry too)."
-            run_coverage_attempt
-          fi
+          max_attempts=3
+          attempt=1
+          while true; do
+            if run_coverage_attempt; then
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::coverage failed on all $max_attempts attempts — see the comment above this step's script; a genuine coverage regression or test bug reproduces every time, unlike runner contention."
+              exit 1
+            fi
+            echo "::warning::coverage attempt $attempt/$max_attempts failed — retrying (see the comment above this step's script: PR #117 found this job's real-time child-process waits can transiently stall on this runner; a genuine failure reproduces on every attempt)."
+            attempt=$((attempt + 1))
+          done
