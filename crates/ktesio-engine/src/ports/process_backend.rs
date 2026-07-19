@@ -262,6 +262,23 @@ pub enum BackendError {
         /// The bound (seconds) that elapsed before the write was abandoned.
         timeout_secs: u64,
     },
+
+    /// A [`ProcessBackend::stop`] call sent SIGKILL (or the platform
+    /// equivalent — `TerminateJobObject`/`TerminateProcess` on Windows) but
+    /// could not CONFIRM the process's death within [`KILL_CONFIRM_TIMEOUT`]
+    /// (fix pass, review of #80 follow-up — the CRITICAL finding: see
+    /// `KILL_CONFIRM_TIMEOUT`'s docs for the full mechanism). The process is
+    /// NOT necessarily gone — it may still be alive, stuck in an OS-level
+    /// uninterruptible I/O wait that no signal can interrupt — so the caller
+    /// must NOT treat this as a successful stop.
+    #[error(
+        "SIGKILL was sent but the process has not been confirmed dead within {timeout_secs}s \
+         (it may be stuck in an OS-level I/O wait, e.g. disk pressure)"
+    )]
+    StopUnconfirmed {
+        /// The bound (seconds) that elapsed before confirmation was abandoned.
+        timeout_secs: u64,
+    },
 }
 
 /// How long a [`ProcessBackend::write_stdin`] call may block before the
@@ -287,6 +304,57 @@ pub enum BackendError {
 /// (30s) scaled down for a much smaller, interactive-sized payload rather
 /// than a whole graceful-shutdown grace period.
 pub const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`ProcessBackend::stop`] may block CONFIRMING a process's death
+/// after SIGKILL (or the platform equivalent) has already been sent, before
+/// giving up and reporting [`BackendError::StopUnconfirmed`] instead of
+/// continuing to wait (fix pass, review of #80 follow-up — the CRITICAL
+/// finding).
+///
+/// **The mechanism this bounds:** the EARLIER fix pass (review of #80) closed
+/// a crash-safety bug by moving agent stdout/stderr from `Stdio::piped()`
+/// (read by an engine-owned reader thread) to a DIRECT `Stdio::from(file)`
+/// redirect — the right fix for that problem (a pipe's read end vanishing
+/// when the engine crashes must never be able to kill, or blind capture for,
+/// the supervised agent). But a pipe's finite kernel buffer was ALSO
+/// providing INCIDENTAL backpressure: a slow (or, after that fix, entirely
+/// absent) reader naturally throttled a fast writer. A direct file has no
+/// such throttle — a child can write at raw disk I/O speed (empirically
+/// ~1.1-2 GB/s), so a sufficiently fast/unbounded writer can exhaust
+/// available disk space. Once that happens, the writing process can enter an
+/// OS-level UNINTERRUPTIBLE I/O wait (Linux `D` state; macOS `U`/`Us` per
+/// `ps aux`) — a state that does not respond to ANY signal, including
+/// SIGKILL, until the underlying I/O operation resolves at the
+/// kernel/storage layer. Before this bound, [`ProcessBackend::stop`] waited
+/// for confirmed death with NO deadline at all in this phase (a bare,
+/// unbounded `Child::wait()` on Unix/Windows) — and `stop` runs while the
+/// caller holds the engine-wide `EngineInner::supervisor` lock (`engine.rs`),
+/// so a single unconfirmable process could freeze EVERY other instance's
+/// `start`/`stop`/`pause`/`resume`/`send` and the crash-detection reaper, for
+/// an OS-determined, UNBOUNDED duration — worse than
+/// [`STDIN_WRITE_TIMEOUT`]'s already-bounded residual, because this one had
+/// no upper bound at all.
+///
+/// 5 seconds mirrors [`STDIN_WRITE_TIMEOUT`]'s existing precedent (story 4.1
+/// fix pass) and the informal 5-second bound this codebase already used for
+/// an ADOPTED handle's post-kill confirmation poll (which this fix pass also
+/// makes honest — see the backends' `stop()` docs): a NORMAL process (i.e.
+/// NOT stuck in an uninterruptible wait) is reaped within low-single-digit
+/// MILLISECONDS of a SIGKILL/`TerminateJobObject`/`TerminateProcess`, so 5
+/// seconds leaves generous headroom for scheduler jitter while still keeping
+/// a genuinely stuck process from wedging the engine for anything beyond a
+/// human-noticeable pause. Deliberately non-configurable — an internal
+/// resilience bound, not a user-facing setting, mirroring
+/// [`STDIN_WRITE_TIMEOUT`]'s own precedent.
+///
+/// This does NOT (and cannot) make an uninterruptible-wait process killable —
+/// that is an OS-level limitation outside the engine's control. It bounds
+/// only the ENGINE's own waiting/blocking behavior: see
+/// [`crate::domain::Supervisor::stop`]'s docs for how the domain layer
+/// reconciles the instance's state once this bound is hit (an honest
+/// [`crate::domain::EngineError::StopUnconfirmed`], never a false `stopped`)
+/// and how it avoids compounding the wait on an immediate retry.
+pub const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The per-generation byte cap for the attributed output capture (story 4-2,
 /// AD-12, epics.md's literal "10MB × 3"). A FIXED, non-configurable engine
@@ -1009,6 +1077,20 @@ pub trait ProcessBackend {
     /// exited within `graceful_window`, escalate to a forced kill of the whole
     /// group/job. Reaps the process so no zombie remains. Returns a
     /// [`StopOutcome`] recording whether escalation happened (AC3).
+    ///
+    /// **Bounded death confirmation (fix pass, review of #80 follow-up — the
+    /// CRITICAL finding):** after escalating, this CONFIRMS the process is
+    /// actually gone, bounded to [`KILL_CONFIRM_TIMEOUT`] — see its docs for
+    /// the full mechanism (a fast writer can exhaust disk and enter an
+    /// OS-level uninterruptible I/O wait immune to SIGKILL). If death is not
+    /// confirmed within that bound, this returns
+    /// [`BackendError::StopUnconfirmed`] rather than continuing to block —
+    /// `stop` runs while the caller holds the engine-wide supervisor lock, so
+    /// an unbounded wait here would freeze every other instance's
+    /// `start`/`stop`/`pause`/`resume`/`send` and the crash-detection reaper.
+    /// This does NOT (and cannot) make the process killable sooner — that is
+    /// an OS-level limitation outside the engine's control; it only bounds
+    /// the ENGINE's own waiting.
     fn stop(
         &self,
         handle: &mut Self::Handle,
@@ -1233,6 +1315,30 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains('5'), "{msg}");
         assert!(msg.contains("draining"), "{msg}");
+    }
+
+    #[test]
+    fn stop_unconfirmed_error_message_names_the_bound_and_the_likely_cause() {
+        // Fix pass (review of #80 follow-up): the honest diagnostic must name
+        // the bound and hint at the likely cause (an OS-level I/O wait), never
+        // implying the process is simply gone.
+        let e = BackendError::StopUnconfirmed { timeout_secs: 5 };
+        let msg = e.to_string();
+        assert!(msg.contains('5'), "{msg}");
+        assert!(msg.contains("SIGKILL"), "{msg}");
+        assert!(
+            msg.contains("I/O wait"),
+            "must hint at the likely cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn kill_confirm_timeout_mirrors_the_stdin_write_timeout_precedent() {
+        // Both are deliberately non-configurable 5s resilience bounds
+        // (STDIN_WRITE_TIMEOUT is 4.1's precedent; KILL_CONFIRM_TIMEOUT is
+        // this fix pass's own, applied to a different phase of stop()).
+        assert_eq!(KILL_CONFIRM_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT);
     }
 
     #[test]

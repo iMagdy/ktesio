@@ -24,7 +24,7 @@ pub(crate) use process_backend::{
 };
 pub use process_backend::{
     BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StdinState,
-    StopOutcome, STDIN_WRITE_TIMEOUT,
+    StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,

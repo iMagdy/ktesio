@@ -386,6 +386,41 @@ pub enum EngineError {
         timeout_secs: u64,
     },
 
+    /// A [`Supervisor::stop`](super::supervisor::Supervisor::stop) call sent
+    /// SIGKILL (or the platform equivalent) but could not CONFIRM the
+    /// process's death within the bounded window (fix pass, review of #80
+    /// follow-up — the CRITICAL finding: see
+    /// [`crate::ports::KILL_CONFIRM_TIMEOUT`]'s docs for the full mechanism —
+    /// removing the pipe from agent output capture, review of #80's earlier
+    /// crash-safety fix, also removed the incidental backpressure it
+    /// provided, so a fast writer can exhaust disk and enter an OS-level
+    /// uninterruptible I/O wait immune to every signal, including SIGKILL).
+    ///
+    /// The instance remains [`LifecycleState::Stopping`](super::lifecycle::LifecycleState::Stopping)
+    /// — NOT `Stopped` (that would be a lie we cannot back up) and NOT a
+    /// fabricated new terminal state — until a LATER reconciliation confirms
+    /// the process has actually exited: either a RETRY `stop()` call (which
+    /// performs a cheap, non-blocking liveness check rather than re-running
+    /// the whole SIGTERM/SIGKILL/confirm sequence — see
+    /// [`Supervisor::stop`](super::supervisor::Supervisor::stop)'s docs) or
+    /// the crash-detection reaper's own next poll, whichever observes the
+    /// exit first. Mirrors [`EngineError::InteractionTimedOut`]'s shape
+    /// (story 4.1 fix pass) for an analogous "we hit a bounded resilience
+    /// wait and gave up honestly" case, applied to `stop` instead of `send`.
+    /// Names the instance + the bound that elapsed.
+    #[error(
+        "Agent Instance '{name}' was sent SIGKILL but has not been confirmed dead within \
+         {timeout_secs}s (it may be stuck in an OS-level I/O wait, e.g. disk pressure); it \
+         remains 'stopping' — a later `stop` retry will check again without re-blocking if it \
+         is still stuck, and will succeed once the process actually exits"
+    )]
+    StopUnconfirmed {
+        /// The instance `stop` targeted.
+        name: String,
+        /// The bound (seconds) that elapsed before confirmation was abandoned.
+        timeout_secs: u64,
+    },
+
     /// A [`StateStore`](crate::ports::StateStore) operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

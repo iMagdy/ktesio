@@ -32,8 +32,13 @@
 //! implements the graceful step as "give the process the window to exit on its
 //! own, then terminate the job": it waits up to `graceful_window` for the
 //! process to exit, and if it has not, escalates to `TerminateJobObject`
-//! (`forced == true`). If the process exits within the window, the stop is
-//! graceful (`forced == false`). Richer graceful mechanisms (a
+//! (`forced == true`), then CONFIRMS death bounded to
+//! [`crate::ports::KILL_CONFIRM_TIMEOUT`] (fix pass, review of #80 follow-up
+//! — the CRITICAL finding: a thread stuck in kernel-mode I/O is not
+//! terminated until it returns to user mode, so termination can be sent
+//! successfully yet the process still not actually exit for a while — see
+//! that constant's docs). If the process exits within the graceful window,
+//! the stop is graceful (`forced == false`). Richer graceful mechanisms (a
 //! `CTRL_BREAK_EVENT` to the process group, or an adapter-specific shutdown
 //! request) are a later refinement; the no-survivor guarantee is unchanged.
 //!
@@ -87,7 +92,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::ports::{
     spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
     ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
-    STDIN_WRITE_TIMEOUT,
+    KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 
 /// `STILL_ACTIVE` (259): the exit code a process reports while still running.
@@ -404,9 +409,9 @@ impl ProcessBackend for WindowsBackend {
             sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
 
-        // Escalate. Spawned: terminate the whole job (kills parent + descendants)
-        // and reap the child. Adopted (no job, no child): terminate the opened
-        // process HANDLE with TerminateProcess.
+        // Escalate. Spawned: terminate the whole job (kills parent + descendants).
+        // Adopted (no job, no child): terminate the opened process HANDLE with
+        // TerminateProcess.
         if !handle.job.is_null() {
             let ok = unsafe { TerminateJobObject(handle.job, 1) };
             if ok == 0 {
@@ -423,14 +428,21 @@ impl ProcessBackend for WindowsBackend {
                     detail: format!("TerminateProcess failed (os error {})", last_error()),
                 });
             }
-            // Wait briefly for the adopted process to actually exit.
-            let h = handle.adopted;
-            let _ = unsafe { WaitForSingleObject(h, 5000) };
         }
-        // Reap the direct child if it is ours (adopted: OS handles it).
-        if let Some(child) = handle.child.as_mut() {
-            let _ = child.wait();
-        }
+        // CONFIRM death — bounded to KILL_CONFIRM_TIMEOUT (fix pass, review
+        // of #80 follow-up — the CRITICAL finding; see that constant's docs
+        // for the full mechanism, which applies identically on Windows: a
+        // thread stuck in kernel-mode I/O is not terminated until it returns
+        // to user mode, so `TerminateJobObject`/`TerminateProcess` can be
+        // sent successfully yet the process still does not actually exit
+        // for a while). A single unified polling loop via `reap_if_exited`
+        // (NON-BLOCKING on both the spawned — `try_wait` +
+        // `WaitForSingleObject(_, 0)` — and adopted branches) replaces the
+        // OLD unbounded `child.wait()` (spawned) / a fire-and-forget
+        // `WaitForSingleObject(_, 5000)` whose result was discarded (adopted
+        // — it silently returned `Ok` even if the process was still alive
+        // after its own 5s wait).
+        confirm_death(handle, KILL_CONFIRM_TIMEOUT)?;
         Ok(StopOutcome { forced: true })
     }
 
@@ -670,6 +682,39 @@ impl Drop for JobGuard {
 fn last_error() -> u32 {
     // SAFETY: GetLastError is always safe to call and has no preconditions.
     unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+/// Poll `handle` (via the NON-BLOCKING [`WindowsProcess::reap_if_exited`])
+/// until it reports exited, or `timeout` elapses — the bounded
+/// death-confirmation primitive [`WindowsBackend::stop`]'s escalation phase
+/// uses (fix pass, review of #80 follow-up — the CRITICAL finding). Mirrors
+/// the Unix backend's identical `confirm_death` helper.
+///
+/// `timeout` is a PARAMETER (never hardcoded in this function) so it stays
+/// directly unit-testable with a SHORT duration for fast, deterministic
+/// coverage of the bound-enforcement logic itself — mirrors
+/// [`write_stdin_bounded`]'s existing "timeout as a parameter, tested
+/// directly with a short value" precedent (story 4.1 fix pass); production
+/// calls this with [`KILL_CONFIRM_TIMEOUT`]. Returns `Ok(())` once confirmed
+/// dead; [`BackendError::StopUnconfirmed`] if `timeout` elapses first
+/// (naming the ACTUAL `timeout` passed); any other [`BackendError`] from
+/// `reap_if_exited` propagates unchanged.
+fn confirm_death(handle: &mut WindowsProcess, timeout: Duration) -> Result<(), BackendError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.reap_if_exited()?.is_exited() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Release the caller (never keep blocking): the process is NOT
+            // confirmed dead — it may be alive, stuck. The caller
+            // (`Supervisor::stop_inner`) must not claim `stopped`.
+            return Err(BackendError::StopUnconfirmed {
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+        sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
 }
 
 /// Check the engine secrets file's permissions on Windows (story 2-4 AC6, spine

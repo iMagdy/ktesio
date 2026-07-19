@@ -5,7 +5,11 @@
 //! signals the WHOLE group with `killpg`, catching any child processes the agent
 //! itself spawned — the load-bearing mechanism behind AC3 "no process of the
 //! instance survives". Graceful stop is `SIGTERM` to the group; after the window
-//! elapses it escalates to `SIGKILL` to the group.
+//! elapses it escalates to `SIGKILL` to the group, then CONFIRMS death bounded
+//! to [`crate::ports::KILL_CONFIRM_TIMEOUT`] (fix pass, review of #80
+//! follow-up — the CRITICAL finding: see that constant's docs for why
+//! confirmation can no longer assume SIGKILL is always near-instant, and
+//! `ProcessBackend::stop`'s docs for the full mechanism).
 //!
 //! This module is the allowlisted home for OS-conditional code (it is
 //! `#[cfg(unix)]`-gated at its `mod` declaration in `backends/mod.rs`). It uses
@@ -40,7 +44,7 @@ use nix::unistd::{setsid, Pid};
 use crate::ports::{
     spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
     ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
-    STDIN_WRITE_TIMEOUT,
+    KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 
 /// How often the graceful-stop wait polls for the process to exit.
@@ -335,33 +339,27 @@ impl ProcessBackend for UnixBackend {
             sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
 
-        // (3) Escalate: SIGKILL to the whole group, then reap the child so no
-        // zombie remains. SIGKILL cannot be caught/ignored, so the group dies.
+        // (3) Escalate: SIGKILL to the whole group, then CONFIRM death —
+        // bounded to KILL_CONFIRM_TIMEOUT (fix pass, review of #80
+        // follow-up — the CRITICAL finding; see its docs for the full
+        // mechanism: removing the pipe also removed its incidental
+        // backpressure, so a fast writer can exhaust disk and enter an
+        // OS-level UNINTERRUPTIBLE I/O wait immune to every signal,
+        // including SIGKILL, until the underlying I/O resolves at the
+        // kernel/storage layer). SIGKILL cannot be caught/ignored by a
+        // NORMAL process, so the ONLY reason confirmation would take longer
+        // than a few milliseconds is exactly that stuck-I/O scenario.
+        //
+        // A single unified polling loop via `reap_if_exited` (NON-BLOCKING
+        // on both the spawned — `try_wait` — and adopted — `kill(pid, 0)` +
+        // fingerprint re-check — branches) replaces the OLD unbounded
+        // `child.wait()` (spawned) / already-informally-bounded-but-
+        // dishonest `while pid_is_alive` (adopted, which used to silently
+        // return `Ok` even when still alive after its own 5s poll). Group
+        // members are killed by the SIGKILL below and reaped by init (or,
+        // for a still-stuck leader, will be once the OS condition clears).
         signal_group(handle.pgid, Signal::SIGKILL)?;
-        match handle.child.as_mut() {
-            // Spawned: block until the direct child is reaped (it was just
-            // SIGKILLed, so this is bounded). Group members are killed by the
-            // SIGKILL above and reaped by init.
-            Some(child) => {
-                child.wait().map_err(|e| BackendError::Control {
-                    op: "wait",
-                    detail: e.to_string(),
-                })?;
-            }
-            // Adopted (not our child): we cannot `wait` it, but the SIGKILL to
-            // the group is delivered and its real parent / init reaps it. Poll
-            // liveness briefly so the desired end state ("no process survives")
-            // is confirmed before returning.
-            None => {
-                let kill_deadline = Instant::now() + Duration::from_secs(5);
-                while pid_is_alive(handle.pid) {
-                    if Instant::now() >= kill_deadline {
-                        break;
-                    }
-                    sleep(STOP_POLL_INTERVAL);
-                }
-            }
-        }
+        confirm_death(handle, KILL_CONFIRM_TIMEOUT)?;
         Ok(StopOutcome { forced: true })
     }
 
@@ -689,6 +687,40 @@ fn signal_group(pgid: Pid, signal: Signal) -> Result<(), BackendError> {
             op: "signal",
             detail: e.to_string(),
         }),
+    }
+}
+
+/// Poll `handle` (via the NON-BLOCKING [`UnixProcess::reap_if_exited`]) until
+/// it reports exited, or `timeout` elapses — the bounded death-confirmation
+/// primitive [`UnixBackend::stop`]'s escalation phase uses (fix pass, review
+/// of #80 follow-up — the CRITICAL finding).
+///
+/// `timeout` is a PARAMETER (never hardcoded in this function) so it stays
+/// directly unit-testable with a SHORT duration for fast, deterministic
+/// coverage of the bound-enforcement logic itself — mirrors
+/// [`write_stdin_bounded`]'s existing "timeout as a parameter, tested
+/// directly with a short value" precedent (story 4.1 fix pass); production
+/// calls this with [`KILL_CONFIRM_TIMEOUT`]. Returns `Ok(())` once confirmed
+/// dead; [`BackendError::StopUnconfirmed`] if `timeout` elapses first
+/// (naming the ACTUAL `timeout` passed, so a short test timeout reports
+/// itself honestly rather than always claiming the production bound); any
+/// other [`BackendError`] from `reap_if_exited` (e.g. an unexpected `wait`
+/// failure) propagates unchanged.
+fn confirm_death(handle: &mut UnixProcess, timeout: Duration) -> Result<(), BackendError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.reap_if_exited()?.is_exited() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Release the caller (never keep blocking): the process is NOT
+            // confirmed dead — it may be alive, stuck. The caller
+            // (`Supervisor::stop_inner`) must not claim `stopped`.
+            return Err(BackendError::StopUnconfirmed {
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+        sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -1252,6 +1284,75 @@ mod tests {
             "a SIGTERM-ignoring process must be force-killed (escalation)"
         );
         assert!(backend.poll(&mut proc).unwrap().is_exited());
+    }
+
+    #[test]
+    fn confirm_death_gives_up_honestly_within_the_bound_when_the_process_never_exits() {
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): a
+        // deterministic, FAST proof of the bound-enforcement logic itself —
+        // mirrors this codebase's EXISTING `write_stdin_bounded`-called-
+        // directly-with-a-short-timeout pattern (story 4.1 fix pass), rather
+        // than waiting out the real 5s `KILL_CONFIRM_TIMEOUT` production
+        // bound. No genuine OS-level "immune to SIGKILL" state (the
+        // uninterruptible-I/O-wait this fix pass targets, empirically
+        // confirmed via a dedicated ramdisk experiment — see the story file's
+        // Dev Agent Record) is needed to prove THIS property: `confirm_death`
+        // only calls `reap_if_exited` and does not know or care WHY it keeps
+        // reporting `Alive` — a process that is simply still ALIVE when a
+        // SHORT test timeout elapses exercises the identical code path.
+        // `confirm_death` is called DIRECTLY here (never sending SIGKILL) so
+        // this test proves the WAIT-BOUNDING logic in isolation; the
+        // escalation call site's actual SIGKILL + confirm_death sequencing
+        // is covered by `stop_escalates_to_forced_kill_when_graceful_window_elapses`
+        // above (a NORMAL process, confirmed quickly).
+        let backend = UnixBackend::new();
+        let mut proc = backend
+            .spawn(&spec("sleep", &["30"]))
+            .expect("spawn sleep 30");
+        let start = Instant::now();
+        let err = confirm_death(&mut proc, Duration::from_millis(150)).expect_err(
+            "a still-alive process must not be reported confirmed dead within a short bound",
+        );
+        let elapsed = start.elapsed();
+        match err {
+            BackendError::StopUnconfirmed { timeout_secs } => {
+                // 150ms rounds down to 0 whole seconds — proves the ACTUAL
+                // timeout passed is what gets reported, not a hardcoded 5.
+                assert_eq!(timeout_secs, 0, "reports the timeout actually passed");
+            }
+            other => panic!("expected StopUnconfirmed, got {other}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "must honor the full bound before giving up: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not overshoot substantially: {elapsed:?}"
+        );
+        // Clean up: confirm_death only POLLS, it never signals, so the
+        // process is still alive — actually stop it now.
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn confirm_death_returns_promptly_once_the_process_actually_exits() {
+        // The self-healing / no-compounding counterpart: once the process
+        // DOES exit (here, naturally and quickly via `true`), confirm_death
+        // must return Ok promptly rather than waiting out the full bound —
+        // this is what lets a RETRY `stop()` (Supervisor::stop_inner) or the
+        // crash reaper reconcile a previously-stuck instance quickly once
+        // the underlying condition clears, instead of always paying the
+        // full timeout.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        let start = Instant::now();
+        confirm_death(&mut proc, Duration::from_secs(5)).expect("must confirm death");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a quickly-exiting process must be confirmed well before the bound: {elapsed:?}"
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@ use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
     assemble_usage_event, BackendError, LogCapture, ObservedUsageSource, ParsedUsage,
     ProcessBackend, ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
-    LOG_ROTATE_GENERATIONS,
+    KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -282,6 +282,21 @@ struct Supervised {
     /// Present only for an `engine-observed` instance (a `self-reported` instance
     /// leaves it `None` and drives the log-tail `drain_usage_for` instead).
     observed_source: Option<ObservedUsageSource>,
+    /// Set when a PRIOR [`Supervisor::stop`] call on this handle's `stop_inner`
+    /// pass got [`BackendError::StopUnconfirmed`] back from the backend (fix
+    /// pass, review of #80 follow-up — the CRITICAL finding): SIGKILL was sent
+    /// but death could not be confirmed within [`KILL_CONFIRM_TIMEOUT`], most
+    /// likely because the process is stuck in an OS-level uninterruptible I/O
+    /// wait. Defaults `false` for a freshly started OR adopted instance (an
+    /// ordinary stop attempt never sets it). Lets BOTH a RETRY `stop()` call
+    /// (see `stop_inner`'s docs) and the crash reaper (`poll_once`) recognize
+    /// "this handle's death is pending reconciliation" — via a cheap,
+    /// NON-BLOCKING liveness poll, never a repeat of the whole bounded
+    /// SIGTERM/SIGKILL/confirm sequence — distinctly from an ORDINARY
+    /// in-flight stop or an externally-forced `stopping` row (neither of
+    /// which ever sets this flag), so this fix pass changes behavior ONLY
+    /// for the specific scenario it targets.
+    stop_unconfirmed: bool,
 }
 
 /// The lifecycle supervisor: owns running process handles + drives transitions.
@@ -683,6 +698,8 @@ impl Supervisor {
                 breached_scopes: std::collections::HashSet::new(),
                 observed_listener,
                 observed_source,
+                // A fresh start's stop attempt has not happened yet.
+                stop_unconfirmed: false,
             },
         );
 
@@ -723,7 +740,31 @@ impl Supervisor {
     /// backend and escalates to a forced kill after `window` (default
     /// [`DEFAULT_STOP_WINDOW`]) if needed, records the escalation in the instance
     /// log, then `stopping → stopped`. No process of the instance survives (the
-    /// backend kills the whole group/job).
+    /// backend kills the whole group/job) — in the NORMAL case.
+    ///
+    /// **Bounded death confirmation (fix pass, review of #80 follow-up — the
+    /// CRITICAL finding):** after escalating to a forced kill, the backend
+    /// CONFIRMS death bounded to [`crate::ports::KILL_CONFIRM_TIMEOUT`] (see
+    /// its docs for the mechanism: a fast writer can exhaust disk and enter
+    /// an OS-level uninterruptible I/O wait immune to every signal, including
+    /// the one just sent). If confirmation is not reached within that bound,
+    /// this returns [`EngineError::StopUnconfirmed`] instead of continuing to
+    /// block — the instance stays `stopping` (never a false `stopped`), and
+    /// the handle is RETAINED (not dropped) so the situation can be
+    /// reconciled later.
+    ///
+    /// **No compounding on retry:** a SUBSEQUENT `stop` call against an
+    /// instance still `stopping` with a retained (unconfirmed) handle does
+    /// NOT re-run the whole SIGTERM/graceful-window/SIGKILL/confirm sequence
+    /// — it performs a single cheap, NON-BLOCKING liveness poll instead
+    /// (`ProcessBackend::poll`, never `ProcessBackend::stop`). If the process
+    /// has since actually exited (the OS condition cleared), this
+    /// SELF-HEALS: it completes the stuck `stopping → stopped` transition
+    /// right here. If it is still alive, this fails fast with the SAME
+    /// honest [`EngineError::StopUnconfirmed`], with no new signal and no new
+    /// wait. (The crash-detection reaper's own poll, `poll_once`, performs
+    /// the identical reconciliation if it observes the exit first — whichever
+    /// happens first, the row does not stay permanently stuck.)
     pub fn stop(
         &mut self,
         registry: &Registry,
@@ -766,6 +807,75 @@ impl Supervisor {
             reason,
         })?;
         let instance = registry.lookup(&name).map_err(registry_to_engine)?;
+
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): a RETRY
+        // `stop` against an instance already `stopping` whose handle is
+        // marked `stop_unconfirmed` means a PRIOR pass through THIS function
+        // already sent SIGKILL but could not confirm death within
+        // KILL_CONFIRM_TIMEOUT (`EngineError::StopUnconfirmed`) — most likely
+        // because the process is stuck in an OS-level uninterruptible I/O
+        // wait. The transition gate below (`next_state`) has no
+        // `(Stopping, Stop)` row, so an unmodified retry would either reject
+        // with a generic, non-self-healing `InvalidTransition`, or (if that
+        // gate were bypassed) re-run the WHOLE SIGTERM/graceful-window/
+        // SIGKILL/confirm sequence for an outcome we can already suspect is
+        // unchanged — exactly the compounding wait this fix pass closes.
+        // Instead: a single cheap, NON-BLOCKING poll (`ProcessBackend::poll`,
+        // never `ProcessBackend::stop`) decides the outcome — self-heals if
+        // the process has since actually died (the OS condition cleared), or
+        // fails fast with the SAME honest error if it is still alive, with NO
+        // new signal and NO new wait. Gated specifically on `stop_unconfirmed`
+        // (not merely "state is `stopping`") so this new branch changes
+        // behavior ONLY for the scenario it targets — an externally-forced
+        // `stopping` row with no real stop attempt behind it (as
+        // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+        // exercises) takes the ORIGINAL, unchanged path below.
+        if instance.state == LifecycleState::Stopping {
+            let stuck = match self.running.get_mut(&name) {
+                Some(supervised) if supervised.stop_unconfirmed => {
+                    let status = self
+                        .backend
+                        .poll(&mut supervised.handle)
+                        .map_err(|source| EngineError::Backend {
+                            name: name.as_str().to_string(),
+                            source,
+                        })?;
+                    let log_capture = self.backend.log_capture(&supervised.handle);
+                    Some((status, log_capture))
+                }
+                _ => None,
+            };
+            if let Some((status, log_capture)) = stuck {
+                if !status.is_exited() {
+                    // Still stuck: fail fast, honestly, with no new blocking.
+                    return Err(EngineError::StopUnconfirmed {
+                        name: name.as_str().to_string(),
+                        timeout_secs: KILL_CONFIRM_TIMEOUT.as_secs(),
+                    });
+                }
+                // Self-healing: the process has now actually exited (the OS
+                // condition that made confirmation time out has cleared).
+                // Complete the stuck `stopping -> stopped` transition exactly
+                // as the ordinary path below would have on confirmed death.
+                self.running.remove(&name);
+                registry
+                    .clear_spawn_record(&name)
+                    .map_err(registry_to_engine)?;
+                self.transition_with_log_capture(
+                    registry,
+                    &name,
+                    LifecycleState::Stopping,
+                    LifecycleState::Stopped,
+                    TransitionCause::stop_forced(
+                        "SIGKILL was sent by an earlier stop attempt; the process's death was \
+                         confirmed on a later reconciliation (it may have been stuck in an \
+                         OS-level I/O wait that has since cleared)",
+                    ),
+                    log_capture,
+                )?;
+                return registry.lookup(&name).map_err(registry_to_engine);
+            }
+        }
 
         // Transition gate (AC4): stop on stopped / registered / … rejects here
         // with the uniform InvalidTransition, before touching any process.
@@ -818,13 +928,33 @@ impl Supervisor {
         let (outcome, log_capture) = match self.running.get_mut(&name) {
             Some(supervised) => {
                 let log_capture = self.backend.log_capture(&supervised.handle);
-                let outcome =
-                    self.backend
-                        .stop(&mut supervised.handle, window)
-                        .map_err(|source| EngineError::Backend {
+                let outcome = self.backend.stop(&mut supervised.handle, window).map_err(
+                    |source| match source {
+                        // Fix pass (review of #80 follow-up — the CRITICAL
+                        // finding): mark the handle so a RETRY `stop` (or the
+                        // crash reaper's own poll) recognizes this EXACT
+                        // scenario and reconciles it with a cheap,
+                        // non-blocking poll instead of re-running the whole
+                        // bounded SIGTERM/SIGKILL/confirm sequence (see
+                        // `stop_inner`'s retry-branch docs above and
+                        // `poll_once`'s docs). This `?` skips
+                        // `self.running.remove` below, so the handle is
+                        // RETAINED, never silently dropped — the instance
+                        // stays `stopping` (the terminal transition below is
+                        // never reached), an honest, non-terminal state.
+                        BackendError::StopUnconfirmed { timeout_secs } => {
+                            supervised.stop_unconfirmed = true;
+                            EngineError::StopUnconfirmed {
+                                name: name.as_str().to_string(),
+                                timeout_secs,
+                            }
+                        }
+                        other => EngineError::Backend {
                             name: name.as_str().to_string(),
-                            source,
-                        })?;
+                            source: other,
+                        },
+                    },
+                )?;
                 (outcome, log_capture)
             }
             None => (crate::ports::StopOutcome { forced: false }, None),
@@ -1445,6 +1575,51 @@ impl Supervisor {
             };
             if !matches!(state, LifecycleState::Running | LifecycleState::Paused) {
                 // Requested stop (or already-terminal) — not a crash.
+                //
+                // Fix pass (review of #80 follow-up — the CRITICAL finding,
+                // self-healing requirement): if this handle's PRIOR stop
+                // attempt sent SIGKILL but could not confirm death within
+                // KILL_CONFIRM_TIMEOUT (`stop_unconfirmed` — set ONLY by
+                // that specific path, see `stop_inner`'s docs) and the store
+                // still shows `stopping`, THIS poll's own observed `Exited`
+                // is the reconciliation event the stuck stop() call itself
+                // could not wait for: finalize `stopping -> stopped` here
+                // rather than silently dropping the handle, so the row does
+                // not stay permanently stuck even if no operator ever
+                // retries `stop` manually. This is DELIBERATELY narrower
+                // than "any exit while stopping" — an ordinary in-flight
+                // (non-stuck) stop() call ALWAYS finalizes this transition
+                // itself upon its own return, so only the
+                // stuck-then-abandoned case needs the reaper's help; every
+                // OTHER "not a crash" exit (mirrored by
+                // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`,
+                // which never sets `stop_unconfirmed`) keeps its EXISTING,
+                // unchanged silent-drop behavior.
+                let stuck_stopping = state == LifecycleState::Stopping
+                    && self.running.get(&name).is_some_and(|s| s.stop_unconfirmed);
+                if stuck_stopping {
+                    let log_capture = self
+                        .running
+                        .get(&name)
+                        .and_then(|s| self.backend.log_capture(&s.handle));
+                    self.running.remove(&name);
+                    if registry.clear_spawn_record(&name).is_ok() {
+                        let _ = self.transition_with_log_capture(
+                            registry,
+                            &name,
+                            LifecycleState::Stopping,
+                            LifecycleState::Stopped,
+                            TransitionCause::stop_forced(
+                                "SIGKILL was sent by an earlier stop attempt; the \
+                                 crash-detection reaper confirmed the process's death on a \
+                                 later poll (it may have been stuck in an OS-level I/O wait \
+                                 that has since cleared)",
+                            ),
+                            log_capture,
+                        );
+                    }
+                    continue;
+                }
                 self.running.remove(&name);
                 continue;
             }
@@ -1668,6 +1843,9 @@ impl Supervisor {
                             // log-tail drain is unaffected (it needs no listener).
                             observed_listener: None,
                             observed_source: None,
+                            // An adopted instance's stop attempt has not
+                            // happened yet in THIS engine session.
+                            stop_unconfirmed: false,
                         },
                     );
                     adopted += 1;
@@ -3661,6 +3839,201 @@ mod tests {
         // The state is NOT `failed` (no crash transition was applied); it stays
         // `stopping` (the requested end state the operator stop will finalize).
         assert_eq!(state_of(&registry, "stopping"), LifecycleState::Stopping);
+    }
+
+    // ---- Fix pass (review of #80 follow-up — the CRITICAL finding): the
+    // bound-post-SIGKILL-wait fix's retry/no-compounding/self-healing logic.
+    //
+    // These are WHITE-BOX tests: rather than needing a genuinely OS-unkillable
+    // process (which requires disk-exhaustion-induced uninterruptible I/O
+    // wait — reproduced separately via a dedicated, SAFE ramdisk experiment;
+    // see the story file's Dev Agent Record for the full empirical proof),
+    // they directly construct the EXACT bookkeeping state a real
+    // `BackendError::StopUnconfirmed` would have left behind
+    // (`Supervised::stop_unconfirmed = true`, store state `stopping`, handle
+    // retained) and prove `stop_inner`'s/`poll_once`'s reconciliation logic
+    // against it. This is deterministic and fast (no real 5s wait), mirroring
+    // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+    // immediately above's own technique of forcing `stopping` via
+    // `registry.set_state` directly.
+
+    #[test]
+    fn stop_on_a_stopping_instance_without_the_unconfirmed_flag_takes_the_ordinary_path() {
+        // The negative-space complement of the retry tests below: an
+        // instance that is `stopping` with a held handle but is NOT marked
+        // `stop_unconfirmed` (the flag ONLY a real `BackendError::
+        // StopUnconfirmed` sets) must NOT take the new cheap-poll retry
+        // branch — it falls through to the ORIGINAL, unchanged
+        // `next_state` gate, which rejects with the uniform
+        // `InvalidTransition` exactly as it did before this fix pass. This
+        // proves the new branch is gated precisely on `stop_unconfirmed`,
+        // not merely "state is stopping" (which
+        // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+        // above ALSO forces, for a different, pre-existing reason).
+        let (_state, _manifest, registry) = setup_fake("notflagged", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "notflagged").unwrap();
+        let name = InstanceName::new("notflagged").unwrap();
+
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        assert!(
+            !sup.running.get(&name).unwrap().stop_unconfirmed,
+            "a freshly-started handle must default to NOT stop_unconfirmed"
+        );
+
+        let err = sup.stop(&registry, "notflagged", None).unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidTransition(_)),
+            "without the flag, this must be the ORIGINAL uniform InvalidTransition, not the new \
+             StopUnconfirmed retry path: {err:?}"
+        );
+
+        // Teardown.
+        let supervised = sup.running.get_mut(&name).unwrap();
+        let _ = sup
+            .backend
+            .stop(&mut supervised.handle, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_retry_on_a_stuck_unconfirmed_instance_polls_cheaply_no_compounding() {
+        // A retry `stop()` against an instance whose handle is marked
+        // `stop_unconfirmed` (a prior real stop attempt hit
+        // KILL_CONFIRM_TIMEOUT) must NOT re-run the whole
+        // SIGTERM/graceful-window/SIGKILL/confirm sequence — it polls ONCE,
+        // cheaply, and fails fast with the SAME honest error while the
+        // process is still genuinely alive (no new signal, no new wait).
+        let (_state, _manifest, registry) = setup_fake("stuck", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "stuck").unwrap();
+        let name = InstanceName::new("stuck").unwrap();
+
+        // Simulate the aftermath of a real StopUnconfirmed (stop_inner's
+        // own bookkeeping on that path — see its docs): the row is
+        // `stopping`, the handle is retained, and it is marked unconfirmed.
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+        let start = Instant::now();
+        let err = sup.stop(&registry, "stuck", None).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(&err, EngineError::StopUnconfirmed { name, .. } if name == "stuck"),
+            "expected StopUnconfirmed, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a retry against a still-alive stuck instance must poll cheaply (ProcessBackend::poll, \
+             never ProcessBackend::stop), not re-block for a whole new \
+             graceful-window/SIGKILL/confirm cycle: {elapsed:?}"
+        );
+        // No compounding: the row is untouched (still stopping), the handle
+        // is still retained (not dropped) for a further retry to reconcile.
+        assert_eq!(state_of(&registry, "stuck"), LifecycleState::Stopping);
+        assert!(
+            sup.running.contains_key(&name),
+            "the handle must be retained across a failed retry, never silently dropped"
+        );
+
+        // Teardown: really kill the still-running process so it does not
+        // leak past this test.
+        let supervised = sup.running.get_mut(&name).unwrap();
+        let _ = sup
+            .backend
+            .stop(&mut supervised.handle, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
+        // The self-healing counterpart: once the process behind a
+        // stop_unconfirmed handle has ACTUALLY died (the OS condition that
+        // made confirmation time out has cleared), a retry `stop()` must
+        // reconcile the instance to `stopped` — never leaving it permanently
+        // stuck just because one earlier attempt could not confirm death in
+        // time.
+        let (_state, _manifest, registry) = setup_fake("heals", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "heals").unwrap();
+        let name = InstanceName::new("heals").unwrap();
+
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+        // Simulate the OS condition clearing: the process ACTUALLY exits now.
+        // A real, portable kill via the SAME ProcessBackend::stop the
+        // production code already uses (cfg-free at this call site — the
+        // OS-specific mechanics live entirely in `backends/`), not a raw
+        // OS-specific signal call, so this stays a legitimate domain-layer
+        // test. The process is NOT genuinely stuck in this test (only its
+        // BOOKKEEPING pretends it was), so this succeeds quickly.
+        {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .stop(&mut supervised.handle, Duration::from_secs(2))
+                .expect("the process is not genuinely stuck in this test and must die promptly");
+        }
+
+        let instance = sup
+            .stop(&registry, "heals", None)
+            .expect("a retry must self-heal once the process is confirmed dead");
+        assert_eq!(
+            instance.state,
+            LifecycleState::Stopped,
+            "the stuck stopping row must reconcile to stopped, not stay stuck forever"
+        );
+        assert!(
+            !sup.running.contains_key(&name),
+            "the handle must be released once reconciled"
+        );
+    }
+
+    #[test]
+    fn poll_once_reconciles_a_stuck_unconfirmed_stop_to_stopped_self_healing() {
+        // The crash reaper's OWN reconciliation path (`poll_once`) — the
+        // OTHER self-healing route besides a manual retry `stop()` (whichever
+        // observes the exit first): when a `stop_unconfirmed`-marked handle's
+        // process is found `Exited` during a routine reaper poll, poll_once
+        // must finalize `stopping -> stopped` itself, rather than silently
+        // dropping the handle (which would leave the row PERMANENTLY stuck,
+        // since a later retry `stop()` would find no handle to poll).
+        // Contrast directly with
+        // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+        // above: that test's contrived `stopping` row is NOT
+        // `stop_unconfirmed` (it never went through a real stop attempt), so
+        // it correctly keeps the ORIGINAL silent-drop behavior — proving this
+        // fix pass changes behavior ONLY for the scenario it targets.
+        let (_state, _manifest, registry) = setup_fake("reaperheals", &["--crash-after-ms", "300"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "reaperheals").unwrap();
+        let name = InstanceName::new("reaperheals").unwrap();
+
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+        // Wait for the process to actually exit on its own, then let the
+        // reaper observe it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let plans = sup.poll_once(&registry);
+            assert!(
+                plans.is_empty(),
+                "this is a reconciliation, never a crash/restart"
+            );
+            if !sup.running.contains_key(&name) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "handle should be reconciled after exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state_of(&registry, "reaperheals"),
+            LifecycleState::Stopped,
+            "the reaper must finalize a stuck-unconfirmed stopping row to stopped, not leave it \
+             permanently stuck"
+        );
     }
 
     #[test]

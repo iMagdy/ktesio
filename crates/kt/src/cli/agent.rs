@@ -27,7 +27,8 @@ use crate::error::{
     AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentIo,
     AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable,
     AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
-    AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
+    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
+    AgentUnknownKind,
 };
 use crate::ui;
 
@@ -1688,6 +1689,25 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): `stop`
+        // sent SIGKILL but could not confirm the process's death within the
+        // bound — most likely because it is stuck in an OS-level
+        // uninterruptible I/O wait (e.g. disk pressure caused by a fast
+        // writer with no reader-side backpressure). The instance is NOT
+        // `stopped` — it stays `stopping`; point at retrying `stop` (which
+        // will not re-block for the same duration if it is still stuck) and
+        // name the likely cause honestly rather than implying a bug.
+        EngineError::StopUnconfirmed { name, timeout_secs } => AgentStopUnconfirmed {
+            message: format!(
+                "Agent Instance '{name}' was sent SIGKILL but has not been confirmed dead \
+                 within {timeout_secs}s; it may be stuck in an OS-level I/O wait (for example, \
+                 disk pressure). It remains in the 'stopping' state. Try again with: \
+                 kt agent stop {name} — this will not re-block if it is still stuck, and will \
+                 succeed once the process actually exits (which may require relieving disk \
+                 pressure or waiting for the stuck I/O to resolve)."
+            ),
+        }
+        .into(),
         EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -1828,6 +1848,38 @@ mod tests {
         assert!(
             !msg.contains("unsupported") && !msg.contains("declares"),
             "must never be misattributed to CapabilityUnsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_engine_error_renders_the_stop_unconfirmed_diagnostic() {
+        // Fix pass (review of #80 follow-up — the CRITICAL finding)
+        // coverage-closer: mirrors `map_engine_error_renders_the_
+        // interaction_timed_out_diagnostic`'s reasoning exactly —
+        // `EngineError::StopUnconfirmed` needs a process GENUINELY stuck in
+        // an OS-level uninterruptible I/O wait (disk exhaustion), which a
+        // full CLI-process-spawning test cannot safely or deterministically
+        // induce (and must never attempt against the real host disk — see
+        // the fix pass's mandatory ramdisk-only empirical proof). So this
+        // diagnostic's rendering is unit-tested directly here instead.
+        let err = map_engine_error(EngineError::StopUnconfirmed {
+            name: "stuck".to_string(),
+            timeout_secs: 5,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("stuck"), "names the instance: {msg}");
+        assert!(msg.contains('5'), "names the bound: {msg}");
+        assert!(
+            msg.contains("SIGKILL") && msg.contains("I/O wait"),
+            "names the honest likely cause, not a generic failure: {msg}"
+        );
+        assert!(
+            msg.contains("'stopping'"),
+            "states the instance's actual (non-terminal) state honestly: {msg}"
+        );
+        assert!(
+            msg.contains("kt agent stop stuck"),
+            "points at retrying stop rather than a generic remediation: {msg}"
         );
     }
 
