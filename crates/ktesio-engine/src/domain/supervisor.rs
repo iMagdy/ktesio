@@ -4002,7 +4002,12 @@ mod tests {
         // `stop_unconfirmed` (it never went through a real stop attempt), so
         // it correctly keeps the ORIGINAL silent-drop behavior — proving this
         // fix pass changes behavior ONLY for the scenario it targets.
-        let (_state, _manifest, registry) = setup_fake("reaperheals", &["--crash-after-ms", "300"]);
+        // --crash-after-ms must comfortably EXCEED READINESS_WINDOW (300ms) or
+        // the process looks like an immediate-exit launch failure (AC2)
+        // instead of a clean start that later crashes — the same pitfall
+        // documented above for `--linger-ms` in this file; 500ms is that
+        // established, proven-safe margin.
+        let (_state, _manifest, registry) = setup_fake("reaperheals", &["--crash-after-ms", "500"]);
         let mut sup = Supervisor::with_backoff(fast_backoff());
         sup.start(&registry, "reaperheals").unwrap();
         let name = InstanceName::new("reaperheals").unwrap();
