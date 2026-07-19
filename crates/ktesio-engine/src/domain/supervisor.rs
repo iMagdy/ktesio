@@ -41,7 +41,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use ktesio_adapter_api::{Capability, OsId, SupportLevel};
@@ -50,8 +49,8 @@ use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
 use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
-    assemble_usage_event, BackendError, ObservedUsageSource, ParsedUsage, ProcessBackend,
-    ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+    assemble_usage_event, BackendError, LogCapture, ObservedUsageSource, ParsedUsage,
+    ProcessBackend, ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
     LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
@@ -581,6 +580,10 @@ impl Supervisor {
             // `pipe_stdin`/`Capability::Interaction` — that gate governs only
             // the stdin *write* direction).
             attributed_log_path: Some(registry.attributed_output_log_path(&name)),
+            // Fix pass (review of #80): the crash-immune raw STDERR capture,
+            // computed from the SAME path authority, paired 1:1:1 with
+            // `log_file`/`attributed_log_path` (all three Some together).
+            stderr_log_file: Some(registry.agent_stderr_log_path(&name)),
             instance_name: name.as_str().to_string(),
             pipe_stdin,
         };
@@ -638,18 +641,18 @@ impl Supervisor {
             None => TransitionCause::AdapterReady,
         };
         // Story 4-2, Task 4: `handle` already exists (spawned above) and
-        // carries a live `log_sender` (capture is unconditional, AC-E), but
+        // carries a live `log_capture` (capture is unconditional, AC-E), but
         // it is not YET in `self.running` (inserted below) — so the default
         // `self.transition(...)`'s `self.running`-based lookup would miss
-        // it. Pass the sender explicitly so the `starting → running` line
+        // it. Pass the capture explicitly so the `starting → running` line
         // lands in the attributed capture too.
-        self.transition_with_log_sender(
+        self.transition_with_log_capture(
             registry,
             &name,
             starting,
             LifecycleState::Running,
             ready_cause,
-            self.backend.log_sender(&handle),
+            self.backend.log_capture(&handle),
         )?;
         // Mint the fresh Run id for this `starting`→terminal span (spine AD-7). Each
         // `starting` — operator start OR restart (story 1-6) — mints a distinct id
@@ -801,16 +804,20 @@ impl Supervisor {
         // stop. With story 1-6 adoption, a handle for a still-live process
         // started by a PRIOR engine IS re-held (via `adopt_orphans`), so a
         // cross-restart stop now really terminates it.
-        // Story 4-2, Task 4: capture the log_sender HERE, before `running.remove`
-        // drops the handle below — the default `self.transition(...)` lookup
-        // (via `self.running`) would find NOTHING by the time the terminal
-        // transition below runs, even though the writer/reader threads
-        // themselves stay alive a little longer still (until the killed
-        // process's pipes actually EOF), so the line lands correctly ordered
-        // relative to the last agent-out/err lines.
-        let (outcome, log_sender) = match self.running.get_mut(&name) {
+        // Story 4-2, Task 4 (fix pass, review of #80): capture the
+        // log_capture HERE, before `running.remove` drops the handle below
+        // — the default `self.transition(...)` lookup (via `self.running`)
+        // would find NOTHING by the time the terminal transition below
+        // runs. By the time `backend.stop` (below) returns, the process is
+        // provably dead (its raw capture files can never grow again), and
+        // `send_engine_line`'s inline catch-up folds in every remaining
+        // byte of agent output BEFORE the "-> stopped" line, so the engine
+        // line still lands correctly ordered after it, regardless of
+        // whether the process handle's `Drop` (which also signals the
+        // background tailer thread to stop) has run yet.
+        let (outcome, log_capture) = match self.running.get_mut(&name) {
             Some(supervised) => {
-                let log_sender = self.backend.log_sender(&supervised.handle);
+                let log_capture = self.backend.log_capture(&supervised.handle);
                 let outcome =
                     self.backend
                         .stop(&mut supervised.handle, window)
@@ -818,7 +825,7 @@ impl Supervisor {
                             name: name.as_str().to_string(),
                             source,
                         })?;
-                (outcome, log_sender)
+                (outcome, log_capture)
             }
             None => (crate::ports::StopOutcome { forced: false }, None),
         };
@@ -842,13 +849,13 @@ impl Supervisor {
         } else {
             TransitionCause::StopGraceful
         };
-        self.transition_with_log_sender(
+        self.transition_with_log_capture(
             registry,
             &name,
             stopping,
             LifecycleState::Stopped,
             cause,
-            log_sender,
+            log_capture,
         )?;
 
         registry.lookup(&name).map_err(registry_to_engine)
@@ -1244,7 +1251,24 @@ impl Supervisor {
     /// command — `show`/`send`/`pause` all do this); a REGISTERED-but-never-
     /// started instance still falls through to an honest empty vec (mirrors
     /// `read_events_from`'s "missing file → empty" precedent).
-    pub fn read_agent_log(registry: &Registry, name: &str) -> Result<Vec<LogLine>, EngineError> {
+    ///
+    /// Fix pass (M1, review of #80): ALSO returns the byte-cursor position
+    /// (into the CURRENT generation, matching
+    /// [`Supervisor::read_agent_log_since`]'s cursor shape exactly) this
+    /// read reached — computed from the SAME bytes this call parsed, never a
+    /// second, separately-timed read. `kt agent logs --follow` (the sole
+    /// production caller) primes its poll loop's cursor from this value
+    /// directly, instead of a SEPARATE `read_agent_log_since(name, 0)` call
+    /// whose returned lines it used to discard — that discarding call read
+    /// up to a slightly LATER point in time than this one-shot dump, so
+    /// anything emitted in the gap between the two reads was silently lost
+    /// before `--follow` ever started polling. Returning the cursor here
+    /// closes that gap: there is only ever ONE read establishing both the
+    /// dump and the resume point.
+    pub fn read_agent_log(
+        registry: &Registry,
+        name: &str,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
         let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
             name: name.to_string(),
             reason,
@@ -1263,12 +1287,27 @@ impl Supervisor {
             })?;
         }
         let current = registry.attributed_output_log_path(&name);
-        read_log_lines_from(&current, &mut lines).map_err(|detail| EngineError::Log {
+        // Read the CURRENT generation's raw text ONCE so its exact byte
+        // length (the cursor) and its parsed lines come from the identical
+        // bytes — never a second, later, potentially-inconsistent read.
+        let current_text = match std::fs::read_to_string(&current) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: current.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        let cursor = current_text.len() as u64;
+        parse_log_lines(&current_text, &mut lines).map_err(|detail| EngineError::Log {
             name: name.as_str().to_string(),
             path: current.to_string_lossy().into_owned(),
             detail,
         })?;
-        Ok(lines)
+        Ok((lines, cursor))
     }
 
     /// A CURSOR-based follow read for `kt agent logs --follow`'s poll loop
@@ -1414,14 +1453,14 @@ impl Supervisor {
             // `never` or crash-loop — can enrich the recorded crash cause), then
             // apply running/paused → failed with that detail (AC5).
             //
-            // Story 4-2, Task 4: capture the log_sender BEFORE removing the
+            // Story 4-2, Task 4: capture the log_capture BEFORE removing the
             // entry below — same reasoning as `stop_inner`'s terminal
             // transition (the default `self.transition(...)` lookup would
             // otherwise miss it).
-            let crash_log_sender = self
+            let crash_log_capture = self
                 .running
                 .get(&name)
-                .and_then(|s| self.backend.log_sender(&s.handle));
+                .and_then(|s| self.backend.log_capture(&s.handle));
             self.running.remove(&name);
             let base_detail = match code {
                 Some(c) => format!("process exited unexpectedly with code {c}"),
@@ -1438,13 +1477,13 @@ impl Supervisor {
             // falls back to for the failed cause once the terminal record is
             // cleared (AC9).
             if self
-                .transition_with_log_sender(
+                .transition_with_log_capture(
                     registry,
                     &name,
                     state,
                     LifecycleState::Failed,
                     TransitionCause::crashed(decision.crash_cause.clone()),
-                    crash_log_sender,
+                    crash_log_capture,
                 )
                 .is_err()
             {
@@ -1696,9 +1735,13 @@ impl Supervisor {
     /// Story 4-2, Task 4: ALSO best-effort-projects the transition into the
     /// unified attributed-output stream as an `engine`-attributed [`LogLine`]
     /// — a human-readable mirror of the SAME fact `instance.log` (above,
-    /// unchanged, machine-authoritative) just recorded. The writer-thread
-    /// `Sender` is looked up via [`Supervisor::log_sender_for`] (the
-    /// instance's CURRENT `self.running` entry, when one exists).
+    /// unchanged, machine-authoritative) just recorded. The output-capture
+    /// handle is looked up via [`Supervisor::log_capture_for`] (the
+    /// instance's CURRENT `self.running` entry, when one exists); fix pass
+    /// (review of #80): [`LogCapture::send_engine_line`] catches up any
+    /// pending agent-out/agent-err content FIRST, so the engine line lands
+    /// after whatever agent output already existed at this moment rather
+    /// than racing the background tailer thread's own poll schedule.
     fn transition(
         &self,
         registry: &Registry,
@@ -1707,27 +1750,27 @@ impl Supervisor {
         new: LifecycleState,
         cause: TransitionCause,
     ) -> Result<TransitionEvent, EngineError> {
-        let log_sender = self.log_sender_for(name);
-        self.transition_with_log_sender(registry, name, prior, new, cause, log_sender)
+        let log_capture = self.log_capture_for(name);
+        self.transition_with_log_capture(registry, name, prior, new, cause, log_capture)
     }
 
-    /// Like [`Supervisor::transition`], but the `engine`-attributed writer
-    /// `Sender` is supplied EXPLICITLY rather than looked up via
-    /// `self.running` — needed at the two call sites (`start_inner`'s
+    /// Like [`Supervisor::transition`], but the `engine`-attributed
+    /// [`LogCapture`] is supplied EXPLICITLY rather than looked up via
+    /// `self.running` — needed at the three call sites (`start_inner`'s
     /// `starting → running`, `stop_inner`'s `stopping → stopped`, and
     /// `poll_once`'s crash `→ failed`) where the just-spawned/about-to-be-
     /// torn-down handle is not (or no longer) present in `self.running` at
-    /// the exact moment of the call, even though a live writer thread still
-    /// exists (captured by the caller a few lines earlier, before the
+    /// the exact moment of the call, even though a live capture pipeline
+    /// still exists (captured by the caller a few lines earlier, before the
     /// map mutation that would otherwise hide it).
-    fn transition_with_log_sender(
+    fn transition_with_log_capture(
         &self,
         registry: &Registry,
         name: &InstanceName,
         prior: LifecycleState,
         new: LifecycleState,
         cause: TransitionCause,
-        log_sender: Option<mpsc::Sender<LogLine>>,
+        log_capture: Option<LogCapture>,
     ) -> Result<TransitionEvent, EngineError> {
         registry.set_state(name, new).map_err(registry_to_engine)?;
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
@@ -1741,9 +1784,9 @@ impl Supervisor {
                 detail,
             }
         })?;
-        if let Some(sender) = log_sender {
+        if let Some(capture) = log_capture {
             let text = engine_transition_line_text(&event);
-            let _ = sender.send(LogLine::new(
+            capture.send_engine_line(LogLine::new(
                 name.as_str(),
                 LogStream::Engine,
                 text,
@@ -1753,14 +1796,14 @@ impl Supervisor {
         Ok(event)
     }
 
-    /// The writer-thread `Sender` this engine session currently holds for
+    /// The output-capture handle this engine session currently holds for
     /// `name`, if any (story 4-2, Task 4) — `None` when the instance has no
     /// `self.running` entry (not started this session, already torn down, or
-    /// adopted with no recoverable capture threads).
-    fn log_sender_for(&self, name: &InstanceName) -> Option<mpsc::Sender<LogLine>> {
+    /// adopted with no recoverable capture pipeline).
+    fn log_capture_for(&self, name: &InstanceName) -> Option<LogCapture> {
         self.running
             .get(name)
-            .and_then(|s| self.backend.log_sender(&s.handle))
+            .and_then(|s| self.backend.log_capture(&s.handle))
     }
 
     /// Land a spawn failure in `failed` with the backend diagnostic preserved
@@ -4052,8 +4095,8 @@ mod tests {
     fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
         // A direct, pure-function proof of the RENDERER's own completeness,
         // independent of which causes the current supervisor wiring happens
-        // to route a live log_sender through (e.g. a launch-failure never
-        // gets a log_sender today — see the Dev Agent Record) — the match
+        // to route a live log_capture through (e.g. a launch-failure never
+        // gets a log_capture today — see the Dev Agent Record) — the match
         // itself must stay exhaustive and correct for every variant.
         let cases: Vec<(TransitionCause, &str)> = vec![
             (TransitionCause::command("start"), " (start)"),
@@ -4135,8 +4178,9 @@ mod tests {
     #[test]
     fn read_agent_log_on_a_registered_but_never_started_instance_is_empty_not_an_error() {
         let (_state, _manifest, registry) = setup_fake("neverstarted", &["--linger-ms", "600000"]);
-        let lines = Supervisor::read_agent_log(&registry, "neverstarted").unwrap();
+        let (lines, cursor) = Supervisor::read_agent_log(&registry, "neverstarted").unwrap();
         assert!(lines.is_empty());
+        assert_eq!(cursor, 0, "no file yet → the cursor starts at 0");
     }
 
     #[test]
@@ -4170,18 +4214,27 @@ mod tests {
                 "2026-07-15T00:00:01Z",
             ),
         );
+        let current_path = registry.attributed_output_log_path(&name);
         write_line(
-            &registry.attributed_output_log_path(&name),
+            &current_path,
             &log_line("gens", LogStream::Engine, "newest", "2026-07-15T00:00:02Z"),
         );
 
-        let lines = Supervisor::read_agent_log(&registry, "gens").unwrap();
+        let (lines, cursor) = Supervisor::read_agent_log(&registry, "gens").unwrap();
         let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["oldest", "middle", "newest"]);
         let streams: Vec<LogStream> = lines.iter().map(|l| l.stream).collect();
         assert_eq!(
             streams,
             vec![LogStream::AgentOut, LogStream::AgentErr, LogStream::Engine]
+        );
+        // The returned cursor (M1, review of #80) is the CURRENT generation's
+        // exact byte length — matching read_agent_log_since's cursor shape —
+        // never the concatenated multi-generation total.
+        assert_eq!(
+            cursor,
+            std::fs::metadata(&current_path).unwrap().len(),
+            "cursor must be the CURRENT generation's byte length only"
         );
     }
 

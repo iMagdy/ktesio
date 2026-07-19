@@ -889,8 +889,11 @@ impl Engine {
     /// [`Supervisor::read_agent_log`]'s docs for the full existence-check
     /// rationale, a deliberate improvement over
     /// [`Engine::transition_events`]/[`Engine::budget_breach_events`]'s
-    /// precedent above).
-    pub async fn read_agent_log(&self, name: &str) -> Result<Vec<LogLine>, EngineError> {
+    /// precedent above). ALSO returns the byte-cursor (into the current
+    /// generation) this read reached (fix pass M1, review of #80), so a
+    /// caller priming a `--follow` loop needs no separate, discarding
+    /// `read_agent_log_since(name, 0)` call.
+    pub async fn read_agent_log(&self, name: &str) -> Result<(Vec<LogLine>, u64), EngineError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1034,7 +1037,7 @@ impl Blocking<'_> {
     }
 
     /// Blocking [`Engine::read_agent_log`] (story 4-2, AC-A).
-    pub fn read_agent_log(&self, name: &str) -> Result<Vec<LogLine>, EngineError> {
+    pub fn read_agent_log(&self, name: &str) -> Result<(Vec<LogLine>, u64), EngineError> {
         self.engine.rt.block_on(self.engine.read_agent_log(name))
     }
 

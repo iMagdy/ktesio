@@ -31,17 +31,16 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::{setsid, Pid};
 
-use crate::domain::LogLine;
 use crate::ports::{
-    spawn_output_capture, write_stdin_bounded, BackendError, ProcessBackend, ProcessFingerprint,
-    ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome, STDIN_WRITE_TIMEOUT,
+    spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
+    ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
+    STDIN_WRITE_TIMEOUT,
 };
 
 /// How often the graceful-stop wait polls for the process to exit.
@@ -104,16 +103,17 @@ pub struct UnixProcess {
     /// fail honestly (`EngineError::InteractionUnavailable` /
     /// `EngineError::InteractionTimedOut`), never silently succeed.
     stdin: StdinState,
-    /// The output-capture writer thread's `Sender` (story 4-2, AD-12), if
-    /// this handle has one. `Some` for a FRESHLY SPAWNED handle whenever the
-    /// caller gave us somewhere to capture (`SpawnSpec::attributed_log_path`/
-    /// `log_file`); `None` for an ADOPTED process — no OS-portable way to
-    /// recover a pipe fd from a bare PID, so no capture threads exist for it
-    /// (parity with `stdin`'s `NoPipe`-on-adoption). This is NOT a functional
-    /// gap for `kt agent logs`/`--follow` (AC-H): reading only needs the
-    /// FILE, which the ORIGINAL (pre-adoption) engine session's threads keep
-    /// writing to for as long as the process itself lives.
-    log_sender: Option<mpsc::Sender<LogLine>>,
+    /// The output-capture pipeline handle (story 4-2, AD-12; fix pass,
+    /// review of #80), if this handle has one. `Some` for a FRESHLY SPAWNED
+    /// handle whenever the caller gave us somewhere to capture
+    /// (`SpawnSpec::log_file`/`stderr_log_file`/`attributed_log_path`);
+    /// `None` for an ADOPTED process — no live tailer thread survives the
+    /// engine process that spawned it (parity with `stdin`'s
+    /// `NoPipe`-on-adoption). This is NOT a functional gap for `kt agent
+    /// logs`/`--follow` (AC-H): reading only needs the crash-immune raw
+    /// FILES, which the agent process itself keeps writing to directly
+    /// (never through any engine-held handle) for as long as it lives.
+    log_capture: Option<LogCapture>,
 }
 
 /// The Unix process backend (AD-4).
@@ -141,53 +141,78 @@ impl ProcessBackend for UnixBackend {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
-        // Story 4-2 (AD-12, AC-E): stdout/stderr capture is UNCONDITIONAL and
-        // capability-independent — piped whenever the caller gave us
-        // somewhere to write BOTH the legacy raw passthrough AND the new
-        // attributed capture (every PRODUCTION spawn does; the supervisor
-        // always computes `log_file`/`attributed_log_path` together from the
-        // SAME Registry path authority). This does NOT gate on
-        // `Capability::Interaction` or any other capability — reading FROM a
-        // process is never capability-gated, only writing TO it (`pipe_stdin`
-        // below) is. `None` (both fields) stays `Stdio::null()`, unchanged
-        // from before this story — a narrow test-fixture convenience for the
-        // small number of unit tests in this module that assert nothing
-        // about captured output, not a product-facing escape hatch (real
-        // spawns never take this branch).
-        let capture = match (&spec.log_file, &spec.attributed_log_path) {
-            (Some(legacy), Some(attributed)) => Some((legacy.clone(), attributed.clone())),
+        // Story 4-2 (AD-12, AC-E), fix pass (review of #80): stdout/stderr
+        // capture is UNCONDITIONAL and capability-independent — each stream
+        // is redirected DIRECTLY to its OWN regular file (crash-immune, NOT
+        // a pipe: see the module docs on `spawn_output_capture` for why)
+        // whenever the caller gave us somewhere to write all THREE capture
+        // destinations (every PRODUCTION spawn does; the supervisor always
+        // computes `log_file`/`stderr_log_file`/`attributed_log_path`
+        // together from the SAME Registry path authority). This does NOT
+        // gate on `Capability::Interaction` or any other capability —
+        // reading FROM a process is never capability-gated, only writing TO
+        // it (`pipe_stdin` below) is. `None` (all three fields) stays
+        // `Stdio::null()`, unchanged from before this story — a narrow
+        // test-fixture convenience for the small number of unit tests in
+        // this module that assert nothing about captured output, not a
+        // product-facing escape hatch (real spawns never take this
+        // branch).
+        debug_assert!(
+            spec.log_file.is_some() == spec.attributed_log_path.is_some()
+                && spec.log_file.is_some() == spec.stderr_log_file.is_some(),
+            "SpawnSpec's three capture-path fields must be all Some or all None together"
+        );
+        let capture = match (
+            &spec.log_file,
+            &spec.stderr_log_file,
+            &spec.attributed_log_path,
+        ) {
+            (Some(stdout_raw), Some(stderr_raw), Some(attributed)) => {
+                Some((stdout_raw.clone(), stderr_raw.clone(), attributed.clone()))
+            }
             _ => None,
         };
-        // Fail FAST (mirrors the pre-story eager log_file-open validation
-        // that lived here before the capture rework) if either destination
-        // cannot be opened — never a silent no-capture outcome an operator
-        // would only notice from an unexpectedly-empty log later. The
-        // reader/writer threads (Task 2) reopen these paths per-write, so
-        // this is a validate-then-drop probe, not a held handle.
-        if let Some((legacy, attributed)) = &capture {
-            for (label, path) in [
-                ("log file", legacy.as_path()),
-                ("attributed output log", attributed.as_path()),
-            ] {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| BackendError::Spawn {
-                        exec: spec.exec.clone(),
-                        detail: format!("could not open {label} {}: {e}", path.display()),
-                    })?;
+        // Fail FAST (mirrors the pre-story eager log_file-open validation)
+        // if any destination cannot be opened — never a silent no-capture
+        // outcome an operator would only notice from an unexpectedly-empty
+        // log later. `stdout_target`/`stderr_target` are the SAME open
+        // `File`s handed directly to `Stdio::from` below (a successful open
+        // IS the fail-fast proof — no second reopen needed, unlike the old
+        // dual-stream-into-one-file mechanism this superseded, which needed
+        // a `try_clone` because two streams shared one file); the
+        // attributed path is validated then dropped (whichever of the
+        // background tailer thread or an inline `send_engine_line` call
+        // reopens it per-append — see `append_attributed_lines`'s docs).
+        let (stdout_target, stderr_target) = match &capture {
+            Some((stdout_raw, stderr_raw, attributed)) => {
+                let open = |path: &std::path::Path, label: &str| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map_err(|e| BackendError::Spawn {
+                            exec: spec.exec.clone(),
+                            detail: format!("could not open {label} {}: {e}", path.display()),
+                        })
+                };
+                let stdout_file = open(stdout_raw, "log file")?;
+                let stderr_file = open(stderr_raw, "stderr log file")?;
+                drop(open(attributed, "attributed output log")?);
+                (Some(stdout_file), Some(stderr_file))
             }
-        }
-        command.stdout(if capture.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
+            None => (None, None),
+        };
+        // DIRECT, crash-immune redirects (never `Stdio::piped()` — the whole
+        // point of this fix pass): the agent's `write()` to either stream
+        // succeeds or fails based ONLY on this regular file, never on
+        // whether the engine process is even still alive to read anything.
+        command.stdout(match stdout_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
         });
-        command.stderr(if capture.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
+        command.stderr(match stderr_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
         });
         // Piped ONLY when the caller (the supervisor, at spawn time) resolved
         // the declared Capability::Interaction level to Guaranteed/BestEffort
@@ -244,15 +269,18 @@ impl ProcessBackend for UnixBackend {
             Some(s) => StdinState::Live(s),
             None => StdinState::NoPipe,
         };
-        // Story 4-2 (Task 3): a FRESHLY SPAWNED handle gets the shared
-        // reader/writer-thread capture whenever `capture` is `Some` (both
-        // stdout/stderr are guaranteed `Some` here — `Stdio::piped()`
-        // populates them above).
-        let log_sender = capture.map(|(legacy_log_path, attributed_log_path)| {
+        // Story 4-2 (Task 3), fix pass (review of #80): a FRESHLY SPAWNED
+        // handle gets the output-capture pipeline whenever `capture` is
+        // `Some`. `spawn_output_capture` takes only the raw files' PATHS
+        // (never `child.stdout`/`child.stderr` — those stay `None` here,
+        // since neither stream was piped) — the tailer it starts reopens
+        // them by path on every poll, exactly like any later reader would,
+        // which is what makes this crash-immune: nothing depends on a
+        // handle this engine session holds.
+        let log_capture = capture.map(|(stdout_raw_path, stderr_raw_path, attributed_log_path)| {
             spawn_output_capture(
-                child.stdout.take().expect("piped stdout"),
-                child.stderr.take().expect("piped stderr"),
-                legacy_log_path,
+                stdout_raw_path,
+                stderr_raw_path,
                 attributed_log_path,
                 spec.instance_name.clone(),
             )
@@ -263,7 +291,7 @@ impl ProcessBackend for UnixBackend {
             pid,
             start_time,
             stdin,
-            log_sender,
+            log_capture,
         })
     }
 
@@ -411,18 +439,20 @@ impl ProcessBackend for UnixBackend {
         // handle fails with `EngineError::InteractionUnavailable`, never
         // silently succeeding.
         //
-        // `log_sender: None` (story 4-2): likewise, no OS-portable way to
-        // recover the stdout/stderr pipe fds from a bare pid, so an adopted
-        // handle gets no capture threads either. Reading/following this
-        // instance's output still works (AC-H) — it needs only the FILE the
-        // ORIGINAL engine session's still-running threads keep writing to.
+        // `log_capture: None` (story 4-2, fix pass review of #80): no live
+        // tailer thread survives the engine process that spawned it, so an
+        // adopted handle gets no capture pipeline either. Reading/following
+        // this instance's output still works (AC-H) — it needs only the
+        // crash-immune raw FILES the agent process itself keeps writing to
+        // directly, for as long as it lives, independent of any engine
+        // session.
         Ok(Some(UnixProcess {
             child: None,
             pgid: Pid::from_raw(fingerprint.pid as i32),
             pid: fingerprint.pid,
             start_time: live_start,
             stdin: StdinState::NoPipe,
-            log_sender: None,
+            log_capture: None,
         }))
     }
 
@@ -445,8 +475,8 @@ impl ProcessBackend for UnixBackend {
         write_stdin_bounded(&mut handle.stdin, data, STDIN_WRITE_TIMEOUT)
     }
 
-    fn log_sender(&self, handle: &Self::Handle) -> Option<mpsc::Sender<LogLine>> {
-        handle.log_sender.clone()
+    fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture> {
+        handle.log_capture.clone()
     }
 }
 
@@ -529,7 +559,21 @@ impl Drop for UnixProcess {
     /// (re-acquired on engine start) likewise SIGKILLs its group on drop, but
     /// cannot `wait` a non-child (the OS/init reaps it); this keeps the
     /// no-survivor guarantee across engine restarts.
+    ///
+    /// Fix pass (review of #80): ALSO signals the output-capture pipeline's
+    /// background tailer thread to stop (one final catch-up pass, then
+    /// exit) — unconditionally, regardless of whether the process itself
+    /// was still alive at this point, so a tailer thread never outlives its
+    /// instance (no per-stop/restart thread leak over a long engine
+    /// session). This is purely a LOCAL bookkeeping signal — it never
+    /// touches the agent process and has NOTHING to do with its crash
+    /// resilience, which comes entirely from the raw capture files being
+    /// direct, engine-independent OS redirects (see `spawn_output_capture`'s
+    /// docs).
     fn drop(&mut self) {
+        if let Some(capture) = &self.log_capture {
+            capture.signal_stop();
+        }
         // If already reaped/exited, nothing to do; otherwise SIGKILL the group.
         if let Ok(ProcessStatus::Alive) = self.reap_if_exited() {
             let _ = killpg(self.pgid, Signal::SIGKILL);
@@ -679,7 +723,7 @@ pub fn check_secrets_file_permissions(path: &std::path::Path) -> Result<(), Secr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::LogStream;
+    use crate::domain::{LogLine, LogStream};
     use std::collections::BTreeMap;
 
     /// Resolve the `fake_agent` helper binary via the conformance dev-dependency
@@ -700,6 +744,7 @@ mod tests {
             // tests that assert nothing about captured output, mirroring
             // `log_file: None`'s existing "don't care" convention exactly.
             attributed_log_path: None,
+            stderr_log_file: None,
             instance_name: "test".to_string(),
             // Preserves this shared helper's pre-fix behavior (piping was
             // unconditional before the HIGH fix): every test using this
@@ -779,6 +824,7 @@ mod tests {
         let mut s = spec("echo", &["hello-from-child"]);
         s.log_file = Some(log.clone());
         s.attributed_log_path = Some(dir.path().join("output.log"));
+        s.stderr_log_file = Some(dir.path().join("stderr.raw"));
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&s).expect("spawn echo");
         // Wait for it to exit.
@@ -787,23 +833,18 @@ mod tests {
             assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(10));
         }
-        // Story 4-2: the log is now written by an ENGINE-SIDE reader thread
-        // (not a synchronous kernel-direct redirect), so there is a narrow,
-        // bounded window between "the child process has exited" and "the
-        // reader thread has drained the last buffered bytes to disk" — poll
-        // for the expected content rather than assuming it is instantly
-        // present the moment `poll` reports Exited (the same committed-
-        // state-polling discipline this codebase applies everywhere else).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(&log) {
-                if contents.contains("hello-from-child") {
-                    break;
-                }
-            }
-            assert!(Instant::now() < deadline, "log content never appeared");
-            sleep(Duration::from_millis(10));
-        }
+        // Fix pass (review of #80): `log_file` is once again a DIRECT,
+        // synchronous OS redirect (`Stdio::from(file)`, not a pipe an
+        // engine-side reader thread drains on its own schedule) — so
+        // "the child process has exited" once again implies "every byte it
+        // wrote is already on disk," with NO reader-thread catch-up window
+        // to poll for (the pre-story-4-2 guarantee, restored). A single
+        // direct read suffices.
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            contents.contains("hello-from-child"),
+            "content must be present immediately, no reader-thread lag: {contents:?}"
+        );
     }
 
     #[test]
@@ -969,7 +1010,7 @@ mod tests {
             pid: fp.pid,
             start_time: fp.start_time.wrapping_add(1),
             stdin: StdinState::NoPipe,
-            log_sender: None,
+            log_capture: None,
         };
         assert_eq!(
             backend.poll(&mut recycled).unwrap(),
@@ -1002,7 +1043,7 @@ mod tests {
             pid,
             start_time: 0, // no recorded token → bare-liveness fallback
             stdin: StdinState::NoPipe,
-            log_sender: None,
+            log_capture: None,
         };
         assert_eq!(
             backend.poll(&mut degraded).unwrap(),
@@ -1025,10 +1066,12 @@ mod tests {
         std::fs::write(&blocker, b"not a dir").unwrap();
         let mut s = spec("sleep", &["30"]);
         s.log_file = Some(blocker.join("inner.log"));
-        // A valid attributed path, so `capture` is considered wanted and
-        // the eager validation actually runs (both fields gate capture
-        // together — see the backend's `spawn()` docs).
+        // Valid attributed/stderr paths, so `capture` is considered wanted
+        // and the eager validation actually runs (all three fields gate
+        // capture together — see the backend's `spawn()` docs). `log_file`
+        // is opened FIRST, so its failure is what surfaces.
         s.attributed_log_path = Some(dir.path().join("output.log"));
+        s.stderr_log_file = Some(dir.path().join("stderr.raw"));
         let backend = UnixBackend::new();
         let err = backend.spawn(&s).unwrap_err();
         match err {
@@ -1135,6 +1178,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
         };
@@ -1233,6 +1277,7 @@ mod tests {
             pipe_stdin: true,
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
         };
         s.env.clear();
@@ -1332,6 +1377,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
         };
@@ -1343,20 +1389,12 @@ mod tests {
             assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(10));
         }
-        // Story 4-2: poll for the content rather than assuming it is
-        // instantly present the moment `poll` reports Exited — see
-        // `log_file_captures_child_stdout`'s identical comment for why (a
-        // narrow, bounded engine-reader-thread flush lag).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let contents = loop {
-            if let Ok(contents) = std::fs::read_to_string(&log) {
-                if contents.contains("env=applied") {
-                    break contents;
-                }
-            }
-            assert!(Instant::now() < deadline, "log content never appeared");
-            sleep(Duration::from_millis(10));
-        };
+        // Fix pass (review of #80): `log_file` is a DIRECT, synchronous OS
+        // redirect again (see `log_file_captures_child_stdout`'s identical
+        // comment) — "exited" already implies "fully written", no
+        // reader-thread catch-up window to poll for.
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(contents.contains("env=applied"), "log={contents:?}");
         // The working dir is the temp dir (canonicalize to dodge /var→/private/var).
         let want = std::fs::canonicalize(dir.path()).unwrap();
         assert!(
@@ -1387,6 +1425,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
         };
@@ -1505,6 +1544,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(dir.path().join("agent.log")),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
         };
@@ -1562,6 +1602,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(dir.path().join("agent.log")),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
         };
@@ -1600,14 +1641,27 @@ mod tests {
     // ---- Story 4-2: capture-path wiring (AC-A, AC-B, AC-E) ----
 
     #[test]
-    fn spawn_captures_both_streams_attributed_and_unchanged_in_the_legacy_log() {
-        // Task 3: spawning fake_agent with output on BOTH streams produces
-        // attributed lines in the NEW capture (agent-out/agent-err) AND
-        // unchanged content in the legacy agent.log — proving the
-        // Stdio::null() -> Stdio::piped() rework did not regress the legacy
-        // passthrough while adding attribution on top.
+    fn spawn_captures_both_streams_attributed_and_stdout_only_in_the_legacy_log() {
+        // Task 3, fix pass (review of #80): spawning fake_agent with output
+        // on BOTH streams produces attributed lines for BOTH in the NEW
+        // attributed capture (agent-out/agent-err) — proving direct,
+        // crash-immune per-stream redirects (`Stdio::from(file)`, never a
+        // pipe) still feed full attribution via the background tailer.
+        //
+        // DELIBERATE CHANGE from this test's pre-fix-pass form (renamed
+        // accordingly): the legacy `agent.log` is now DIRECTLY,
+        // synchronously written by the OS for STDOUT ALONE (never merged
+        // with stderr via any engine-side hop — see `SpawnSpec::log_file`'s
+        // docs for why: `drain_usage_for`'s billing-critical sentinel is a
+        // stdout-only convention, so keeping `agent.log` a PURE, zero-hop
+        // stdout redirect is what fully closes H2, the fix pass's
+        // billing-race finding). Stderr is captured to its OWN separate raw
+        // file (`stderr_log_file`), asserted directly below, rather than
+        // asserting it appears (it no longer does, by design) inside
+        // `agent.log`.
         let dir = tempfile::tempdir().unwrap();
         let agent_log = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
         let output_log = dir.path().join("output.log");
         let bin = fake_agent_path();
         let s = SpawnSpec {
@@ -1624,39 +1678,51 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(output_log.clone()),
+            stderr_log_file: Some(stderr_raw.clone()),
             instance_name: "dual".to_string(),
             pipe_stdin: false,
         };
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
         assert!(
-            backend.log_sender(&proc).is_some(),
-            "a freshly spawned, captured handle has a live log_sender"
+            backend.log_capture(&proc).is_some(),
+            "a freshly spawned, captured handle has a live log_capture"
         );
 
-        // Wait for at least one heartbeat on EACH stream to land in BOTH the
-        // legacy log and the attributed capture. A generous 10s deadline
-        // (rather than 5s) — this test spawns a real process AND drives two
-        // background reader threads under whatever CI/parallel-test load is
+        // Wait for at least one heartbeat on EACH stream to land in its raw
+        // file AND the attributed capture. A generous 10s deadline (rather
+        // than 5s) — this test spawns a real process AND drives a
+        // background tailer thread under whatever CI/parallel-test load is
         // in effect; the poll is deadline-based (never a fixed sleep), so a
         // slower runner just takes longer, not a false failure.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let legacy = std::fs::read_to_string(&agent_log).unwrap_or_default();
+            let stderr = std::fs::read_to_string(&stderr_raw).unwrap_or_default();
             let attributed = std::fs::read_to_string(&output_log).unwrap_or_default();
-            let legacy_has_both = legacy.lines().any(|l| l.starts_with("heartbeat "))
-                && legacy.lines().any(|l| l.starts_with("stderr-heartbeat "));
+            let raw_has_both = legacy.lines().any(|l| l.starts_with("heartbeat "))
+                && stderr.lines().any(|l| l.starts_with("stderr-heartbeat "));
             let attributed_has_both = attributed.contains("\"stream\":\"agent-out\"")
                 && attributed.contains("\"stream\":\"agent-err\"");
-            if legacy_has_both && attributed_has_both {
+            if raw_has_both && attributed_has_both {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "never observed both streams in both captures; legacy={legacy:?} attributed={attributed:?}"
+                "never observed both streams in both captures; legacy={legacy:?} stderr={stderr:?} attributed={attributed:?}"
             );
             sleep(Duration::from_millis(20));
         }
+
+        // The legacy log NEVER carries stderr content (the deliberate
+        // change this test's rename documents) — even after the deadline
+        // loop above already confirmed BOTH streams are captured
+        // elsewhere, re-affirm this file specifically stays stdout-only.
+        let legacy = std::fs::read_to_string(&agent_log).unwrap();
+        assert!(
+            !legacy.lines().any(|l| l.starts_with("stderr-heartbeat ")),
+            "agent.log must never carry stderr content: {legacy:?}"
+        );
 
         // The attributed capture parses as well-formed LogLine JSON-Lines,
         // each carrying exactly the expected attribution.
@@ -1674,8 +1740,8 @@ mod tests {
     }
 
     #[test]
-    fn adopted_handle_has_no_log_sender() {
-        // Task 3: an adopted handle gets NO capture threads (mirrors
+    fn adopted_handle_has_no_log_capture() {
+        // Task 3: an adopted handle gets NO capture pipeline (mirrors
         // has_stdin_is_true_when_spawned_and_false_once_adopted's precedent
         // for stdin) — not a functional gap for reading/following (AC-H),
         // only for the live-write side this handle would need to originate
@@ -1683,13 +1749,13 @@ mod tests {
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn sleep");
         assert!(
-            backend.log_sender(&proc).is_none(),
+            backend.log_capture(&proc).is_none(),
             "spec() opts out of capture"
         );
         let _ = backend.stop(&mut proc, Duration::from_secs(2));
 
         // Spawn WITH capture this time, then adopt — the adopted copy must
-        // have no log_sender even though the ORIGINAL did.
+        // have no log_capture even though the ORIGINAL did.
         let dir = tempfile::tempdir().unwrap();
         let s = SpawnSpec {
             exec: "sleep".to_string(),
@@ -1698,11 +1764,12 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             log_file: Some(dir.path().join("agent.log")),
             attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: false,
         };
         let mut original = backend.spawn(&s).expect("spawn sleep with capture");
-        assert!(backend.log_sender(&original).is_some());
+        assert!(backend.log_capture(&original).is_some());
         let fp = backend.fingerprint(&original);
         let adopter = UnixBackend::new();
         let adopted = adopter
@@ -1710,8 +1777,8 @@ mod tests {
             .expect("adopt call ok")
             .expect("a live matching process must be adopted");
         assert!(
-            adopter.log_sender(&adopted).is_none(),
-            "an adopted handle has no recoverable capture threads"
+            adopter.log_capture(&adopted).is_none(),
+            "an adopted handle has no recoverable capture pipeline"
         );
         let _ = backend.stop(&mut original, Duration::from_secs(2));
     }

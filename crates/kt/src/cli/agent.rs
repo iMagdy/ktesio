@@ -12,7 +12,7 @@
 //! only — conventions). Output discipline (AD-12): command results to stdout,
 //! diagnostics/notices to stderr.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
@@ -885,6 +885,28 @@ pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// configurable one.
 const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
+/// How long AC-C's final drain (below) may retry after a non-`running`
+/// transition is observed, before giving up and printing the exit note
+/// (fix pass, M2, review of #80). `Supervisor::transition_with_log_capture`
+/// writes `output.log`'s engine line SYNCHRONOUSLY now (fix pass, H1 — no
+/// background writer thread/channel is involved anymore), but it does so
+/// AFTER first persisting the new state to the DB (`registry.set_state`) —
+/// two separate steps within the SAME call, not one atomic unit. `kt agent
+/// logs --follow` runs in a SEPARATE process from whatever transitions the
+/// instance (e.g. a concurrent `kt agent stop`), so it can observe the NEW
+/// state via `instance_status` (step one) a moment before that OTHER
+/// process has finished the engine-line write (step two) — a real,
+/// cross-process race, distinct from (and independent of) the reader/tailer
+/// mechanics. Retrying briefly here closes it. Mirrors
+/// `crates/ktesio-engine/tests/logs.rs`'s
+/// `follow_drains_and_exits_cleanly_on_stop`'s own accommodation for this
+/// exact race (there, a 3s bound); kept short here since the remaining gap
+/// between the two steps is normally sub-millisecond.
+const FOLLOW_FINAL_DRAIN_BOUND: Duration = Duration::from_secs(2);
+
+/// How often the final-drain retry (above) re-polls while waiting.
+const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// `kt agent logs <name> [--follow]` — read retained logs, optionally
 /// following live output (story 4-2, FR-25, spine AD-12).
 ///
@@ -897,30 +919,28 @@ const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// periodically checking `instance_status`. On a detected rotation (the
 /// engine's returned cursor snaps BELOW the one just passed in), prints one
 /// honest notice rather than silently claiming completeness. On a non-
-/// `running` state, performs one FINAL drain (so no line emitted before the
-/// transition is lost) and exits cleanly with a state-appropriate note — a
-/// `paused` instance is not "gone", so it gets an honest "paused" note, not
-/// an error. No special Ctrl-C handling is needed: this is a read-only
-/// command holding no supervising handle, so a SIGINT exit is always safe.
+/// `running` state, performs a bounded final drain (fix pass, M2 — see
+/// [`FOLLOW_FINAL_DRAIN_BOUND`]; so no line emitted before the transition is
+/// lost) and exits cleanly with a state-appropriate note — a `paused`
+/// instance is not "gone", so it gets an honest "paused" note, not an
+/// error. No special Ctrl-C handling is needed: this is a read-only command
+/// holding no supervising handle, so a SIGINT exit is always safe.
 pub fn logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     let facade = engine.blocking();
 
-    let lines = facade.read_agent_log(name).map_err(map_engine_error)?;
+    // Fix pass (M1, review of #80): `read_agent_log` returns the byte-cursor
+    // it reached ALONGSIDE its one-shot dump — this primes the follow loop's
+    // cursor directly from the SAME read, with no separate
+    // `read_agent_log_since(name, 0)` priming call whose own lines used to
+    // be silently discarded (a T1→T2 window between the two reads during
+    // which any emitted output was lost before `--follow` ever started
+    // polling).
+    let (lines, mut cursor) = facade.read_agent_log(name).map_err(map_engine_error)?;
     print_log_lines(&lines);
     if !follow {
         return Ok(());
     }
-
-    // Prime the cursor to the CURRENT generation's present end so the
-    // follow loop below only ever prints lines NEWER than the one-shot dump
-    // above (`read_agent_log`'s concatenated multi-generation view has no
-    // cursor of its own to resume from — a read at cursor 0 discovers the
-    // current length without printing anything, since we deliberately
-    // discard the lines it returns here).
-    let (_already_shown, mut cursor) = facade
-        .read_agent_log_since(name, 0)
-        .map_err(map_engine_error)?;
 
     loop {
         std::thread::sleep(LOGS_FOLLOW_POLL_INTERVAL);
@@ -933,13 +953,27 @@ pub fn logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         let status = facade.instance_status(name).map_err(map_engine_error)?;
         if status.instance.state != LifecycleState::Running {
-            // AC-C: one final drain so nothing emitted right up to the
-            // transition is lost, THEN the honest exit note.
-            let (final_lines, final_cursor) = facade
-                .read_agent_log_since(name, cursor)
-                .map_err(map_engine_error)?;
-            note_if_rotated(final_cursor, cursor, name);
-            print_log_lines(&final_lines);
+            // AC-C: a BOUNDED final drain (fix pass, M2) so nothing emitted
+            // right up to the transition is lost — retries briefly rather
+            // than a single unretried read (see FOLLOW_FINAL_DRAIN_BOUND's
+            // docs for why); RETRIES while a poll comes back empty (the
+            // writer thread has not caught up yet) and stops as soon as
+            // EITHER a poll finds new content or the bound elapses —
+            // never the reverse (stopping on the FIRST empty read would
+            // defeat the retry's whole purpose).
+            let final_deadline = Instant::now() + FOLLOW_FINAL_DRAIN_BOUND;
+            loop {
+                let (more, next_cursor) = facade
+                    .read_agent_log_since(name, cursor)
+                    .map_err(map_engine_error)?;
+                note_if_rotated(next_cursor, cursor, name);
+                print_log_lines(&more);
+                cursor = next_cursor;
+                if !more.is_empty() || Instant::now() >= final_deadline {
+                    break;
+                }
+                std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
+            }
             ui::note(follow_exit_note(name, status.instance.state));
             return Ok(());
         }

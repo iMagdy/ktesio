@@ -111,7 +111,7 @@ fn wait_for_min_lines_per_stream(
 ) -> Vec<LogLine> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let lines = facade.read_agent_log(name).expect("read_agent_log");
+        let (lines, _cursor) = facade.read_agent_log(name).expect("read_agent_log");
         let out = lines
             .iter()
             .filter(|l| l.stream == LogStream::AgentOut)
@@ -356,19 +356,28 @@ fn follow_drains_and_exits_cleanly_on_stop() {
                 let status = facade.instance_status("svc").expect("instance_status");
                 if status.instance.state != LifecycleState::Running {
                     // One final drain (AC-C): no line up to the transition
-                    // may be lost. The engine-attributed "stopped" line is
-                    // enqueued synchronously inside `stop_inner` (before the
-                    // DB write `instance_status` just observed even
-                    // returns), but the WRITER thread's OWN dequeue-then-
-                    // fsync is a separate, independently-scheduled step —
-                    // under heavy parallel-test CPU contention this can lag
-                    // by a few milliseconds. Retry the drain briefly
+                    // may be lost. Fix pass (review of #80): the
+                    // engine-attributed "stopped" line is now written
+                    // SYNCHRONOUSLY inside `stop_inner` (no background
+                    // writer thread/channel involved at all — see
+                    // `LogCapture::send_engine_line`'s docs) — but
+                    // `stop_inner` persists the NEW STATE to the DB
+                    // (`registry.set_state`, what `instance_status` above
+                    // just read) BEFORE it writes that engine line: two
+                    // separate steps within the SAME call, not one atomic
+                    // unit. This poll runs in the SAME process/thread here,
+                    // so in practice it rarely wins that narrow gap, but
+                    // it is not IMPOSSIBLE (and the equivalent CLI-level
+                    // race — a genuinely SEPARATE `kt agent logs --follow`
+                    // process racing a concurrent `kt agent stop` — is
+                    // real and is what M2's fix pass addresses in
+                    // `kt/src/cli/agent.rs`). Retry the drain briefly
                     // (committed-state polling, never a fixed sleep) rather
                     // than a single one-shot read, so a slow scheduler
                     // moment cannot turn into a false test failure; the
-                    // PRODUCT's own `kt agent logs --follow` still performs
-                    // exactly the one drain AC-C specifies — this loop is a
-                    // test-robustness allowance only.
+                    // PRODUCT's own `kt agent logs --follow` performs the
+                    // SAME bounded retry (M2), not a single unretried
+                    // drain — this loop mirrors it.
                     let final_deadline = Instant::now() + Duration::from_secs(3);
                     loop {
                         let (more, final_c) = facade
@@ -592,15 +601,23 @@ fn legacy_agent_log_is_byte_identical_to_pre_story_content() {
     // adversarially-reviewed billing-critical metering ingestion) reads
     // `agent.log` TODAY, splitting on '\n' and matching a
     // "KTESIO_USAGE {json}" sentinel AT THE START of each RAW physical
-    // line. Prove BOTH halves hold even though this story reworks the
-    // CAPTURE PATH (piped + engine-side reader threads, not a kernel
-    // passthrough): (a) `agent.log`'s bytes are UNCHANGED — the exact raw
-    // lines `fake_agent` wrote, byte for byte, no JSON envelope, no
-    // attribution prefix, no timestamp, even though the SAME reader threads
-    // ALSO feed the new attributed capture; and (b) `drain_usage_for`'s
-    // ledger ingestion still works completely unmodified end to end
-    // (mirrors `metering.rs`'s fixture pattern exactly, reused verbatim —
-    // this story provably does not touch Epic 3's billing path).
+    // line. Prove BOTH halves hold: (a) `agent.log`'s bytes are UNCHANGED —
+    // the exact raw lines `fake_agent` wrote, byte for byte, no JSON
+    // envelope, no attribution prefix, no timestamp; and (b)
+    // `drain_usage_for`'s ledger ingestion still works completely
+    // unmodified end to end (mirrors `metering.rs`'s fixture pattern
+    // exactly, reused verbatim — this story provably does not touch Epic
+    // 3's billing path).
+    //
+    // Fix pass (review of #80): `agent.log`'s CAPTURE PATH changed TWICE
+    // now — story 4-2 originally made it piped + engine-side reader
+    // threads (never a kernel passthrough); THIS fix pass reverted it back
+    // to a DIRECT, synchronous OS redirect (`Stdio::from(file)`) for the
+    // child's stdout alone, closing an engine-crash-kills-the-agent
+    // regression the piped design introduced (see
+    // `ports::process_backend`'s module docs). `agent.log`'s CONTENT
+    // guarantee below is unaffected either way — this test is precisely
+    // what proves that across both capture-path reworks.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_logs_manifest(
@@ -810,16 +827,28 @@ fn logs_adoption_helper_subprocess() {
     facade.start("svc").unwrap();
     // Let a real, substantial pre-crash history accrue (several heartbeats
     // on stdout — this manifest's args only enable --heartbeat-ms, not the
-    // stderr counterpart) BEFORE "crashing" — this engine session's
-    // capture threads are what write it, so the crash-adoption test below
-    // needs GENUINE content already on disk to prove engine 2 can read it.
+    // stderr counterpart) BEFORE "crashing" — `read_agent_log`/
+    // `wait_for_min_lines_per_stream` read the ATTRIBUTED `output.log`,
+    // which is populated by THIS engine session's background tailer thread
+    // (fix pass, review of #80 — the raw `agent.log`/`agent-stderr.log`
+    // files are written directly by the OS, independent of any engine
+    // thread, but the ATTRIBUTED view still needs the tailer alive to
+    // exist) — so the crash-adoption test below needs GENUINE attributed
+    // content already on disk to prove engine 2 can read it.
     let _ = wait_for_min_lines_per_stream(&facade, "svc", 5, 0);
     // Crash: exit WITHOUT dropping the engine, so the kill-on-drop handle
     // never fires and the agent (its own session leader) survives,
-    // re-parented to init. This process's OWN reader/writer threads die
-    // WITH it (a process exit ends every thread in it, regardless of
-    // Drop) — so nothing further will EVER be appended to either capture
-    // file after this point; see the main test's doc comment.
+    // re-parented to init. This process's OWN background tailer thread
+    // dies WITH it (a process exit ends every thread in it, regardless of
+    // Drop) — so `output.log` (the ATTRIBUTED capture) never grows again
+    // after this point. The RAW `agent.log`/`agent-stderr.log` files are
+    // DIFFERENT: `fake_agent` writes them directly via its own OS-level
+    // redirect, with zero engine participation (the fix pass's crash-immune
+    // guarantee), so THEY keep growing for as long as `fake_agent` itself
+    // runs, entirely independent of this process's death — see the main
+    // test's doc comment for why this distinction does not change AC-H's
+    // OWN claim (which is specifically about the attributed, followable
+    // view `read_agent_log`/`read_agent_log_since` expose).
     std::process::exit(0);
 }
 
@@ -831,31 +860,43 @@ fn adopted_instance_can_be_followed_from_a_fresh_engine_session() {
     // pipe); HERE, by contrast, `read_agent_log`/`read_agent_log_since` on
     // an adopted instance SUCCEEDS — reading only ever needs the
     // deterministically-computed FILE path, not a live handle, so a
-    // SECOND engine session (which holds NO capture threads of its own for
-    // this instance — Task 3's `adopt()` sets `log_sender: None`) can still
+    // SECOND engine session (which holds NO capture pipeline of its own for
+    // this instance — Task 3's `adopt()` sets `log_capture: None`) can still
     // read everything ENGINE 1 captured before it exited.
     //
     // HONEST SCOPE (verified empirically, not merely assumed): a
     // `std::process::exit` (this harness's crash simulation, matching the
     // REAL crash case — a `SIGKILL` on the engine likewise reclaims every
     // fd the OS holds for it) terminates EVERY thread in that process,
-    // including its output-capture reader/writer threads — there is no
-    // "the old threads keep running in the background" outcome; the
+    // including its background output-capture TAILER thread — there is no
+    // "the old thread keeps running in the background" outcome; the
     // process is simply gone. `fake_agent` itself SURVIVES (re-parented to
     // init, confirmed via `pid_alive` below) because it is a SEPARATE
-    // process in its own group, but its stdout/stderr pipes now have NO
-    // reader on the other end, so nothing more will EVER reach either
-    // capture file — this is precisely the Dev Notes' own qualifier
-    // ("...capture threads running, in WHICHEVER engine session
-    // originally spawned it and has NOT YET EXITED") made concrete. So
-    // this test proves AC-H's actual, achievable claim: reading an
-    // ADOPTED instance's ALREADY-CAPTURED history NEVER ERRORS and NEEDS
-    // NO live handle/daemon/subscription — contrasted explicitly with
+    // process in its own group.
+    //
+    // Fix pass (review of #80) REFINEMENT of this scope, still true to the
+    // spirit of the ORIGINAL finding below: `fake_agent`'s raw stdout/
+    // stderr are no longer PIPES with "no reader on the other end" — they
+    // are DIRECT file redirects (`agent.log`/`agent-stderr.log`), so they
+    // keep growing for as long as `fake_agent` itself runs, with ZERO
+    // dependency on any engine thread (the crash-immunity this fix pass
+    // exists to guarantee). What DOES stop, and stay stopped, is
+    // specifically the ATTRIBUTED, followable view (`output.log`) this
+    // test's assertions read `read_agent_log`/`read_agent_log_since`
+    // through — that view is a derived, best-effort projection the NOW-GONE
+    // tailer thread produced, and nothing in a SECOND, merely-adopting
+    // session ever resumes producing more of it (by design — Task 3's
+    // `adopt()` starts no new tailer either, mirroring `stdin`'s
+    // `NoPipe`-on-adoption precedent). So this test proves AC-H's actual,
+    // achievable claim about that ATTRIBUTED view specifically: reading an
+    // ADOPTED instance's ALREADY-CAPTURED history NEVER ERRORS and NEEDS NO
+    // live handle/daemon/subscription — contrasted explicitly with
     // `send_input`'s hard failure on the identical instance (4.1 AC-D) —
-    // not that content magically keeps growing after the sole writer is
-    // gone (a claim this test deliberately does NOT make, unlike an
-    // earlier draft that incorrectly assumed it and was caught by this
-    // exact test failing against the real system).
+    // not that the ATTRIBUTED view magically keeps growing after the sole
+    // tailer is gone (a claim this test deliberately does NOT make, unlike
+    // an earlier draft that incorrectly assumed it and was caught by this
+    // exact test failing against the real system before this fix pass ever
+    // existed).
     //
     // Runtime-skip on Windows: this needs the child to genuinely SURVIVE
     // the engine-1 subprocess's exit (Unix re-parenting to init); on
@@ -916,7 +957,7 @@ fn adopted_instance_can_be_followed_from_a_fresh_engine_session() {
     // `send_input_on_an_adopted_instance_is_interaction_unavailable`: THAT
     // call on this SAME kind of instance returns a hard
     // `InteractionUnavailable` error; THIS one returns real data.
-    let lines = facade2.read_agent_log("svc").unwrap();
+    let (lines, one_shot_cursor) = facade2.read_agent_log("svc").unwrap();
     assert!(
         !lines.is_empty(),
         "the adopted instance's already-captured output must be readable from a fresh session"
@@ -941,6 +982,14 @@ fn adopted_instance_can_be_followed_from_a_fresh_engine_session() {
         "read_agent_log_since(0) must agree with read_agent_log's one-shot count \
          (both read the same current-generation content here — no rotation occurred)"
     );
+    // M1 (review of #80): read_agent_log's OWN returned cursor must agree
+    // with read_agent_log_since's, so a `kt agent logs --follow` invocation
+    // can prime its poll loop directly from the one-shot dump's cursor with
+    // no separate, discarding priming call.
+    assert_eq!(
+        one_shot_cursor, cursor_after_all,
+        "read_agent_log's returned cursor must match read_agent_log_since(0)'s resulting cursor"
+    );
     // A further poll from the end of the retained content honestly reports
     // nothing new (never errors, never fabricates growth) — the accurate,
     // testable expression of "no writer remains" for a session that never
@@ -955,4 +1004,221 @@ fn adopted_instance_can_be_followed_from_a_fresh_engine_session() {
     // orphan remains.
     facade2.stop("svc", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the adopted process");
+}
+
+// ---- Finding A: the crash-kill experiment (empirical proof, fix pass review of #80) ----
+//
+// Reproduces the adversarial reviewer's exact experiment against the FIXED
+// code: a process with the OS's DEFAULT SIGPIPE disposition — deliberately
+// NOT `fake_agent`, which (being a Rust binary) installs `SIG_IGN` for
+// SIGPIPE at startup like every Rust/Python process, masking exactly the
+// failure mode a real, non-Rust/non-Python agent CLI (a shell script, a C
+// program, many real-world model-CLI wrappers) would hit — spawned through
+// the REAL engine, followed by a simulated engine crash
+// (`std::process::exit(0)` WITHOUT dropping the `Engine`, the SAME pattern
+// `adoption.rs`'s `run_engine1` already uses to model AD-5 crash scenarios).
+//
+// BEFORE this fix pass: the still-alive, re-parented, NEVER-EXPLICITLY-
+// TOUCHED agent process died within 13-20ms of the engine's crash (the
+// reviewer's own measurement), confirmed via exit code 141 (=128+13=
+// SIGPIPE) — the engine's crash closed its fd table, vanishing the piped
+// stdout's sole read-end reference, so the process's NEXT `write()` got
+// `EPIPE` and its default SIGPIPE disposition killed it.
+//
+// AFTER this fix pass: stdout is a DIRECT file redirect (`Stdio::from`,
+// never a pipe — see `SpawnSpec::log_file`'s docs), so the process's
+// `write()` never depends on the engine's liveness at all. It must SURVIVE
+// and keep writing successfully long after the "crash".
+
+/// `yes` — a real, standard Unix utility (present on Linux and macOS by
+/// default), NOT written in Rust or Python: it has the OS's DEFAULT SIGPIPE
+/// disposition (unlike `fake_agent`), and prints "y" to stdout forever,
+/// completely independent of this test's own logic, until killed or its
+/// stdout breaks. Wrapped in `sh -c 'echo $$ > <marker>; exec yes'` SOLELY
+/// so the marker file ends up holding the exact PID of the running `yes`
+/// process (`exec` replaces the shell's image in place, keeping the SAME
+/// pid, and preserves the shell's own SIGPIPE disposition — SIG_DFL,
+/// unless something upstream explicitly changed it — across the replace;
+/// `std::process::Command` already resets SIGPIPE to SIG_DFL for every
+/// spawned child regardless of the ENGINE's own SIG_IGN, which is precisely
+/// why this experiment is meaningful to run at all).
+fn write_yes_manifest(dir: &Path, pid_marker: &Path) {
+    // Single-quote the marker path for the SHELL (handles spaces without
+    // needing shell-escapes); this whole shell command then becomes ONE
+    // TOML basic string (double-quoted) below — Display (not Debug/`{:?}`,
+    // which would inject its OWN literal double quotes and break the TOML)
+    // is what keeps the two layers of quoting from colliding.
+    let shell_cmd = format!("echo $$ > '{}'; exec yes", pid_marker.display());
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "sigpipe-probe"
+
+[lifecycle.start]
+exec = "sh"
+args = ["-c", {shell_cmd:?}]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+    );
+    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+}
+
+/// Run "engine 1" in a SEPARATE child process (mirrors `run_engine1`/
+/// `adoption.rs`'s identical pattern): register + start `svc` (the `yes`
+/// probe), then exit WITHOUT dropping the engine (crash semantics). Blocks
+/// until the child exits.
+fn run_crash_helper(state: &Path, manifest: &Path) {
+    let exe = std::env::current_exe().expect("test exe");
+    let status = Command::new(exe)
+        .args(["--exact", "crash_kill_helper_subprocess", "--nocapture"])
+        .env("KTESIO_CRASH_HELPER", "1")
+        .env("KTESIO_CRASH_STATE", state)
+        .env("KTESIO_CRASH_MANIFEST", manifest)
+        .status()
+        .expect("run crash-kill helper subprocess");
+    assert!(
+        status.success(),
+        "crash-kill helper subprocess failed: {status}"
+    );
+}
+
+/// The re-exec entry for [`run_crash_helper`]. When `KTESIO_CRASH_HELPER` is
+/// unset this is a trivial pass (it runs as a normal test in the parent
+/// binary too, and does nothing).
+#[test]
+fn crash_kill_helper_subprocess() {
+    let Ok(_mode) = std::env::var("KTESIO_CRASH_HELPER") else {
+        return; // normal in-process invocation: nothing to do.
+    };
+    let state = PathBuf::from(std::env::var("KTESIO_CRASH_STATE").unwrap());
+    let manifest = PathBuf::from(std::env::var("KTESIO_CRASH_MANIFEST").unwrap());
+
+    let engine = Engine::open(Some(state)).expect("engine1 open");
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest))
+        .unwrap();
+    facade.start("svc").unwrap();
+    // Crash IMMEDIATELY after start (no linger): exit WITHOUT dropping the
+    // engine, so the kill-on-drop handle never fires. This is the
+    // WORST-CASE timing for the pre-fix bug — the engine dies as soon as
+    // possible after spawning, maximizing the chance a live pipe's read end
+    // would already be gone by the time the child's very next write()
+    // happens.
+    std::process::exit(0);
+}
+
+/// Read the `yes` process's pid directly out of the state DB (the write-
+/// ahead spawn record — `agent_runtime.pid`, story 1-6/AD-5), bypassing the
+/// crashed engine session entirely (its process no longer exists to ask).
+/// Mirrors `usage_row_count`'s identical "read-only direct connection to
+/// the same state DB the engine commits to" pattern.
+fn read_pid_from_db(state_dir: &Path, name: &str) -> u32 {
+    let conn = rusqlite::Connection::open(state_dir.join("state.db")).expect("open state db");
+    conn.query_row(
+        "SELECT r.pid FROM agent_runtime r \
+         JOIN agent_instances i ON i.id = r.instance_id \
+         WHERE i.name = ?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("a write-ahead spawn record must exist") as u32
+}
+
+#[test]
+fn crash_kill_experiment_a_default_sigpipe_process_survives_an_engine_crash() {
+    // See the section docs above for the full experiment design/rationale.
+    if OsId::current() == OsId::Windows {
+        return; // no SIGPIPE / no `yes` on Windows; N/A there (see the fix's own docs).
+    }
+    if is_linux_ci() {
+        return; // #109: same heavy re-exec + surviving-orphan CI mitigation as the other harnesses.
+    }
+
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let pid_marker = state.path().join("yes.pid");
+    write_yes_manifest(manifest.path(), &pid_marker);
+
+    // Engine 1 (a subprocess): start `svc` (the `yes` probe), then crash
+    // (exit without drop) as fast as possible after start.
+    let crash_at = Instant::now();
+    run_crash_helper(state.path(), manifest.path());
+    let crashed_after = crash_at.elapsed();
+
+    // Learn the `yes` process's pid — from the DB (the crashed engine
+    // session can no longer be asked), cross-checked against the marker
+    // file `sh` wrote right before `exec`ing into `yes` (same pid, since
+    // `exec` never forks).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(contents) = std::fs::read_to_string(&pid_marker) {
+            if let Ok(marker_pid) = contents.trim().parse::<u32>() {
+                break marker_pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "yes.pid marker never appeared");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let db_pid = read_pid_from_db(state.path(), "svc");
+    assert_eq!(
+        db_pid, pid,
+        "the marker-file pid and the write-ahead record's pid must agree (same process)"
+    );
+
+    let agent_log = agent_log_path(state.path(), "svc");
+    let len_at_t0 = std::fs::metadata(&agent_log).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        pid_alive(pid),
+        "the yes process must be alive immediately after the simulated crash (pid {pid})"
+    );
+
+    // The reviewer's pre-fix measurement: death within 13-20ms of the
+    // crash. Wait a window MANY times larger (300ms — ~15-20x) before
+    // re-checking, so a pass here is not a lucky race but a genuine,
+    // comfortable margin.
+    let proof_window = Duration::from_millis(300);
+    std::thread::sleep(proof_window);
+
+    let still_alive = pid_alive(pid);
+    let len_at_t1 = std::fs::metadata(&agent_log).map(|m| m.len()).unwrap_or(0);
+
+    // Report the exact numbers for the record (visible with --nocapture),
+    // mirroring the reviewer's own "confirmed via exit code 141" precision.
+    println!(
+        "crash-kill experiment: helper subprocess crashed after {crashed_after:?}; \
+         yes pid={pid}; agent.log length at crash={len_at_t0} bytes, \
+         after a {proof_window:?} wait={len_at_t1} bytes (grew by {} bytes); \
+         still alive after the wait={still_alive}",
+        len_at_t1.saturating_sub(len_at_t0)
+    );
+
+    assert!(
+        still_alive,
+        "REGRESSION: the yes process (pid {pid}) died within {proof_window:?} of the engine's \
+         simulated crash — this is the exact SIGPIPE-on-crash regression this fix pass exists \
+         to close (pre-fix, the reviewer measured death within 13-20ms)"
+    );
+    assert!(
+        len_at_t1 > len_at_t0,
+        "the yes process must have kept WRITING successfully after the crash, not merely \
+         still exist (agent.log length {len_at_t0} -> {len_at_t1})"
+    );
+
+    // Teardown: this process was never adopted (no second engine session
+    // ran here), so it is a bare orphan — kill it directly.
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    wait_until_gone(
+        pid,
+        "the yes process must be killable directly after the experiment",
+    );
 }

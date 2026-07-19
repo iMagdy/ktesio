@@ -3729,7 +3729,7 @@ fn logs_reads_retained_output_after_the_instance_stops() {
 }
 
 #[test]
-fn logs_follow_on_an_adopted_running_instance_streams_new_output() {
+fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop() {
     // AC-H at the CLI layer — the mirror image of 4.1's AC-D CLI test
     // (`send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable`):
     // THERE, `send` on this SAME kind of instance exits non-zero
@@ -3739,23 +3739,30 @@ fn logs_follow_on_an_adopted_running_instance_streams_new_output() {
     // handle/daemon needed to read/follow an adopted instance) together
     // with AC-C (a clean, non-hanging exit) through the real `kt` binary.
     //
-    // DEVIATION FROM THE STORY FILE (documented, mirrors 4.1 Task 8's own
-    // precedent of a test-outcome correction once verified against the
-    // real system): Task 9's bullet literally describes this test
-    // asserting NEW output appears "after the follow command starts."
-    // Verified empirically — both here and at the engine level in
-    // `ktesio-engine/tests/logs.rs`'s
-    // `adopted_instance_can_be_followed_from_a_fresh_engine_session` — that
-    // this is NOT achievable: `start_via_surviving_engine`'s starting
-    // session EXITS (the crash simulation) before this test's `--follow`
-    // ever runs, and a process exit terminates EVERY thread in it,
-    // including the output-capture reader/writer threads — there is no
-    // "the old capture keeps running in the background" outcome, matching
-    // the story's OWN Dev Notes qualifier ("...capture threads running...
-    // in WHICHEVER engine session... has NOT YET EXITED"). So no further
-    // bytes ever reach either capture file once the starting session is
-    // gone — `fake_agent` itself survives (re-parented to init), but its
-    // stdout/stderr pipes have no reader on the other end. This test
+    // RENAMED (fix pass, L3, review of #80) from
+    // `logs_follow_on_an_adopted_running_instance_streams_new_output`: the
+    // OLD name claimed exactly what this test's own doc comment already
+    // admitted it doesn't prove — mirrors how the engine-level sibling test
+    // is correctly named
+    // `adopted_instance_can_be_followed_from_a_fresh_engine_session`
+    // (`ktesio-engine/tests/logs.rs`), not "...streams_new_output". Verified
+    // EMPIRICALLY (both here and at the engine level, unaffected by this
+    // fix pass's crash-safety redesign — an adopted handle still gets no
+    // capture pipeline of its own, by design, matching pre-fix behavior
+    // exactly) that this is NOT achievable: `start_via_surviving_engine`'s
+    // starting session EXITS (the crash simulation) before this test's
+    // `--follow` ever runs, and a process exit terminates EVERY thread in
+    // it, including the output-capture threads — there is no "the old
+    // capture keeps running in the background" outcome, matching the
+    // story's OWN Dev Notes qualifier ("...capture threads running... in
+    // WHICHEVER engine session... has NOT YET EXITED"). So no further bytes
+    // ever reach either capture file once the starting session is gone —
+    // `fake_agent` itself survives (re-parented to init), but its
+    // stdout/stderr redirects have no active writer-side participant left
+    // to extend them further (the RAW files themselves would still accept
+    // direct writes from the still-alive agent process, crash-immune as
+    // ever — it is specifically the ATTRIBUTED capture's tailer, which only
+    // the now-gone starting session ever ran, that stops). This test
     // instead proves the actual, honest, achievable AC-H claim: the
     // pre-crash history is followable with no error, and follow exits
     // cleanly (never hanging) once the instance is stopped by a THIRD,

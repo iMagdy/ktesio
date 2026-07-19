@@ -26,10 +26,11 @@
 //! dynamic dispatch, and the port stays free of OS types.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ChildStdin;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -51,22 +52,59 @@ pub struct SpawnSpec {
     pub env: BTreeMap<String, String>,
     /// The working directory for the child — the Agent Home.
     pub working_dir: PathBuf,
-    /// A file the child's stdout/stderr are redirected to — the per-instance log
-    /// seed (AD-12). `None` inherits the engine's streams (used only in tests
-    /// that do not assert captured output).
+    /// A file the child's STDOUT ALONE is redirected to — the legacy,
+    /// Epic-3-critical `agent.log` (AD-12). Fix pass (review of #80): this
+    /// is a DIRECT OS-level redirect (`Stdio::from(file)`), the SAME
+    /// crash-immune mechanism used before story 4-2 ever piped anything —
+    /// the child's `write()` to stdout succeeds or fails based ONLY on this
+    /// regular file, NEVER on whether the engine process is even still
+    /// alive to read anything. Story 4-2 (pre-fix) combined stdout+stderr
+    /// into this ONE file via engine-side reader threads draining a pipe;
+    /// that coupled the agent's write-success to the engine's liveness for
+    /// the first time (NFR-1 regression) and, separately, made
+    /// `drain_usage_for`'s billing-critical sentinel read depend on a
+    /// reader thread's OWN schedule (a genuinely new race, H2). Reverting to
+    /// a direct per-STREAM redirect (see [`SpawnSpec::stderr_log_file`] for
+    /// the other stream) closes BOTH: `agent.log`'s CONTENT stays raw,
+    /// unattributed, byte-identical to today's format (only stdout, since
+    /// the `KTESIO_USAGE` sentinel `drain_usage_for` parses is a
+    /// stdout-only convention — confirmed via `docs/manifest.md`/
+    /// `docs/architecture.md`/`ports::usage_source` — so nothing
+    /// billing-critical is lost by not ALSO merging stderr into this file
+    /// directly; stderr is captured separately, see below). `None` inherits
+    /// the engine's streams (used only in tests that do not assert captured
+    /// output).
     pub log_file: Option<PathBuf>,
     /// Where the ATTRIBUTED, rotated capture (`agent-out`/`agent-err`/`engine`
     /// lines) should be written — the CURRENT generation file (story 4-2,
-    /// AD-12). `Some` in every PRODUCTION spawn, paired 1:1 with
-    /// `log_file: Some(..)` (the supervisor computes both from the SAME
-    /// `Registry` path authority in the same breath) — capture is
+    /// AD-12). `Some` in every PRODUCTION spawn, paired 1:1:1 with
+    /// `log_file`/`stderr_log_file` (the supervisor computes all three from
+    /// the SAME `Registry` path authority in the same breath) — capture is
     /// UNCONDITIONAL and capability-independent (AC-E), never gated on
     /// `Capability::Interaction` the way [`SpawnSpec::pipe_stdin`] gates the
     /// stdin *write* direction. `None` only alongside `log_file: None`, the
     /// small set of unit tests that assert nothing about captured output —
     /// this pairing is a narrow test-fixture convenience, not a capability
     /// gate: reading FROM a process is never gated, only writing TO it is.
+    ///
+    /// Fix pass (review of #80): this file is no longer fed by a live pipe
+    /// either — it is populated by a background TAILER that incrementally
+    /// reads the two crash-immune raw files ([`SpawnSpec::log_file`],
+    /// [`SpawnSpec::stderr_log_file`]) and re-attributes+rotates their
+    /// content, so it can lag or stop entirely if the engine crashes
+    /// without harming the agent's OWN writes at all — it is now a derived,
+    /// best-effort VIEW, never a dependency of the agent's liveness.
     pub attributed_log_path: Option<PathBuf>,
+    /// A file the child's STDERR ALONE is redirected to (fix pass — review of
+    /// #80) — the crash-immune raw stderr capture, direct OS write, exactly
+    /// like [`SpawnSpec::log_file`] but for the other stream. `Some` in
+    /// every PRODUCTION spawn, paired 1:1:1 with `log_file`/
+    /// `attributed_log_path` (all three `Some` together, or all `None` —
+    /// see [`SpawnSpec::attributed_log_path`]'s docs on the narrow
+    /// test-fixture `None` convenience). See the module docs above the
+    /// capture primitives for why stdout and stderr each get their OWN
+    /// direct file rather than sharing one.
+    pub stderr_log_file: Option<PathBuf>,
     /// The Agent Instance name, stamped on every captured [`LogLine`]
     /// (`LogLine.instance`) — paired with [`SpawnSpec::attributed_log_path`].
     pub instance_name: String,
@@ -426,48 +464,160 @@ pub(crate) fn write_stdin_bounded(
     }
 }
 
-// ---- Story 4-2 (AD-12): the shared output-capture reader/writer threads ----
+// ---- Story 4-2 (AD-12), fix pass (review of #80): crash-immune capture ----
 //
-// Three distinct sources can produce a `LogLine` for the same instance: the
-// stdout reader thread, the stderr reader thread, and (Task 4) the
-// supervisor's own transition-time `engine`-attributed sends — potentially
-// from three different OS threads. Rather than a shared `Mutex` guarding a
-// rotate-then-append sequence, ONE background writer thread owns the current-
-// generation file handle and performs every rotation-check-then-append
-// SERIALLY, fed by a single `mpsc::Sender<LogLine>` every source clones —
-// eliminating the lock entirely (no two threads ever touch the file) and
-// mirroring `write_stdin_bounded`'s established `std::thread` + `mpsc`
-// continuous-I/O convention (the SAME pattern, not a new one). The writer
-// thread exits naturally when every `Sender` clone is dropped (the channel
-// closes, `recv()` returns `Err`) — no explicit shutdown signal needed.
+// ROOT CAUSE this fix pass closes: story 4-2 originally connected the child's
+// stdout/stderr to `Stdio::piped()` unconditionally, with the ENGINE holding
+// the pipes' read ends (consumed by reader threads, for attribution). That
+// coupled the agent's write-SUCCESS to the engine's LIVENESS for the first
+// time: if the engine process exits by any means that skips its own `Drop`
+// (SIGKILL, panic-abort, OOM), the OS closes its fd table, the pipe's sole
+// read-end reference vanishes, and the agent's NEXT `write()` gets `EPIPE` —
+// which kills a default-SIGPIPE-disposition process outright (the common case
+// for shell scripts, C programs, and many non-Rust/non-Python agent CLIs) and,
+// for a SIGPIPE-immune agent (Rust/Python's default), permanently ends output
+// capture for the rest of that instance's life. This is a direct regression
+// against NFR-1 (an engine crash must never be able to kill, or permanently
+// blind us to, a process it is supposed to be resiliently supervising).
+//
+// THE FIX: eliminate the pipe entirely for output capture. The child's
+// stdout and stderr are each redirected DIRECTLY to their OWN regular file
+// (`Stdio::from(file)`, one file per stream — see [`SpawnSpec::log_file`] /
+// [`SpawnSpec::stderr_log_file`]), exactly the crash-immune mechanism this
+// codebase used for `agent.log` BEFORE story 4-2 ever piped anything: a
+// regular file never generates `SIGPIPE`/`EPIPE` on write regardless of
+// whether anything is reading it, so the agent's own `write()` succeeds or
+// fails based ONLY on that file, NEVER on the engine's liveness. The stdout
+// file IS `agent.log` (CRITICAL SCOPING #3 — byte-identical raw content,
+// still what `drain_usage_for` reads directly and synchronously, so its
+// billing-critical sentinel read has ZERO added hop latency, same as before
+// story 4-2 ever existed — this is also the H2 fix: `drain_usage_for`'s
+// terminal, pre-kill read can no longer race a reader thread's own schedule,
+// because there is no longer a reader thread between the agent's write() and
+// this file).
+//
+// ATTRIBUTION + ROTATION (the actual point of story 4-2) now come from a
+// background TAILER: a per-instance thread that incrementally re-reads
+// (cursor-based, the same idea [`crate::domain::Supervisor::read_agent_log_since`]
+// already uses) the two crash-immune raw files and re-attributes+rotates
+// their content into `output.log[.N]` (via [`append_attributed_line`],
+// UNCHANGED below). This is now a DERIVED, best-effort VIEW: it can lag, or
+// stop entirely if the engine crashes, WITHOUT harming the agent's own
+// writes at all (unlike the pre-fix reader threads, whose live pipes the
+// agent's writes depended on).
+//
+// H1 fix (review of #80, second finding): the ORIGINAL version of this fix
+// pass kept story 4-2's single-background-writer-thread-fed-by-a-channel
+// design for `output.log` (only the READER side changed, from blocking pipe
+// reads to a polling tailer). That left a DIFFERENT async hop in place for
+// Task 4's `Engine`-attributed lines: `transition_with_log_capture` would
+// `send` a line into the channel and return immediately, trusting the
+// writer thread to eventually dequeue and append it — but a caller that
+// starts an instance and then EXITS right away (e.g. a `kt agent start`-style
+// CLI invocation, or this fix pass's own crash-adoption test harnesses) can
+// race that writer thread's own `recv`/write cycle, losing the
+// just-enqueued "engine: ... -> running" line entirely if the process ends
+// before the writer thread is even scheduled once (confirmed empirically:
+// `logs_reads_retained_output_after_the_instance_stops` failed
+// DETERMINISTICALLY, not just flakily, once this was the only remaining
+// async hop). There is no way to "join" that thread from a caller doing
+// `std::process::exit` immediately after — the ONLY robust fix is to remove
+// the asynchronous hand-off entirely for this write path, not merely narrow
+// its window. So `output.log`'s writes are now FULLY SYNCHRONOUS too: NO
+// background writer thread, NO channel — [`LogCapture::send_engine_line`]
+// and the tailer's own catch-up pass both call [`append_attributed_line`]
+// DIRECTLY, on whichever thread is doing the work, serialized by ONE shared
+// [`Mutex`] (guarding both the tail cursors AND the rotate-then-append
+// sequence) so two callers can never interleave a rotation or corrupt the
+// file — the same non-negotiable property the story's ORIGINAL single-writer-
+// thread design existed to guarantee, just via a lock instead of a channel
+// (a substitution the story's own Dev Notes anticipated a reviewer might
+// expect: "a future reviewer might expect a `Mutex<File>` instead"). This
+// makes `send_engine_line` (and thus every lifecycle transition) block
+// briefly on a small, cheap disk append — a deliberate, bounded trade
+// (microseconds, not the unbounded-write hazard 4.1's `STDIN_WRITE_TIMEOUT`
+// fix pass guarded against) in exchange for a WRITE THAT HAS DEMONSTRABLY
+// HAPPENED before the call returns, which is the only way to make this
+// class of race structurally impossible rather than merely unlikely.
 
-/// Append ONE [`LogLine`] to the attributed capture at `path`, rotating FIRST
-/// if the file's CURRENT size has already reached [`LOG_ROTATE_MAX_BYTES`]
-/// ([`should_rotate`]) — so no line ever spans a rotation boundary. One
-/// JSON-Lines record per call.
-///
-/// A free function (not a method) so it is directly unit-testable in a tight
-/// loop with no thread/channel synchronization needed (the writer thread
-/// below is a thin loop around this). Best-effort: there is no caller to
-/// propagate a failure to (fed by a channel, from a background thread with no
-/// return path) — a write hiccup here must never crash the engine over a
-/// captured-log line, mirroring this codebase's existing best-effort
-/// discipline for background capture (e.g. `drain_usage_for`'s read-failure
-/// skip).
+/// Append ONE [`LogLine`] to the attributed capture at `path` — a thin,
+/// single-item wrapper around [`append_attributed_lines`] (see its docs for
+/// the rotation/best-effort contract). Kept as its own name because it is
+/// the direct call [`LogCapture::send_engine_line`] makes (exactly one
+/// line) and because several existing unit tests already call it by this
+/// name.
 fn append_attributed_line(path: &Path, line: &LogLine) {
+    append_attributed_lines(path, std::slice::from_ref(line));
+}
+
+/// Append a BATCH of [`LogLine`]s to the attributed capture at `path` in
+/// ONE file open (fix pass, review of #80 — the performance/liveness
+/// finding this batching closes): checks [`should_rotate`] ONCE against the
+/// size BEFORE this batch (rotating first if needed), then opens `path`
+/// ONCE and writes every line before closing — never one open-check-write-
+/// close cycle PER line. This matters because [`tail_new_lines`] can hand
+/// this dozens to thousands of lines from a single catch-up pass (a fast,
+/// bursty writer with no backpressure — e.g. a real OS process writing
+/// directly to its own regular-file redirect, exactly the crash-immune
+/// mechanism this fix pass introduces — can accumulate a large backlog
+/// between polls): a naive one-open-per-line loop over such a backlog would
+/// make a SINGLE [`LogCapture::send_engine_line`] call (which runs
+/// SYNCHRONOUSLY, potentially while the caller holds the engine-wide
+/// supervisor lock — see `domain::supervisor`'s `EngineInner`) take
+/// seconds to minutes purely on open/close syscall overhead, a genuine
+/// engine-freezing hazard this batching eliminates (empirically confirmed
+/// during this fix pass's own crash-kill experiment: an unbounded `yes`
+/// process, writing with zero backpressure to its direct-file redirect,
+/// produced a backlog large enough that the pre-batching implementation
+/// spun for minutes and exhausted tens of gigabytes of disk before this fix
+/// was applied). A single generation may end up slightly over
+/// [`LOG_ROTATE_MAX_BYTES`] as a result (the whole batch lands after one
+/// rotation check, never mid-batch) — an accepted approximation, consistent
+/// with [`should_rotate`]'s existing "checked before, not enforced
+/// mid-write" contract. `lines` is capped by
+/// [`MAX_TAIL_LINES_PER_PASS`]/[`MAX_TAIL_BYTES_PER_PASS`] at the caller
+/// ([`tail_new_lines`]), so a single batch here is itself bounded.
+///
+/// A free function (not a method) so it is directly unit-testable with no
+/// thread synchronization needed. Best-effort: a write hiccup here must
+/// never crash the engine over a captured-log line, mirroring this
+/// codebase's existing best-effort discipline for background capture (e.g.
+/// `drain_usage_for`'s read-failure skip).
+fn append_attributed_lines(path: &Path, lines: &[LogLine]) {
+    if lines.is_empty() {
+        return;
+    }
     let current_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if should_rotate(current_len) {
         rotate_generations(path, LOG_ROTATE_GENERATIONS);
     }
-    let Ok(json) = serde_json::to_string(line) else {
-        return;
-    };
+    // Serialize the WHOLE batch into ONE in-memory buffer and issue ONE
+    // `write_all` call (fix pass, review of #80 — a second, independent
+    // performance finding from the same crash-kill experiment this batch
+    // API was introduced for): a naive per-line `writeln!` on a bare,
+    // unbuffered `File` is a SEPARATE `write()` SYSCALL per line — for a
+    // batch of hundreds of thousands of tiny lines (a fast, bursty writer
+    // with no backpressure can accumulate exactly that many within
+    // [`MAX_TAIL_BYTES_PER_PASS`]), that is still hundreds of thousands of
+    // syscalls despite the file being opened only once, which empirically
+    // took SECONDS — long enough to matter for a call
+    // ([`LogCapture::send_engine_line`]) that may run while the engine-wide
+    // supervisor lock is held. Building one buffer and writing it in a
+    // single call reduces this to O(1) syscalls regardless of batch size.
+    let mut buf = String::with_capacity(lines.len() * 96);
+    for line in lines {
+        let Ok(json) = serde_json::to_string(line) else {
+            continue;
+        };
+        buf.push_str(&json);
+        buf.push('\n');
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{json}");
+        let _ = file.write_all(buf.as_bytes());
     }
 }
 
@@ -511,153 +661,329 @@ fn rotate_generations(base: &Path, generations: u8) {
     let _ = std::fs::rename(base, generation_path(base, 1));
 }
 
-/// Spawn the SINGLE background writer thread for one instance's attributed
-/// capture (story 4-2, Task 2), returning the `Sender` every capture source
-/// (both reader threads, and the supervisor's own transition-time sends,
-/// Task 4) clones. `pub(crate)` and separate from [`spawn_output_capture`] so
-/// tests can drive + `join` it directly (send lines, drop every `Sender`
-/// clone, join, THEN assert on disk — a deterministic synchronization, no
-/// wall-clock polling) without needing a real spawned process.
-pub(crate) fn spawn_log_writer(
-    attributed_log_path: PathBuf,
-) -> (mpsc::Sender<LogLine>, thread::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<LogLine>();
-    let handle = thread::spawn(move || {
-        while let Ok(line) = rx.recv() {
-            append_attributed_line(&attributed_log_path, &line);
-        }
-    });
-    (tx, handle)
+/// How often the background tailer thread ([`spawn_tailer_thread`]) re-reads
+/// the crash-immune raw per-stream files for new, complete lines (fix pass,
+/// review of #80) — mirrors [`crate::backends::unix::STOP_POLL_INTERVAL`]'s
+/// existing precedent of a short, hardcoded poll bound. Fast enough that
+/// `output.log`'s attributed view stays close to real time (well within the
+/// generous multi-second deadlines every existing follow/attribution test
+/// already tolerates), cheap enough (two small file reads per tick) not to
+/// be wasteful.
+const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The MAXIMUM number of new bytes [`tail_new_lines`] reads (and thus the
+/// most it ever hands to ONE [`append_attributed_lines`] batch) per call
+/// (fix pass, review of #80). This is the bound that keeps
+/// [`LogCapture::send_engine_line`] — which runs SYNCHRONOUSLY and may be
+/// called while the engine-wide supervisor lock is held — from blocking for
+/// an unbounded time when a fast, bursty writer (a real OS process with no
+/// backpressure at all, since it writes to a direct file redirect, never a
+/// pipe) has accumulated a large backlog between polls. A backlog LARGER
+/// than this bound is simply left for the NEXT catch-up pass (the tailer's
+/// own next tick, or the next `send_engine_line`/tailer call to acquire the
+/// lock) — never fully "lost", just spread across more passes. 4MB keeps a
+/// single pass fast (well under [`LOG_ROTATE_MAX_BYTES`], so it can never
+/// itself force more than one rotation) while still making rapid progress
+/// against a genuinely large backlog.
+const MAX_TAIL_BYTES_PER_PASS: u64 = 4 * 1024 * 1024;
+
+/// The MAXIMUM number of LINES [`tail_new_lines`] processes per call (fix
+/// pass, review of #80 — a SECOND bound, alongside
+/// [`MAX_TAIL_BYTES_PER_PASS`], found necessary by this fix pass's own
+/// empirical crash-kill experiment). [`MAX_TAIL_BYTES_PER_PASS`] alone does
+/// NOT bound the per-call WORK for a writer that emits many TINY lines (a
+/// real OS process — e.g. `yes`, or any tight `while true; do echo ...; done`
+/// loop — writing millions of short lines per second): even after batching
+/// every append into ONE file write ([`append_attributed_lines`]), each
+/// line still needs its OWN [`LogLine`] construction and
+/// `serde_json::to_string` call — empirically, ~2 MILLION tiny lines
+/// (a 4MB batch of 2-byte "y\n" lines) took ~1s even in an OPTIMIZED
+/// release build, and ~15s in an unoptimized debug build (the build this
+/// project's own test suite and gates run under) — far too slow for a call
+/// that may run while the engine-wide supervisor lock is held.
+/// Capping the LINE COUNT (not just the byte count) directly bounds this
+/// per-line work regardless of how tiny individual lines are; a backlog
+/// with many more lines than this is simply spread across more passes,
+/// exactly like exceeding the byte bound.
+const MAX_TAIL_LINES_PER_PASS: usize = 2000;
+
+/// How far into each of the two crash-immune raw per-stream files the
+/// tailer has already folded content into the attributed capture (fix
+/// pass). This ONE [`Mutex`] is the SOLE synchronization primitive for
+/// `output.log`: it guards both the cursor state AND every
+/// rotate-then-append sequence (via [`LogCapture::catch_up_locked`]),
+/// serializing the background tailer thread against any INLINE caller
+/// ([`LogCapture::send_engine_line`]) so the two can never interleave a
+/// rotation or a write (H1 fix — see the module docs above).
+#[derive(Default, Debug)]
+struct TailCursors {
+    /// Bytes of [`LogCapture::stdout_raw`] already tailed.
+    stdout: u64,
+    /// Bytes of [`LogCapture::stderr_raw`] already tailed.
+    stderr: u64,
 }
 
-/// Strip a trailing `\n` (and a preceding `\r`, if present) from a raw line
-/// buffer, lossily decoding the remainder as UTF-8 (never a panic on
-/// non-UTF8 agent output — the SAME defensive stance this codebase takes
-/// everywhere text crosses a process boundary). Used only for the
-/// ATTRIBUTED [`LogLine::text`] — the legacy `agent.log` write uses the raw
-/// bytes verbatim, delimiter included, completely independently (CRITICAL
-/// SCOPING #3).
-fn strip_trailing_newline(buf: &[u8]) -> String {
-    let mut bytes = buf;
-    if bytes.last() == Some(&b'\n') {
-        bytes = &bytes[..bytes.len() - 1];
-        if bytes.last() == Some(&b'\r') {
-            bytes = &bytes[..bytes.len() - 1];
-        }
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// Spawn ONE reader thread that drains `pipe` (the child's stdout or stderr)
-/// line-by-line via [`BufRead::read_until`] (story 4-2, Task 2) — NOT
-/// `BufRead::lines()`, deliberately: `read_until(b'\n', ..)` returns the raw
-/// bytes INCLUDING the delimiter when found (or the exact trailing bytes with
-/// NO synthesized delimiter at EOF), which is what makes the legacy-log write
-/// below byte-identical to today's kernel passthrough even for a final line
-/// with no trailing newline (`lines()` strips the delimiter from every
-/// yielded item, which would silently ADD a `\n` back on re-write that the
-/// original raw stream never had).
-///
-/// For each line read, this thread does BOTH, independently:
-/// 1. Appends the RAW bytes VERBATIM to `legacy_log_path` (CRITICAL SCOPING
-///    #3 — same bytes, same file, same format as today; only the writer
-///    changed from "the OS kernel" to this thread). Opening the file in
-///    APPEND mode on every write mirrors the existing dual
-///    `Stdio::from(file)`/`try_clone()` atomicity this replaces: an
-///    append-mode write is atomically placed at the file's current end by
-///    the OS, so two independently-opened handles (this reader + its stderr
-///    sibling) can safely interleave without corrupting either line.
-/// 2. Sends an attributed, timestamped, newline-stripped [`LogLine`]
-///    (`stream`) to the writer thread via `sender`.
-///
-/// Exits naturally on EOF (the pipe closes when the child exits and its fd
-/// closes) or a read error. Unlike the stdin *write* direction, a *read*
-/// cannot hang indefinitely on backpressure — it only ever yields data, EOF,
-/// or an error — so, deliberately, NO timeout is used here; a reviewer should
-/// not expect a mechanism symmetrical to [`write_stdin_bounded`].
-fn spawn_reader_thread<R>(
-    pipe: R,
-    stream: LogStream,
-    legacy_log_path: PathBuf,
+/// A handle to one instance's output-capture pipeline (fix pass, review of
+/// #80). Cloning is cheap (two `Arc` clones + small `PathBuf`/`String`
+/// clones): the supervisor clones it to send `Engine`-attributed lines
+/// (Task 4) via [`LogCapture::send_engine_line`].
+#[derive(Clone, Debug)]
+pub struct LogCapture {
+    /// The Agent Instance name, stamped on every [`LogLine`] this capture
+    /// produces.
     instance: String,
-    sender: mpsc::Sender<LogLine>,
-) where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        loop {
-            let mut buf: Vec<u8> = Vec::new();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break, // true EOF: nothing read.
-                Ok(_) => {
-                    // (1) Legacy capture: the raw bytes, unmodified.
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&legacy_log_path)
-                    {
-                        let _ = file.write_all(&buf);
-                    }
-                    // (2) Attributed capture: the same content, attributed +
-                    // timestamped, sent to the writer thread. Best-effort —
-                    // a closed receiver (the writer thread already gone)
-                    // just means nobody is listening anymore; this thread
-                    // must keep draining the pipe regardless (so the child
-                    // never blocks on a full pipe buffer), not stop here.
-                    let text = strip_trailing_newline(&buf);
-                    let _ =
-                        sender.send(LogLine::new(instance.clone(), stream, text, now_rfc3339()));
-                }
-                Err(_) => break,
-            }
+    /// The crash-immune, direct-redirect STDOUT file (== [`SpawnSpec::log_file`]
+    /// == `agent.log`).
+    stdout_raw: PathBuf,
+    /// The crash-immune, direct-redirect STDERR file ([`SpawnSpec::stderr_log_file`]).
+    stderr_raw: PathBuf,
+    /// The attributed, rotated capture's CURRENT-generation path
+    /// ([`SpawnSpec::attributed_log_path`]) — [`append_attributed_line`]'s
+    /// target for every line this capture writes, directly and
+    /// synchronously (H1 fix — no background writer thread, no channel).
+    attributed_log_path: PathBuf,
+    /// Shared, mutex-guarded tail cursors AND the write lock (see
+    /// [`TailCursors`]'s docs).
+    cursors: Arc<Mutex<TailCursors>>,
+    /// Set by the process handle's `Drop` impl so the background tailer
+    /// thread performs one final catch-up pass and exits, rather than
+    /// leaking a thread per stop/restart for the remainder of the engine's
+    /// life.
+    stop: Arc<AtomicBool>,
+}
+
+impl LogCapture {
+    /// Fold any newly-written, COMPLETE lines from both raw files DIRECTLY
+    /// into the attributed capture (synchronous — [`append_attributed_line`],
+    /// no channel), while `cursors` is already locked by the caller. A
+    /// trailing partial line (no `\n` yet) is left for the next pass —
+    /// mirrors [`crate::domain::supervisor`]'s `plan_follow`'s "only
+    /// complete lines" rule.
+    fn catch_up_locked(&self, cursors: &mut TailCursors) {
+        tail_new_lines(
+            &self.stdout_raw,
+            &mut cursors.stdout,
+            LogStream::AgentOut,
+            &self.instance,
+            &self.attributed_log_path,
+        );
+        tail_new_lines(
+            &self.stderr_raw,
+            &mut cursors.stderr,
+            LogStream::AgentErr,
+            &self.instance,
+            &self.attributed_log_path,
+        );
+    }
+
+    /// Lock `cursors` and fold in any newly-written content. Idempotent and
+    /// safe to call concurrently with the background tailer thread or
+    /// another [`LogCapture::send_engine_line`] call (the mutex serializes
+    /// every caller); a redundant call (nothing new since the last one) is
+    /// a cheap no-op.
+    fn catch_up(&self) {
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.catch_up_locked(&mut cursors);
+    }
+
+    /// Catch up any pending agent output, THEN append an `Engine`-attributed
+    /// [`LogLine`] (story 4-2, Task 4; fix pass H1, review of #80) —
+    /// SYNCHRONOUSLY, both under the SAME lock acquisition, so no
+    /// concurrent tailer pass can land between the catch-up and this
+    /// engine line. By the time this call RETURNS, the line is durably on
+    /// disk — there is no background thread left to race a caller that
+    /// exits (or crashes) immediately after (the exact race H1 identified:
+    /// a helper process starting an instance then exiting right away used
+    /// to lose the "engine: ... -> running" line if the old writer thread
+    /// never got scheduled first).
+    pub(crate) fn send_engine_line(&self, line: LogLine) {
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.catch_up_locked(&mut cursors);
+        append_attributed_line(&self.attributed_log_path, &line);
+    }
+
+    /// Signal the background tailer thread to perform one final catch-up
+    /// pass and exit (fix pass, review of #80). Called from the process
+    /// handle's `Drop` impl so a tailer thread never outlives its instance.
+    pub(crate) fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Read new, COMPLETE lines from `path` since `*cursor` (a byte offset),
+/// appending them as a SINGLE BATCH (synchronously —
+/// [`append_attributed_lines`], one file open for the whole batch) of
+/// attributed, timestamped [`LogLine`]s into `attributed_log_path` (fix
+/// pass, review of #80) — the pull-based replacement for the old blocking
+/// pipe reader threads, with NO channel hand-off. A trailing partial line
+/// (no `\n` yet) is left un-consumed for the next call. Best-effort: any
+/// read hiccup (the file momentarily missing, a transient I/O error) is a
+/// silent skip, never fatal — this is a derived, best-effort VIEW, mirroring
+/// this codebase's existing best-effort discipline for background capture.
+///
+/// BOUNDED per call to [`MAX_TAIL_BYTES_PER_PASS`] AND [`MAX_TAIL_LINES_PER_PASS`]
+/// (fix pass, review of #80 — see their docs for why BOTH are needed: bytes
+/// alone does not bound the per-line JSON-serialization work for a writer
+/// emitting many TINY lines): a backlog larger than either bound is read/
+/// attributed only up to whichever limit is hit FIRST this pass, leaving the
+/// rest for the next call — this is what keeps a single pass (and thus a
+/// single, synchronous [`LogCapture::send_engine_line`] call) fast
+/// regardless of how large a backlog has accumulated, or how it is shaped.
+///
+/// A shrink (the file is now SHORTER than `*cursor`) is treated like
+/// [`crate::domain::supervisor`]'s `plan_follow`'s shrink guard: snap the
+/// cursor to the new length and read nothing this pass, rather than
+/// re-reading from the start (which would re-attribute already-seen bytes).
+/// This should not normally happen for these append-only raw captures; it is
+/// a defensive guard, not an expected path.
+fn tail_new_lines(
+    path: &Path,
+    cursor: &mut u64,
+    stream: LogStream,
+    instance: &str,
+    attributed_log_path: &Path,
+) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return;
+    };
+    if len <= *cursor {
+        if len < *cursor {
+            *cursor = len; // shrink guard — never re-read from the start.
         }
-    });
+        return;
+    }
+    if file.seek(SeekFrom::Start(*cursor)).is_err() {
+        return;
+    }
+    // Cap this pass's read to MAX_TAIL_BYTES_PER_PASS — a large backlog is
+    // handled across MULTIPLE passes, never in one unbounded read.
+    let want = (len - *cursor).min(MAX_TAIL_BYTES_PER_PASS);
+    let mut buf = vec![0u8; want as usize];
+    if file.read_exact(&mut buf).is_err() {
+        return;
+    }
+    // Only whole, COMPLETE lines: up to the last '\n' WITHIN this bounded
+    // window, further capped to at most MAX_TAIL_LINES_PER_PASS lines (the
+    // position of the Nth newline, if the window holds more than that many)
+    // — whichever limit is hit first. A trailing partial line, or any line
+    // beyond the line-count cap, waits for the next pass. Splitting exactly
+    // at a '\n' byte is always a safe UTF-8 boundary (a newline byte never
+    // appears inside a multi-byte UTF-8 sequence), so the lossy decode
+    // below never corrupts a split multi-byte character.
+    let consumable = buf
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b == b'\n')
+        .map(|(pos, _)| pos + 1)
+        .take(MAX_TAIL_LINES_PER_PASS)
+        .last()
+        .unwrap_or(0);
+    if consumable == 0 {
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf[..consumable]).into_owned();
+    let at = now_rfc3339();
+    let lines: Vec<LogLine> = text
+        .lines()
+        .map(|line| LogLine::new(instance, stream, line, at.clone()))
+        .collect();
+    append_attributed_lines(attributed_log_path, &lines);
+    *cursor += consumable as u64;
+}
+
+/// Spawn the per-instance background tailer thread (fix pass, review of
+/// #80) — the pull-based replacement for the old two blocking pipe-reader
+/// threads. Loops [`LOG_TAIL_POLL_INTERVAL`], calling
+/// [`LogCapture::catch_up`] on its OWN clone of `capture` — the SAME method
+/// (and the SAME `cursors` mutex) [`LogCapture::send_engine_line`]'s inline
+/// catch-up uses, so the two can never race each other into a
+/// double-append or a torn rotation. Exits once `capture`'s `stop` flag is
+/// observed set, after ONE final catch-up pass (so nothing the process
+/// wrote right before being killed is stranded). Returns the
+/// [`thread::JoinHandle`] so tests can `join` it deterministically after
+/// signaling `stop`; production callers ([`spawn_output_capture`])
+/// intentionally discard it (fire-and-forget) — the thread's lifetime is
+/// bounded by `stop`, not by anyone joining it.
+fn spawn_tailer_thread(capture: LogCapture) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        let should_stop = capture.stop.load(Ordering::Relaxed);
+        capture.catch_up();
+        if should_stop {
+            break;
+        }
+        thread::sleep(LOG_TAIL_POLL_INTERVAL);
+    })
 }
 
 /// Wire the shared output-capture primitive into a freshly spawned process
-/// (story 4-2, Task 2/3): starts the ONE writer thread plus TWO reader
-/// threads (stdout, stderr — separately, so attribution can tell them apart;
-/// never a single interleaved reader), and returns the writer's `Sender` so
-/// the caller (a backend's `spawn()`) can store it on the process handle —
-/// the supervisor later clones it to send `Engine`-attributed lines through
-/// the SAME channel (Task 4).
+/// (story 4-2, Task 2/3; fix pass, review of #80): starts ONE background
+/// tailer thread (pull-based, reading the two crash-immune raw files —
+/// [`spawn_tailer_thread`]) and returns a [`LogCapture`] the caller (a
+/// backend's `spawn()`) stores on the process handle — the supervisor later
+/// clones it to send `Engine`-attributed lines (Task 4) via
+/// [`LogCapture::send_engine_line`], which writes SYNCHRONOUSLY (H1 fix —
+/// no writer thread, no channel, for either the tailer's own catch-up or an
+/// engine line).
+///
+/// `stdout_raw_path`/`stderr_raw_path` are the ALREADY-OPEN direct redirect
+/// targets ([`SpawnSpec::log_file`]/[`SpawnSpec::stderr_log_file`]) — this
+/// function takes only their PATHS (never a live pipe/fd), since it reads
+/// them the same way any later reader would (a `File::open` by path), which
+/// is exactly what makes this mechanism crash-immune: nothing here depends
+/// on any handle the spawning engine session holds.
+///
+/// The tailer's cursors start at the CURRENT length of each raw file (read
+/// here, before this new process can have written a single byte) rather than
+/// `0` — a stop→start reuses the SAME append-only raw files (mirrors
+/// `Supervisor::agent_log_len`'s identical "anchor at the pre-spawn length"
+/// reasoning for the usage-ingestion cursor), so starting at `0` would
+/// re-tail an entire prior Run's history into `output.log` again.
 ///
 /// Called identically from both backends (mirrors `write_stdin_bounded`'s
 /// "ONE shared implementation called identically from both `backends/unix`
 /// and `backends/windows`" precedent). An ADOPTED handle never calls this —
-/// there is no OS-portable way to recover a pipe fd from a bare PID, so it
-/// gets no capture threads at all (mirrors `stdin`'s `None`-on-adoption
-/// precedent); this is not a functional gap for reading/following (AC-H),
-/// since reading only ever needs the FILE these threads keep writing to,
-/// never a live handle.
+/// there is no OS-portable way to recover which raw files a bare PID was
+/// writing to independent of the registry path authority already computing
+/// them, and more fundamentally no live tailer thread survives the engine
+/// process that spawned it, so an adopted handle gets no [`LogCapture`] at
+/// all (mirrors `stdin`'s `None`-on-adoption precedent); this is not a
+/// functional gap for reading/following (AC-H), since reading only ever
+/// needs the FILE these threads keep writing to, never a live handle.
 pub(crate) fn spawn_output_capture(
-    stdout: std::process::ChildStdout,
-    stderr: std::process::ChildStderr,
-    legacy_log_path: PathBuf,
+    stdout_raw_path: PathBuf,
+    stderr_raw_path: PathBuf,
     attributed_log_path: PathBuf,
     instance: String,
-) -> mpsc::Sender<LogLine> {
-    let (tx, _writer_handle) = spawn_log_writer(attributed_log_path);
-    // The writer thread is intentionally never joined here: it runs for the
-    // process's whole supervised lifetime and exits naturally once every
-    // `Sender` clone (this one, plus the two reader threads' clones below,
-    // plus whatever the supervisor holds/clones — Task 3/4) is dropped.
-    spawn_reader_thread(
-        stdout,
-        LogStream::AgentOut,
-        legacy_log_path.clone(),
-        instance.clone(),
-        tx.clone(),
-    );
-    spawn_reader_thread(
-        stderr,
-        LogStream::AgentErr,
-        legacy_log_path,
+) -> LogCapture {
+    let cursors = Arc::new(Mutex::new(TailCursors {
+        stdout: std::fs::metadata(&stdout_raw_path)
+            .map(|m| m.len())
+            .unwrap_or(0),
+        stderr: std::fs::metadata(&stderr_raw_path)
+            .map(|m| m.len())
+            .unwrap_or(0),
+    }));
+    let stop = Arc::new(AtomicBool::new(false));
+    let capture = LogCapture {
         instance,
-        tx.clone(),
-    );
-    tx
+        stdout_raw: stdout_raw_path,
+        stderr_raw: stderr_raw_path,
+        attributed_log_path,
+        cursors,
+        stop,
+    };
+    let _tailer_handle = spawn_tailer_thread(capture.clone());
+    capture
 }
 
 /// The process-control port (spine AD-1 side port; AD-4 per-OS).
@@ -817,17 +1143,18 @@ pub trait ProcessBackend {
     /// caller for a bounded duration.
     fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError>;
 
-    /// A clone of this handle's output-capture writer-thread `Sender`, if it
-    /// has one (story 4-2, AD-12) — `Some` for a FRESHLY SPAWNED handle
-    /// (capture is unconditional and capability-independent, AC-E: every
-    /// spawn calls [`spawn_output_capture`] whenever it has somewhere to
-    /// write, independent of any declared `Capability`); `None` for an
-    /// ADOPTED handle (no capture threads were ever started for it — see
-    /// [`ProcessBackend::adopt`]'s docs). A cheap accessor (an `mpsc::Sender`
-    /// clone is a refcount bump, no I/O) mirroring [`ProcessBackend::has_stdin`]'s
-    /// style; used by the supervisor to send `Engine`-attributed lines
-    /// (Task 4) through the SAME channel the reader threads feed.
-    fn log_sender(&self, handle: &Self::Handle) -> Option<mpsc::Sender<LogLine>>;
+    /// A clone of this handle's output-capture pipeline, if it has one
+    /// (story 4-2, AD-12; fix pass, review of #80) — `Some` for a FRESHLY
+    /// SPAWNED handle (capture is unconditional and capability-independent,
+    /// AC-E: every spawn calls [`spawn_output_capture`] whenever it has
+    /// somewhere to write, independent of any declared `Capability`);
+    /// `None` for an ADOPTED handle (no tailer thread was ever started for
+    /// it — see [`ProcessBackend::adopt`]'s docs). A cheap accessor (a
+    /// [`LogCapture`] clone is two `Arc` clones plus small `PathBuf`/`String`
+    /// clones, no I/O) mirroring [`ProcessBackend::has_stdin`]'s style; used
+    /// by the supervisor to send `Engine`-attributed lines (Task 4) via
+    /// [`LogCapture::send_engine_line`], which writes SYNCHRONOUSLY.
+    fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture>;
 }
 
 #[cfg(test)]
@@ -892,6 +1219,7 @@ mod tests {
             working_dir: PathBuf::from("/home"),
             log_file: None,
             attributed_log_path: None,
+            stderr_log_file: None,
             instance_name: "x".to_string(),
             pipe_stdin: true,
         };
@@ -945,7 +1273,7 @@ mod tests {
         );
     }
 
-    // ---- Story 4-2: rotation-decision logic + the reader/writer threads ----
+    // ---- Story 4-2: rotation-decision logic + the synchronous append ----
 
     #[test]
     fn should_rotate_at_the_exact_boundary() {
@@ -956,16 +1284,6 @@ mod tests {
         );
         assert!(should_rotate(LOG_ROTATE_MAX_BYTES), "exactly at: rotate");
         assert!(should_rotate(LOG_ROTATE_MAX_BYTES + 1), "one over: rotate");
-    }
-
-    #[test]
-    fn strip_trailing_newline_handles_lf_crlf_and_no_newline() {
-        assert_eq!(strip_trailing_newline(b"hello\n"), "hello");
-        assert_eq!(strip_trailing_newline(b"hello\r\n"), "hello");
-        assert_eq!(strip_trailing_newline(b"hello"), "hello");
-        assert_eq!(strip_trailing_newline(b""), "");
-        // Lossy on non-UTF8 — never a panic.
-        assert_eq!(strip_trailing_newline(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
     }
 
     #[test]
@@ -983,6 +1301,19 @@ mod tests {
 
     fn line(text: &str) -> LogLine {
         LogLine::new("svc", LogStream::AgentOut, text, now_rfc3339())
+    }
+
+    #[test]
+    fn append_attributed_lines_on_an_empty_batch_is_a_harmless_no_op() {
+        // Defensive guard: tail_new_lines never calls this with an empty
+        // batch in practice (it returns early itself when `consumable == 0`),
+        // but append_attributed_lines is a directly-callable free function,
+        // so its own empty-input guard is exercised here directly rather
+        // than left as dead code — must not create the file or rotate.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("output.log");
+        append_attributed_lines(&base, &[]);
+        assert!(!base.exists(), "an empty batch must not create the file");
     }
 
     #[test]
@@ -1076,27 +1407,26 @@ mod tests {
     }
 
     #[test]
-    fn writer_thread_preserves_send_order_for_a_burst_of_same_second_lines() {
-        // AC-G: multiple lines sent within one wall-clock second (the SAME
-        // `at` value, since now_rfc3339 has whole-second resolution) must
-        // land on disk in SEND order — never re-sorted. Deterministic: no
-        // wall-clock dependency, driven entirely through the channel, then
-        // synchronized via `join` (not a sleep-poll).
+    fn synchronous_append_preserves_order_for_a_burst_of_same_second_lines() {
+        // AC-G: multiple lines appended within one wall-clock second (the
+        // SAME `at` value, since now_rfc3339 has whole-second resolution)
+        // must land on disk in CALL order — never re-sorted. Fix pass
+        // (review of #80): `append_attributed_line` is now the DIRECT,
+        // synchronous write primitive (no channel/writer-thread hop to test
+        // separately) — a single thread's sequential calls trivially
+        // preserve order (each call fully completes, including its own
+        // rotate-check, before the next begins), which is exactly what
+        // makes this property hold with no additional synchronization
+        // needed for the single-caller case.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("output.log");
-        let (tx, handle) = spawn_log_writer(base.clone());
         let same_at = "2026-07-15T00:00:00Z";
         for i in 0..20 {
-            tx.send(LogLine::new(
-                "svc",
-                LogStream::AgentOut,
-                format!("line-{i}"),
-                same_at,
-            ))
-            .unwrap();
+            append_attributed_line(
+                &base,
+                &LogLine::new("svc", LogStream::AgentOut, format!("line-{i}"), same_at),
+            );
         }
-        drop(tx); // close the channel so the writer thread's recv() loop ends
-        handle.join().expect("writer thread must not panic");
 
         let contents = std::fs::read_to_string(&base).unwrap();
         let texts: Vec<String> = contents
@@ -1108,20 +1438,294 @@ mod tests {
             })
             .collect();
         let want: Vec<String> = (0..20).map(|i| format!("line-{i}")).collect();
-        assert_eq!(texts, want, "append order must equal send order");
+        assert_eq!(texts, want, "append order must equal call order");
     }
 
     #[test]
-    fn spawn_log_writer_exits_naturally_once_every_sender_clone_is_dropped() {
-        // No explicit shutdown signal is needed: the writer thread's recv()
-        // loop ends (and the thread returns) once the channel closes.
+    fn log_capture_send_engine_line_is_safe_under_concurrent_callers() {
+        // Fix pass (H1, review of #80): the whole point of guarding both
+        // the tail cursors AND the rotate-then-append sequence with ONE
+        // Mutex is that MULTIPLE concurrent callers (here: several cloned
+        // `LogCapture` handles, standing in for the tailer thread racing an
+        // inline `send_engine_line` call) can never interleave a
+        // rotate/append and corrupt or lose a line — every line sent must
+        // land, intact, parseable, exactly once.
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("output.log");
-        let (tx, handle) = spawn_log_writer(base);
-        let tx2 = tx.clone();
-        drop(tx);
-        drop(tx2);
-        // The thread must terminate promptly; join() blocks until it does.
-        handle.join().expect("writer thread must not panic");
+        let stdout_raw = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&stdout_raw, b"").unwrap();
+        std::fs::write(&stderr_raw, b"").unwrap();
+        let capture = spawn_output_capture(
+            stdout_raw,
+            stderr_raw,
+            attributed.clone(),
+            "svc".to_string(),
+        );
+        capture.signal_stop(); // no background tailer ticks racing this test
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 25;
+        thread::scope(|scope| {
+            for t in 0..THREADS {
+                let capture = capture.clone();
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        capture.send_engine_line(LogLine::new(
+                            "svc",
+                            LogStream::Engine,
+                            format!("t{t}-{i}"),
+                            now_rfc3339(),
+                        ));
+                    }
+                });
+            }
+        });
+        drop(capture);
+
+        let contents = std::fs::read_to_string(&attributed).unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        for l in contents.lines() {
+            let parsed: LogLine = serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("every line must parse intact, never torn: {e}: {l:?}"));
+            seen.push(parsed.text);
+        }
+        assert_eq!(
+            seen.len(),
+            THREADS * PER_THREAD,
+            "every concurrently-sent line must land exactly once, none lost or duplicated"
+        );
+        let mut want: Vec<String> = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).map(move |i| format!("t{t}-{i}")))
+            .collect();
+        seen.sort();
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "the exact SET of lines must match (order across threads is unspecified)"
+        );
+    }
+
+    // ---- Fix pass (review of #80): the crash-immune raw-file tailer ----
+
+    /// Read back an attributed capture file into parsed [`LogLine`]s
+    /// (test-only helper; `read_agent_log`'s production equivalent lives in
+    /// `domain::supervisor`, which this cfg-free module does not depend on).
+    fn read_attributed(path: &Path) -> Vec<LogLine> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn tail_new_lines_reads_only_complete_lines_leaving_a_partial_tail() {
+        // A trailing line with no '\n' yet must NOT be consumed this pass
+        // (mirrors plan_follow's "only complete lines" rule) — proven
+        // directly against the raw file, no thread needed.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"a\nb\nc").unwrap(); // "c" has no trailing '\n'
+        let mut cursor = 0u64;
+        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        let lines = read_attributed(&attributed);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "the partial trailing line ('c', no newline yet) must wait for the next pass"
+        );
+        assert_eq!(
+            cursor, 4,
+            "cursor advances only past the two complete lines"
+        );
+
+        // Appending the missing newline (+ more) makes "c" complete NOW.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&raw).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "\nd").unwrap();
+        drop(file);
+        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        let lines2 = read_attributed(&attributed);
+        assert_eq!(
+            lines2
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"],
+            "the now-complete 'c' plus the new 'd' line must both be observed, appended after 'a'/'b'"
+        );
+    }
+
+    #[test]
+    fn tail_new_lines_is_idempotent_when_nothing_new_since_the_last_call() {
+        // A redundant catch-up call (no growth since the last one) is a
+        // harmless no-op — safe for the tailer thread and an inline
+        // send_engine_line catch-up to both call this without duplicating
+        // content.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"a\nb\n").unwrap();
+        let mut cursor = 0u64;
+        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        assert_eq!(cursor, 4);
+        // Call again with NO new bytes written — must append nothing further.
+        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        let lines = read_attributed(&attributed);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the redundant second call must not re-append already-tailed lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn tail_new_lines_shrink_guard_snaps_the_cursor_without_reattributing() {
+        // Defensive guard (should not normally happen for an append-only raw
+        // capture): if the file is somehow shorter than the cursor, snap
+        // forward and read nothing, rather than re-reading from the start
+        // (which would re-attribute already-seen bytes as new).
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"a\nb\nc\n").unwrap();
+        let mut cursor = 100u64; // artificially past the (real) 6-byte length
+        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        assert_eq!(cursor, 6, "cursor snaps to the file's actual length");
+        assert!(
+            !attributed.exists() || read_attributed(&attributed).is_empty(),
+            "nothing must be (mis)appended on a shrink"
+        );
+    }
+
+    #[test]
+    fn tail_new_lines_stays_fast_against_a_huge_backlog_of_tiny_lines() {
+        // Regression guard (fix pass, review of #80): a fast, bursty writer
+        // with ZERO backpressure (a real OS process writing directly to its
+        // own file redirect — exactly the crash-immune mechanism this fix
+        // pass introduces) can accumulate a backlog of MANY tiny lines
+        // between polls. This was EMPIRICALLY caught by this fix pass's own
+        // crash-kill experiment (a `yes` process, writing "y\n" as fast as
+        // the OS allows): a single `tail_new_lines` pass over a ~4MB/2M-line
+        // backlog took ~15.7s in an unoptimized debug build BEFORE
+        // MAX_TAIL_LINES_PER_PASS existed (bytes alone did not bound the
+        // per-line LogLine/JSON-serialization work) — unacceptable for a
+        // call that may run SYNCHRONOUSLY while the engine-wide supervisor
+        // lock is held ([`LogCapture::send_engine_line`]). One pass over
+        // the SAME shape of backlog must now complete in, at most, a small
+        // fraction of a second — asserted generously (2s) to stay robust on
+        // a slow/loaded CI runner while still catching a regression back to
+        // the old unbounded-per-line behavior (which was 1000x+ slower).
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        let big = "y\n".repeat((MAX_TAIL_BYTES_PER_PASS as usize) / 2 + 10);
+        std::fs::write(&raw, big.as_bytes()).unwrap();
+        let mut cursor = 0u64;
+        let t0 = std::time::Instant::now();
+        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a single tail_new_lines pass must stay fast even against a huge tiny-line backlog, \
+             took {elapsed:?} (pre-fix: ~15.7s in debug)"
+        );
+        // The line-count bound (not the byte bound) is what limits THIS
+        // pass, since 2-byte lines make the byte bound reach far more
+        // lines than MAX_TAIL_LINES_PER_PASS allows in one pass.
+        assert_eq!(
+            cursor,
+            (MAX_TAIL_LINES_PER_PASS * 2) as u64,
+            "capped by MAX_TAIL_LINES_PER_PASS lines, not the byte bound, for this tiny-line shape"
+        );
+    }
+
+    #[test]
+    fn log_capture_send_engine_line_catches_up_pending_raw_content_first() {
+        // The ordering guarantee this fix pass adds: send_engine_line must
+        // fold in whatever raw content already exists BEFORE appending its
+        // own Engine line, so the engine line lands AFTER prior agent
+        // output rather than racing the background tailer thread's own
+        // poll schedule.
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_raw = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&stdout_raw, b"").unwrap();
+        std::fs::write(&stderr_raw, b"").unwrap();
+
+        // Start the capture pipeline FIRST (its tailer cursor anchors at
+        // the CURRENT, still-empty file length — mirroring how a real spawn
+        // anchors before the child can write anything), THEN write raw
+        // stdout content — simulating the agent emitting output that has
+        // NOT yet been tailed by the time a transition happens.
+        let capture = spawn_output_capture(
+            stdout_raw.clone(),
+            stderr_raw.clone(),
+            attributed.clone(),
+            "svc".to_string(),
+        );
+        // Signal stop IMMEDIATELY (before the tailer's own 20ms poll can
+        // fire) so THIS test's own send_engine_line call is what performs
+        // the catch-up, not a lucky tailer tick — a deterministic proof of
+        // send_engine_line's own inline catch-up, not the tailer's.
+        capture.signal_stop();
+        std::fs::write(&stdout_raw, b"heartbeat 0\nheartbeat 1\n").unwrap();
+        capture.send_engine_line(LogLine::new(
+            "svc",
+            LogStream::Engine,
+            "engine: running -> stopped",
+            now_rfc3339(),
+        ));
+        drop(capture);
+
+        // Fix pass (H1, review of #80): send_engine_line writes
+        // SYNCHRONOUSLY (no background writer thread/channel involved) —
+        // by the time it returns, both the caught-up raw content and the
+        // engine line are already durably on disk, so a single direct read
+        // suffices; no polling needed.
+        let contents = std::fs::read_to_string(&attributed).unwrap();
+        let lines: Vec<LogLine> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let streams: Vec<LogStream> = lines.iter().map(|l| l.stream).collect();
+        assert_eq!(
+            streams,
+            vec![LogStream::AgentOut, LogStream::AgentOut, LogStream::Engine],
+            "the pre-existing raw content must be caught up BEFORE the engine line: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn log_capture_signal_stop_lets_the_tailer_thread_exit_promptly() {
+        // The tailer thread must not leak forever once its instance is
+        // done: signaling stop makes it perform one final pass and return,
+        // joinable deterministically (no wall-clock guess). Constructs a
+        // `LogCapture` directly (rather than via `spawn_output_capture`,
+        // which starts its OWN internal tailer) so this test can spawn and
+        // `join` an INDEPENDENT tailer thread for one.
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_raw = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
+        std::fs::write(&stdout_raw, b"").unwrap();
+        std::fs::write(&stderr_raw, b"").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture = LogCapture {
+            instance: "svc".to_string(),
+            stdout_raw,
+            stderr_raw,
+            attributed_log_path: dir.path().join("output.log"),
+            cursors: Arc::new(Mutex::new(TailCursors::default())),
+            stop: Arc::clone(&stop),
+        };
+        let handle = spawn_tailer_thread(capture);
+        stop.store(true, Ordering::Relaxed);
+        // join() blocks until the thread actually returns — a hang here
+        // would fail the test via the harness's own timeout, proving the
+        // thread does NOT loop forever once stop is set.
+        handle.join().expect("tailer thread must not panic");
     }
 }

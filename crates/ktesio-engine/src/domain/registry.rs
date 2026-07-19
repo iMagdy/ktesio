@@ -979,11 +979,32 @@ impl Registry {
         self.instance_log_dir(name).join("instance.log")
     }
 
-    /// The per-instance AGENT output log FILE — the spawned process's
-    /// stdout/stderr capture (AD-12 seed). Kept separate from the engine event
-    /// log; full agent-out/agent-err attribution + rotation is Epic 4.
+    /// The per-instance AGENT output log FILE — the spawned process's STDOUT
+    /// capture (AD-12 seed). Kept separate from the engine event log.
+    ///
+    /// Fix pass (review of #80): this is now a DIRECT, crash-immune
+    /// redirect target for the child's stdout ALONE (`Stdio::from(file)`) —
+    /// the write path Epic 3's `drain_usage_for` depends on for its
+    /// billing-critical `KTESIO_USAGE` sentinel read, which is a
+    /// stdout-only convention (`docs/manifest.md`/`docs/architecture.md`).
+    /// Stderr is captured SEPARATELY (see
+    /// [`Self::agent_stderr_log_path`]) rather than merged back into this
+    /// file, so this file's write path never depends on any engine-side
+    /// hop (thread, tailer, or otherwise) — only the OS and the agent
+    /// process itself.
     pub(crate) fn agent_output_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
         self.instance_log_dir(name).join("agent.log")
+    }
+
+    /// The per-instance RAW STDERR capture FILE (fix pass, review of #80) —
+    /// the crash-immune counterpart of [`Self::agent_output_log_path`] for
+    /// the child's stderr: a DIRECT redirect target (`Stdio::from(file)`),
+    /// never a live pipe, so the agent's stderr writes never depend on the
+    /// engine's liveness either. Feeds the attributed capture's background
+    /// tailer (`agent-err` lines); NOT merged into the legacy `agent.log`
+    /// (which stays stdout-only — see that path's docs for why).
+    pub(crate) fn agent_stderr_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("agent-stderr.log")
     }
 
     /// The per-instance BUDGET-BREACH log FILE — the JSON-Lines

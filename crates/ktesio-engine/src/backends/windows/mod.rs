@@ -70,7 +70,6 @@
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -85,10 +84,10 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
-use crate::domain::LogLine;
 use crate::ports::{
-    spawn_output_capture, write_stdin_bounded, BackendError, ProcessBackend, ProcessFingerprint,
-    ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome, STDIN_WRITE_TIMEOUT,
+    spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
+    ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
+    STDIN_WRITE_TIMEOUT,
 };
 
 /// `STILL_ACTIVE` (259): the exit code a process reports while still running.
@@ -132,15 +131,16 @@ pub struct WindowsProcess {
     /// (`EngineError::InteractionUnavailable` /
     /// `EngineError::InteractionTimedOut`), never silently succeed.
     stdin: StdinState,
-    /// The output-capture writer thread's `Sender` (story 4-2, AD-12), if
-    /// this handle has one. `Some` for a FRESHLY SPAWNED handle whenever the
-    /// caller gave us somewhere to capture; `None` for an ADOPTED process —
-    /// no OS-portable way to recover a pipe handle from a bare PID, so no
-    /// capture threads exist for it (parity with `stdin`'s `NoPipe`-on-
+    /// The output-capture pipeline handle (story 4-2, AD-12; fix pass,
+    /// review of #80), if this handle has one. `Some` for a FRESHLY SPAWNED
+    /// handle whenever the caller gave us somewhere to capture; `None` for
+    /// an ADOPTED process — no live tailer thread survives the engine
+    /// process that spawned it (parity with `stdin`'s `NoPipe`-on-
     /// adoption). Not a functional gap for `kt agent logs`/`--follow`
-    /// (AC-H): reading only needs the FILE, which the ORIGINAL (pre-
-    /// adoption) engine session's threads keep writing to.
-    log_sender: Option<mpsc::Sender<LogLine>>,
+    /// (AC-H): reading only needs the crash-immune raw FILES, which the
+    /// agent process itself keeps writing to directly (never through any
+    /// engine-held handle) for as long as it lives.
+    log_capture: Option<LogCapture>,
 }
 
 // The raw Job / process HANDLEs are owned OS resources this struct is solely
@@ -148,7 +148,16 @@ pub struct WindowsProcess {
 unsafe impl Send for WindowsProcess {}
 
 impl Drop for WindowsProcess {
+    /// Fix pass (review of #80): ALSO signals the output-capture pipeline's
+    /// background tailer thread to stop (one final catch-up pass, then
+    /// exit) — unconditionally, mirroring the Unix backend's identical
+    /// addition. Purely local bookkeeping; the agent process's crash
+    /// resilience comes entirely from the raw capture files being direct,
+    /// engine-independent OS redirects, never from this signal.
     fn drop(&mut self) {
+        if let Some(capture) = &self.log_capture {
+            capture.signal_stop();
+        }
         // Spawned: closing the job handle kills the tree (kill-on-close), then
         // release it. Adopted: SIGKILL-equivalent is not applied on drop for a
         // process we merely re-opened (parity with Unix would kill it; but on
@@ -223,49 +232,70 @@ impl ProcessBackend for WindowsBackend {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
-        // Story 4-2 (AD-12, AC-E): stdout/stderr capture is UNCONDITIONAL and
-        // capability-independent — piped whenever the caller gave us
-        // somewhere to write BOTH the legacy raw passthrough AND the new
-        // attributed capture (every PRODUCTION spawn does; the supervisor
-        // always computes `log_file`/`attributed_log_path` together from the
-        // SAME Registry path authority). Mirrors the Unix backend's
-        // identical branch — see its comment for the full rationale
-        // (including why `None`/`None` is a narrow test-fixture convenience,
-        // not a capability gate).
-        let capture = match (&spec.log_file, &spec.attributed_log_path) {
-            (Some(legacy), Some(attributed)) => Some((legacy.clone(), attributed.clone())),
+        // Story 4-2 (AD-12, AC-E), fix pass (review of #80): stdout/stderr
+        // capture is UNCONDITIONAL and capability-independent — each stream
+        // is redirected DIRECTLY to its OWN regular file (crash-immune, NOT
+        // a pipe) whenever the caller gave us somewhere to write all THREE
+        // capture destinations (every PRODUCTION spawn does; the supervisor
+        // always computes `log_file`/`stderr_log_file`/`attributed_log_path`
+        // together from the SAME Registry path authority). Mirrors the Unix
+        // backend's identical branch — see its comment for the full
+        // rationale (including why `None`/`None`/`None` is a narrow
+        // test-fixture convenience, not a capability gate).
+        debug_assert!(
+            spec.log_file.is_some() == spec.attributed_log_path.is_some()
+                && spec.log_file.is_some() == spec.stderr_log_file.is_some(),
+            "SpawnSpec's three capture-path fields must be all Some or all None together"
+        );
+        let capture = match (
+            &spec.log_file,
+            &spec.stderr_log_file,
+            &spec.attributed_log_path,
+        ) {
+            (Some(stdout_raw), Some(stderr_raw), Some(attributed)) => {
+                Some((stdout_raw.clone(), stderr_raw.clone(), attributed.clone()))
+            }
             _ => None,
         };
-        // Fail FAST (mirrors the pre-story eager log_file-open validation
-        // that lived here before the capture rework) if either destination
-        // cannot be opened — never a silent no-capture outcome an operator
-        // would only notice from an unexpectedly-empty log later. The
-        // reader/writer threads (Task 2) reopen these paths per-write, so
-        // this is a validate-then-drop probe, not a held handle.
-        if let Some((legacy, attributed)) = &capture {
-            for (label, path) in [
-                ("log file", legacy.as_path()),
-                ("attributed output log", attributed.as_path()),
-            ] {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| BackendError::Spawn {
-                        exec: spec.exec.clone(),
-                        detail: format!("could not open {label} {}: {e}", path.display()),
-                    })?;
+        // Fail FAST (mirrors the pre-story eager log_file-open validation)
+        // if any destination cannot be opened — never a silent no-capture
+        // outcome an operator would only notice from an unexpectedly-empty
+        // log later. `stdout_target`/`stderr_target` are the SAME open
+        // `File`s handed directly to `Stdio::from` below (a successful open
+        // IS the fail-fast proof); the attributed path is validated then
+        // dropped (whichever of the background tailer thread or an inline
+        // `send_engine_line` call reopens it per-append). Mirrors the Unix
+        // backend's identical logic.
+        let (stdout_target, stderr_target) = match &capture {
+            Some((stdout_raw, stderr_raw, attributed)) => {
+                let open = |path: &std::path::Path, label: &str| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map_err(|e| BackendError::Spawn {
+                            exec: spec.exec.clone(),
+                            detail: format!("could not open {label} {}: {e}", path.display()),
+                        })
+                };
+                let stdout_file = open(stdout_raw, "log file")?;
+                let stderr_file = open(stderr_raw, "stderr log file")?;
+                drop(open(attributed, "attributed output log")?);
+                (Some(stdout_file), Some(stderr_file))
             }
-        }
-        command.stdout(if capture.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
+            None => (None, None),
+        };
+        // DIRECT, crash-immune redirects (never `Stdio::piped()`): the
+        // agent's `write()` to either stream succeeds or fails based ONLY
+        // on this regular file, never on whether the engine process is even
+        // still alive to read anything.
+        command.stdout(match stdout_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
         });
-        command.stderr(if capture.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
+        command.stderr(match stderr_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
         });
         // Piped ONLY when the caller (the supervisor, at spawn time) resolved
         // the declared Capability::Interaction level to Guaranteed/BestEffort
@@ -327,15 +357,16 @@ impl ProcessBackend for WindowsBackend {
             Some(s) => StdinState::Live(s),
             None => StdinState::NoPipe,
         };
-        // Story 4-2 (Task 3): a FRESHLY SPAWNED handle gets the shared
-        // reader/writer-thread capture whenever `capture` is `Some` (both
-        // stdout/stderr are guaranteed `Some` here — `Stdio::piped()`
-        // populates them above).
-        let log_sender = capture.map(|(legacy_log_path, attributed_log_path)| {
+        // Story 4-2 (Task 3), fix pass (review of #80): a FRESHLY SPAWNED
+        // handle gets the output-capture pipeline whenever `capture` is
+        // `Some`. `spawn_output_capture` takes only the raw files' PATHS
+        // (never `child.stdout`/`child.stderr` — those stay `None` here,
+        // since neither stream was piped) — the tailer it starts reopens
+        // them by path on every poll, which is what makes this crash-immune.
+        let log_capture = capture.map(|(stdout_raw_path, stderr_raw_path, attributed_log_path)| {
             spawn_output_capture(
-                child.stdout.take().expect("piped stdout"),
-                child.stderr.take().expect("piped stderr"),
-                legacy_log_path,
+                stdout_raw_path,
+                stderr_raw_path,
                 attributed_log_path,
                 spec.instance_name.clone(),
             )
@@ -346,7 +377,7 @@ impl ProcessBackend for WindowsBackend {
             adopted: std::ptr::null_mut(),
             pid,
             stdin,
-            log_sender,
+            log_capture,
         })
     }
 
@@ -477,19 +508,19 @@ impl ProcessBackend for WindowsBackend {
         // handle fails with `EngineError::InteractionUnavailable`, never
         // silently succeeding.
         //
-        // `log_sender: None` (story 4-2): likewise, no OS-portable way to
-        // recover the stdout/stderr pipe handles from a bare pid, so an
-        // adopted handle gets no capture threads either. Reading/following
+        // `log_capture: None` (story 4-2, fix pass review of #80): no live
+        // tailer thread survives the engine process that spawned it, so an
+        // adopted handle gets no capture pipeline either. Reading/following
         // this instance's output still works (AC-H) — it needs only the
-        // FILE the ORIGINAL engine session's still-running threads keep
-        // writing to.
+        // crash-immune raw FILES the agent process itself keeps writing to
+        // directly, for as long as it lives.
         Ok(Some(WindowsProcess {
             child: None,
             job: std::ptr::null_mut(),
             adopted: h,
             pid: fingerprint.pid,
             stdin: StdinState::NoPipe,
-            log_sender: None,
+            log_capture: None,
         }))
     }
 
@@ -512,8 +543,8 @@ impl ProcessBackend for WindowsBackend {
         write_stdin_bounded(&mut handle.stdin, data, STDIN_WRITE_TIMEOUT)
     }
 
-    fn log_sender(&self, handle: &Self::Handle) -> Option<mpsc::Sender<LogLine>> {
-        handle.log_sender.clone()
+    fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture> {
+        handle.log_capture.clone()
     }
 }
 
