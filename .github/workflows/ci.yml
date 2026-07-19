@@ -554,60 +554,82 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "1"
         shell: bash
         run: |
-          set -euo pipefail
-          rm -rf cov && mkdir -p cov
-          # Crate list as positional params (portable, no word-split reliance):
-          # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
-          set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes ktesio ktesio-engine
-          for pkg in "$@"; do
-            echo "::group::tarpaulin -p $pkg"
-            echo "--- resources before $pkg ---"
-            free -h || true
-            df -h / || true
-            cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
-              -p "$pkg" --out Lcov --output-dir "cov/$pkg"
+          set -uo pipefail
+          # Whole-job retry (PR #117): this job's per-test real-time waits (a
+          # child process spawn + a stdin/stdout round trip) were empirically
+          # observed to transiently stall COMPLETELY (not merely run slow) on
+          # this free-tier runner — across otherwise-identical reruns of the
+          # SAME commit, a DIFFERENT, unrelated test failed each time, always
+          # one needing a real child-process round trip, never one on a
+          # fast-fail path with no I/O; a local repro under the identical
+          # tarpaulin/instrumentation config passed instantly. That signature
+          # is runner contention, not a product bug. Retrying the WHOLE
+          # attempt once (never a PER-TEST retry, e.g. nextest's `retries`,
+          # which this repo has already seen silently absorb a real,
+          # reproducible data-loss race — see the 4-2 H1 fix) keeps the gate
+          # meaningful: a genuine coverage regression or a genuine test bug
+          # reproduces on BOTH attempts and still fails the job.
+          run_coverage_attempt() (
+            set -euo pipefail
+            rm -rf cov && mkdir -p cov
+            # Crate list as positional params (portable, no word-split reliance):
+            # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
+            set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes ktesio ktesio-engine
+            for pkg in "$@"; do
+              echo "::group::tarpaulin -p $pkg"
+              echo "--- resources before $pkg ---"
+              free -h || true
+              df -h / || true
+              cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+                -p "$pkg" --out Lcov --output-dir "cov/$pkg"
+              echo "::endgroup::"
+            done
+            # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
+            # is a doc-only stub today (0 coverable lines, no tracefile) — skip any
+            # crate that produced no lcov.info so the merge does not choke on it, and
+            # it lights up automatically once epic 6 gives it code. --ignore-errors
+            # inconsistent: tolerate lcov 2.x's benign cross-run FN-start-line drift
+            # (line data is unaffected).
+            add_args=""
+            for pkg in "$@"; do
+              if [ -s "cov/$pkg/lcov.info" ]; then
+                add_args="$add_args -a cov/$pkg/lcov.info"
+              else
+                echo "::notice::no coverable lines for $pkg (expected for the hermes stub); skipping in merge."
+              fi
+            done
+            echo "::group::merge tracefiles"
+            # shellcheck disable=SC2086
+            lcov $add_args -o cov/merged.info --ignore-errors inconsistent,inconsistent
             echo "::endgroup::"
-          done
-          # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
-          # is a doc-only stub today (0 coverable lines, no tracefile) — skip any
-          # crate that produced no lcov.info so the merge does not choke on it, and
-          # it lights up automatically once epic 6 gives it code. --ignore-errors
-          # inconsistent: tolerate lcov 2.x's benign cross-run FN-start-line drift
-          # (line data is unaffected).
-          add_args=""
-          for pkg in "$@"; do
-            if [ -s "cov/$pkg/lcov.info" ]; then
-              add_args="$add_args -a cov/$pkg/lcov.info"
-            else
-              echo "::notice::no coverable lines for $pkg (expected for the hermes stub); skipping in merge."
+            # Enforce the SAME workspace >= 95 gate on the MERGED aggregate. Parse the
+            # `(<hit> of <found> lines)` FRACTION from `lcov --summary` (version-stable
+            # across lcov 1.x/2.x) and compute the exact percentage — more robust than
+            # the 1-decimal rounded `NN.N%` near the boundary. `lines_pair` is the two
+            # integers "<hit> <found>"; a single awk both extracts and decides, so
+            # there is no heredoc / read indentation fragility.
+            echo "::group::merged coverage summary"
+            lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
+            echo "::endgroup::"
+            lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
+              | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
+            hit="${lines_pair%% *}"
+            found="${lines_pair##* }"
+            if [ -z "${found:-}" ] || ! [ "${found}" -gt 0 ] 2>/dev/null; then
+              echo "::error::Could not parse merged line coverage from lcov --summary; aborting the coverage gate (#101)."
+              exit 1
             fi
-          done
-          echo "::group::merge tracefiles"
-          # shellcheck disable=SC2086
-          lcov $add_args -o cov/merged.info --ignore-errors inconsistent,inconsistent
-          echo "::endgroup::"
-          # Enforce the SAME workspace >= 95 gate on the MERGED aggregate. Parse the
-          # `(<hit> of <found> lines)` FRACTION from `lcov --summary` (version-stable
-          # across lcov 1.x/2.x) and compute the exact percentage — more robust than
-          # the 1-decimal rounded `NN.N%` near the boundary. `lines_pair` is the two
-          # integers "<hit> <found>"; a single awk both extracts and decides, so
-          # there is no heredoc / read indentation fragility.
-          echo "::group::merged coverage summary"
-          lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
-          echo "::endgroup::"
-          lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
-            | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
-          hit="${lines_pair%% *}"
-          found="${lines_pair##* }"
-          if [ -z "${found:-}" ] || ! [ "${found}" -gt 0 ] 2>/dev/null; then
-            echo "::error::Could not parse merged line coverage from lcov --summary; aborting the coverage gate (#101)."
-            exit 1
-          fi
-          pct="$(awk -v h="$hit" -v f="$found" 'BEGIN { printf "%.4f", (h / f) * 100 }')"
-          echo "Merged workspace coverage: ${pct}% (${hit}/${found} lines) across the per-crate split (#101)."
-          if awk -v p="$pct" 'BEGIN { exit (p + 0 >= 95) ? 0 : 1 }'; then
-            echo "Coverage gate green: merged ${pct}% >= 95% on the per-crate union (#101)."
-          else
-            echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
-            exit 1
+            pct="$(awk -v h="$hit" -v f="$found" 'BEGIN { printf "%.4f", (h / f) * 100 }')"
+            echo "Merged workspace coverage: ${pct}% (${hit}/${found} lines) across the per-crate split (#101)."
+            if awk -v p="$pct" 'BEGIN { exit (p + 0 >= 95) ? 0 : 1 }'; then
+              echo "Coverage gate green: merged ${pct}% >= 95% on the per-crate union (#101)."
+            else
+              echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
+              exit 1
+            fi
+          )
+
+          if ! run_coverage_attempt; then
+            echo "::warning::coverage attempt 1/2 failed — retrying the whole job once (see the comment above this step's script: PR #117 found this job's real-time child-process waits can transiently stall on this runner; a genuine failure reproduces on the retry too)."
+            run_coverage_attempt
           fi
