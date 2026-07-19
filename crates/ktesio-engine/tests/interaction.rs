@@ -104,7 +104,17 @@ fn agent_log_path(base: &Path, name: &str) -> PathBuf {
 /// observable state, never a wall-clock sleep-then-assert (the Epic-2-retro
 /// AI-35/38 lesson every later story mirrors).
 fn wait_for_stdin_line(agent_log: &Path, wanted: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 20s, not 5s: this polls real IPC through a fully-instrumented round trip
+    // (engine dispatch + a real child process, both instrumented under
+    // `cargo tarpaulin`) on the coverage job's resource-constrained ubuntu
+    // runner. 5s was comfortably sufficient under plain `cargo nextest` (the
+    // full 860-test suite completes in well under a minute) but 4 tests in
+    // this file failed here, deterministically, the first time this branch
+    // ran through the coverage job -- tarpaulin's per-line instrumentation
+    // overhead compounds across every hop of this round trip, unlike the
+    // narrow fixed-boundary races elsewhere in this codebase (e.g.
+    // READINESS_WINDOW). This is a throughput margin, not a race window.
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(contents) = std::fs::read_to_string(agent_log) {
             if contents.lines().any(|l| l == wanted) {
