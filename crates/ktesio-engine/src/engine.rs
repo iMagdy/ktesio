@@ -34,7 +34,7 @@ use ktesio_adapter_api::EffectiveCapabilities;
 use crate::adapter::AdapterRef;
 use crate::domain::{
     AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, EffectiveConfig, EngineError,
-    FleetEntry, InstanceName, LifecycleState, Registry, RegistryError, RemoveDisposition,
+    FleetEntry, InstanceName, LifecycleState, LogLine, Registry, RegistryError, RemoveDisposition,
     RestartPolicy, Supervisor, TransitionCause, TransitionEvent,
 };
 
@@ -655,6 +655,32 @@ impl Engine {
         .await
     }
 
+    /// Send text input to a running Agent Instance's native input channel
+    /// (story 4.1, FR-24, spine AD-12). Drives
+    /// [`Supervisor::send_input`](crate::domain::Supervisor::send_input)'s
+    /// dispatch: `NotRunning` if the instance is not
+    /// [`LifecycleState`](crate::domain::LifecycleState)`::Running`;
+    /// [`EngineError::CapabilityUnsupported`] if the effective
+    /// `Capability::Interaction` level is `unsupported` on this OS (fails
+    /// fast, no I/O); [`EngineError::InteractionUnavailable`] if the instance
+    /// is running but this engine session holds no live stdin pipe for it
+    /// (e.g. an ADOPTED instance — see the method's docs); otherwise appends
+    /// a trailing `\n` if absent and writes the bytes to the child's stdin.
+    /// This is the FIRST interaction-shaped method on the public Embedding
+    /// Interface (AD-2/AD-13): a Host embedding the engine gets `send_input`
+    /// for free, no CLI required.
+    pub async fn send_input(&self, name: &str, text: &str) -> Result<(), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        let text = text.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.send_input(&registry, &name, &text)
+        })
+        .await
+    }
+
     /// The per-instance runtime status (story 1-6, AC9): Lifecycle State +
     /// effective Restart Policy + restart count + (for `failed`) the last-known
     /// cause. This is the read `kt agent list`/`show` uses to surface the restart
@@ -854,6 +880,49 @@ impl Engine {
         .await
     }
 
+    /// Read the retained ATTRIBUTED output log for an instance (story 4-2,
+    /// AC-A) — a ONE-SHOT full read of whatever is currently retained (the
+    /// current generation plus any rotated predecessors), in on-disk append
+    /// order (AC-G). This is the FIRST CLI-facing consumer of this shape
+    /// (`kt agent logs`) — an unregistered name fails
+    /// [`EngineError::NotFound`] (see
+    /// [`Supervisor::read_agent_log`]'s docs for the full existence-check
+    /// rationale, a deliberate improvement over
+    /// [`Engine::transition_events`]/[`Engine::budget_breach_events`]'s
+    /// precedent above). ALSO returns the byte-cursor (into the current
+    /// generation) this read reached (fix pass M1, review of #80), so a
+    /// caller priming a `--follow` loop needs no separate, discarding
+    /// `read_agent_log_since(name, 0)` call.
+    pub async fn read_agent_log(&self, name: &str) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            Supervisor::read_agent_log(&registry, &name)
+        })
+        .await
+    }
+
+    /// A cursor-based follow read (story 4-2, AC-B/AC-C/AC-H) — `kt agent
+    /// logs --follow`'s poll loop drives this in a loop with the previously
+    /// returned cursor. See [`Supervisor::read_agent_log_since`]'s docs for
+    /// the cursor semantics (current-generation-only) and the
+    /// rotation-shrink signal (a returned cursor less than the one just
+    /// passed in).
+    pub async fn read_agent_log_since(
+        &self,
+        name: &str,
+        cursor: u64,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            Supervisor::read_agent_log_since(&registry, &name, cursor)
+        })
+        .await
+    }
+
     /// Run a blocking closure on tokio's blocking pool and await its result.
     ///
     /// Centralizes the `spawn_blocking` bridge so every async wrapper follows the
@@ -950,6 +1019,11 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.resume(name))
     }
 
+    /// Blocking [`Engine::send_input`].
+    pub fn send_input(&self, name: &str, text: &str) -> Result<(), EngineError> {
+        self.engine.rt.block_on(self.engine.send_input(name, text))
+    }
+
     /// Blocking [`Engine::transition_events`].
     pub fn transition_events(&self, name: &str) -> Result<Vec<TransitionEvent>, EngineError> {
         self.engine.rt.block_on(self.engine.transition_events(name))
@@ -960,6 +1034,22 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.budget_breach_events(name))
+    }
+
+    /// Blocking [`Engine::read_agent_log`] (story 4-2, AC-A).
+    pub fn read_agent_log(&self, name: &str) -> Result<(Vec<LogLine>, u64), EngineError> {
+        self.engine.rt.block_on(self.engine.read_agent_log(name))
+    }
+
+    /// Blocking [`Engine::read_agent_log_since`] (story 4-2, AC-B/AC-C/AC-H).
+    pub fn read_agent_log_since(
+        &self,
+        name: &str,
+        cursor: u64,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.read_agent_log_since(name, cursor))
     }
 
     /// Blocking [`Engine::instance_status`] (story 1-6, AC9).

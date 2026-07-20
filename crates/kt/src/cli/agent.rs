@@ -12,21 +12,23 @@
 //! only — conventions). Output discipline (AD-12): command results to stdout,
 //! diagnostics/notices to stderr.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, Micros, RegistryError, RemoveDisposition, SupportLevel,
-    UsageView, FLEET_SCHEMA_VERSION,
+    FleetEntry, FleetListing, FleetTotals, LifecycleState, LogLine, Micros, RegistryError,
+    RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInvalidName,
-    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
-    AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource,
-    AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionTimedOut,
+    AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentIo,
+    AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable,
+    AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
+    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
+    AgentUnknownKind,
 };
 use crate::ui;
 
@@ -851,6 +853,168 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `kt agent send <name> <text>` — send text input to a running Agent
+/// Instance's native input channel (story 4.1, FR-24).
+///
+/// Drives `send_input` through the blocking facade. Unlike `pause`/`resume`,
+/// `send` is not a lifecycle transition, so there is no new Lifecycle State to
+/// print — on success only a confirmation goes to stdout. Failure modes,
+/// mapped by [`map_engine_error`]: the instance is not `running`
+/// ([`AgentNotRunning`]); interaction is `unsupported` on this OS, quoting the
+/// Capability Declaration ([`AgentCapabilityUnsupported`]); or the instance is
+/// running but this engine session holds no live stdin pipe for it, e.g. an
+/// ADOPTED instance ([`AgentInteractionUnavailable`]).
+pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+    match facade.send_input(name, text) {
+        Ok(()) => {
+            ui::success(format!(
+                "Sent input to Agent Instance {}",
+                ui::skill_name(name)
+            ));
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// How often `kt agent logs --follow` polls for new output (story 4-2,
+/// Assumption 7) — a reasonable default left unspecified by any source
+/// document, mirroring `STOP_POLL_INTERVAL`'s existing precedent
+/// (`backends/unix/mod.rs`) of a hardcoded short interval rather than a
+/// configurable one.
+const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// How long AC-C's final drain (below) may retry after a non-`running`
+/// transition is observed, before giving up and printing the exit note
+/// (fix pass, M2, review of #80). `Supervisor::transition_with_log_capture`
+/// writes `output.log`'s engine line SYNCHRONOUSLY now (fix pass, H1 — no
+/// background writer thread/channel is involved anymore), but it does so
+/// AFTER first persisting the new state to the DB (`registry.set_state`) —
+/// two separate steps within the SAME call, not one atomic unit. `kt agent
+/// logs --follow` runs in a SEPARATE process from whatever transitions the
+/// instance (e.g. a concurrent `kt agent stop`), so it can observe the NEW
+/// state via `instance_status` (step one) a moment before that OTHER
+/// process has finished the engine-line write (step two) — a real,
+/// cross-process race, distinct from (and independent of) the reader/tailer
+/// mechanics. Retrying briefly here closes it. Mirrors
+/// `crates/ktesio-engine/tests/logs.rs`'s
+/// `follow_drains_and_exits_cleanly_on_stop`'s own accommodation for this
+/// exact race (there, a 3s bound); kept short here since the remaining gap
+/// between the two steps is normally sub-millisecond.
+const FOLLOW_FINAL_DRAIN_BOUND: Duration = Duration::from_secs(2);
+
+/// How often the final-drain retry (above) re-polls while waiting.
+const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// `kt agent logs <name> [--follow]` — read retained logs, optionally
+/// following live output (story 4-2, FR-25, spine AD-12).
+///
+/// One-shot: dumps every currently-retained [`LogLine`] to stdout (this IS
+/// the command's result — AD-12's "stdout of kt is command output"
+/// convention) and returns. `--follow` (AC-B/AC-C): after that initial dump
+/// (mirroring `docker logs -f`'s "show existing, then keep streaming"
+/// convention), loops on [`LOGS_FOLLOW_POLL_INTERVAL`] calling
+/// `read_agent_log_since`, printing new lines as they arrive, and
+/// periodically checking `instance_status`. On a detected rotation (the
+/// engine's returned cursor snaps BELOW the one just passed in), prints one
+/// honest notice rather than silently claiming completeness. On a non-
+/// `running` state, performs a bounded final drain (fix pass, M2 — see
+/// [`FOLLOW_FINAL_DRAIN_BOUND`]; so no line emitted before the transition is
+/// lost) and exits cleanly with a state-appropriate note — a `paused`
+/// instance is not "gone", so it gets an honest "paused" note, not an
+/// error. No special Ctrl-C handling is needed: this is a read-only command
+/// holding no supervising handle, so a SIGINT exit is always safe.
+pub fn logs(name: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+
+    // Fix pass (M1, review of #80): `read_agent_log` returns the byte-cursor
+    // it reached ALONGSIDE its one-shot dump — this primes the follow loop's
+    // cursor directly from the SAME read, with no separate
+    // `read_agent_log_since(name, 0)` priming call whose own lines used to
+    // be silently discarded (a T1→T2 window between the two reads during
+    // which any emitted output was lost before `--follow` ever started
+    // polling).
+    let (lines, mut cursor) = facade.read_agent_log(name).map_err(map_engine_error)?;
+    print_log_lines(&lines);
+    if !follow {
+        return Ok(());
+    }
+
+    loop {
+        std::thread::sleep(LOGS_FOLLOW_POLL_INTERVAL);
+        let (new_lines, next_cursor) = facade
+            .read_agent_log_since(name, cursor)
+            .map_err(map_engine_error)?;
+        note_if_rotated(next_cursor, cursor, name);
+        print_log_lines(&new_lines);
+        cursor = next_cursor;
+
+        let status = facade.instance_status(name).map_err(map_engine_error)?;
+        if status.instance.state != LifecycleState::Running {
+            // AC-C: a BOUNDED final drain (fix pass, M2) so nothing emitted
+            // right up to the transition is lost — retries briefly rather
+            // than a single unretried read (see FOLLOW_FINAL_DRAIN_BOUND's
+            // docs for why); RETRIES while a poll comes back empty (the
+            // writer thread has not caught up yet) and stops as soon as
+            // EITHER a poll finds new content or the bound elapses —
+            // never the reverse (stopping on the FIRST empty read would
+            // defeat the retry's whole purpose).
+            let final_deadline = Instant::now() + FOLLOW_FINAL_DRAIN_BOUND;
+            loop {
+                let (more, next_cursor) = facade
+                    .read_agent_log_since(name, cursor)
+                    .map_err(map_engine_error)?;
+                note_if_rotated(next_cursor, cursor, name);
+                print_log_lines(&more);
+                cursor = next_cursor;
+                if !more.is_empty() || Instant::now() >= final_deadline {
+                    break;
+                }
+                std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
+            }
+            ui::note(follow_exit_note(name, status.instance.state));
+            return Ok(());
+        }
+    }
+}
+
+/// Render each [`LogLine`] to stdout as `<at> [<stream>] <text>`, in the
+/// order given (AC-G: the caller is responsible for never re-sorting).
+fn print_log_lines(lines: &[LogLine]) {
+    for line in lines {
+        println!("{} [{}] {}", line.at, line.stream, line.text);
+    }
+}
+
+/// If `next_cursor` snapped BELOW `prior_cursor`, a rotation happened since
+/// the last poll (story 4-2, AC-D/AC-H) — print the one honest notice rather
+/// than silently claim completeness. This is how the CLI detects the
+/// signal `Supervisor::read_agent_log_since` returns via the plain
+/// `(Vec<LogLine>, u64)` shape (no separate boolean field).
+fn note_if_rotated(next_cursor: u64, prior_cursor: u64, name: &str) {
+    if next_cursor < prior_cursor {
+        ui::note(format!(
+            "output rotated; a small window may be missing from the live tail — `kt agent logs {name}` \
+             (without --follow) re-reads everything currently retained"
+        ));
+    }
+}
+
+/// The honest `--follow` exit note for a non-`running` state (AC-C) — a
+/// `paused` instance is not "gone" (so it gets its own wording, never an
+/// error), while every other non-running state gets a generic "no further
+/// output will arrive" note.
+fn follow_exit_note(name: &str, state: LifecycleState) -> String {
+    if state == LifecycleState::Paused {
+        format!("Agent Instance '{name}' is paused; no further output until it is resumed.")
+    } else {
+        format!("Agent Instance '{name}' is {state}; no further output will arrive.")
+    }
+}
+
 /// After a successful best-effort-eligible pause/resume, re-read the effective
 /// Capability Declaration and, if pause is [`SupportLevel::BestEffort`] on the
 /// current OS, print a one-line qualifier NOTE to STDERR (AD-12: notices →
@@ -1470,6 +1634,80 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
         }
         .into(),
+        // Story 4.1 AC-C: `send` targeted an instance that is not `running`.
+        // Not a transition error (there is no transition table entry for
+        // `send`), so it gets its own remediation naming the current state.
+        //
+        // M2 fix (review of #79): the remediation VERB must match the
+        // instance's ACTUAL state. A `paused` instance's correct remediation
+        // is `kt agent resume` — suggesting `kt agent start` there hits a
+        // SECOND, confusing `InvalidTransition` error (start only accepts
+        // registered/stopped/failed), not a helpful fix. Every other
+        // NOT-running state (registered/starting/stopping/stopped/failed)
+        // keeps the original `start` remediation.
+        EngineError::NotRunning { name, state } => {
+            let remediation = if state == "paused" {
+                format!("resume it with: kt agent resume {name}")
+            } else {
+                format!("start it first with: kt agent start {name}")
+            };
+            AgentNotRunning {
+                message: format!(
+                    "Agent Instance '{name}' is not running (current state: {state}); \
+                     {remediation}. List the Fleet with: kt agent list"
+                ),
+            }
+            .into()
+        }
+        // Story 4.1 AC-D: the instance IS running, but this engine session
+        // holds no live stdin pipe for it (most commonly an instance ADOPTED
+        // from a prior engine session). Distinct from CapabilityUnsupported —
+        // the adapter's declaration may truthfully say `interaction:
+        // guaranteed`; it is this session's reach that is limited. State the
+        // single-lifetime boundary honestly rather than implying a bug.
+        EngineError::InteractionUnavailable { name, detail } => AgentInteractionUnavailable {
+            message: format!(
+                "Agent Instance '{name}' cannot receive input right now: {detail}. Durable \
+                 cross-invocation interaction needs a persistent engine session (planned for a \
+                 future release); within a single `kt` process/embedding session this works."
+            ),
+        }
+        .into(),
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): `send`'s
+        // write to this instance's stdin did not complete within the bounded
+        // timeout — the agent may be stuck (not draining its input).
+        // Distinct from InteractionUnavailable: this engine session DID hold
+        // a live pipe and attempted the write; it simply never came back.
+        // The instance's interaction channel is now permanently unusable for
+        // the rest of this session, so the remediation is a fresh start.
+        EngineError::InteractionTimedOut { name, timeout_secs } => AgentInteractionTimedOut {
+            message: format!(
+                "Agent Instance '{name}' is not draining its input within {timeout_secs}s and \
+                 may be stuck. Its interaction channel is now unavailable for the rest of this \
+                 session; restart it for a fresh one: kt agent stop {name} && kt agent start \
+                 {name}"
+            ),
+        }
+        .into(),
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): `stop`
+        // sent SIGKILL but could not confirm the process's death within the
+        // bound — most likely because it is stuck in an OS-level
+        // uninterruptible I/O wait (e.g. disk pressure caused by a fast
+        // writer with no reader-side backpressure). The instance is NOT
+        // `stopped` — it stays `stopping`; point at retrying `stop` (which
+        // will not re-block for the same duration if it is still stuck) and
+        // name the likely cause honestly rather than implying a bug.
+        EngineError::StopUnconfirmed { name, timeout_secs } => AgentStopUnconfirmed {
+            message: format!(
+                "Agent Instance '{name}' was sent SIGKILL but has not been confirmed dead \
+                 within {timeout_secs}s; it may be stuck in an OS-level I/O wait (for example, \
+                 disk pressure). It remains in the 'stopping' state. Try again with: \
+                 kt agent stop {name} — this will not re-block if it is still stuck, and will \
+                 succeed once the process actually exits (which may require relieving disk \
+                 pressure or waiting for the stuck I/O to resolve)."
+            ),
+        }
+        .into(),
         EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -1577,6 +1815,72 @@ mod tests {
             ktesio_engine::ports::StoreError::Backend("db gone".into()),
         ));
         assert!(store.to_string().contains("State store error"));
+    }
+
+    #[test]
+    fn map_engine_error_renders_the_interaction_timed_out_diagnostic() {
+        // Fix pass (CRITICAL finding, review of #79) coverage-closer: unlike
+        // every OTHER `map_engine_error` arm (all reached only indirectly
+        // through full CLI-process-spawning tests in `agent_cli.rs`),
+        // `EngineError::InteractionTimedOut`'s CLI rendering CANNOT be
+        // exercised that way at all — a genuinely stuck write needs a LIVE
+        // pipe, which only exists within the SAME engine session that
+        // spawned it, but a single `kt agent send` invocation opens its OWN
+        // fresh `Engine` and exits after one call; a SEPARATE `kt agent
+        // send` reaching an instance a prior invocation started can only do
+        // so via `adopt_orphans`, which NEVER carries a live pipe (mirrors
+        // the story's OWN Task 8 Deviation 1 finding for
+        // `InteractionUnavailable`'s happy path — the same structural
+        // constraint, one variant further). So this diagnostic's rendering
+        // is unit-tested directly here, mirroring `map_error_includes_
+        // remediation_hints`'s existing direct-call pattern for `map_error`.
+        let err = map_engine_error(EngineError::InteractionTimedOut {
+            name: "stuck".to_string(),
+            timeout_secs: 5,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("stuck"), "names the instance: {msg}");
+        assert!(msg.contains('5'), "names the bound: {msg}");
+        assert!(
+            msg.contains("kt agent stop stuck") && msg.contains("kt agent start stuck"),
+            "points at a restart for a fresh channel: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported") && !msg.contains("declares"),
+            "must never be misattributed to CapabilityUnsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_engine_error_renders_the_stop_unconfirmed_diagnostic() {
+        // Fix pass (review of #80 follow-up — the CRITICAL finding)
+        // coverage-closer: mirrors `map_engine_error_renders_the_
+        // interaction_timed_out_diagnostic`'s reasoning exactly —
+        // `EngineError::StopUnconfirmed` needs a process GENUINELY stuck in
+        // an OS-level uninterruptible I/O wait (disk exhaustion), which a
+        // full CLI-process-spawning test cannot safely or deterministically
+        // induce (and must never attempt against the real host disk — see
+        // the fix pass's mandatory ramdisk-only empirical proof). So this
+        // diagnostic's rendering is unit-tested directly here instead.
+        let err = map_engine_error(EngineError::StopUnconfirmed {
+            name: "stuck".to_string(),
+            timeout_secs: 5,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("stuck"), "names the instance: {msg}");
+        assert!(msg.contains('5'), "names the bound: {msg}");
+        assert!(
+            msg.contains("SIGKILL") && msg.contains("I/O wait"),
+            "names the honest likely cause, not a generic failure: {msg}"
+        );
+        assert!(
+            msg.contains("'stopping'"),
+            "states the instance's actual (non-terminal) state honestly: {msg}"
+        );
+        assert!(
+            msg.contains("kt agent stop stuck"),
+            "points at retrying stop rather than a generic remediation: {msg}"
+        );
     }
 
     #[test]

@@ -165,7 +165,7 @@ class ReleaseDocsTests(unittest.TestCase):
         # verbose preserved; -p "$pkg" + Lcov out into cov/$pkg replaces --workspace).
         self.assertIn(
             'cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 '
-            "--verbose \\\n              -p \"$pkg\" --out Lcov --output-dir "
+            "--verbose \\\n                -p \"$pkg\" --out Lcov --output-dir "
             '"cov/$pkg"',
             ci,
         )

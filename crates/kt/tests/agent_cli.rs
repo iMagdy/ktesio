@@ -1018,6 +1018,434 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
     );
 }
 
+// ---- Story 4-1: `kt agent send <name> <text>` (AC-A, AC-B, AC-C) ----
+
+/// Write a `fake_agent` manifest whose CURRENT-OS interaction level is
+/// `interaction_level` (mirrors `fake_agent_manifest_with_pause`).
+fn fake_agent_manifest_with_interaction(
+    dir: &Path,
+    args: &[&str],
+    interaction_level: &str,
+) -> std::path::PathBuf {
+    let m = dir.join("send-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "fake"
+
+[lifecycle.start]
+exec = {exec:?}
+args = [{args_toml}]
+
+[capabilities.interaction]
+{os} = "{interaction_level}"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        os = current_os_pause_key(),
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    m
+}
+
+/// The agent.log path inside an instance's Agent Home.
+fn agent_log_path(state_dir: &Path, name: &str) -> std::path::PathBuf {
+    state_dir
+        .join("agents")
+        .join(name)
+        .join("logs")
+        .join("agent.log")
+}
+
+#[test]
+fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable() {
+    // DEVIATION FROM THE STORY FILE (documented; see the story's Dev Agent
+    // Record / Completion Notes and the PR description for the full
+    // rationale): Task 8's first bullet describes this test asserting exit 0
+    // + delivered input, mirroring
+    // `pause_prints_paused_state_and_exits_zero_guaranteed_unix` via
+    // `start_via_surviving_engine`. That harness works for pause (guaranteed
+    // pause only needs the pgid/PID, which adoption fully restores), but for
+    // `send` it is structurally impossible to succeed: `start_via_surviving_engine`
+    // starts the agent in a SEPARATE helper subprocess that exits without
+    // dropping its engine, so the SEPARATE `kt agent send` invocation this
+    // test drives NECESSARILY reaches the instance only via `adopt_orphans`
+    // — and an adopted handle NEVER carries a recoverable stdin pipe (AC-D,
+    // Task 1's `adopt()`), on Unix or Windows alike (this is not an OS
+    // difference; a pipe file descriptor is process-local and cannot survive
+    // a re-parent to init the way a bare pid/pgid does). Running the test AS
+    // LITERALLY DESCRIBED reproducibly fails with EXACTLY the
+    // `InteractionUnavailable` error AC-D mandates — confirming the
+    // implementation is correct and the story's test-outcome description
+    // does not account for send's pipe-vs-pid distinction (spelled out in
+    // the story's OWN Dev Notes: "pause/stop/poll do not have this problem
+    // ... while send needs an actual open file descriptor this engine
+    // session holds"). So this test instead proves the CLI-level surfacing
+    // of AC-D's honest failure (genuinely new coverage: the
+    // `AgentInteractionUnavailable` diagnostic's rendering through the real
+    // `kt` binary, which no other test exercises) — never
+    // `CapabilityUnsupported`, never a silent success, and NO input
+    // delivered. AC-A's single-session happy path (exit 0 + delivered input)
+    // is fully proven at the engine level by
+    // `send_input_delivers_text_to_a_running_manifest_adapter_agent` in
+    // `crates/ktesio-engine/tests/interaction.rs`, which does not cross a
+    // process boundary.
+    //
+    // Runtime-skip on Windows: `start_via_surviving_engine`'s cross-lifetime
+    // survival needs Unix re-parenting to init (`JOB_OBJECT_LIMIT_KILL_ON_
+    // JOB_CLOSE` kills the child on Windows when the helper exits) — the SAME
+    // reason the pause CLI tests skip Windows. NO `#[cfg]` (data-driven; this
+    // file is outside the backends allowlist).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--echo-stdin", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Start via a surviving (crashed-engine) subprocess so the process is
+    // genuinely LIVE when the send command's SEPARATE engine adopts it.
+    start_via_surviving_engine(state_dir, "svc");
+
+    let sent = run_kt_agent(
+        &["agent", "send", "svc", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "send on an adopted instance must exit non-zero (no recoverable pipe); stdout={}",
+        sent.stdout
+    );
+    assert!(
+        sent.stderr.contains("cannot receive input"),
+        "stderr must state the honest InteractionUnavailable cause; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("svc"),
+        "stderr must name the instance; stderr={}",
+        sent.stderr
+    );
+    // Never misattributed to CapabilityUnsupported — the adapter's
+    // declaration is truthful; it is this session's reach that is limited.
+    assert!(
+        !sent.stderr.contains("unsupported") && !sent.stderr.contains("declares"),
+        "must never be misattributed to CapabilityUnsupported: stderr={}",
+        sent.stderr
+    );
+
+    // Confirm this genuinely exercised the ADOPTED-and-running path (not some
+    // other failure): the persisted row is `running`.
+    let conn = rusqlite::Connection::open(state_db(state_dir)).unwrap();
+    let persisted_state: String = conn
+        .query_row(
+            "SELECT state FROM agent_instances WHERE name = 'svc'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_state, "running",
+        "the instance must genuinely be adopted as running for this to be AC-D, not some other failure"
+    );
+    drop(conn);
+
+    // No input was delivered (a failed send must deliver NOTHING).
+    let contents = std::fs::read_to_string(agent_log_path(state_dir, "svc")).unwrap_or_default();
+    assert!(
+        !contents.lines().any(|l| l.starts_with("stdin:")),
+        "a failed send must deliver no input: {contents:?}"
+    );
+
+    // Teardown: stop the adopted process so no orphan remains.
+    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn send_unsupported_exits_nonzero_quoting_the_declaration() {
+    // AC-B at the CLI: `send` on an instance whose interaction is
+    // `unsupported` on this OS fails fast with a non-zero exit and a
+    // diagnostic (stderr) quoting the declaration. Same
+    // `start_via_surviving_engine` requirement as pause's identical test — an
+    // unsupported-but-DB-hacked `force_state_running` would not survive
+    // `adopt_orphans`' reconciliation (see that test's own comment on why the
+    // heavier harness is required even for the fail-fast path).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // Declare interaction only for an OS that is NOT the current one → the
+    // current-OS projection is Unsupported.
+    let other = if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--echo-stdin", "--linger-ms", "600000"],
+        "ignored",
+    );
+    // Overwrite the manifest so interaction is declared ONLY for the other OS.
+    let bin = fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "fake"
+[lifecycle.start]
+exec = {exec:?}
+args = ["--echo-stdin", "--linger-ms", "600000"]
+[capabilities.interaction]
+{other} = "guaranteed"
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        other = other,
+    );
+    std::fs::write(m.join("adapter.toml"), body).unwrap();
+
+    run_kt_agent(
+        &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Start via a surviving (crashed-engine) subprocess so the instance is
+    // genuinely `running` (adopted) when send runs — so send fails fast with
+    // the UNSUPPORTED diagnostic, not a reconciled-to-failed transition error.
+    start_via_surviving_engine(state_dir, "un");
+
+    let sent = run_kt_agent(
+        &["agent", "send", "un", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "unsupported send must exit non-zero; stdout={}",
+        sent.stdout
+    );
+    assert!(
+        sent.stderr.contains("cannot interaction"),
+        "stderr must quote the declaration; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("unsupported"),
+        "stderr must name the level; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("kt agent show un"),
+        "stderr must point at kt agent show; stderr={}",
+        sent.stderr
+    );
+
+    // Fail-fast attempted NO I/O: the captured log gained no `stdin:` line.
+    let contents = std::fs::read_to_string(agent_log_path(state_dir, "un")).unwrap_or_default();
+    assert!(
+        !contents.lines().any(|l| l.starts_with("stdin:")),
+        "no I/O may be attempted on the Unsupported fail-fast path: {contents:?}"
+    );
+
+    // Teardown.
+    run_kt_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
+}
+
+#[test]
+fn send_on_registered_instance_is_not_running() {
+    // AC-C at the CLI: `send` on a registered (never started) instance fails
+    // with a non-zero exit and a diagnostic naming the current state — the
+    // LIGHTER path suffices here (no live process needed at all): the
+    // `NotRunning` check fires before anything process-related, mirroring
+    // `pause_on_registered_returns_uniform_invalid_transition`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "nat", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(
+        &["agent", "send", "nat", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!run.success, "send on registered should exit non-zero");
+    assert!(
+        run.stderr.contains("not running"),
+        "stderr should name the not-running state; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("nat"),
+        "stderr should name the instance; stderr={}",
+        run.stderr
+    );
+}
+
+// ---- Fix pass (review of #79): M1 (hyphen-safe text / --help interception)
+// and M2 (paused-instance remediation) ----
+
+#[test]
+fn send_text_that_looks_like_help_flag_is_sent_literally_not_intercepted_as_cli_help() {
+    // M1 fix: `text` is hyphen-safe (`allow_hyphen_values`) and `send`'s own
+    // `--help`/`-h` is disabled (`disable_help_flag`), so a text value of
+    // "--help" is delivered as literal input, never silently intercepted as
+    // the CLI's OWN help — which used to print help and exit 0 WITHOUT
+    // sending anything, so a caller checking only the exit code would
+    // wrongly believe the send succeeded.
+    //
+    // No instance named "ghost" is registered, so the real send logic must
+    // reach the ordinary NotFound diagnostic — proving "--help" was routed
+    // as the TEXT value into the real command, not consumed as a help
+    // request (which would have printed clap's usage/help text and exited
+    // 0 with nothing attempted).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let sent = run_kt_agent(
+        &["agent", "send", "ghost", "--help"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "must NOT silently exit 0 via help interception; stdout={}",
+        sent.stdout
+    );
+    assert!(
+        !sent.stdout.contains("Usage:") && !sent.stderr.contains("Usage:"),
+        "must not print clap's help/usage text; stdout={} stderr={}",
+        sent.stdout,
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("ghost"),
+        "must surface the ordinary NotFound diagnostic naming the instance \
+         (proving --help was treated as literal text, not a help request); stderr={}",
+        sent.stderr
+    );
+
+    // The hyphen-value parse problem (`kt agent send x "-5 degrees"` used to
+    // be a clap parse error) is likewise fixed: a leading-hyphen text value
+    // reaches the ordinary send logic instead of a clap "unexpected
+    // argument" failure.
+    let sent2 = run_kt_agent(
+        &["agent", "send", "ghost", "-5 degrees"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        sent2.stderr.contains("ghost"),
+        "a hyphen-leading text value must reach the ordinary NotFound diagnostic, \
+         not a clap parse error; stderr={}",
+        sent2.stderr
+    );
+    assert!(
+        !sent2.stderr.contains("unexpected argument") && !sent2.stderr.contains("Usage:"),
+        "must not be rejected as a clap parse error; stderr={}",
+        sent2.stderr
+    );
+}
+
+/// Seed a `paused` state onto an already-registered instance directly in the
+/// engine's SQLite DB (mirrors `force_state_running`) — `send`'s `NotRunning`
+/// check fires purely from the persisted state, before any capability read or
+/// live-process need, so this lighter DB-seed harness suffices (no real
+/// process required).
+fn force_state_paused(state_dir: &Path, name: &str) {
+    let conn = rusqlite::Connection::open(state_db(state_dir)).expect("open state db");
+    let affected = conn
+        .execute(
+            "UPDATE agent_instances SET state = 'paused' WHERE name = ?1",
+            [name],
+        )
+        .expect("update state");
+    assert_eq!(affected, 1, "expected to update exactly one row");
+}
+
+#[test]
+fn send_on_a_paused_instance_is_not_running_with_resume_remediation_not_start() {
+    // M2 fix: `NotRunning`'s remediation must match the instance's ACTUAL
+    // state. Before the fix, the message UNCONDITIONALLY said "start it
+    // first with: kt agent start <name>" even for a `paused` instance —
+    // but `start` on a paused instance hits `InvalidTransition` (a SECOND,
+    // confusing error), since the correct remediation is `kt agent resume`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "pz", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    force_state_paused(state_dir, "pz");
+
+    let sent = run_kt_agent(
+        &["agent", "send", "pz", "hello"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !sent.success,
+        "send on a paused instance must exit non-zero"
+    );
+    assert!(
+        sent.stderr.contains("not running"),
+        "stderr should name the not-running state; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("current state: paused"),
+        "stderr should name the ACTUAL current state (paused); stderr={}",
+        sent.stderr
+    );
+    assert!(
+        sent.stderr.contains("kt agent resume pz"),
+        "the remediation must point at resume for a paused instance; stderr={}",
+        sent.stderr
+    );
+    assert!(
+        !sent.stderr.contains("kt agent start pz"),
+        "must NOT suggest start (which would hit a second, confusing \
+         InvalidTransition error on a paused instance); stderr={}",
+        sent.stderr
+    );
+}
+
 // ---- Story 1-6: restart count / failed cause / policy surface (AC9) + restart ----
 
 /// Seed a `failed` instance with an `agent_runtime` record carrying a Restart
@@ -3235,5 +3663,253 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
         serde_json::Value::Null,
         "a rejected write must persist nothing; doc={}",
         list.stdout
+    );
+}
+
+// ---- Story 4-2: `kt agent logs <name> [--follow]` (AC-A, AC-B, AC-H) ----
+
+#[test]
+fn logs_reads_retained_output_after_the_instance_stops() {
+    // AC-A: register, start via the surviving-engine harness (so real
+    // content genuinely accrues before that starting session exits), stop
+    // it via a SEPARATE `kt agent stop` invocation (which must first adopt
+    // the still-live orphan), then a THIRD, separate `kt agent logs`
+    // invocation reads the complete retained history — the common case,
+    // and (unlike 4.1's `send`) expected to succeed even across a clean
+    // process boundary, since a stopped instance's log file needs no live
+    // handle at all.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--heartbeat-ms", "40", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        stopped.success,
+        "stop of the adopted instance should exit 0; stderr={}",
+        stopped.stderr
+    );
+
+    let logs = run_kt_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
+    assert!(logs.success, "logs should exit 0; stderr={}", logs.stderr);
+    assert!(
+        logs.stdout.contains("[agent-out]"),
+        "attributed agent-out lines must be present; stdout={}",
+        logs.stdout
+    );
+    assert!(
+        logs.stdout.contains("heartbeat"),
+        "the retained heartbeat output must be readable; stdout={}",
+        logs.stdout
+    );
+    assert!(
+        logs.stdout.contains("[engine]"),
+        "an engine-attributed transition line must be present; stdout={}",
+        logs.stdout
+    );
+}
+
+#[test]
+fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop() {
+    // AC-H at the CLI layer — the mirror image of 4.1's AC-D CLI test
+    // (`send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable`):
+    // THERE, `send` on this SAME kind of instance exits non-zero
+    // (`InteractionUnavailable`); HERE, `kt agent logs --follow` reads the
+    // pre-crash captured history with NO error and exits CLEANLY once the
+    // instance transitions out of running — proving AC-H (no live
+    // handle/daemon needed to read/follow an adopted instance) together
+    // with AC-C (a clean, non-hanging exit) through the real `kt` binary.
+    //
+    // RENAMED (fix pass, L3, review of #80) from
+    // `logs_follow_on_an_adopted_running_instance_streams_new_output`: the
+    // OLD name claimed exactly what this test's own doc comment already
+    // admitted it doesn't prove — mirrors how the engine-level sibling test
+    // is correctly named
+    // `adopted_instance_can_be_followed_from_a_fresh_engine_session`
+    // (`ktesio-engine/tests/logs.rs`), not "...streams_new_output". Verified
+    // EMPIRICALLY (both here and at the engine level, unaffected by this
+    // fix pass's crash-safety redesign — an adopted handle still gets no
+    // capture pipeline of its own, by design, matching pre-fix behavior
+    // exactly) that this is NOT achievable: `start_via_surviving_engine`'s
+    // starting session EXITS (the crash simulation) before this test's
+    // `--follow` ever runs, and a process exit terminates EVERY thread in
+    // it, including the output-capture threads — there is no "the old
+    // capture keeps running in the background" outcome, matching the
+    // story's OWN Dev Notes qualifier ("...capture threads running... in
+    // WHICHEVER engine session... has NOT YET EXITED"). So no further bytes
+    // ever reach either capture file once the starting session is gone —
+    // `fake_agent` itself survives (re-parented to init), but its
+    // stdout/stderr redirects have no active writer-side participant left
+    // to extend them further (the RAW files themselves would still accept
+    // direct writes from the still-alive agent process, crash-immune as
+    // ever — it is specifically the ATTRIBUTED capture's tailer, which only
+    // the now-gone starting session ever ran, that stops). This test
+    // instead proves the actual, honest, achievable AC-H claim: the
+    // pre-crash history is followable with no error, and follow exits
+    // cleanly (never hanging) once the instance is stopped by a THIRD,
+    // separate command.
+    //
+    // Runtime-skip on Windows: the SAME cross-lifetime-survival limitation
+    // `start_via_surviving_engine`'s other CLI tests document
+    // (`agent_cli.rs:906-918`) — inherited, not new. NO `#[cfg]`
+    // (data-driven; this file is outside the backends allowlist).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--heartbeat-ms", "40", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    // Spawn `kt agent logs svc --follow` in the BACKGROUND (not
+    // `run_kt_agent`, which blocks for full completion) so the main thread
+    // can stop the instance concurrently and observe the follow process
+    // exit cleanly on its own.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(["agent", "logs", "svc", "--follow"])
+        .current_dir(&ctx.project_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kt agent logs --follow");
+
+    // Give follow a moment to complete its initial one-shot dump and enter
+    // its poll loop, then stop the instance from a SEPARATE process.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        stopped.success,
+        "stop of the adopted instance should exit 0; stderr={}",
+        stopped.stderr
+    );
+
+    // The follow process must exit on its own within a bounded time —
+    // never hang — once it observes the non-running state (AC-C).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "kt agent logs --follow must not hang after the instance stops"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "follow must exit 0 on a clean stop-triggered end"
+    );
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    {
+        use std::io::Read;
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+    }
+
+    assert!(
+        stdout.contains("[agent-out]"),
+        "the pre-crash captured history must be readable via follow's initial dump; stdout={stdout}"
+    );
+    assert!(stdout.contains("heartbeat"), "stdout={stdout}");
+    assert!(
+        stderr.contains("no further output"),
+        "an honest exit note must be printed once the instance stops; stderr={stderr}"
+    );
+}
+
+#[test]
+fn logs_on_a_never_started_instance_is_empty_not_an_error() {
+    // AC-A negative-space case: a registered-but-never-started instance
+    // returns an honest empty result, not an error.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "nat", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
+    assert!(
+        run.success,
+        "logs on a never-started instance should exit 0; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stdout.trim().is_empty(),
+        "no output should be retained yet; stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn logs_on_an_unregistered_name_is_not_found() {
+    // The deliberate-improvement check from Task 5's second bullet: unlike
+    // `transition_events`/`budget_breach_events`'s precedent (which never
+    // check the registry at all), `read_agent_log` is the first CLI-facing
+    // consumer of this shape, so a truly unregistered name is a NotFound
+    // diagnostic, not a silently-empty result.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let run = run_kt_agent(&["agent", "logs", "ghost"], &ctx.project_dir, state_dir);
+    assert!(
+        !run.success,
+        "logs on an unregistered name should exit non-zero"
+    );
+    assert!(
+        run.stderr.contains("No Agent Instance named 'ghost'"),
+        "stderr should name the missing instance; stderr={}",
+        run.stderr
     );
 }

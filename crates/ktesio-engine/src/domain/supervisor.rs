@@ -49,8 +49,9 @@ use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
 use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
-    assemble_usage_event, BackendError, ObservedUsageSource, ParsedUsage, ProcessBackend,
-    ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+    assemble_usage_event, BackendError, LogCapture, ObservedUsageSource, ParsedUsage,
+    ProcessBackend, ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
+    KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -58,7 +59,9 @@ use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
 use super::config::{self, ConfigLayer};
 use super::cost::{CostEvaluator, EstimateLabel, Micros};
 use super::error::EngineError;
-use super::event::{BreachDimension, BudgetBreachEvent, TransitionCause, TransitionEvent};
+use super::event::{
+    BreachDimension, BudgetBreachEvent, LogLine, LogStream, TransitionCause, TransitionEvent,
+};
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
@@ -178,6 +181,52 @@ fn plan_drain(bytes: &[u8], cursor: u64, mode: DrainMode) -> DrainPlan {
     }
 }
 
+/// What one `Supervisor::read_agent_log_since` poll should do, decided purely
+/// from `(bytes, cursor)` (story 4-2, Task 5, AC-D/AC-H/AC-G). MIRRORS (does
+/// NOT literally reuse) [`plan_drain`]'s shrink-guard + "consume only up to
+/// the last complete newline" shape — deliberately kept as an INDEPENDENT
+/// pure function rather than a shared generalization: this is Epic 4's READ
+/// path, `plan_drain` is Epic 3's adversarially-reviewed BILLING ingestion
+/// path (story 3-1/AD-7), and coupling them would put a change to one at risk
+/// of silently affecting the other's already-hardened behavior (a
+/// genericization was evaluated and deliberately NOT taken — Task 1's Dev
+/// Notes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FollowPlan {
+    /// The file is SHORTER than the cursor — a rotation happened since the
+    /// last poll. Snap the cursor to `new_cursor` (the file's new length) and
+    /// deliver nothing new THIS pass; the caller detects the snap-back
+    /// (`new_cursor < cursor`) and prints the one-line rotation notice
+    /// (Task 6) — never a claim of completeness across the boundary.
+    Shrunk { new_cursor: u64 },
+    /// Consume `bytes[range]` (a whole number of COMPLETE lines only — a
+    /// trailing partial line, if any, waits for the next poll, exactly like
+    /// `plan_drain`'s MidRun tail rule) and advance the cursor to
+    /// `new_cursor`.
+    Consume {
+        range: std::ops::Range<usize>,
+        new_cursor: u64,
+    },
+}
+
+/// Decide what one `read_agent_log_since` poll reads. Pure — no I/O.
+fn plan_follow(bytes: &[u8], cursor: u64) -> FollowPlan {
+    let len = bytes.len() as u64;
+    if cursor > len {
+        return FollowPlan::Shrunk { new_cursor: len };
+    }
+    let start = cursor as usize;
+    let tail = &bytes[start..];
+    let consumable = match tail.iter().rposition(|b| *b == b'\n') {
+        Some(pos) => pos + 1,
+        None => 0,
+    };
+    FollowPlan::Consume {
+        range: start..start + consumable,
+        new_cursor: cursor + consumable as u64,
+    }
+}
+
 /// The in-memory supervision state for ONE running Agent Instance (story 3-1).
 ///
 /// Beyond the process [`Handle`](backends::Handle) the supervisor has always held,
@@ -233,6 +282,21 @@ struct Supervised {
     /// Present only for an `engine-observed` instance (a `self-reported` instance
     /// leaves it `None` and drives the log-tail `drain_usage_for` instead).
     observed_source: Option<ObservedUsageSource>,
+    /// Set when a PRIOR [`Supervisor::stop`] call on this handle's `stop_inner`
+    /// pass got [`BackendError::StopUnconfirmed`] back from the backend (fix
+    /// pass, review of #80 follow-up — the CRITICAL finding): SIGKILL was sent
+    /// but death could not be confirmed within [`KILL_CONFIRM_TIMEOUT`], most
+    /// likely because the process is stuck in an OS-level uninterruptible I/O
+    /// wait. Defaults `false` for a freshly started OR adopted instance (an
+    /// ordinary stop attempt never sets it). Lets BOTH a RETRY `stop()` call
+    /// (see `stop_inner`'s docs) and the crash reaper (`poll_once`) recognize
+    /// "this handle's death is pending reconciliation" — via a cheap,
+    /// NON-BLOCKING liveness poll, never a repeat of the whole bounded
+    /// SIGTERM/SIGKILL/confirm sequence — distinctly from an ORDINARY
+    /// in-flight stop or an externally-forced `stopping` row (neither of
+    /// which ever sets this flag), so this fix pass changes behavior ONLY
+    /// for the specific scenario it targets.
+    stop_unconfirmed: bool,
 }
 
 /// The lifecycle supervisor: owns running process handles + drives transitions.
@@ -383,6 +447,31 @@ impl Supervisor {
             .metering_source(&name)
             .map_err(registry_to_engine)?;
 
+        // Read the effective (current-OS) Capability::Interaction level (story
+        // 4.1 fix pass, HIGH finding — review of #79) to decide whether THIS
+        // spawn should pipe stdin at all. The story's original implementation
+        // piped UNCONDITIONALLY for every process; an adversarial audit showed
+        // this can hang an adapter that declares no interaction support: a
+        // process that blocks reading stdin at startup (a common "sniff for
+        // piped input" real-CLI idiom) never sees EOF, because the engine
+        // holds the pipe's write end open for the process's whole supervised
+        // lifetime and nothing ever writes to it unless `send` is called — the
+        // child hangs forever yet is reported `running` (readiness here is
+        // just "the process didn't exit immediately"), a silent deadlock with
+        // no error signal anywhere. Mirrors how the rest of this codebase
+        // gates BEHAVIOR (not just callability) on declared capabilities
+        // (e.g. pause's SIGSTOP-vs-noop branching). Read here (a pure
+        // snapshot read, mirroring `metering_source` above) before any side
+        // effect, so a corrupt snapshot rejects the start cleanly like every
+        // other pre-transition read.
+        let interaction_level = registry
+            .effective_support(&name, Capability::Interaction)
+            .map_err(registry_to_engine)?;
+        let pipe_stdin = matches!(
+            interaction_level,
+            SupportLevel::Guaranteed | SupportLevel::BestEffort
+        );
+
         // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
         // (story 2-2, FR-12) — still before any persisted state change, so a
         // config/mapping failure rejects the start cleanly (no spurious state
@@ -501,6 +590,17 @@ impl Supervisor {
             env: launch.env,
             working_dir: home,
             log_file: Some(agent_log_path),
+            // Story 4-2 (AC-E): capture is unconditional, computed from the
+            // SAME Registry path authority as `log_file` (never gated on
+            // `pipe_stdin`/`Capability::Interaction` — that gate governs only
+            // the stdin *write* direction).
+            attributed_log_path: Some(registry.attributed_output_log_path(&name)),
+            // Fix pass (review of #80): the crash-immune raw STDERR capture,
+            // computed from the SAME path authority, paired 1:1:1 with
+            // `log_file`/`attributed_log_path` (all three Some together).
+            stderr_log_file: Some(registry.agent_stderr_log_path(&name)),
+            instance_name: name.as_str().to_string(),
+            pipe_stdin,
         };
 
         // (4) Spawn. A spawn failure lands the instance in `failed` with the
@@ -555,12 +655,19 @@ impl Supervisor {
             }
             None => TransitionCause::AdapterReady,
         };
-        self.transition(
+        // Story 4-2, Task 4: `handle` already exists (spawned above) and
+        // carries a live `log_capture` (capture is unconditional, AC-E), but
+        // it is not YET in `self.running` (inserted below) — so the default
+        // `self.transition(...)`'s `self.running`-based lookup would miss
+        // it. Pass the capture explicitly so the `starting → running` line
+        // lands in the attributed capture too.
+        self.transition_with_log_capture(
             registry,
             &name,
             starting,
             LifecycleState::Running,
             ready_cause,
+            self.backend.log_capture(&handle),
         )?;
         // Mint the fresh Run id for this `starting`→terminal span (spine AD-7). Each
         // `starting` — operator start OR restart (story 1-6) — mints a distinct id
@@ -591,6 +698,8 @@ impl Supervisor {
                 breached_scopes: std::collections::HashSet::new(),
                 observed_listener,
                 observed_source,
+                // A fresh start's stop attempt has not happened yet.
+                stop_unconfirmed: false,
             },
         );
 
@@ -631,7 +740,31 @@ impl Supervisor {
     /// backend and escalates to a forced kill after `window` (default
     /// [`DEFAULT_STOP_WINDOW`]) if needed, records the escalation in the instance
     /// log, then `stopping → stopped`. No process of the instance survives (the
-    /// backend kills the whole group/job).
+    /// backend kills the whole group/job) — in the NORMAL case.
+    ///
+    /// **Bounded death confirmation (fix pass, review of #80 follow-up — the
+    /// CRITICAL finding):** after escalating to a forced kill, the backend
+    /// CONFIRMS death bounded to [`crate::ports::KILL_CONFIRM_TIMEOUT`] (see
+    /// its docs for the mechanism: a fast writer can exhaust disk and enter
+    /// an OS-level uninterruptible I/O wait immune to every signal, including
+    /// the one just sent). If confirmation is not reached within that bound,
+    /// this returns [`EngineError::StopUnconfirmed`] instead of continuing to
+    /// block — the instance stays `stopping` (never a false `stopped`), and
+    /// the handle is RETAINED (not dropped) so the situation can be
+    /// reconciled later.
+    ///
+    /// **No compounding on retry:** a SUBSEQUENT `stop` call against an
+    /// instance still `stopping` with a retained (unconfirmed) handle does
+    /// NOT re-run the whole SIGTERM/graceful-window/SIGKILL/confirm sequence
+    /// — it performs a single cheap, NON-BLOCKING liveness poll instead
+    /// (`ProcessBackend::poll`, never `ProcessBackend::stop`). If the process
+    /// has since actually exited (the OS condition cleared), this
+    /// SELF-HEALS: it completes the stuck `stopping → stopped` transition
+    /// right here. If it is still alive, this fails fast with the SAME
+    /// honest [`EngineError::StopUnconfirmed`], with no new signal and no new
+    /// wait. (The crash-detection reaper's own poll, `poll_once`, performs
+    /// the identical reconciliation if it observes the exit first — whichever
+    /// happens first, the row does not stay permanently stuck.)
     pub fn stop(
         &mut self,
         registry: &Registry,
@@ -675,6 +808,75 @@ impl Supervisor {
         })?;
         let instance = registry.lookup(&name).map_err(registry_to_engine)?;
 
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): a RETRY
+        // `stop` against an instance already `stopping` whose handle is
+        // marked `stop_unconfirmed` means a PRIOR pass through THIS function
+        // already sent SIGKILL but could not confirm death within
+        // KILL_CONFIRM_TIMEOUT (`EngineError::StopUnconfirmed`) — most likely
+        // because the process is stuck in an OS-level uninterruptible I/O
+        // wait. The transition gate below (`next_state`) has no
+        // `(Stopping, Stop)` row, so an unmodified retry would either reject
+        // with a generic, non-self-healing `InvalidTransition`, or (if that
+        // gate were bypassed) re-run the WHOLE SIGTERM/graceful-window/
+        // SIGKILL/confirm sequence for an outcome we can already suspect is
+        // unchanged — exactly the compounding wait this fix pass closes.
+        // Instead: a single cheap, NON-BLOCKING poll (`ProcessBackend::poll`,
+        // never `ProcessBackend::stop`) decides the outcome — self-heals if
+        // the process has since actually died (the OS condition cleared), or
+        // fails fast with the SAME honest error if it is still alive, with NO
+        // new signal and NO new wait. Gated specifically on `stop_unconfirmed`
+        // (not merely "state is `stopping`") so this new branch changes
+        // behavior ONLY for the scenario it targets — an externally-forced
+        // `stopping` row with no real stop attempt behind it (as
+        // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+        // exercises) takes the ORIGINAL, unchanged path below.
+        if instance.state == LifecycleState::Stopping {
+            let stuck = match self.running.get_mut(&name) {
+                Some(supervised) if supervised.stop_unconfirmed => {
+                    let status = self
+                        .backend
+                        .poll(&mut supervised.handle)
+                        .map_err(|source| EngineError::Backend {
+                            name: name.as_str().to_string(),
+                            source,
+                        })?;
+                    let log_capture = self.backend.log_capture(&supervised.handle);
+                    Some((status, log_capture))
+                }
+                _ => None,
+            };
+            if let Some((status, log_capture)) = stuck {
+                if !status.is_exited() {
+                    // Still stuck: fail fast, honestly, with no new blocking.
+                    return Err(EngineError::StopUnconfirmed {
+                        name: name.as_str().to_string(),
+                        timeout_secs: KILL_CONFIRM_TIMEOUT.as_secs(),
+                    });
+                }
+                // Self-healing: the process has now actually exited (the OS
+                // condition that made confirmation time out has cleared).
+                // Complete the stuck `stopping -> stopped` transition exactly
+                // as the ordinary path below would have on confirmed death.
+                self.running.remove(&name);
+                registry
+                    .clear_spawn_record(&name)
+                    .map_err(registry_to_engine)?;
+                self.transition_with_log_capture(
+                    registry,
+                    &name,
+                    LifecycleState::Stopping,
+                    LifecycleState::Stopped,
+                    TransitionCause::stop_forced(
+                        "SIGKILL was sent by an earlier stop attempt; the process's death was \
+                         confirmed on a later reconciliation (it may have been stuck in an \
+                         OS-level I/O wait that has since cleared)",
+                    ),
+                    log_capture,
+                )?;
+                return registry.lookup(&name).map_err(registry_to_engine);
+            }
+        }
+
         // Transition gate (AC4): stop on stopped / registered / … rejects here
         // with the uniform InvalidTransition, before touching any process.
         let stopping = next_state(instance.state, LifecycleCommand::Stop)?;
@@ -712,16 +914,50 @@ impl Supervisor {
         // stop. With story 1-6 adoption, a handle for a still-live process
         // started by a PRIOR engine IS re-held (via `adopt_orphans`), so a
         // cross-restart stop now really terminates it.
-        let outcome = match self.running.get_mut(&name) {
+        // Story 4-2, Task 4 (fix pass, review of #80): capture the
+        // log_capture HERE, before `running.remove` drops the handle below
+        // — the default `self.transition(...)` lookup (via `self.running`)
+        // would find NOTHING by the time the terminal transition below
+        // runs. By the time `backend.stop` (below) returns, the process is
+        // provably dead (its raw capture files can never grow again), and
+        // `send_engine_line`'s inline catch-up folds in every remaining
+        // byte of agent output BEFORE the "-> stopped" line, so the engine
+        // line still lands correctly ordered after it, regardless of
+        // whether the process handle's `Drop` (which also signals the
+        // background tailer thread to stop) has run yet.
+        let (outcome, log_capture) = match self.running.get_mut(&name) {
             Some(supervised) => {
-                self.backend
-                    .stop(&mut supervised.handle, window)
-                    .map_err(|source| EngineError::Backend {
-                        name: name.as_str().to_string(),
-                        source,
-                    })?
+                let log_capture = self.backend.log_capture(&supervised.handle);
+                let outcome = self.backend.stop(&mut supervised.handle, window).map_err(
+                    |source| match source {
+                        // Fix pass (review of #80 follow-up — the CRITICAL
+                        // finding): mark the handle so a RETRY `stop` (or the
+                        // crash reaper's own poll) recognizes this EXACT
+                        // scenario and reconciles it with a cheap,
+                        // non-blocking poll instead of re-running the whole
+                        // bounded SIGTERM/SIGKILL/confirm sequence (see
+                        // `stop_inner`'s retry-branch docs above and
+                        // `poll_once`'s docs). This `?` skips
+                        // `self.running.remove` below, so the handle is
+                        // RETAINED, never silently dropped — the instance
+                        // stays `stopping` (the terminal transition below is
+                        // never reached), an honest, non-terminal state.
+                        BackendError::StopUnconfirmed { timeout_secs } => {
+                            supervised.stop_unconfirmed = true;
+                            EngineError::StopUnconfirmed {
+                                name: name.as_str().to_string(),
+                                timeout_secs,
+                            }
+                        }
+                        other => EngineError::Backend {
+                            name: name.as_str().to_string(),
+                            source: other,
+                        },
+                    },
+                )?;
+                (outcome, log_capture)
             }
-            None => crate::ports::StopOutcome { forced: false },
+            None => (crate::ports::StopOutcome { forced: false }, None),
         };
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
@@ -743,7 +979,14 @@ impl Supervisor {
         } else {
             TransitionCause::StopGraceful
         };
-        self.transition(registry, &name, stopping, LifecycleState::Stopped, cause)?;
+        self.transition_with_log_capture(
+            registry,
+            &name,
+            stopping,
+            LifecycleState::Stopped,
+            cause,
+            log_capture,
+        )?;
 
         registry.lookup(&name).map_err(registry_to_engine)
     }
@@ -937,6 +1180,156 @@ impl Supervisor {
         })
     }
 
+    /// Send text input to a running Agent Instance's native input channel
+    /// (story 4.1, FR-24, spine AD-12) — the v1 interaction surface. For
+    /// every adapter that can actually run today (native mock or manifest),
+    /// "the native input channel" is the spawned child's OS stdin pipe (both
+    /// backends pipe it unconditionally at spawn, Task 1); this needs ZERO
+    /// per-kind branching, so one method serves both (AC-A).
+    ///
+    /// Unlike [`Supervisor::suspend_or_resume`], `send` is NOT itself a state
+    /// transition (AD-15's transition table has no `send` entry): no
+    /// `next_state` call, no [`TransitionEvent`]. The dispatch order:
+    ///
+    /// 1. name-resolve (`NotFound` unchanged),
+    /// 2. **AC-C**: the instance MUST be [`LifecycleState::Running`] —
+    ///    anything else fails with [`EngineError::NotRunning`], checked
+    ///    BEFORE the capability read (mirrors "transition gate before any
+    ///    side effect"),
+    /// 3. **AC-B**: read the effective (current-OS) `Capability::Interaction`
+    ///    level — `Unsupported` FAILS FAST with
+    ///    [`EngineError::CapabilityUnsupported`] (the already-generic
+    ///    machinery, reused verbatim — same shape pause already produces),
+    ///    no I/O attempted,
+    /// 4. **AC-D**: `Guaranteed` and `BestEffort` take the IDENTICAL action —
+    ///    unlike pause/resume there is no OS-conditional difference in
+    ///    writing bytes to a pipe, so a declared `best-effort` is purely an
+    ///    adapter-author honesty signal, not a different code path. A
+    ///    missing handle, or one with no live stdin pipe (an ADOPTED
+    ///    instance has no recoverable pipe — see
+    ///    [`crate::ports::ProcessBackend::has_stdin`]'s docs), is a HARD
+    ///    ERROR ([`EngineError::InteractionUnavailable`]): unlike
+    ///    [`Supervisor::signal_backend`]'s "no handle = harmless no-op" (a
+    ///    suspend/resume of an already-gone process trivially satisfies its
+    ///    own desired end state), there is no equivalent "desired end state"
+    ///    for text that was never delivered — a silent success would violate
+    ///    FR-24's "honest failure" framing, and this must NEVER be
+    ///    misattributed to `CapabilityUnsupported` (the declaration is
+    ///    truthful; it is this engine session's reach that is limited).
+    ///    **Fix pass addition (review of #79):** a handle whose PRIOR write
+    ///    already timed out ([`crate::ports::ProcessBackend::stdin_timed_out`])
+    ///    fails fast with [`EngineError::InteractionTimedOut`] here too — a
+    ///    cheap, no-I/O check, never a repeat doomed write.
+    /// 5. **AC-F**: append exactly one trailing `\n` if `text` doesn't
+    ///    already end with one, then write + flush via
+    ///    [`crate::ports::ProcessBackend::write_stdin`] — BOUNDED to
+    ///    [`crate::ports::STDIN_WRITE_TIMEOUT`] (fix pass, the CRITICAL
+    ///    finding: the original unbounded write could freeze the ENTIRE
+    ///    engine, since this call runs while the caller already holds the
+    ///    single, engine-wide supervisor lock — see `write_stdin`'s docs). A
+    ///    timeout maps to [`EngineError::InteractionTimedOut`]; any OTHER
+    ///    [`BackendError`] maps to [`EngineError::Backend`] — the SAME
+    ///    generic mapping `signal_backend` already uses for pause/resume.
+    pub fn send_input(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        text: &str,
+    ) -> Result<(), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let instance = registry.lookup(&name).map_err(registry_to_engine)?;
+
+        // (1) AC-C: send is not a transition, so this is a dedicated
+        // pre-flight state check — before any capability read or I/O.
+        if instance.state != LifecycleState::Running {
+            return Err(EngineError::NotRunning {
+                name: name.as_str().to_string(),
+                state: instance.state.as_str().to_string(),
+            });
+        }
+
+        // (2) AC-B: reuse the already-generic capability-unsupported
+        // fail-fast machinery verbatim.
+        let level = registry
+            .effective_support(&name, Capability::Interaction)
+            .map_err(registry_to_engine)?;
+        let os = OsId::current();
+        if level == SupportLevel::Unsupported {
+            return Err(EngineError::CapabilityUnsupported {
+                name: name.as_str().to_string(),
+                capability: Capability::Interaction.as_str().to_string(),
+                os: os.as_str().to_string(),
+                level: level.as_str().to_string(),
+            });
+        }
+
+        // (3) AC-D: Guaranteed and BestEffort collapse to the SAME action
+        // below (no OS-conditional difference in delivering bytes to a
+        // pipe). A missing handle, or one with no live stdin pipe (an
+        // adopted instance), is a HARD error — never a silent success.
+        let Some(supervised) = self.running.get_mut(&name) else {
+            return Err(EngineError::InteractionUnavailable {
+                name: name.as_str().to_string(),
+                detail: "no live process handle is held in this engine session".to_string(),
+            });
+        };
+        // Fix pass (CRITICAL finding, review of #79): a cheap, no-I/O check
+        // FIRST — a handle whose prior write already exceeded the bounded
+        // timeout is PERMANENTLY broken for the rest of this engine session
+        // (see `write_stdin`'s docs). Checked before `has_stdin` (which would
+        // also read `false` here) so the more precise, honest diagnostic
+        // wins: "we had a pipe and it stopped draining" is a materially
+        // different fact from "no pipe was ever recoverable", and the CLI's
+        // remediation differs (restart to get a fresh channel either way, but
+        // the cause is not the same).
+        if self.backend.stdin_timed_out(&supervised.handle) {
+            return Err(EngineError::InteractionTimedOut {
+                name: name.as_str().to_string(),
+                timeout_secs: crate::ports::STDIN_WRITE_TIMEOUT.as_secs(),
+            });
+        }
+        if !self.backend.has_stdin(&supervised.handle) {
+            return Err(EngineError::InteractionUnavailable {
+                name: name.as_str().to_string(),
+                detail: "no live stdin pipe is held for this instance in this engine session \
+                         (an adopted instance has no recoverable pipe; durable cross-invocation \
+                         interaction needs a persistent engine session, planned for Epic 7/v1.x)"
+                    .to_string(),
+            });
+        }
+
+        // (4) AC-F: append exactly one trailing newline if absent, so a
+        // line-oriented agent (`BufRead::read_line`) receives a complete
+        // line.
+        let mut bytes = text.as_bytes().to_vec();
+        if !text.ends_with('\n') {
+            bytes.push(b'\n');
+        }
+        // Fix pass (CRITICAL finding): this write is now BOUNDED to
+        // `STDIN_WRITE_TIMEOUT` (`write_stdin`'s new contract) rather than
+        // the story's original unbounded `write_all` — still runs while
+        // `self` (the supervisor) is held under the caller's lock, exactly
+        // like `stop`'s existing bounded graceful-window wait; a deliberate,
+        // ACCEPTED, BOUNDED tradeoff, not the unbounded-freeze problem this
+        // fix closes.
+        match self.backend.write_stdin(&mut supervised.handle, &bytes) {
+            Ok(()) => Ok(()),
+            Err(BackendError::StdinTimedOut { timeout_secs }) => {
+                Err(EngineError::InteractionTimedOut {
+                    name: name.as_str().to_string(),
+                    timeout_secs,
+                })
+            }
+            Err(source) => Err(EngineError::Backend {
+                name: name.as_str().to_string(),
+                source,
+            }),
+        }
+    }
+
     /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if
     /// this engine holds no live handle for it (never started this lifetime, or
     /// already stopped/crashed). The Fleet read uses it to scope the current-Run
@@ -963,6 +1356,148 @@ impl Supervisor {
             path: path.to_string_lossy().into_owned(),
             detail,
         })
+    }
+
+    /// One-shot full read of every currently-retained ATTRIBUTED output line
+    /// for an instance (story 4-2, AC-A/AC-G) — reads the rotated generations
+    /// OLDEST-to-newest (`.2`, `.1`, current — skipping any that do not exist
+    /// yet), concatenates, and parses each JSON-Lines [`LogLine`] record in
+    /// ON-DISK APPEND ORDER (the sole ordering authority; NEVER re-sorted by
+    /// `at` — AC-G, since `now_rfc3339`'s whole-second resolution makes
+    /// same-second lines common). This reads the NEW, SEPARATE
+    /// `logs/output.log[.N]` file (CRITICAL SCOPING #3) — never `agent.log`,
+    /// which stays byte-identical and untouched for Epic 3's
+    /// `drain_usage_for`.
+    ///
+    /// DELIBERATE IMPROVEMENT over the `read_events`/`read_breach_events`
+    /// precedent above (which never check the registry for the instance's
+    /// existence at all — harmless there, since neither is exposed via any
+    /// `kt` command): `read_agent_log` is the FIRST CLI-facing consumer of
+    /// this shape (`kt agent logs`, Task 6), where silently showing "no
+    /// output" for a mistyped name would be genuinely confusing UX
+    /// (indistinguishable from "the agent just hasn't said anything yet").
+    /// So this DOES check the registry first: a truly UNREGISTERED name
+    /// fails [`EngineError::NotFound`] (matching every other CLI-facing
+    /// command — `show`/`send`/`pause` all do this); a REGISTERED-but-never-
+    /// started instance still falls through to an honest empty vec (mirrors
+    /// `read_events_from`'s "missing file → empty" precedent).
+    ///
+    /// Fix pass (M1, review of #80): ALSO returns the byte-cursor position
+    /// (into the CURRENT generation, matching
+    /// [`Supervisor::read_agent_log_since`]'s cursor shape exactly) this
+    /// read reached — computed from the SAME bytes this call parsed, never a
+    /// second, separately-timed read. `kt agent logs --follow` (the sole
+    /// production caller) primes its poll loop's cursor from this value
+    /// directly, instead of a SEPARATE `read_agent_log_since(name, 0)` call
+    /// whose returned lines it used to discard — that discarding call read
+    /// up to a slightly LATER point in time than this one-shot dump, so
+    /// anything emitted in the gap between the two reads was silently lost
+    /// before `--follow` ever started polling. Returning the cursor here
+    /// closes that gap: there is only ever ONE read establishing both the
+    /// dump and the resume point.
+    pub fn read_agent_log(
+        registry: &Registry,
+        name: &str,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let mut lines = Vec::new();
+        // Oldest generation first (LOG_ROTATE_GENERATIONS - 1 down to 1),
+        // then the current generation last — append order overall.
+        for generation in (1..LOG_ROTATE_GENERATIONS).rev() {
+            let path = registry.attributed_output_log_generation_path(&name, generation);
+            read_log_lines_from(&path, &mut lines).map_err(|detail| EngineError::Log {
+                name: name.as_str().to_string(),
+                path: path.to_string_lossy().into_owned(),
+                detail,
+            })?;
+        }
+        let current = registry.attributed_output_log_path(&name);
+        // Read the CURRENT generation's raw text ONCE so its exact byte
+        // length (the cursor) and its parsed lines come from the identical
+        // bytes — never a second, later, potentially-inconsistent read.
+        let current_text = match std::fs::read_to_string(&current) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: current.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        let cursor = current_text.len() as u64;
+        parse_log_lines(&current_text, &mut lines).map_err(|detail| EngineError::Log {
+            name: name.as_str().to_string(),
+            path: current.to_string_lossy().into_owned(),
+            detail,
+        })?;
+        Ok((lines, cursor))
+    }
+
+    /// A CURSOR-based follow read for `kt agent logs --follow`'s poll loop
+    /// (story 4-2, AC-B/AC-C/AC-H, AD-13). `cursor` is a byte offset into the
+    /// CURRENT generation ONLY (mirrors `agent_log_len`/`plan_drain`'s
+    /// existing cursor shape) — distinct from `read_agent_log`'s
+    /// concatenated multi-generation view, so a caller must not mix cursors
+    /// from the two methods. Returns `(new_lines, next_cursor)` — plain
+    /// request/response (AD-13), never a `Stream`-typed API (see the story's
+    /// Dev Notes on why: this keeps the existing async/blocking pairing with
+    /// zero new API shape).
+    ///
+    /// On a detected SHRINK (the current generation's length is now LESS
+    /// than `cursor` — a rotation happened since the last poll), the cursor
+    /// snaps to the new length and this returns `(vec![], new_len)` — the
+    /// CALLER detects the signal itself by comparing the returned cursor to
+    /// the one it just passed in (`next_cursor < cursor`) and prints one
+    /// honest notice (Task 6); `read_agent_log` WITHOUT `--follow` always
+    /// re-reads everything currently retained, so this never loses data
+    /// permanently — only a possible (rare) live-tail gap at the rotation
+    /// boundary.
+    pub fn read_agent_log_since(
+        registry: &Registry,
+        name: &str,
+        cursor: u64,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let path = registry.attributed_output_log_path(&name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        match plan_follow(&bytes, cursor) {
+            FollowPlan::Shrunk { new_cursor } => Ok((Vec::new(), new_cursor)),
+            FollowPlan::Consume { range, new_cursor } => {
+                let mut lines = Vec::new();
+                if !range.is_empty() {
+                    parse_log_lines(&String::from_utf8_lossy(&bytes[range]), &mut lines).map_err(
+                        |detail| EngineError::Log {
+                            name: name.as_str().to_string(),
+                            path: path.to_string_lossy().into_owned(),
+                            detail,
+                        },
+                    )?;
+                }
+                Ok((lines, new_cursor))
+            }
+        }
     }
 
     /// The crash-detection reaper pass (story 1-6, AC-A / AC3 / AC5).
@@ -1040,6 +1575,51 @@ impl Supervisor {
             };
             if !matches!(state, LifecycleState::Running | LifecycleState::Paused) {
                 // Requested stop (or already-terminal) — not a crash.
+                //
+                // Fix pass (review of #80 follow-up — the CRITICAL finding,
+                // self-healing requirement): if this handle's PRIOR stop
+                // attempt sent SIGKILL but could not confirm death within
+                // KILL_CONFIRM_TIMEOUT (`stop_unconfirmed` — set ONLY by
+                // that specific path, see `stop_inner`'s docs) and the store
+                // still shows `stopping`, THIS poll's own observed `Exited`
+                // is the reconciliation event the stuck stop() call itself
+                // could not wait for: finalize `stopping -> stopped` here
+                // rather than silently dropping the handle, so the row does
+                // not stay permanently stuck even if no operator ever
+                // retries `stop` manually. This is DELIBERATELY narrower
+                // than "any exit while stopping" — an ordinary in-flight
+                // (non-stuck) stop() call ALWAYS finalizes this transition
+                // itself upon its own return, so only the
+                // stuck-then-abandoned case needs the reaper's help; every
+                // OTHER "not a crash" exit (mirrored by
+                // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`,
+                // which never sets `stop_unconfirmed`) keeps its EXISTING,
+                // unchanged silent-drop behavior.
+                let stuck_stopping = state == LifecycleState::Stopping
+                    && self.running.get(&name).is_some_and(|s| s.stop_unconfirmed);
+                if stuck_stopping {
+                    let log_capture = self
+                        .running
+                        .get(&name)
+                        .and_then(|s| self.backend.log_capture(&s.handle));
+                    self.running.remove(&name);
+                    if registry.clear_spawn_record(&name).is_ok() {
+                        let _ = self.transition_with_log_capture(
+                            registry,
+                            &name,
+                            LifecycleState::Stopping,
+                            LifecycleState::Stopped,
+                            TransitionCause::stop_forced(
+                                "SIGKILL was sent by an earlier stop attempt; the \
+                                 crash-detection reaper confirmed the process's death on a \
+                                 later poll (it may have been stuck in an OS-level I/O wait \
+                                 that has since cleared)",
+                            ),
+                            log_capture,
+                        );
+                    }
+                    continue;
+                }
                 self.running.remove(&name);
                 continue;
             }
@@ -1047,6 +1627,15 @@ impl Supervisor {
             // A crash. Consult the Restart Policy FIRST (so a terminal outcome —
             // `never` or crash-loop — can enrich the recorded crash cause), then
             // apply running/paused → failed with that detail (AC5).
+            //
+            // Story 4-2, Task 4: capture the log_capture BEFORE removing the
+            // entry below — same reasoning as `stop_inner`'s terminal
+            // transition (the default `self.transition(...)` lookup would
+            // otherwise miss it).
+            let crash_log_capture = self
+                .running
+                .get(&name)
+                .and_then(|s| self.backend.log_capture(&s.handle));
             self.running.remove(&name);
             let base_detail = match code {
                 Some(c) => format!("process exited unexpectedly with code {c}"),
@@ -1063,12 +1652,13 @@ impl Supervisor {
             // falls back to for the failed cause once the terminal record is
             // cleared (AC9).
             if self
-                .transition(
+                .transition_with_log_capture(
                     registry,
                     &name,
                     state,
                     LifecycleState::Failed,
                     TransitionCause::crashed(decision.crash_cause.clone()),
+                    crash_log_capture,
                 )
                 .is_err()
             {
@@ -1253,6 +1843,9 @@ impl Supervisor {
                             // log-tail drain is unaffected (it needs no listener).
                             observed_listener: None,
                             observed_source: None,
+                            // An adopted instance's stop attempt has not
+                            // happened yet in THIS engine session.
+                            stop_unconfirmed: false,
                         },
                     );
                     adopted += 1;
@@ -1316,6 +1909,17 @@ impl Supervisor {
     /// Apply one transition: persist the new state, then append the event to the
     /// per-instance log. Persist-before-log so the durable state leads; a log
     /// append failure surfaces (the escalation record is load-bearing for AC3).
+    ///
+    /// Story 4-2, Task 4: ALSO best-effort-projects the transition into the
+    /// unified attributed-output stream as an `engine`-attributed [`LogLine`]
+    /// — a human-readable mirror of the SAME fact `instance.log` (above,
+    /// unchanged, machine-authoritative) just recorded. The output-capture
+    /// handle is looked up via [`Supervisor::log_capture_for`] (the
+    /// instance's CURRENT `self.running` entry, when one exists); fix pass
+    /// (review of #80): [`LogCapture::send_engine_line`] catches up any
+    /// pending agent-out/agent-err content FIRST, so the engine line lands
+    /// after whatever agent output already existed at this moment rather
+    /// than racing the background tailer thread's own poll schedule.
     fn transition(
         &self,
         registry: &Registry,
@@ -1323,6 +1927,28 @@ impl Supervisor {
         prior: LifecycleState,
         new: LifecycleState,
         cause: TransitionCause,
+    ) -> Result<TransitionEvent, EngineError> {
+        let log_capture = self.log_capture_for(name);
+        self.transition_with_log_capture(registry, name, prior, new, cause, log_capture)
+    }
+
+    /// Like [`Supervisor::transition`], but the `engine`-attributed
+    /// [`LogCapture`] is supplied EXPLICITLY rather than looked up via
+    /// `self.running` — needed at the three call sites (`start_inner`'s
+    /// `starting → running`, `stop_inner`'s `stopping → stopped`, and
+    /// `poll_once`'s crash `→ failed`) where the just-spawned/about-to-be-
+    /// torn-down handle is not (or no longer) present in `self.running` at
+    /// the exact moment of the call, even though a live capture pipeline
+    /// still exists (captured by the caller a few lines earlier, before the
+    /// map mutation that would otherwise hide it).
+    fn transition_with_log_capture(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        cause: TransitionCause,
+        log_capture: Option<LogCapture>,
     ) -> Result<TransitionEvent, EngineError> {
         registry.set_state(name, new).map_err(registry_to_engine)?;
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
@@ -1336,7 +1962,26 @@ impl Supervisor {
                 detail,
             }
         })?;
+        if let Some(capture) = log_capture {
+            let text = engine_transition_line_text(&event);
+            capture.send_engine_line(LogLine::new(
+                name.as_str(),
+                LogStream::Engine,
+                text,
+                event.at.clone(),
+            ));
+        }
         Ok(event)
+    }
+
+    /// The output-capture handle this engine session currently holds for
+    /// `name`, if any (story 4-2, Task 4) — `None` when the instance has no
+    /// `self.running` entry (not started this session, already torn down, or
+    /// adopted with no recoverable capture pipeline).
+    fn log_capture_for(&self, name: &InstanceName) -> Option<LogCapture> {
+        self.running
+            .get(name)
+            .and_then(|s| self.backend.log_capture(&s.handle))
     }
 
     /// Land a spawn failure in `failed` with the backend diagnostic preserved
@@ -2117,6 +2762,44 @@ fn base_url_override(base_url: &str) -> ConfigLayer {
     ConfigLayer::from_table(table)
 }
 
+/// A best-effort, HUMAN-READABLE one-line rendering of a [`TransitionEvent`]
+/// for the `engine`-attributed capture line (story 4-2, Task 4) — the
+/// RECOMMENDED default: mirror every `TransitionEvent` (start/stop/pause/
+/// resume/crash/restart/breach-driven), the SAME set `instance.log` already
+/// records, so this is a projection of IDENTICAL facts, not a second,
+/// divergent notion of "notable". `instance.log` stays the structured,
+/// machine-authoritative record; this text is NEVER parsed back — a wording
+/// change here is not a wire-format change.
+fn engine_transition_line_text(event: &TransitionEvent) -> String {
+    format!(
+        "engine: {} -> {}{}",
+        event.prior_state,
+        event.new_state,
+        cause_suffix(&event.cause)
+    )
+}
+
+/// The parenthetical detail suffix for [`engine_transition_line_text`], keyed
+/// on the transition's [`TransitionCause`].
+fn cause_suffix(cause: &TransitionCause) -> String {
+    match cause {
+        TransitionCause::Command { command } => format!(" ({command})"),
+        TransitionCause::AdapterReady => String::new(),
+        TransitionCause::LaunchError { detail } => format!(" (launch error: {detail})"),
+        TransitionCause::StopGraceful => String::new(),
+        TransitionCause::StopForced { detail } => format!(" (forced: {detail})"),
+        TransitionCause::PauseBestEffort { detail } => format!(" (best-effort: {detail})"),
+        TransitionCause::ResumeBestEffort { detail } => format!(" (best-effort: {detail})"),
+        TransitionCause::Crashed { detail } => format!(" (crashed: {detail})"),
+        TransitionCause::Restarted { count, waited_ms } => {
+            format!(" (restart #{count}, waited {waited_ms}ms)")
+        }
+        TransitionCause::BudgetExceeded {
+            scope, dimension, ..
+        } => format!(" (breach: {scope} {dimension})"),
+    }
+}
+
 /// Append one transition event as a single JSON line to the instance log.
 ///
 /// One event per line (JSON Lines) so [`read_events_from`] can parse them back
@@ -2153,6 +2836,37 @@ fn read_events_from(path: &Path) -> Result<Vec<TransitionEvent>, String> {
         events.push(event);
     }
     Ok(events)
+}
+
+/// Parse JSON-Lines [`LogLine`] records from `text`, APPENDING them to `out`
+/// in encounter order (story 4-2, AC-G — append order is the sole ordering
+/// authority; callers must never re-sort the result). Blank lines are
+/// skipped; a malformed line is an error naming it (a corrupt capture is
+/// worth surfacing, mirroring [`read_events_from`]'s convention).
+fn parse_log_lines(text: &str, out: &mut Vec<LogLine>) -> Result<(), String> {
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: LogLine = serde_json::from_str(line)
+            .map_err(|e| format!("corrupt output-log line {}: {e}", idx + 1))?;
+        out.push(parsed);
+    }
+    Ok(())
+}
+
+/// Read back one attributed-output-log FILE (one generation) and append its
+/// parsed [`LogLine`]s to `out` — a missing generation (not every generation
+/// exists yet) is a silent no-op, mirroring [`read_events_from`]'s "missing
+/// file → empty" precedent, so [`Supervisor::read_agent_log`]'s
+/// oldest-to-newest loop can unconditionally probe every generation.
+fn read_log_lines_from(path: &Path, out: &mut Vec<LogLine>) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    parse_log_lines(&text, out)
 }
 
 /// Append one [`BudgetBreachEvent`] as a single JSON line to the per-instance
@@ -3127,6 +3841,206 @@ mod tests {
         assert_eq!(state_of(&registry, "stopping"), LifecycleState::Stopping);
     }
 
+    // ---- Fix pass (review of #80 follow-up — the CRITICAL finding): the
+    // bound-post-SIGKILL-wait fix's retry/no-compounding/self-healing logic.
+    //
+    // These are WHITE-BOX tests: rather than needing a genuinely OS-unkillable
+    // process (which requires disk-exhaustion-induced uninterruptible I/O
+    // wait — reproduced separately via a dedicated, SAFE ramdisk experiment;
+    // see the story file's Dev Agent Record for the full empirical proof),
+    // they directly construct the EXACT bookkeeping state a real
+    // `BackendError::StopUnconfirmed` would have left behind
+    // (`Supervised::stop_unconfirmed = true`, store state `stopping`, handle
+    // retained) and prove `stop_inner`'s/`poll_once`'s reconciliation logic
+    // against it. This is deterministic and fast (no real 5s wait), mirroring
+    // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+    // immediately above's own technique of forcing `stopping` via
+    // `registry.set_state` directly.
+
+    #[test]
+    fn stop_on_a_stopping_instance_without_the_unconfirmed_flag_takes_the_ordinary_path() {
+        // The negative-space complement of the retry tests below: an
+        // instance that is `stopping` with a held handle but is NOT marked
+        // `stop_unconfirmed` (the flag ONLY a real `BackendError::
+        // StopUnconfirmed` sets) must NOT take the new cheap-poll retry
+        // branch — it falls through to the ORIGINAL, unchanged
+        // `next_state` gate, which rejects with the uniform
+        // `InvalidTransition` exactly as it did before this fix pass. This
+        // proves the new branch is gated precisely on `stop_unconfirmed`,
+        // not merely "state is stopping" (which
+        // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+        // above ALSO forces, for a different, pre-existing reason).
+        let (_state, _manifest, registry) = setup_fake("notflagged", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "notflagged").unwrap();
+        let name = InstanceName::new("notflagged").unwrap();
+
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        assert!(
+            !sup.running.get(&name).unwrap().stop_unconfirmed,
+            "a freshly-started handle must default to NOT stop_unconfirmed"
+        );
+
+        let err = sup.stop(&registry, "notflagged", None).unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidTransition(_)),
+            "without the flag, this must be the ORIGINAL uniform InvalidTransition, not the new \
+             StopUnconfirmed retry path: {err:?}"
+        );
+
+        // Teardown.
+        let supervised = sup.running.get_mut(&name).unwrap();
+        let _ = sup
+            .backend
+            .stop(&mut supervised.handle, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_retry_on_a_stuck_unconfirmed_instance_polls_cheaply_no_compounding() {
+        // A retry `stop()` against an instance whose handle is marked
+        // `stop_unconfirmed` (a prior real stop attempt hit
+        // KILL_CONFIRM_TIMEOUT) must NOT re-run the whole
+        // SIGTERM/graceful-window/SIGKILL/confirm sequence — it polls ONCE,
+        // cheaply, and fails fast with the SAME honest error while the
+        // process is still genuinely alive (no new signal, no new wait).
+        let (_state, _manifest, registry) = setup_fake("stuck", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "stuck").unwrap();
+        let name = InstanceName::new("stuck").unwrap();
+
+        // Simulate the aftermath of a real StopUnconfirmed (stop_inner's
+        // own bookkeeping on that path — see its docs): the row is
+        // `stopping`, the handle is retained, and it is marked unconfirmed.
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+        let start = Instant::now();
+        let err = sup.stop(&registry, "stuck", None).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(&err, EngineError::StopUnconfirmed { name, .. } if name == "stuck"),
+            "expected StopUnconfirmed, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a retry against a still-alive stuck instance must poll cheaply (ProcessBackend::poll, \
+             never ProcessBackend::stop), not re-block for a whole new \
+             graceful-window/SIGKILL/confirm cycle: {elapsed:?}"
+        );
+        // No compounding: the row is untouched (still stopping), the handle
+        // is still retained (not dropped) for a further retry to reconcile.
+        assert_eq!(state_of(&registry, "stuck"), LifecycleState::Stopping);
+        assert!(
+            sup.running.contains_key(&name),
+            "the handle must be retained across a failed retry, never silently dropped"
+        );
+
+        // Teardown: really kill the still-running process so it does not
+        // leak past this test.
+        let supervised = sup.running.get_mut(&name).unwrap();
+        let _ = sup
+            .backend
+            .stop(&mut supervised.handle, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
+        // The self-healing counterpart: once the process behind a
+        // stop_unconfirmed handle has ACTUALLY died (the OS condition that
+        // made confirmation time out has cleared), a retry `stop()` must
+        // reconcile the instance to `stopped` — never leaving it permanently
+        // stuck just because one earlier attempt could not confirm death in
+        // time.
+        let (_state, _manifest, registry) = setup_fake("heals", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "heals").unwrap();
+        let name = InstanceName::new("heals").unwrap();
+
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+        // Simulate the OS condition clearing: the process ACTUALLY exits now.
+        // A real, portable kill via the SAME ProcessBackend::stop the
+        // production code already uses (cfg-free at this call site — the
+        // OS-specific mechanics live entirely in `backends/`), not a raw
+        // OS-specific signal call, so this stays a legitimate domain-layer
+        // test. The process is NOT genuinely stuck in this test (only its
+        // BOOKKEEPING pretends it was), so this succeeds quickly.
+        {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .stop(&mut supervised.handle, Duration::from_secs(2))
+                .expect("the process is not genuinely stuck in this test and must die promptly");
+        }
+
+        let instance = sup
+            .stop(&registry, "heals", None)
+            .expect("a retry must self-heal once the process is confirmed dead");
+        assert_eq!(
+            instance.state,
+            LifecycleState::Stopped,
+            "the stuck stopping row must reconcile to stopped, not stay stuck forever"
+        );
+        assert!(
+            !sup.running.contains_key(&name),
+            "the handle must be released once reconciled"
+        );
+    }
+
+    #[test]
+    fn poll_once_reconciles_a_stuck_unconfirmed_stop_to_stopped_self_healing() {
+        // The crash reaper's OWN reconciliation path (`poll_once`) — the
+        // OTHER self-healing route besides a manual retry `stop()` (whichever
+        // observes the exit first): when a `stop_unconfirmed`-marked handle's
+        // process is found `Exited` during a routine reaper poll, poll_once
+        // must finalize `stopping -> stopped` itself, rather than silently
+        // dropping the handle (which would leave the row PERMANENTLY stuck,
+        // since a later retry `stop()` would find no handle to poll).
+        // Contrast directly with
+        // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
+        // above: that test's contrived `stopping` row is NOT
+        // `stop_unconfirmed` (it never went through a real stop attempt), so
+        // it correctly keeps the ORIGINAL silent-drop behavior — proving this
+        // fix pass changes behavior ONLY for the scenario it targets.
+        // --crash-after-ms must comfortably EXCEED READINESS_WINDOW (300ms) or
+        // the process looks like an immediate-exit launch failure (AC2)
+        // instead of a clean start that later crashes — the same pitfall
+        // documented above for `--linger-ms` in this file; 500ms is that
+        // established, proven-safe margin.
+        let (_state, _manifest, registry) = setup_fake("reaperheals", &["--crash-after-ms", "500"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "reaperheals").unwrap();
+        let name = InstanceName::new("reaperheals").unwrap();
+
+        registry.set_state(&name, LifecycleState::Stopping).unwrap();
+        sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+        // Wait for the process to actually exit on its own, then let the
+        // reaper observe it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let plans = sup.poll_once(&registry);
+            assert!(
+                plans.is_empty(),
+                "this is a reconciliation, never a crash/restart"
+            );
+            if !sup.running.contains_key(&name) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "handle should be reconciled after exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state_of(&registry, "reaperheals"),
+            LifecycleState::Stopped,
+            "the reaper must finalize a stuck-unconfirmed stopping row to stopped, not leave it \
+             permanently stuck"
+        );
+    }
+
     #[test]
     fn poll_once_with_no_handles_is_a_noop() {
         // The empty-reaper path: with nothing supervised, poll_once returns no
@@ -3492,6 +4406,330 @@ mod tests {
         );
     }
 
+    // ---- Story 4-2: read_agent_log_since's follow-cursor planning (AC-D/AC-H) ----
+
+    #[test]
+    fn plan_follow_consumes_only_complete_lines_leaving_a_partial_tail() {
+        let bytes = b"a\nb\nhalf-written";
+        assert_eq!(
+            plan_follow(bytes, 0),
+            FollowPlan::Consume {
+                range: 0..4,
+                new_cursor: 4
+            }
+        );
+    }
+
+    #[test]
+    fn plan_follow_with_no_newline_yet_consumes_nothing() {
+        assert_eq!(
+            plan_follow(b"no newline yet", 0),
+            FollowPlan::Consume {
+                range: 0..0,
+                new_cursor: 0
+            }
+        );
+    }
+
+    #[test]
+    fn plan_follow_from_a_cursor_consumes_only_the_new_tail() {
+        let bytes = b"old\nnew-tail\n";
+        assert_eq!(
+            plan_follow(bytes, 4),
+            FollowPlan::Consume {
+                range: 4..bytes.len(),
+                new_cursor: bytes.len() as u64
+            }
+        );
+    }
+
+    #[test]
+    fn plan_follow_shrink_snaps_the_cursor_and_delivers_nothing() {
+        // AC-D/AC-H rotation-notice path: the file is shorter than the
+        // cursor (a rotation happened since the last poll). Snap, deliver
+        // nothing this pass — the caller detects the snap-back itself.
+        let bytes = b"short"; // len 5
+        assert_eq!(
+            plan_follow(bytes, 100),
+            FollowPlan::Shrunk { new_cursor: 5 }
+        );
+    }
+
+    #[test]
+    fn plan_follow_at_end_of_log_consumes_nothing() {
+        let bytes = b"a\nb\n";
+        assert_eq!(
+            plan_follow(bytes, 4),
+            FollowPlan::Consume {
+                range: 4..4,
+                new_cursor: 4
+            }
+        );
+    }
+
+    // ---- Story 4-2: engine-attributed line rendering (Task 4) ----
+
+    #[test]
+    fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
+        // A direct, pure-function proof of the RENDERER's own completeness,
+        // independent of which causes the current supervisor wiring happens
+        // to route a live log_capture through (e.g. a launch-failure never
+        // gets a log_capture today — see the Dev Agent Record) — the match
+        // itself must stay exhaustive and correct for every variant.
+        let cases: Vec<(TransitionCause, &str)> = vec![
+            (TransitionCause::command("start"), " (start)"),
+            (TransitionCause::AdapterReady, ""),
+            (
+                TransitionCause::launch_error("boom"),
+                " (launch error: boom)",
+            ),
+            (TransitionCause::StopGraceful, ""),
+            (
+                TransitionCause::stop_forced("escalated"),
+                " (forced: escalated)",
+            ),
+            (
+                TransitionCause::pause_best_effort("windows"),
+                " (best-effort: windows)",
+            ),
+            (
+                TransitionCause::resume_best_effort("windows"),
+                " (best-effort: windows)",
+            ),
+            (
+                TransitionCause::crashed("exit code 1"),
+                " (crashed: exit code 1)",
+            ),
+            (
+                TransitionCause::restarted(2, 500),
+                " (restart #2, waited 500ms)",
+            ),
+            (
+                TransitionCause::budget_exceeded(BreachScope::PerRun, 1000, 1200),
+                " (breach: per-run tokens)",
+            ),
+            (
+                TransitionCause::cost_cap_exceeded(
+                    BreachScope::Cumulative,
+                    Micros(5_000_000),
+                    Micros(5_250_000),
+                    EstimateLabel::Estimated,
+                ),
+                " (breach: cumulative dollars)",
+            ),
+        ];
+        for (cause, want_suffix) in cases {
+            assert_eq!(cause_suffix(&cause), want_suffix, "{cause:?}");
+        }
+
+        // engine_transition_line_text wraps the suffix into the full "engine:
+        // A -> B(...)" sentence.
+        let event = TransitionEvent::new(
+            "svc",
+            LifecycleState::Running,
+            LifecycleState::Paused,
+            TransitionCause::pause_best_effort("windows"),
+            "2026-07-15T00:00:00Z",
+        );
+        assert_eq!(
+            engine_transition_line_text(&event),
+            "engine: running -> paused (best-effort: windows)"
+        );
+    }
+
+    // ---- Story 4-2: Supervisor::read_agent_log / read_agent_log_since ----
+
+    fn log_line(instance: &str, stream: LogStream, text: &str, at: &str) -> LogLine {
+        LogLine::new(instance, stream, text, at)
+    }
+
+    #[test]
+    fn read_agent_log_on_an_unregistered_name_is_not_found() {
+        // The deliberate improvement over read_events/read_breach_events'
+        // precedent: an unregistered name is NotFound, not a silent empty.
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log(&registry, "ghost").unwrap_err();
+        assert!(matches!(err, EngineError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_on_a_registered_but_never_started_instance_is_empty_not_an_error() {
+        let (_state, _manifest, registry) = setup_fake("neverstarted", &["--linger-ms", "600000"]);
+        let (lines, cursor) = Supervisor::read_agent_log(&registry, "neverstarted").unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(cursor, 0, "no file yet → the cursor starts at 0");
+    }
+
+    #[test]
+    fn read_agent_log_concatenates_generations_oldest_to_newest() {
+        // AC-A/AC-G: hand-craft the 3 generations directly (deterministic,
+        // no real rotation/process needed) and assert the read order is
+        // oldest-generation-first, current-generation-last — append order,
+        // never a timestamp re-sort.
+        let (_state, _manifest, registry) = setup_fake("gens", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("gens").unwrap();
+        std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+
+        let write_line = |path: &Path, l: &LogLine| {
+            std::fs::write(path, format!("{}\n", serde_json::to_string(l).unwrap())).unwrap();
+        };
+        write_line(
+            &registry.attributed_output_log_generation_path(&name, 2),
+            &log_line(
+                "gens",
+                LogStream::AgentOut,
+                "oldest",
+                "2026-07-15T00:00:00Z",
+            ),
+        );
+        write_line(
+            &registry.attributed_output_log_generation_path(&name, 1),
+            &log_line(
+                "gens",
+                LogStream::AgentErr,
+                "middle",
+                "2026-07-15T00:00:01Z",
+            ),
+        );
+        let current_path = registry.attributed_output_log_path(&name);
+        write_line(
+            &current_path,
+            &log_line("gens", LogStream::Engine, "newest", "2026-07-15T00:00:02Z"),
+        );
+
+        let (lines, cursor) = Supervisor::read_agent_log(&registry, "gens").unwrap();
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["oldest", "middle", "newest"]);
+        let streams: Vec<LogStream> = lines.iter().map(|l| l.stream).collect();
+        assert_eq!(
+            streams,
+            vec![LogStream::AgentOut, LogStream::AgentErr, LogStream::Engine]
+        );
+        // The returned cursor (M1, review of #80) is the CURRENT generation's
+        // exact byte length — matching read_agent_log_since's cursor shape —
+        // never the concatenated multi-generation total.
+        assert_eq!(
+            cursor,
+            std::fs::metadata(&current_path).unwrap().len(),
+            "cursor must be the CURRENT generation's byte length only"
+        );
+    }
+
+    #[test]
+    fn read_agent_log_since_on_an_unregistered_name_is_not_found() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log_since(&registry, "ghost", 0).unwrap_err();
+        assert!(matches!(err, EngineError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_since_happy_path_reads_only_the_new_tail() {
+        let (_state, _manifest, registry) = setup_fake("since", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("since").unwrap();
+        std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+        let path = registry.attributed_output_log_path(&name);
+
+        let l1 = log_line("since", LogStream::AgentOut, "one", "2026-07-15T00:00:00Z");
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&l1).unwrap())).unwrap();
+        let (first, cursor1) = Supervisor::read_agent_log_since(&registry, "since", 0).unwrap();
+        assert_eq!(first, vec![l1]);
+        assert!(cursor1 > 0);
+
+        // No new bytes yet: an empty read at the same cursor.
+        let (none, cursor_same) =
+            Supervisor::read_agent_log_since(&registry, "since", cursor1).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(cursor_same, cursor1);
+
+        // Append a second line; read_agent_log_since(cursor1) returns ONLY it.
+        let l2 = log_line("since", LogStream::AgentErr, "two", "2026-07-15T00:00:01Z");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", serde_json::to_string(&l2).unwrap()).unwrap();
+        drop(f);
+        let (second, cursor2) =
+            Supervisor::read_agent_log_since(&registry, "since", cursor1).unwrap();
+        assert_eq!(second, vec![l2]);
+        assert!(cursor2 > cursor1);
+    }
+
+    #[test]
+    fn read_agent_log_since_detects_a_rotation_shrink_and_snaps_the_cursor() {
+        // AC-D/AC-H: simulate a rotation having happened between two polls by
+        // shrinking the current-generation file below the previously
+        // returned cursor. The caller (Task 6's CLI) detects this by
+        // comparing `next_cursor < cursor` — assert that property holds.
+        let (_state, _manifest, registry) = setup_fake("rot", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("rot").unwrap();
+        std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+        let path = registry.attributed_output_log_path(&name);
+
+        let l1 = log_line(
+            "rot",
+            LogStream::AgentOut,
+            "before-rotation",
+            "2026-07-15T00:00:00Z",
+        );
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&l1).unwrap())).unwrap();
+        let (_lines, cursor) = Supervisor::read_agent_log_since(&registry, "rot", 0).unwrap();
+        assert!(cursor > 0);
+
+        // Simulate rotation: the current generation is now a FRESH, SHORTER
+        // file (as if it had just been rotated and a new line appended).
+        let l2 = log_line(
+            "rot",
+            LogStream::AgentOut,
+            "after-rotation",
+            "2026-07-15T00:00:05Z",
+        );
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&l2).unwrap())).unwrap();
+        let new_len = std::fs::metadata(&path).unwrap().len();
+        assert!(new_len < cursor, "the fixture must genuinely shrink");
+
+        let (lines, next_cursor) =
+            Supervisor::read_agent_log_since(&registry, "rot", cursor).unwrap();
+        assert!(lines.is_empty(), "nothing delivered on the shrink pass");
+        assert!(
+            next_cursor < cursor,
+            "the returned cursor must snap BELOW the one just passed in — the \
+             caller's rotation-notice signal"
+        );
+        assert_eq!(next_cursor, new_len);
+    }
+
+    #[test]
+    fn read_agent_log_on_an_invalid_name_is_invalid_name() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log(&registry, "Not Valid!").unwrap_err();
+        assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_since_on_an_invalid_name_is_invalid_name() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_agent_log_since(&registry, "Not Valid!", 0).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn read_agent_log_since_on_a_registered_but_never_started_instance_is_empty() {
+        // The current-generation file does not exist yet at all (the
+        // instance was registered but never started) — an honest empty
+        // read (Vec::new fallback for a NotFound file), never an error.
+        let (_state, _manifest, registry) = setup_fake("neverstarted2", &["--linger-ms", "600000"]);
+        let (lines, cursor) =
+            Supervisor::read_agent_log_since(&registry, "neverstarted2", 0).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(cursor, 0);
+    }
+
     // ---- Story 3-4: engine-observed base_url injection + source selection ----
 
     #[test]
@@ -3592,6 +4830,73 @@ mod tests {
         assert!(
             err.to_string().contains("runtime"),
             "names the cause: {err}"
+        );
+    }
+
+    // ---- Story 4-1: `send_input` — narrow branches best exercised as
+    // Supervisor-level unit tests (no reaper/Engine involved), complementing
+    // the AC-level proofs in `crates/ktesio-engine/tests/interaction.rs`. ----
+
+    #[test]
+    fn send_input_on_invalid_name_is_rejected() {
+        // The name-resolve step: an invalid name is rejected with
+        // EngineError::InvalidName, BEFORE any registry lookup.
+        let (_state, _manifest, registry) = setup_fake("x", &["--linger-ms", "1000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.send_input(&registry, "Bad Name", "hi").unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidName { .. }),
+            "expected InvalidName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn send_input_after_the_process_exits_on_its_own_is_a_backend_error() {
+        // A genuine BackendError write failure (Testing Notes: "a genuine
+        // BackendError write failure if practically triggerable"). The
+        // process exits ON ITS OWN (a short --linger-ms) but nothing has yet
+        // reaped/transitioned the persisted row (deliberately no
+        // `poll_once` call here — that would reap the handle and transition
+        // to `failed`, which is exactly the race this test avoids so the
+        // write is genuinely attempted). `send_input`'s write to the now
+        // read-end-closed pipe fails at the OS level (EPIPE/BrokenPipe on
+        // Unix), mapped to `EngineError::Backend` — the SAME generic mapping
+        // every other backend op uses — never silently swallowed, never
+        // misreported as `InteractionUnavailable`.
+        //
+        // Unix-only (EPIPE-on-closed-pipe semantics + a portable "is this pid
+        // still alive" probe both need a real Unix liveness check); runtime
+        // skip on Windows, NO `#[cfg]` (this file is outside the `backends`
+        // allowlist) — mirrors the rest of the codebase's data-driven OS skip
+        // convention.
+        if OsId::current() == OsId::Windows {
+            return;
+        }
+        // --linger-ms must comfortably EXCEED READINESS_WINDOW (300ms) or the
+        // process looks like an immediate-exit launch failure (AC2) instead
+        // of a clean start reaching `running`.
+        let (_state, _manifest, registry) =
+            setup_fake("exiter", &["--echo-stdin", "--linger-ms", "500"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "exiter").unwrap();
+
+        // Wait past the KNOWN, self-configured linger deadline (a FIXED timer
+        // this test itself set, not a guess at some other operation's
+        // duration — the AI-35/38 "never guess" lesson is about polling
+        // unknown async completion, which this is not). A liveness-probing
+        // poll loop (`kill -0`) cannot substitute here: since nothing in this
+        // test reaps the child (deliberately, so the persisted row stays
+        // `running`), the process becomes a defunct zombie on exit, and a
+        // zombie still answers `kill -0` as "alive" — the probe would never
+        // observe the exit and the loop would spin until its own timeout.
+        std::thread::sleep(Duration::from_millis(800));
+
+        // The persisted row is STILL `running` (nothing has reaped it yet) —
+        // send_input reaches the write, which fails at the OS level.
+        let err = sup.send_input(&registry, "exiter", "hello").unwrap_err();
+        assert!(
+            matches!(err, EngineError::Backend { .. }),
+            "expected Backend, got {err:?}"
         );
     }
 }

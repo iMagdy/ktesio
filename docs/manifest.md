@@ -16,7 +16,7 @@ The manifest is parsed and validated **before** any state is written. Unknown ke
 ## Complete Example
 
 ```toml
-contract_version = "0.3.0"
+contract_version = "0.4.0"
 
 [adapter]
 kind = "my-agent"
@@ -57,7 +57,7 @@ A manifest is valid only if it declares all of the following. Validation reports
 
 ### `contract_version`
 
-The Adapter Contract version the manifest targets, as a semver string (current: `"0.3.0"`). A non-semver value is rejected.
+The Adapter Contract version the manifest targets, as a semver string (current: `"0.4.0"`). A non-semver value is rejected.
 
 ### `[adapter]`
 
@@ -113,11 +113,11 @@ source = "self-reported"
 
 ### `[interaction]`
 
-Interaction channel wiring.
+Interaction channel wiring. Optional: omitting this section entirely still means `"stdio"` — the engine unconditionally pipes stdin for every spawned process, regardless of what (or whether) this section says.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `channel` | string | The interaction channel (e.g. `"stdio"`) |
+| `channel` | closed enum | The interaction channel. Currently the only recognized value is `"stdio"` (the spawned child's OS stdin pipe) — an unrecognized value is rejected at parse time. |
 
 ### `[config]` — unified → native config mapping
 

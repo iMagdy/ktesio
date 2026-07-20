@@ -126,3 +126,31 @@ pub struct AgentUnknownConfigKey {
 pub struct AgentConfig {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::not_running))]
+pub struct AgentNotRunning {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::interaction_unavailable))]
+pub struct AgentInteractionUnavailable {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::interaction_timed_out))]
+pub struct AgentInteractionTimedOut {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::stop_unconfirmed))]
+pub struct AgentStopUnconfirmed {
+    pub message: String,
+}

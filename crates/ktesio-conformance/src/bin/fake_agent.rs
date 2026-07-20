@@ -30,6 +30,14 @@
 //!   OBSERVABLE suspension proof for the guaranteed pause path. With no
 //!   `--heartbeat-ms` the loop is a quiet sleep (existing 1-4 tests that only
 //!   assert `ready`/lifecycle are unaffected). Pure `std`, NO OS-cfg.
+//! * `--heartbeat-stderr-ms <ms>` (story 4-2)  print an incrementing
+//!   `stderr-heartbeat <n>` line to STDERR every `<ms>` and flush — the STDERR
+//!   counterpart of `--heartbeat-ms`, independent of it (its own counter, own
+//!   interval) so a test can combine BOTH flags to produce known, deterministic,
+//!   simultaneously-attributable content on stdout AND stderr without racing —
+//!   the vehicle the log-capture-attribution tests (`agent-out`/`agent-err`)
+//!   need. With no `--heartbeat-stderr-ms` nothing is written to stderr by this
+//!   mechanism (existing tests unaffected). Pure `std`, NO OS-cfg.
 //! * `--crash-after-ms <ms>` (+ optional `--crash-with <code>`)  run normally
 //!   (announcing readiness, heartbeating if asked) for `<ms>`, THEN exit with
 //!   `<code>` (default 1) — simulating an UNREQUESTED crash AFTER the readiness
@@ -86,6 +94,14 @@
 //!   exit immediately. The process dies with a half-line in the log, so ONLY the
 //!   engine's TERMINAL drain-on-reap can rescue it — the H1 under-count proof (a
 //!   mid-run drain, which stops at the last newline, would strand it forever).
+//! * `--echo-stdin` (story 4-1)  spawn a dedicated thread that reads stdin
+//!   line-by-line and echoes each as `stdin: <line>` to stdout (flushed),
+//!   captured into `agent.log` exactly like `heartbeat <n>` lines. Runs
+//!   independent of the main loop — coexists with `--heartbeat-ms` /
+//!   `--linger-ms`. This is the deterministic observation vehicle for
+//!   `send_input`: a test writes a known line via the engine's stdin pipe,
+//!   then polls the captured log for `stdin: <line>` (never a wall-clock
+//!   sleep). Pure `std`, NO OS-cfg.
 //! * `--observed-calls <N>` (story 3-4)  ENGINE-OBSERVED mode: after announcing
 //!   readiness, make `<N>` OpenAI-compatible completion requests to the `base_url`
 //!   the engine INJECTED into this process's environment (`OPENAI_BASE_URL` — the
@@ -97,11 +113,23 @@
 //!   pure-`std` HTTP/1.1 client (a raw `TcpStream` — NO dependency, NO OS-cfg) makes
 //!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
 //!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
+//! * `--sniff-stdin-at-startup` (story 4-1 fix pass, HIGH finding, review of
+//!   #79)  BEFORE announcing readiness (before the ready line, before
+//!   `--marker`, before anything else), synchronously BLOCK reading ONE line
+//!   from stdin (`io::stdin().read_line(..)`). This mimics a common real-CLI
+//!   "sniff for piped input at startup" idiom — NOT the `--echo-stdin`
+//!   background-thread mechanism (which runs independent of startup and
+//!   never blocks it). Under `Stdio::null()` (an adapter that declares no
+//!   interaction support) this returns immediately (EOF) and startup
+//!   proceeds normally; under an unconditionally-piped stdin whose write end
+//!   nothing ever closes, this call would hang forever — the regression this
+//!   flag exists to prove does NOT happen once piping is gated on the
+//!   declared Capability. Pure `std`, NO OS-cfg.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 // This whole binary runs only as a SPAWNED SUBPROCESS of the supervision tests,
@@ -122,6 +150,9 @@ struct Opts {
     dump: Option<PathBuf>,
     /// Heartbeat interval (story 1-5). `None` = no heartbeat (quiet sleep loop).
     heartbeat: Option<Duration>,
+    /// STDERR heartbeat interval (story 4-2) — independent of `heartbeat`
+    /// (its own counter, own interval). `None` = nothing written to stderr.
+    heartbeat_stderr: Option<Duration>,
     /// Crash AFTER this interval (story 1-6): run normally, then exit non-zero.
     /// `None` = no self-crash (the linger loop governs exit).
     crash_after: Option<Duration>,
@@ -163,6 +194,14 @@ struct Opts {
     /// no-leak test): a sentinel API key the proxy must relay UPSTREAM faithfully but
     /// leak into NONE of ktesio's surfaces. `None` = no auth header sent.
     observed_auth: Option<String>,
+    /// Echo each stdin line to stdout as `stdin: <line>` (story 4-1). `false` =
+    /// no echo thread (the default; existing tests that never write to stdin
+    /// are unaffected).
+    echo_stdin: bool,
+    /// Synchronously block reading ONE stdin line BEFORE announcing
+    /// readiness (story 4-1 fix pass, HIGH finding). `false` = no sniff (the
+    /// default; existing tests are unaffected).
+    sniff_stdin_at_startup: bool,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -196,6 +235,7 @@ fn parse() -> Opts {
     let mut marker = None;
     let mut dump = None;
     let mut heartbeat = None;
+    let mut heartbeat_stderr = None;
     let mut crash_after = None;
     let mut crash_with = 1;
     let mut crash_times = None;
@@ -207,6 +247,8 @@ fn parse() -> Opts {
     let mut final_usage_no_newline = false;
     let mut observed_calls = 0;
     let mut observed_auth = None;
+    let mut echo_stdin = false;
+    let mut sniff_stdin_at_startup = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -242,6 +284,8 @@ fn parse() -> Opts {
                     observed_auth = Some(v);
                 }
             }
+            "--echo-stdin" => echo_stdin = true,
+            "--sniff-stdin-at-startup" => sniff_stdin_at_startup = true,
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -251,6 +295,11 @@ fn parse() -> Opts {
             "--heartbeat-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
                     heartbeat = Some(Duration::from_millis(ms));
+                }
+            }
+            "--heartbeat-stderr-ms" => {
+                if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    heartbeat_stderr = Some(Duration::from_millis(ms));
                 }
             }
             "--crash-after-ms" => {
@@ -307,6 +356,7 @@ fn parse() -> Opts {
         marker,
         dump,
         heartbeat,
+        heartbeat_stderr,
         crash_after,
         crash_with,
         crash_times,
@@ -318,12 +368,29 @@ fn parse() -> Opts {
         final_usage_no_newline,
         observed_calls,
         observed_auth,
+        echo_stdin,
+        sniff_stdin_at_startup,
     }
 }
 
 #[cfg(not(tarpaulin_include))]
 fn main() {
     let opts = parse();
+
+    // Story 4-1 fix pass (HIGH finding, review of #79): BEFORE anything else
+    // (before the exit-fast path, before announcing readiness), mimic a
+    // common real-CLI "sniff for piped input at startup" idiom by
+    // synchronously blocking on ONE stdin line. Under the fixed engine
+    // behavior (stdin piped only when the declared Capability::Interaction
+    // is Guaranteed/BestEffort), an adapter that declares no interaction
+    // support gets Stdio::null() here, so this read returns immediately
+    // (EOF) and startup proceeds normally; under the OLD unconditional-pipe
+    // regression this would hang forever, since nothing would ever close or
+    // write to the pipe.
+    if opts.sniff_stdin_at_startup {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
 
     // Immediate-exit path (AC2): exit before doing anything else.
     if let Some(code) = opts.exit_fast {
@@ -391,6 +458,27 @@ fn main() {
     // can observe a mapped unified key that landed as a native FLAG (in the args)
     // or ENV var (in the environment), without racing on stdout capture.
     write_dump(&opts.dump);
+
+    // Story 4-1: a dedicated thread reads stdin line-by-line and echoes each as
+    // `stdin: <line>` to the captured log — the deterministic vehicle a test
+    // polls after writing a known line via the engine's `send_input`. Runs
+    // independent of the main loop/heartbeat; ends naturally on stdin EOF (the
+    // pipe closes when the engine drops/closes it) or process exit.
+    if opts.echo_stdin {
+        thread::spawn(|| {
+            let stdin = std::io::stdin();
+            let mut out = std::io::stdout();
+            for line in BufReader::new(stdin).lines() {
+                match line {
+                    Ok(line) => {
+                        let _ = writeln!(out, "stdin: {line}");
+                        let _ = out.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     // Story 3-1: emit self-reported usage sentinel lines (readiness-gated — AFTER
     // the ready line, so the instance has reached `running` and the engine's reaper
@@ -478,6 +566,15 @@ fn main() {
     let crash_deadline = effective_crash_after.map(|d| start + d);
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
+    // Story 4-2: an INDEPENDENT stderr counter/interval (own `beats`, own
+    // `next_beat`) so both streams can heartbeat simultaneously without
+    // sharing state — a test combining both flags gets deterministic,
+    // independently-countable content on stdout AND stderr.
+    let mut stderr = std::io::stderr();
+    let mut stderr_beats: u64 = 0;
+    let mut next_stderr_beat = opts
+        .heartbeat_stderr
+        .map(|interval| Instant::now() + interval);
     while Instant::now() < deadline {
         // Story 1-6: after the crash-after window, exit non-zero (a crash the
         // supervisor's reaper detects, firing the Restart Policy). Checked after
@@ -495,6 +592,14 @@ fn main() {
                 let _ = stdout.flush();
                 beats += 1;
                 next_beat = Some(due + interval);
+            }
+        }
+        if let (Some(interval), Some(due)) = (opts.heartbeat_stderr, next_stderr_beat) {
+            if Instant::now() >= due {
+                let _ = writeln!(stderr, "stderr-heartbeat {stderr_beats}");
+                let _ = stderr.flush();
+                stderr_beats += 1;
+                next_stderr_beat = Some(due + interval);
             }
         }
         sleep(Duration::from_millis(25));
