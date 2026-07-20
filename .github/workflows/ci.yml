@@ -589,17 +589,36 @@ jobs:
               echo "::endgroup::"
             done
             # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
-            # is a doc-only stub today (0 coverable lines, no tracefile) — skip any
-            # crate that produced no lcov.info so the merge does not choke on it, and
-            # it lights up automatically once epic 6 gives it code. --ignore-errors
-            # inconsistent: tolerate lcov 2.x's benign cross-run FN-start-line drift
-            # (line data is unaffected).
+            # is a doc-only stub today (0 coverable lines, no tracefile) -- the ONLY
+            # crate allowed to skip the merge with no lcov.info; it lights up
+            # automatically once epic 6 gives it code. --ignore-errors inconsistent:
+            # tolerate lcov 2.x's benign cross-run FN-start-line drift (line data is
+            # unaffected).
+            #
+            # PR #117 fix pass: this used to skip ANY crate with no lcov.info, not
+            # just hermes. That silently swallowed a real failure mode -- when a
+            # crate's OWN tarpaulin run fails (e.g. ktesio-engine hitting one of this
+            # job's flaky real-IO tests), it produces no lcov.info too, and the old
+            # code merged the aggregate from whatever crates DID succeed anyway. The
+            # resulting gate failure ("merged coverage NN% is below 95%") read like a
+            # genuine coverage shortfall across the whole workspace, when the real
+            # story was "ktesio-engine's measurement is entirely missing, so the
+            # smaller remaining slice can't possibly clear a 95% bar sized for the
+            # full workspace" -- confusing, and it silently accepted a
+            # SUBSET-OF-THE-WORKSPACE gate as if it were the real one. Any crate
+            # OTHER than the known doc-only stub missing its lcov.info now fails the
+            # attempt LOUDLY and immediately, before the misleading percentage math
+            # ever runs -- the retry loop above already treats this exactly like any
+            # other attempt failure.
             add_args=""
             for pkg in "$@"; do
               if [ -s "cov/$pkg/lcov.info" ]; then
                 add_args="$add_args -a cov/$pkg/lcov.info"
+              elif [ "$pkg" = "ktesio-adapters-hermes" ]; then
+                echo "::notice::no coverable lines for $pkg (expected for the doc-only stub); skipping in merge."
               else
-                echo "::notice::no coverable lines for $pkg (expected for the hermes stub); skipping in merge."
+                echo "::error::$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed (a crashed/failed test suite, not a legitimately-empty crate). Treating this as a failed attempt rather than silently merging a partial, misleading aggregate."
+                exit 1
               fi
             done
             echo "::group::merge tracefiles"
