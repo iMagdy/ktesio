@@ -50,6 +50,66 @@ kt agent show demo --json
 
 The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.
 
+## `kt agent usage [<name>] [--json]`
+
+Read Usage Ledger totals for one instance, or for the whole Fleet.
+
+```bash
+kt agent usage
+kt agent usage my-agent
+kt agent usage my-agent --json
+kt agent usage --json
+```
+
+- `<name>` — optional; with a name, reports that instance's usage. Omitted, reports the Fleet-wide totals.
+- `--json` — emit a single versioned document (not newline-delimited; usage is a snapshot, not a stream).
+
+The named form reports tokens by both scopes (cumulative and current-run), the derived dollar cost per scope, and the active Metering Source. The Fleet-wide form reports summed tokens plus the summed derived dollar cost across the instances that have a Rate — flagged as a lower bound, naming how many instances are unpriced, when some metered instance has no Rate.
+
+Token totals equal the Usage Ledger exactly, and are the same numbers `list`/`show` report — this command is a focused surface over the same data, never a second, independently-summed figure. Dollar figures appear only when a Rate is configured and are always labeled estimates; with no Rate the dollar view is honestly inert (`—`), never a fabricated `$0.00`.
+
+Both `--json` forms carry the same Fleet `schema_version` as `list`/`show`, since they serialize the same fleet domain types:
+
+```json
+{
+  "schema_version": 2,
+  "instance": "my-agent",
+  "usage": {
+    "cumulative_input_tokens": 1200,
+    "cumulative_output_tokens": 3400,
+    "current_run_input_tokens": 120,
+    "current_run_output_tokens": 340,
+    "cumulative_dollars": 54600,
+    "current_run_dollars": 5460,
+    "estimate_label": "estimated"
+  }
+}
+```
+
+The Fleet-wide form (no name) is the same document family with `totals` in place of `instance`/`usage`:
+
+```json
+{
+  "schema_version": 2,
+  "totals": {
+    "total_input_tokens": 1200,
+    "total_output_tokens": 3400,
+    "total_dollars": 54600,
+    "dollars_partial": true,
+    "unpriced_count": 1,
+    "estimate_label": "estimated"
+  }
+}
+```
+
+`totals` is byte-identical to the `totals` object `kt agent list --json` carries — one aggregate, two surfaces. `dollars_partial` is `true` when some metered instance has no Rate, making `total_dollars` a lower bound; `unpriced_count` then names how many instances were left out.
+
+Dollars are **integer micro-dollars** (1,000,000 = $1.00) plus an `estimate_label` of `estimated` or `reconciled` — never a preformatted `$` string, so a caller formats its own currency.
+
+Dollar fields are **omitted entirely** when no Rate is configured (`cumulative_dollars`, `current_run_dollars`, `estimate_label` on the named form; `total_dollars` and `estimate_label` on the Fleet form) — an honest absence rather than a fabricated `$0.00`. A parser must treat them as optional.
+
+With no instances registered, the Fleet form still emits a valid document (all-zero totals) and prints a short registration hint to stderr, so an empty Fleet is never mistaken for instances that consumed nothing.
+
 ## `kt agent start <name>`
 
 Start a registered Agent Instance.
@@ -102,13 +162,15 @@ Stdin is piped only for adapters that declare interaction support (`guaranteed` 
 
 If an agent stops draining its input (a stuck/deadlocked process), `send`'s write is bounded — it fails with a distinct diagnostic naming the timeout rather than hanging, and the instance's interaction channel stays unavailable for the rest of that session until it is stopped and started again.
 
-## `kt agent logs <name> [--follow]`
+## `kt agent logs <name> [--follow] [--json]`
 
 Read an Agent Instance's retained output, optionally following live output.
 
 ```bash
 kt agent logs my-agent
 kt agent logs my-agent --follow
+kt agent logs my-agent --json
+kt agent logs my-agent --follow --json
 ```
 
 Every currently-retained line is printed to stdout as `<at> [<stream>] <text>`, in the order it was captured (append order — never re-sorted by timestamp, since same-second lines are common). `<stream>` is one of `agent-out`, `agent-err`, or `engine`: the spawned process's stdout and stderr are captured separately (so you can tell them apart), and a best-effort `engine` line is added at each lifecycle transition (start, stop, pause, resume, crash, restart), mirroring the same facts the structured transition log already records.
@@ -118,6 +180,14 @@ Log capture is **unconditional and capability-independent** — unlike `send`, i
 The captured output is bounded: each generation caps at 10MB, with the current generation plus its 2 most recent rotated predecessors retained (10MB × 3 total, fixed and non-configurable). `kt agent logs` never errors due to rotation — a read that spans a rotation boundary returns whatever is currently retained, not a claim of the instance's entire lifetime history.
 
 `--follow` (`-f`) prints the retained lines first, then keeps polling for new output and printing it as it arrives — exiting cleanly with a note once the instance stops or pauses (never hanging). This works identically whether or not the current `kt` process is the one that originally started the instance: reading only needs the instance's log file, not a live process handle, so `kt agent logs --follow` also works against an instance recovered by crash adoption in a different `kt agent start` session.
+
+`--json` emits **newline-delimited JSON (NDJSON)**: one complete, self-contained log-line object per stdout line, each carrying its own `schema_version`. This is deliberately not a single wrapping document — `--follow` is an unbounded stream that a wrapper could never close — so the shape is identical for the one-shot and `--follow` forms, and a reader can process each line as it arrives:
+
+```json
+{"schema_version": 1, "instance": "my-agent", "stream": "agent-out", "at": "2026-07-20T12:00:00Z", "text": "hello"}
+```
+
+Lines are emitted in on-disk append order (never re-sorted by `at`, whose whole-second resolution makes ties common). An empty log emits nothing at all — zero lines, not `[]`. Under `--json`, stdout is pure NDJSON: the rotation notice and the follow-exit note go to stderr like every other diagnostic.
 
 ## `kt agent remove <name> [--delete | --retain] [--force]`
 
@@ -183,6 +253,41 @@ Set these with `kt agent config set <name> <key> <value>`.
 Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Ktesio displays it.
 
 ## Global Behavior
+
+### Exit codes
+
+Every `kt` command returns one of these numeric exit codes, so failures can be branched on in a script without parsing stderr:
+
+| Code | Meaning | Typical causes |
+|------|---------|----------------|
+| `0` | Success | The command completed; `--help` and `--version` also exit `0` |
+| `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter declaring no capabilities or no metering source, a failed self-update |
+| `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
+| `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
+| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, or a stop that could not be confirmed |
+| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe |
+| `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
+
+A script branches on the code directly — no stderr parsing:
+
+```bash
+kt agent show my-agent --json > status.json
+code=$?
+if [ $code -eq 3 ]; then
+  kt agent register my-agent --kind mock
+elif [ $code -eq 4 ]; then
+  kt agent start my-agent
+elif [ $code -ne 0 ]; then
+  echo "unexpected failure (exit $code)" >&2
+  exit 1
+fi
+```
+
+Here `3` means "not registered yet", `4` means "registered but not in a usable state", and any other non-zero code is a genuine failure worth surfacing.
+
+Every command that writes machine-readable output to stdout keeps that output pure, so `kt agent logs my-agent --json | head -5` is safe: a consumer that stops reading ends the command cleanly with `0` rather than an I/O failure.
+
+These codes are a **v1 compatibility surface**, governed by the same deprecation policy as the `--json` schemas: a breaking change is announced in the release notes, carries at least a one-minor notice window, and is removed only at a major version. Compatibility tests assert each documented condition returns its documented code, so an unannounced change fails CI.
 
 ### Update checks
 

@@ -22,7 +22,8 @@ impl TestContext {
     }
 }
 
-/// Full result of a `kt` invocation, including the exit-success flag.
+/// Full result of a `kt` invocation, including the exit-success flag and the
+/// NUMERIC exit code.
 ///
 /// This never collapses a non-zero exit into an `Err` — agent tests need to
 /// assert exit codes AND inspect stderr on the failure paths (duplicate name,
@@ -31,6 +32,12 @@ impl TestContext {
 #[derive(Debug)]
 pub struct KtRun {
     pub success: bool,
+    /// The numeric process exit code (story 4-3, DC-5/DC-6) — the documented,
+    /// stable `kt` contract (`0` success · `1` general · `2` usage · `3` not-found
+    /// · `4` invalid-state · `5` unsupported-capability · `6` timed-out). `None`
+    /// only when the process was killed by a signal without producing a code,
+    /// which no `kt` test path expects.
+    pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -68,6 +75,7 @@ pub fn run_kt_agent_with_env(
 
     KtRun {
         success: output.status.success(),
+        code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     }

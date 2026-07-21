@@ -958,4 +958,18 @@ mod tests {
         // Rust-derived variant name.
         assert!(json.contains("\"stream\":\"agent-out\""), "{json}");
     }
+
+    #[test]
+    fn log_schema_version_is_1_the_frozen_v1_wire_value() {
+        // Story 4-3 fix pass (H5). The sibling assertion in
+        // `log_line_carries_schema_version_and_all_fields_and_round_trips`
+        // compares `line.schema_version` to the CONSTANT it was stamped from,
+        // so it is tautological: bumping `LOG_SCHEMA_VERSION` cannot fail it.
+        // Pin the LITERAL instead — exactly as `FLEET_SCHEMA_VERSION` is pinned
+        // to a literal `2` by `fleet_schema_version_is_2_after_the_3_5_additive_bump`
+        // — so a version bump on this v1 compatibility surface (PRD §7) must be
+        // a deliberate, announced edit. `LogLine` is the `kt agent logs --json`
+        // NDJSON payload (story 4-3) and the story-7-2 subscription payload.
+        assert_eq!(LOG_SCHEMA_VERSION, 1);
+    }
 }

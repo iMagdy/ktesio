@@ -586,7 +586,7 @@ pub(crate) fn write_stdin_bounded(
 // race that writer thread's own `recv`/write cycle, losing the
 // just-enqueued "engine: ... -> running" line entirely if the process ends
 // before the writer thread is even scheduled once (confirmed empirically:
-// `logs_reads_retained_output_after_the_instance_stops` failed
+// `logs_reads_retained_output_after_the_instance_stops_unix` failed
 // DETERMINISTICALLY, not just flakily, once this was the only remaining
 // async hop). There is no way to "join" that thread from a caller doing
 // `std::process::exit` immediately after — the ONLY robust fix is to remove
