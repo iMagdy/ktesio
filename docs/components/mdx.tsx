@@ -14,7 +14,6 @@ const routeByMarkdownFile = new Map([
   ['testing.md', '/testing'],
   ['contributing.md', '/contributing'],
   ['release-process.md', '/release-process'],
-  ['github-project-sync.md', '/github-project-sync'],
   ['github-repository-audit-checklist.md', '/github-repository-audit-checklist'],
   ['RELEASE_NOTES.md', '/release-notes'],
 ]);

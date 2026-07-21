@@ -6,7 +6,6 @@
 /scripts/ @iMagdy
 
 # Core CLI implementation and package metadata.
-/src/ @iMagdy
-/tests/ @iMagdy
+/crates/ @iMagdy
 /Cargo.toml @iMagdy
 /Cargo.lock @iMagdy

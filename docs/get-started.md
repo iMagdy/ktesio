@@ -1,13 +1,21 @@
 ---
 title: Getting Started
-description: Build Ktesio from source and run the local skill manifest workflow end to end.
+description: Register an AI agent, give it a budget, inspect it, and run it under supervision — end to end.
 ---
 
 # Quickstart
 
-This guide gets Ktesio running from source and shows the full local workflow.
+This guide runs an agent through Ktesio end to end: register it, budget it, inspect the Fleet, and drive its lifecycle.
 
-## Build Ktesio
+## Install Ktesio
+
+Install the `kt` binary (see the [installation guide](installation.md) for every channel):
+
+```bash
+curl -fsSL https://cli.ktesio.dev/install.sh | sh
+```
+
+Or build from source:
 
 ```bash
 git clone https://github.com/iMagdy/ktesio.git
@@ -15,96 +23,126 @@ cd ktesio
 cargo install --path .
 ```
 
-This installs Ktesio onto your Cargo binary path.
-
-## Create a Skills Manifest
-
-From the project where you want to use agent skills:
+Verify:
 
 ```bash
-kt init .
+kt --version
+kt agent --help
 ```
 
-For a new project, this writes:
+## Describe Your Agent With a Manifest Adapter
 
-```json
-{
-  "dependencies": {},
-  "publish": []
-}
+Ktesio registers an agent through an **adapter** — either a native builtin (`--kind`) or a **manifest adapter** you supply as an `adapter.toml` (`--manifest`). A manifest declares how to launch the agent, its per-OS capabilities, and its metering source.
+
+Create a directory `my-agent/` containing `adapter.toml`:
+
+```toml
+contract_version = "0.3.0"
+
+[adapter]
+kind = "my-agent"
+name = "My Agent"
+
+# How the engine launches the agent. exec must resolve on PATH (or be absolute);
+# args and env are optional. Replace this with your agent's real command.
+[lifecycle.start]
+exec = "my-agent"
+args = ["--serve"]
+
+# A non-empty, per-OS Capability Declaration (linux / macos / windows), each
+# "guaranteed", "best-effort", or "unsupported".
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+# A viable Metering Source: "self-reported" or "engine-observed".
+[metering]
+source = "self-reported"
 ```
 
-If `.agents/skills/` already contains installed skills, `kt init .` adopts them as dependencies. Known public skills are recorded as remote dependencies when they can be resolved; unmatched custom skills become local path dependencies. Nothing is published automatically.
+See the [adapter manifest reference](manifest.md) for every section and field.
 
-## Install a Skill
-
-Add and install one skill with:
+## Register the Agent
 
 ```bash
-kt install docs:https://github.com/example/agent-docs.git
-kt install docs:example/agent-docs
+kt agent register my-agent --manifest ./my-agent
 ```
 
-If the source repo declares multiple published skills, install from the repo directly:
+Registration validates the manifest, creates an isolated **Agent Home**, and prints its path plus the effective (current-OS) Capability Declaration. Nothing is written if validation fails.
+
+To try the flow without writing a manifest, register the native builtin:
 
 ```bash
-kt install https://github.com/example/agent-docs.git
-kt install example/agent-docs/docs
-kt install example/agent-docs --skill docs
-kt install --all https://github.com/example/agent-docs.git
+kt agent register demo --kind mock
 ```
 
-Search public skill listings with:
+`mock` is a registration/config fixture — it declares capabilities and a metering source but has **no launch command**, so it cannot be started. Use a manifest adapter to run a real process.
+
+## Set a Budget and a Cost Cap
+
+Budgets and rates are ordinary unified-config values, validated at write time and changeable at any time:
 
 ```bash
-kt search tests
-kt search tests --install
+# Token budget: cap cumulative usage, and pause the agent when it is reached.
+kt agent config set my-agent budget.tokens.cumulative 500000
+kt agent config set my-agent budget.breach_action pause
+
+# Optional dollar cost control: price tokens in $/1M, then cap the derived cost.
+kt agent config set my-agent cost.rate.input 3.00
+kt agent config set my-agent cost.rate.output 15.00
+kt agent config set my-agent budget.dollars.cumulative 10.00
 ```
 
-Search uses skills.sh for discovery and still installs by cloning git repositories. Ktesio respects skills.sh rate limits with bounded retries.
+The Breach Action (`pause`, `stop`, or `warn`) fires the instant a ceiling is reached, on real usage from the Usage Ledger. A dollar cap set without a Rate is inert until a Rate exists.
 
-Or edit `skills.json` manually and run:
+## Inspect the Fleet
 
 ```bash
-kt install
+kt agent list                  # name, kind, state, restarts, budget, usage
+kt agent show my-agent         # capabilities, runtime status, usage, budget, cost, metering source
+kt agent config get my-agent   # the effective config with the source layer of each value
 ```
 
-Installed files are placed under `.agents/skills/<name>/`, and `skills.lock` records the exact commit after a successful fetch and copy.
+Add `--json` to `list` or `show` for a versioned, machine-readable document. Token totals equal the Usage Ledger exactly; dollar figures appear only when a Rate is configured and are always labeled estimates.
 
-Source repos normally declare installable paths in their own `skills.json` `publish` list. If a source repo has no `skills.json`, Ktesio warns, asks for confirmation, and can install one or more directories found under `skills/`, `SKILLS/`, or `.agents/skills/`.
-
-While installing, Ktesio shows a progress bar for cloning and file copy work. Raw git clone output stays hidden unless a failure needs a short summary.
-
-## Inspect Project State
+## Drive the Lifecycle
 
 ```bash
-kt list
-kt list --json
-kt show docs
-kt doctor
+kt agent start my-agent
+kt agent pause my-agent
+kt agent resume my-agent
+kt agent stop my-agent --timeout 10
 ```
 
-Status output is color-coded with small icons in terminals that support them.
+`pause` is honest per-OS: a guaranteed pause suspends the process, a best-effort pause proceeds cooperatively and prints a visible note, and an unsupported pause fails fast quoting the Capability Declaration. `stop` requests a graceful shutdown and escalates to a forced kill after the window (`--timeout`, default 30s).
 
-## Publish Local Skills
+> **Supervision boundary:** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. Durable supervision across separate CLI invocations is future work (a supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
-To expose a local skill from your repo, run:
+## Manage Secrets
+
+Reference secrets indirectly with a `secret:NAME` value — the reference is stored, and the real value is resolved from the environment (then the engine secrets file) at start and delivered to the agent, while staying masked in `kt agent config get`, snapshots, logs, and events:
 
 ```bash
-kt publish add docs skills/docs
+kt agent config set my-agent agent.api_key secret:OPENAI_KEY
+kt agent config get my-agent               # shows secret:**** for that key
+kt agent config get my-agent --reveal      # the sole explicit un-mask
 ```
 
-## Upgrade or Remove Skills
+## Remove an Agent
 
 ```bash
-kt upgrade
-kt remove docs
+kt agent remove my-agent            # keeps the Agent Home by default
+kt agent remove my-agent --delete   # also deletes the Agent Home
 ```
-
-`kt remove` is an alias for `kt uninstall`.
 
 ## Next Steps
 
 - Read the [command reference](commands.md).
-- Learn the [manifest format](manifest.md).
-- Check [troubleshooting](troubleshooting.md) for common git and path issues.
+- Learn the [adapter manifest format](manifest.md).
+- Check [troubleshooting](troubleshooting.md) for common setup and PATH issues.
