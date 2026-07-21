@@ -40,6 +40,24 @@ fn force_state_running(state_dir: &Path, name: &str) {
 /// the test binary into `agent_cli_start_helper_subprocess`, which opens an
 /// engine, starts the instance, and `std::process::exit`s WITHOUT dropping the
 /// engine (no handle Drop → the agent survives and re-parents to init).
+///
+/// **`_unix` naming convention (fix pass, H4).** Cross-lifetime survival cannot
+/// be simulated on Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` kills the child
+/// when the helper exits), so every test built on this helper runtime-`return`s
+/// there. A runtime early-return is reported by the test runner as **PASSED**, so
+/// CI shows green on Windows with zero signal that the assertions never ran.
+/// Every such test therefore carries a `_unix` SUFFIX, making the limitation
+/// visible in the test list on all three OSes rather than hiding inside the body.
+/// Anything those tests guard that is genuinely OS-INDEPENDENT — wire shapes,
+/// schema versions, exit codes — must ALSO be asserted by a test that runs
+/// everywhere; the `_unix` test is the additional end-to-end proof, never the
+/// sole guard. (One exception is stated plainly in the story: exit code `5` has
+/// no cross-OS end-to-end path at all, because both routes to it — `pause` and
+/// `send` on an `unsupported` declaration — need a genuinely running child. Its
+/// full diagnostic→code mapping is pinned cross-OS by the `exit_code.rs`
+/// classifier unit tests plus the `map_engine_error`/`map_error` mapper tests in
+/// `cli::agent`, and `main`'s wiring of that classifier to the process status is
+/// pinned cross-OS by codes `0`/`1`/`2`/`3`/`4`.)
 fn start_via_surviving_engine(state_dir: &Path, name: &str) {
     let exe = std::env::current_exe().expect("test exe");
     let status = std::process::Command::new(exe)
@@ -844,7 +862,7 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
 }
 
 #[test]
-fn pause_best_effort_prints_qualifier_note_to_stderr_only() {
+fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
     // outside the backends allowlist). This test drives the story-1-6 cross-
     // process adoption harness (`start_via_surviving_engine`): a subprocess
@@ -902,7 +920,7 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only() {
 }
 
 #[test]
-fn pause_unsupported_exits_nonzero_quoting_the_declaration() {
+fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
     // outside the backends allowlist). Like the best-effort case above, this test
     // relies on the story-1-6 cross-process adoption harness
@@ -969,6 +987,16 @@ source = "self-reported"
         !paused.success,
         "unsupported pause must exit non-zero; stdout={}",
         paused.stdout
+    );
+    // Story 4-3 (DC-5): an unsupported capability is exit code 5 specifically —
+    // the end-to-end proof for the one exit class that needs a genuinely
+    // running instance to reach (the full diagnostic→code mapping is pinned
+    // cross-OS by the `exit_code` classifier unit tests).
+    assert_eq!(
+        paused.code,
+        Some(5),
+        "unsupported capability must exit 5; stderr={}",
+        paused.stderr
     );
     assert!(
         paused.stderr.contains("cannot pause"),
@@ -1069,7 +1097,7 @@ fn agent_log_path(state_dir: &Path, name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable() {
+fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix() {
     // DEVIATION FROM THE STORY FILE (documented; see the story's Dev Agent
     // Record / Completion Notes and the PR description for the full
     // rationale): Task 8's first bullet describes this test asserting exit 0
@@ -1143,6 +1171,16 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable() {
         "send on an adopted instance must exit non-zero (no recoverable pipe); stdout={}",
         sent.stdout
     );
+    // Story 4-3 (DC-5), strengthened in the fix pass (H1): assert the NUMBER, not
+    // merely "non-zero". `AgentInteractionUnavailable` is documented as exit 5, and
+    // a bare `!success` would have passed just as happily on a 1 — leaving the
+    // wiring from this path to its documented code unpinned end-to-end.
+    assert_eq!(
+        sent.code,
+        Some(5),
+        "an unavailable interaction channel must exit 5; stderr={}",
+        sent.stderr
+    );
     assert!(
         sent.stderr.contains("cannot receive input"),
         "stderr must state the honest InteractionUnavailable cause; stderr={}",
@@ -1189,7 +1227,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable() {
 }
 
 #[test]
-fn send_unsupported_exits_nonzero_quoting_the_declaration() {
+fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // AC-B at the CLI: `send` on an instance whose interaction is
     // `unsupported` on this OS fails fast with a non-zero exit and a
     // diagnostic (stderr) quoting the declaration. Same
@@ -1254,6 +1292,15 @@ source = "self-reported"
         !sent.success,
         "unsupported send must exit non-zero; stdout={}",
         sent.stdout
+    );
+    // Story 4-3 (DC-5), added in the fix pass (H1): the SECOND end-to-end proof
+    // that an unsupported capability is exit 5 specifically (the first is
+    // `pause_unsupported_exits_nonzero_quoting_the_declaration_unix`).
+    assert_eq!(
+        sent.code,
+        Some(5),
+        "an unsupported capability must exit 5; stderr={}",
+        sent.stderr
     );
     assert!(
         sent.stderr.contains("cannot interaction"),
@@ -3669,7 +3716,7 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
 // ---- Story 4-2: `kt agent logs <name> [--follow]` (AC-A, AC-B, AC-H) ----
 
 #[test]
-fn logs_reads_retained_output_after_the_instance_stops() {
+fn logs_reads_retained_output_after_the_instance_stops_unix() {
     // AC-A: register, start via the surviving-engine harness (so real
     // content genuinely accrues before that starting session exits), stop
     // it via a SEPARATE `kt agent stop` invocation (which must first adopt
@@ -3729,9 +3776,9 @@ fn logs_reads_retained_output_after_the_instance_stops() {
 }
 
 #[test]
-fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop() {
+fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_unix() {
     // AC-H at the CLI layer — the mirror image of 4.1's AC-D CLI test
-    // (`send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable`):
+    // (`send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix`):
     // THERE, `send` on this SAME kind of instance exits non-zero
     // (`InteractionUnavailable`); HERE, `kt agent logs --follow` reads the
     // pre-crash captured history with NO error and exits CLEANLY once the
@@ -3912,4 +3959,1251 @@ fn logs_on_an_unregistered_name_is_not_found() {
         "stderr should name the missing instance; stderr={}",
         run.stderr
     );
+}
+
+// ===========================================================================
+// Story 4-3 — COMPATIBILITY SURFACE TESTS (FR-26, PRD §7, DC-5/DC-6)
+// ===========================================================================
+//
+// These are THE compatibility gate for `kt`'s two machine-facing contracts:
+// the `--json` wire shapes and the numeric exit codes. They run in the
+// `test` CI job (`cargo nextest run --workspace --all-targets`) on all three
+// OSes, so an unannounced change fails CI everywhere.
+//
+// WHAT "ALL THREE OSes" PRECISELY COVERS (fix pass, 2026-07-21 — the earlier
+// blanket claim was overstated and an adversarial pass proved it):
+//   * Every WIRE SHAPE is frozen in BOTH its unpriced and its PRICED form (see
+//     `priced_instance` and the `*_PRICED_KEYS` constants — before the fix, every
+//     fixture was Rate-less, so `skip_serializing_if` hid the entire dollar half
+//     of `UsageView`/`FleetTotals`/`BudgetView` from every assertion). None of
+//     these tests spawns a child, so they genuinely gate all three OSes.
+//   * Every `schema_version` is pinned BY LITERAL VALUE, never by comparison to
+//     the constant it was stamped from.
+//   * Exit codes 0/1/2/3/4 are asserted end-to-end through the real binary,
+//     cross-OS.
+//   * Exit codes 5 and 6 are the ONE exception: every route to them needs a
+//     genuinely running child, and the surviving-engine harness is Unix-only.
+//     They are gated cross-OS in two composed halves instead — the mapper tests
+//     in `cli::agent::tests` prove which diagnostic each condition PRODUCES and
+//     how it classifies, and the 0..=4 tests here prove `main` wires `classify`
+//     to the process status. On Unix, code 5 additionally has two end-to-end
+//     assertions (`pause_unsupported_*_unix`, `send_unsupported_*_unix`).
+//   * Any test that cannot run on Windows carries a `_unix` SUFFIX, so a skip is
+//     visible in the test list rather than reported as a silent pass.
+//
+// WHY BESPOKE TESTS AND NOT `cargo-semver-checks` (recorded for reviewers):
+// the repo's semver-check job is (a) currently DORMANT and (b) Rust-API-only
+// by design — it compares the `ktesio-engine` *Rust* public API. It does NOT
+// see serialized JSON (a `#[serde(rename)]` that silently renames a wire
+// field PASSES semver-checks) and it does not see process exit codes at all.
+// It also never inspects the `kt` binary crate, where the CLI-local documents
+// (`ShowDocument`/`UsageDocument`/`FleetUsageDocument`/`ConfigDocument`) and
+// the exit-code classifier live. So these assertions — not semver-checks —
+// are what make an unannounced wire/exit-code change fail CI.
+//
+// HOW THEY FAIL LOUDLY: each `--json` document's key-set is FROZEN with a
+// sorted `assert_eq!`, so ADDING, renaming, or removing a field breaks the
+// assertion and forces an intentional edit (the PRD §7 "announce" gate),
+// rather than silently changing the contract. `schema_version` is pinned by
+// value for the same reason.
+
+/// The FROZEN `FleetEntry` key-set — the per-instance object shared by
+/// `list --json` (rows) and `show --json` (`instance`). `failed_cause` is
+/// `skip_serializing_if` and absent for a healthy instance, so it is not in
+/// the always-present set asserted here.
+const FLEET_ENTRY_KEYS: &[&str] = &[
+    "agent_home",
+    "budget",
+    "kind",
+    "metering_source",
+    "name",
+    "restart_count",
+    "restart_policy",
+    "state",
+    "usage",
+];
+
+/// The FROZEN `UsageView` key-set for an instance with NO Rate configured —
+/// the four always-present token counters. The three dollar fields
+/// (`cumulative_dollars`, `current_run_dollars`, `estimate_label`) are
+/// `skip_serializing_if` and appear ONLY when a Rate exists (AC-B: no Rate ⇒
+/// no dollar figure, never a fabricated `$0.00`).
+const USAGE_VIEW_TOKEN_KEYS: &[&str] = &[
+    "cumulative_input_tokens",
+    "cumulative_output_tokens",
+    "current_run_input_tokens",
+    "current_run_output_tokens",
+];
+
+/// The FROZEN `FleetTotals` key-set with no Rate anywhere in the Fleet.
+/// `total_dollars` + `estimate_label` are `skip_serializing_if` and absent
+/// until at least one instance is priced.
+const FLEET_TOTALS_KEYS: &[&str] = &[
+    "dollars_partial",
+    "total_input_tokens",
+    "total_output_tokens",
+    "unpriced_count",
+];
+
+// ---------------------------------------------------------------------------
+// The PRICED (Rate-configured) key-sets — fix pass, H2
+// ---------------------------------------------------------------------------
+//
+// Every constant above describes the UNPRICED shape, because every fixture
+// registered a plain `mock` with no Rate — and all three dollar-bearing types
+// hide their dollar fields behind `skip_serializing_if = "Option::is_none"`.
+// So until this fix the ENTIRE priced half of the wire was unfrozen: an
+// adversarial pass added a new `blended_rate` field to `UsageView`, populated
+// only in `with_dollars()`, and all 69 compatibility tests still passed.
+//
+// The constants below freeze that second shape. They are reached by the
+// `priced_instance` fixture, which configures a Rate (both directions are
+// required for a Rate to be live) plus both token scopes and both dollar Cost
+// Cap scopes, so every optional field materializes at once — making these the
+// MAXIMAL key-sets of `UsageView`, `FleetTotals`, and `BudgetView`.
+
+/// The FROZEN `UsageView` key-set once a Rate exists: the four token counters
+/// PLUS the three dollar fields (integer micros + the `estimated`/`reconciled`
+/// label — never a `$` string, AD-8/AD-14).
+const USAGE_VIEW_PRICED_KEYS: &[&str] = &[
+    "cumulative_dollars",
+    "cumulative_input_tokens",
+    "cumulative_output_tokens",
+    "current_run_dollars",
+    "current_run_input_tokens",
+    "current_run_output_tokens",
+    "estimate_label",
+];
+
+/// The FROZEN `FleetTotals` key-set once at least one instance is priced:
+/// the unpriced set PLUS `total_dollars` + `estimate_label`.
+const FLEET_TOTALS_PRICED_KEYS: &[&str] = &[
+    "dollars_partial",
+    "estimate_label",
+    "total_dollars",
+    "total_input_tokens",
+    "total_output_tokens",
+    "unpriced_count",
+];
+
+/// The FROZEN, MAXIMAL `BudgetView` key-set — a Rate plus BOTH token scopes and
+/// BOTH dollar Cost Cap scopes configured, so no field is skipped. The dollar
+/// cap fields (`per_run_cost_cap`, `per_run_dollars_remaining`,
+/// `cumulative_cost_cap`, `cumulative_dollars_remaining`, `estimate_label`) sat
+/// in the same unfrozen region as `UsageView`'s dollars before this fix.
+const BUDGET_VIEW_PRICED_KEYS: &[&str] = &[
+    "breach_action",
+    "cumulative_cost_cap",
+    "cumulative_dollars_remaining",
+    "cumulative_limit",
+    "cumulative_remaining",
+    "estimate_label",
+    "per_run_cost_cap",
+    "per_run_dollars_remaining",
+    "per_run_limit",
+    "per_run_remaining",
+];
+
+/// Sorted JSON object keys of `value`, for the frozen key-set assertions.
+fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a JSON object, got: {value}"))
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Assert `value`'s key-set is EXACTLY `expected` (a frozen wire contract).
+fn assert_frozen_keys(value: &serde_json::Value, expected: &[&str], what: &str) {
+    assert_eq!(
+        sorted_keys(value),
+        expected.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        "the frozen `{what}` key-set changed — this is a v1 compatibility \
+         surface (PRD §7). If the change is intentional, announce it and \
+         update this assertion deliberately. Document: {value}",
+    );
+}
+
+/// Register a `mock` instance in a fresh state dir and return the contexts.
+fn registered_mock(name: &str) -> (TestContext, TestContext) {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let run = run_kt_agent(
+        &["agent", "register", name, "--kind", "mock"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert!(
+        run.success,
+        "register should succeed; stderr={}",
+        run.stderr
+    );
+    (ctx, state)
+}
+
+/// Register a `mock` instance and configure EVERY dollar-bearing dimension
+/// (fix pass, H2), so the PRICED wire shape materializes: both Rate directions
+/// (both are required for a Rate to be live), both token budget scopes, and both
+/// dollar Cost Cap scopes. With this fixture `UsageView`, `FleetTotals`, and
+/// `BudgetView` all serialize their maximal key-sets — the half of the wire that
+/// no `registered_mock`-based fixture can ever reach.
+fn priced_instance(name: &str) -> (TestContext, TestContext) {
+    let (ctx, state) = registered_mock(name);
+    let state_dir = state.project_dir.as_path();
+    for (key, value) in [
+        ("cost.rate.input", "3.00"),
+        ("cost.rate.output", "15.00"),
+        ("budget.tokens.per_run", "1000"),
+        ("budget.tokens.cumulative", "500000"),
+        ("budget.dollars.per_run", "1.50"),
+        ("budget.dollars.cumulative", "25.00"),
+    ] {
+        let set = run_kt_agent(
+            &["agent", "config", "set", name, key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+        assert!(
+            set.success,
+            "config set {key}={value} should succeed; stderr={}",
+            set.stderr
+        );
+    }
+    (ctx, state)
+}
+
+// ---------------------------------------------------------------------------
+// 5.3 — `--json` key-set freeze + `schema_version` pins (every read command)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_json_document_key_set_and_schema_version_are_frozen() {
+    // `list --json` = FleetListing { schema_version, totals, instances } with
+    // FleetEntry rows and a FleetTotals aggregate. Freezes FleetListing +
+    // FleetEntry + UsageView + FleetTotals in one real-wire assertion.
+    let (ctx, state) = registered_mock("alpha");
+    let run = run_kt_agent(
+        &["agent", "list", "--json"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(
+        &doc,
+        &["instances", "schema_version", "totals"],
+        "FleetListing",
+    );
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert_frozen_keys(&doc["totals"], FLEET_TOTALS_KEYS, "FleetTotals");
+
+    let entry = &doc["instances"].as_array().expect("instances array")[0];
+    assert_frozen_keys(entry, FLEET_ENTRY_KEYS, "FleetEntry");
+    assert_frozen_keys(&entry["usage"], USAGE_VIEW_TOKEN_KEYS, "UsageView");
+}
+
+#[test]
+fn show_json_document_key_set_and_schema_version_are_frozen() {
+    // `show --json` = ShowDocument { schema_version, instance: FleetEntry }.
+    let (ctx, state) = registered_mock("alpha");
+    let run = run_kt_agent(
+        &["agent", "show", "alpha", "--json"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(&doc, &["instance", "schema_version"], "ShowDocument");
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert_frozen_keys(&doc["instance"], FLEET_ENTRY_KEYS, "FleetEntry");
+    assert_frozen_keys(
+        &doc["instance"]["usage"],
+        USAGE_VIEW_TOKEN_KEYS,
+        "UsageView",
+    );
+}
+
+#[test]
+fn usage_json_named_document_key_set_and_schema_version_are_frozen() {
+    // Story 4-3 net-new: `usage <name> --json` = UsageDocument
+    // { schema_version, instance, usage: UsageView } — a SINGLE versioned
+    // document (NOT NDJSON: usage is a snapshot, not a stream), riding the
+    // SHARED FLEET_SCHEMA_VERSION because it serializes fleet-domain content.
+    let (ctx, state) = registered_mock("alpha");
+    let run = run_kt_agent(
+        &["agent", "usage", "alpha", "--json"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(
+        &doc,
+        &["instance", "schema_version", "usage"],
+        "UsageDocument",
+    );
+    // Reuses FLEET_SCHEMA_VERSION (2) — no `usage`-specific constant was minted.
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert_eq!(doc["instance"], serde_json::json!("alpha"));
+    assert_frozen_keys(&doc["usage"], USAGE_VIEW_TOKEN_KEYS, "UsageView");
+}
+
+#[test]
+fn usage_json_fleet_document_key_set_and_schema_version_are_frozen() {
+    // Story 4-3 net-new: `usage --json` (no name) = FleetUsageDocument
+    // { schema_version, totals: FleetTotals } — the Fleet-wide scope FR-22 names.
+    let (ctx, state) = registered_mock("alpha");
+    let run = run_kt_agent(
+        &["agent", "usage", "--json"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(&doc, &["schema_version", "totals"], "FleetUsageDocument");
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert_frozen_keys(&doc["totals"], FLEET_TOTALS_KEYS, "FleetTotals");
+}
+
+#[test]
+fn usage_json_totals_equal_the_list_json_totals_exactly() {
+    // FR-22 honesty: the standalone `usage` command is a different SURFACE over
+    // the SAME aggregate — never a second, independently-summed number. Both
+    // documents must carry byte-identical totals.
+    let (ctx, state) = registered_mock("alpha");
+    let state_dir = state.project_dir.as_path();
+    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let usage = run_kt_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
+    // Fix pass (L5): assert the exit code BEFORE parsing, so a regression that
+    // makes either command fail reports as a code mismatch naming stderr, rather
+    // than an opaque `from_str().unwrap()` serde panic on empty stdout.
+    assert_eq!(list.code, Some(0), "list --json; stderr={}", list.stderr);
+    assert_eq!(usage.code, Some(0), "usage --json; stderr={}", usage.stderr);
+
+    let list_doc: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    let usage_doc: serde_json::Value = serde_json::from_str(&usage.stdout).unwrap();
+    assert_eq!(
+        list_doc["totals"], usage_doc["totals"],
+        "usage --json totals must equal list --json totals exactly",
+    );
+    // And the named form's usage object equals that instance's `list` row usage.
+    let named = run_kt_agent(
+        &["agent", "usage", "alpha", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(named.code, Some(0), "stderr={}", named.stderr);
+    let named_doc: serde_json::Value = serde_json::from_str(&named.stdout).unwrap();
+    assert_eq!(
+        list_doc["instances"][0]["usage"], named_doc["usage"],
+        "usage <name> --json must equal that instance's list row usage",
+    );
+}
+
+#[test]
+fn usage_on_an_empty_fleet_prints_guidance_on_stderr_and_stays_pure_json() {
+    // Fix pass (L3): `list` guides an operator with an empty Fleet; Fleet-wide
+    // `usage` printed only all-zero totals, which reads as "instances that
+    // consumed nothing" rather than "nothing registered". The hint is a NOTICE,
+    // so it rides stderr in BOTH modes (AD-12) and `--json` stdout stays a pure,
+    // parseable document.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let human = run_kt_agent(&["agent", "usage"], &ctx.project_dir, state_dir);
+    assert_eq!(human.code, Some(0), "stderr={}", human.stderr);
+    assert!(
+        human.stderr.contains("No Agent Instances registered yet"),
+        "the empty-Fleet hint belongs on stderr; stderr={}",
+        human.stderr
+    );
+
+    let json = run_kt_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
+    assert_eq!(json.code, Some(0), "stderr={}", json.stderr);
+    assert!(
+        json.stderr.contains("No Agent Instances registered yet"),
+        "stderr={}",
+        json.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", json.stdout));
+    assert_frozen_keys(&doc, &["schema_version", "totals"], "FleetUsageDocument");
+    assert_frozen_keys(&doc["totals"], FLEET_TOTALS_KEYS, "FleetTotals");
+}
+
+#[test]
+fn budget_view_key_set_is_frozen_on_the_json_wire() {
+    // BudgetView only materializes once a budget is CONFIGURED (an un-budgeted
+    // instance is an honest `null`). With a token-only budget and no Rate, the
+    // dollar fields stay absent (skip_serializing_if) — the frozen minimal set.
+    let (ctx, state) = registered_mock("alpha");
+    let state_dir = state.project_dir.as_path();
+    let set = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "alpha",
+            "budget.tokens.cumulative",
+            "500",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "config set should succeed; stderr={}",
+        set.stderr
+    );
+
+    let run = run_kt_agent(
+        &["agent", "show", "alpha", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    let budget = &doc["instance"]["budget"];
+    assert!(
+        budget.is_object(),
+        "a configured budget is an object: {doc}"
+    );
+    assert_frozen_keys(
+        budget,
+        &["breach_action", "cumulative_limit", "cumulative_remaining"],
+        "BudgetView",
+    );
+    // Dollars are integer micros + a label on the wire, NEVER a `$` string
+    // (AD-8/AD-14) — with no Rate the dollar dimension is absent entirely.
+    assert!(
+        !run.stdout.contains('$'),
+        "no `$` on the wire: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn list_json_priced_shape_key_sets_are_frozen() {
+    // Fix pass (H2): the PRICED half of the wire — every fixture above registers
+    // a Rate-less `mock`, so `skip_serializing_if` hid `UsageView`'s three dollar
+    // fields, `FleetTotals`' two, and `BudgetView`'s five from EVERY frozen
+    // assertion in this file. An adversarial pass added a `blended_rate` field to
+    // `UsageView` (populated only in `with_dollars`) and all 69 tests passed.
+    // With a Rate + both Cost Cap scopes configured, the maximal key-sets of all
+    // three types serialize and are frozen here.
+    let (ctx, state) = priced_instance("alpha");
+    let run = run_kt_agent(
+        &["agent", "list", "--json"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(
+        &doc,
+        &["instances", "schema_version", "totals"],
+        "FleetListing",
+    );
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    assert_frozen_keys(
+        &doc["totals"],
+        FLEET_TOTALS_PRICED_KEYS,
+        "FleetTotals (priced)",
+    );
+
+    let entry = &doc["instances"].as_array().expect("instances array")[0];
+    assert_frozen_keys(entry, FLEET_ENTRY_KEYS, "FleetEntry");
+    assert_frozen_keys(
+        &entry["usage"],
+        USAGE_VIEW_PRICED_KEYS,
+        "UsageView (priced)",
+    );
+    assert_frozen_keys(
+        &entry["budget"],
+        BUDGET_VIEW_PRICED_KEYS,
+        "BudgetView (priced)",
+    );
+
+    // On the wire, dollars are INTEGER MICROS + a label — never a `$` string
+    // (AD-8/AD-14), in the priced shape just as in the unpriced one.
+    assert!(
+        !run.stdout.contains('$'),
+        "no `$` on the wire: {}",
+        run.stdout
+    );
+    assert!(
+        entry["usage"]["cumulative_dollars"].is_number(),
+        "dollars are integer micros: {entry}"
+    );
+    assert_eq!(
+        entry["usage"]["estimate_label"],
+        serde_json::json!("estimated"),
+        "{entry}"
+    );
+}
+
+#[test]
+fn show_and_usage_json_priced_shape_key_sets_are_frozen() {
+    // The same PRICED freeze (fix pass, H2) through the OTHER three documents:
+    // `show --json`'s `ShowDocument.instance`, `usage <name> --json`'s
+    // `UsageDocument.usage`, and `usage --json`'s `FleetUsageDocument.totals`.
+    let (ctx, state) = priced_instance("alpha");
+    let state_dir = state.project_dir.as_path();
+
+    let show = run_kt_agent(
+        &["agent", "show", "alpha", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(show.code, Some(0), "stderr={}", show.stderr);
+    let show_doc: serde_json::Value = serde_json::from_str(&show.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", show.stdout));
+    assert_frozen_keys(&show_doc, &["instance", "schema_version"], "ShowDocument");
+    assert_frozen_keys(
+        &show_doc["instance"]["usage"],
+        USAGE_VIEW_PRICED_KEYS,
+        "UsageView (priced)",
+    );
+    assert_frozen_keys(
+        &show_doc["instance"]["budget"],
+        BUDGET_VIEW_PRICED_KEYS,
+        "BudgetView (priced)",
+    );
+
+    let named = run_kt_agent(
+        &["agent", "usage", "alpha", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(named.code, Some(0), "stderr={}", named.stderr);
+    let named_doc: serde_json::Value = serde_json::from_str(&named.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", named.stdout));
+    assert_frozen_keys(
+        &named_doc,
+        &["instance", "schema_version", "usage"],
+        "UsageDocument",
+    );
+    assert_frozen_keys(
+        &named_doc["usage"],
+        USAGE_VIEW_PRICED_KEYS,
+        "UsageView (priced)",
+    );
+
+    let fleet = run_kt_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
+    assert_eq!(fleet.code, Some(0), "stderr={}", fleet.stderr);
+    let fleet_doc: serde_json::Value = serde_json::from_str(&fleet.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", fleet.stdout));
+    assert_frozen_keys(
+        &fleet_doc,
+        &["schema_version", "totals"],
+        "FleetUsageDocument",
+    );
+    assert_frozen_keys(
+        &fleet_doc["totals"],
+        FLEET_TOTALS_PRICED_KEYS,
+        "FleetTotals (priced)",
+    );
+
+    // The priced documents agree with each other exactly (FR-22), just as the
+    // unpriced ones do — one aggregate, several surfaces.
+    assert_eq!(
+        show_doc["instance"]["usage"], named_doc["usage"],
+        "usage <name> --json must equal show --json's usage object",
+    );
+    for out in [&show.stdout, &named.stdout, &fleet.stdout] {
+        assert!(!out.contains('$'), "no `$` on the wire: {out}");
+    }
+}
+
+#[test]
+fn config_get_json_document_key_set_and_schema_version_are_frozen() {
+    // `config get --json` = ConfigDocument { schema_version, entries: [ConfigLeaf] }
+    // with ConfigLeaf { key, value, source, unvalidated }. Its schema_version is
+    // its OWN constant (1) — `config get` is not fleet-domain content.
+    let (ctx, state) = registered_mock("alpha");
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "config", "set", "alpha", "model", "gpt-4"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    let run = run_kt_agent(
+        &["agent", "config", "get", "alpha", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(&doc, &["entries", "schema_version"], "ConfigDocument");
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    let leaf = &doc["entries"].as_array().expect("entries array")[0];
+    assert_frozen_keys(
+        leaf,
+        &["key", "source", "unvalidated", "value"],
+        "ConfigLeaf",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5.3 — `logs --json` NDJSON wire shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logs_json_on_an_empty_log_emits_zero_stdout_lines_not_an_empty_document() {
+    // The NDJSON empty case: no retained output ⇒ NOTHING on stdout (not `[]`,
+    // not `{}`), and still a clean exit 0. Cross-OS (no process spawn needed).
+    let (ctx, state) = registered_mock("nat");
+    let run = run_kt_agent(
+        &["agent", "logs", "nat", "--json"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.is_empty(),
+        "an empty log must emit zero stdout bytes; stdout={}",
+        run.stdout
+    );
+}
+
+/// The ATTRIBUTED output log the engine's capture thread appends to and
+/// `kt agent logs` reads back — `<state>/agents/<name>/logs/output.log`, JSON
+/// Lines (one serialized `LogLine` per line). Distinct from the raw, legacy
+/// `agent.log` next to it (see [`agent_log_path`]).
+fn attributed_output_log_path(state_dir: &Path, name: &str) -> std::path::PathBuf {
+    state_dir
+        .join("agents")
+        .join(name)
+        .join("logs")
+        .join("output.log")
+}
+
+/// Append `lines` to an instance's attributed output log, creating the log
+/// directory if the instance has never been started (fix pass, H4).
+///
+/// This writes the SAME bytes the engine's capture thread writes — one
+/// `serde_json`-serialized `LogLine` per line — so the CLI reads it back through
+/// the ordinary `Supervisor::read_agent_log{,_since}` path with nothing stubbed.
+/// It exists so the NDJSON WIRE CONTRACT (`logs --json`) can be asserted on ALL
+/// THREE OSes: producing real captured output needs a live child that survives
+/// its starting engine session, which only the Unix-only
+/// `start_via_surviving_engine` harness can arrange.
+fn append_captured_log_lines(state_dir: &Path, name: &str, lines: &[ktesio_engine::LogLine]) {
+    use std::io::Write;
+    let path = attributed_output_log_path(state_dir, name);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create the instance log dir");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("open the attributed output log");
+    for line in lines {
+        writeln!(file, "{}", serde_json::to_string(line).unwrap()).expect("append a log line");
+    }
+    file.flush().expect("flush the attributed output log");
+}
+
+/// One captured line, for [`append_captured_log_lines`].
+fn captured(name: &str, stream: ktesio_engine::LogStream, text: &str) -> ktesio_engine::LogLine {
+    ktesio_engine::LogLine::new(name, stream, text, "2026-07-20T12:00:00Z")
+}
+
+/// Assert every non-empty stdout line is ONE complete, compact `LogLine` JSON
+/// object with the FROZEN key-set at the pinned `LOG_SCHEMA_VERSION`, and return
+/// their `text` values in order. Shared by the one-shot and `--follow` NDJSON
+/// tests so both hold the identical wire contract (story 4-3: the shape is the
+/// same for both modes).
+fn assert_ndjson_log_lines(stdout: &str, instance: &str) -> Vec<String> {
+    let mut texts = Vec::new();
+    for (index, raw) in stdout.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        let line: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|e| {
+            panic!("NDJSON line {index} is not valid JSON: {e}\n{raw}\nfull stdout:\n{stdout}")
+        });
+        assert_frozen_keys(
+            &line,
+            &["at", "instance", "schema_version", "stream", "text"],
+            "LogLine",
+        );
+        // `LOG_SCHEMA_VERSION` pinned BY VALUE on the wire (not compared to the
+        // constant it came from — that would be tautological).
+        assert_eq!(line["schema_version"], serde_json::json!(1), "{line}");
+        assert_eq!(line["instance"], serde_json::json!(instance), "{line}");
+        let stream = line["stream"].as_str().expect("stream is a string");
+        assert!(
+            matches!(stream, "agent-out" | "agent-err" | "engine"),
+            "unexpected stream token `{stream}`",
+        );
+        texts.push(line["text"].as_str().expect("text is a string").to_string());
+    }
+    // Stdout is PURE NDJSON — the human `<at> [<stream>] <text>` rendering never
+    // leaks into it, and every notice rides stderr (AD-12/DC-3).
+    assert!(
+        !stdout.contains("[agent-out]")
+            && !stdout.contains("[agent-err]")
+            && !stdout.contains("[engine]"),
+        "stdout must be pure NDJSON, not the human form; stdout={stdout}",
+    );
+    texts
+}
+
+#[test]
+fn logs_json_wire_shape_is_frozen_ndjson_on_every_os() {
+    // Fix pass (H4) — the CROSS-OS guard for the `logs --json` wire contract.
+    //
+    // Before this test the ONLY coverage of the NDJSON shape, the `LogLine`
+    // key-set, the `LOG_SCHEMA_VERSION` VALUE, and stdout purity lived in
+    // `logs_json_emits_..._in_append_order_unix`, which runtime-`return`s on
+    // Windows — and a runtime early-return reports as PASSED, so CI showed green
+    // there with ZERO signal that none of those assertions had run. This test
+    // needs no live child (it seeds the same capture file the engine writes), so
+    // it genuinely runs on all three OSes and gates the wire everywhere.
+    let (ctx, state) = registered_mock("nat");
+    let state_dir = state.project_dir.as_path();
+    append_captured_log_lines(
+        state_dir,
+        "nat",
+        &[
+            captured("nat", ktesio_engine::LogStream::AgentOut, "first out"),
+            captured("nat", ktesio_engine::LogStream::AgentErr, "second \"err\""),
+            captured("nat", ktesio_engine::LogStream::Engine, "third engine"),
+        ],
+    );
+
+    let run = run_kt_agent(
+        &["agent", "logs", "nat", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let texts = assert_ndjson_log_lines(&run.stdout, "nat");
+    // APPEND ORDER — never re-sorted by the whole-second `at` (all three lines
+    // deliberately share one timestamp, so a sort would be observable).
+    assert_eq!(
+        texts,
+        vec!["first out", "second \"err\"", "third engine"],
+        "NDJSON must preserve on-disk append order",
+    );
+    // Compact one-object-per-line (never `to_string_pretty`).
+    assert_eq!(
+        run.stdout.lines().filter(|l| !l.trim().is_empty()).count(),
+        3,
+        "one JSON object per stdout line; stdout={}",
+        run.stdout
+    );
+    // And the human form reports the SAME lines in the SAME order.
+    let human = run_kt_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
+    let human_texts: Vec<String> = human
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| l.split_once("] ").map(|(_, text)| text.to_string()))
+        .collect();
+    assert_eq!(texts, human_texts, "both modes share one order");
+}
+
+#[test]
+fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
+    // Fix pass (H3) — `--follow --json` was NEVER exercised. The whole suite had
+    // exactly one `--follow` invocation and it ran in HUMAN mode, so an
+    // adversarial pass could change the follow loop's
+    // `emit_log_lines(&new_lines, json)` to `emit_log_lines(&new_lines, false)`
+    // — making every INCREMENTAL follow batch emit human text into a stream the
+    // caller is parsing as NDJSON — and all 33 logs tests still passed.
+    //
+    // This test spawns the real `--follow --json`, waits (by POLLING committed
+    // output, never a fixed sleep) until the initial backlog has been emitted,
+    // and only THEN appends a new captured line. The appended line therefore
+    // cannot be part of the already-read backlog: it can only reach stdout
+    // through a follow batch. Cross-OS: a `registered` instance is not `running`,
+    // so follow emits its batch and then exits cleanly on its own.
+    let (ctx, state) = registered_mock("nat");
+    let state_dir = state.project_dir.as_path();
+    append_captured_log_lines(
+        state_dir,
+        "nat",
+        &[captured(
+            "nat",
+            ktesio_engine::LogStream::AgentOut,
+            "backlog line",
+        )],
+    );
+
+    // Redirect the follow child's stdout to a FILE so the parent can poll it for
+    // committed output while the child is still running.
+    let out_path = ctx.project_dir.join("follow-stdout.ndjson");
+    let err_path = ctx.project_dir.join("follow-stderr.txt");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(["agent", "logs", "nat", "--follow", "--json"])
+        .current_dir(&ctx.project_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .stdout(std::fs::File::create(&out_path).expect("create follow stdout file"))
+        .stderr(std::fs::File::create(&err_path).expect("create follow stderr file"))
+        .spawn()
+        .expect("spawn kt agent logs --follow --json");
+
+    // POLL for the backlog to be committed to stdout (the determinism rule: never
+    // sleep to await state). Once ANY line is visible the one-shot read has
+    // already returned, so the backlog it dumped is fixed and cannot include what
+    // we append next.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let seen = std::fs::read_to_string(&out_path).unwrap_or_default();
+        if seen.contains("backlog line") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follow --json never emitted its initial backlog; stdout so far={seen}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // The INCREMENTAL line — appended strictly after the backlog was emitted.
+    append_captured_log_lines(
+        state_dir,
+        "nat",
+        &[captured(
+            "nat",
+            ktesio_engine::LogStream::Engine,
+            "incremental line",
+        )],
+    );
+
+    // Follow must end on its own (the instance is not running) — never hang.
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < exit_deadline,
+            "kt agent logs --follow --json must not hang on a non-running instance"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "follow must exit 0; stderr={}",
+        std::fs::read_to_string(&err_path).unwrap_or_default()
+    );
+
+    let stdout = std::fs::read_to_string(&out_path).expect("read follow stdout");
+    // EVERY line — backlog AND the incremental batch — is still valid NDJSON with
+    // the frozen key-set, and no human rendering leaked in.
+    let texts = assert_ndjson_log_lines(&stdout, "nat");
+    assert_eq!(
+        texts,
+        vec!["backlog line", "incremental line"],
+        "the incremental batch must be emitted, as NDJSON, in append order",
+    );
+    // The exit note is a NOTICE — stderr only (AD-12/DC-3), never mixed into the
+    // NDJSON stream a caller is parsing.
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    assert!(
+        stderr.contains("no further output"),
+        "the honest follow-exit note belongs on stderr; stderr={stderr}"
+    );
+}
+
+#[test]
+fn logs_json_survives_a_consumer_that_stops_reading_and_still_exits_zero() {
+    // Fix pass (M1): `kt agent logs --json | head -5` used to PANIC. Rust ignores
+    // SIGPIPE, so `println!` hit `ErrorKind::BrokenPipe`, unwrapped, and aborted
+    // with exit 101 — a code outside the frozen table `docs/commands.md`
+    // documents ("Every `kt` command returns one of these numeric exit codes").
+    // A closed downstream pipe is not an error: the consumer got what it asked
+    // for, so the command now ends cleanly with 0.
+    //
+    // Cross-OS and no shell needed: the parent closes the read end of the pipe
+    // immediately and enough output is seeded to far exceed any pipe buffer, so
+    // the child provably writes into a closed pipe.
+    let (ctx, state) = registered_mock("nat");
+    let state_dir = state.project_dir.as_path();
+    let lines: Vec<ktesio_engine::LogLine> = (0..5_000)
+        .map(|i| {
+            captured(
+                "nat",
+                ktesio_engine::LogStream::AgentOut,
+                &format!("line {i} — padding to push well past any pipe buffer"),
+            )
+        })
+        .collect();
+    append_captured_log_lines(state_dir, "nat", &lines);
+
+    for json in [true, false] {
+        let mut args = vec!["agent", "logs", "nat"];
+        if json {
+            args.push("--json");
+        }
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+            .args(&args)
+            .current_dir(&ctx.project_dir)
+            .env("KTESIO_NO_UPDATE_CHECK", "1")
+            .env("KTESIO_STATE_DIR", state_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn kt agent logs");
+        // Close the read end at once — every subsequent child write fails with
+        // BrokenPipe, exactly as `| head -5` does once head has its lines.
+        drop(child.stdout.take());
+
+        let status = child.wait().expect("wait for kt agent logs");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a closed stdout consumer must exit 0 (never a 101 panic); args={args:?}",
+        );
+    }
+}
+
+#[test]
+fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_unix() {
+    // AC1/DC-2/DC-3 for the net-new `logs --json`, against a REAL captured log:
+    // every stdout line is ONE complete, compact `LogLine` JSON object carrying
+    // its OWN schema_version (LOG_SCHEMA_VERSION = 1, reused — no new constant),
+    // the key-set is frozen, stdout is pure NDJSON (no note leaks), and the ORDER
+    // matches the human form exactly (append order — never timestamp-sorted,
+    // story 4-2 AC-G).
+    //
+    // Runtime-skip on Windows: mirrors the sibling `logs_*` CLI tests — the
+    // cross-lifetime survival this needs cannot be simulated there. NO `#[cfg]`
+    // (data-driven; this file is outside the backends allowlist).
+    //
+    // RENAMED with the `_unix` suffix (fix pass, H4 — the repo's existing
+    // convention, cf. `pause_prints_paused_state_and_exits_zero_guaranteed_unix`)
+    // because a runtime early-return reports as PASSED: the old name promised
+    // coverage this test does not provide on Windows. The OS-INDEPENDENT half of
+    // its contract — the NDJSON shape, the frozen `LogLine` key-set, the pinned
+    // `LOG_SCHEMA_VERSION`, stdout purity, and append order — now runs on all
+    // three OSes in `logs_json_wire_shape_is_frozen_ndjson_on_every_os`. What
+    // remains here, and only here, is the end-to-end proof over output captured
+    // by the real engine rather than seeded onto disk.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest_with_interaction(
+        &ctx.project_dir,
+        &["--heartbeat-ms", "40", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    assert!(
+        stopped.success,
+        "stop should succeed; stderr={}",
+        stopped.stderr
+    );
+
+    let run = run_kt_agent(
+        &["agent", "logs", "svc", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let lines: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "the retained history must produce NDJSON lines; stdout={}",
+        run.stdout
+    );
+    let mut texts = Vec::new();
+    for (index, raw) in lines.iter().enumerate() {
+        let line: serde_json::Value = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("NDJSON line {index} is not valid JSON: {e}\n{raw}"));
+        // The FROZEN LogLine key-set + its own schema version (reused, not new).
+        assert_frozen_keys(
+            &line,
+            &["at", "instance", "schema_version", "stream", "text"],
+            "LogLine",
+        );
+        assert_eq!(line["schema_version"], serde_json::json!(1), "{line}");
+        assert_eq!(line["instance"], serde_json::json!("svc"));
+        // `stream` is the kebab-case AD-12 attribution vocabulary.
+        let stream = line["stream"].as_str().expect("stream is a string");
+        assert!(
+            matches!(stream, "agent-out" | "agent-err" | "engine"),
+            "unexpected stream token `{stream}`",
+        );
+        texts.push(line["text"].as_str().expect("text is a string").to_string());
+    }
+
+    // Stdout is PURE NDJSON: the human `<at> [<stream>]` rendering never leaks
+    // into it, and notices ride stderr (AD-12/DC-3).
+    assert!(
+        !run.stdout.contains("[agent-out]") && !run.stdout.contains("[engine]"),
+        "stdout must be pure NDJSON, not the human form; stdout={}",
+        run.stdout
+    );
+
+    // APPEND ORDER: the NDJSON `text` sequence equals the human form's sequence
+    // (same read, same order — never re-sorted by the whole-second `at`).
+    let human = run_kt_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
+    let human_texts: Vec<String> = human
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        // Human form is `<at> [<stream>] <text>` — take everything after "] ".
+        .filter_map(|l| l.split_once("] ").map(|(_, text)| text.to_string()))
+        .collect();
+    assert_eq!(
+        texts, human_texts,
+        "NDJSON order must match the human append order exactly",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5.2 — the numeric exit-code contract, end-to-end through the real binary
+// ---------------------------------------------------------------------------
+//
+// The exhaustive diagnostic→code mapping (including code 5 and code 6, whose
+// triggering conditions need a live/stuck child process) is pinned
+// deterministically and cross-OS by the classifier unit tests in
+// `crates/kt/src/exit_code.rs`. The tests below prove the OTHER half: that the
+// classifier is actually WIRED to the process exit status through `main`, for
+// each condition reachable without a real spawned agent.
+
+#[test]
+fn a_successful_read_command_exits_with_the_success_code() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let run = run_kt_agent(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(0), "success is 0; stderr={}", run.stderr);
+}
+
+#[test]
+fn agent_show_missing_instance_exits_with_the_not_found_code() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    for args in [
+        vec!["agent", "show", "ghost"],
+        vec!["agent", "usage", "ghost"],
+        vec!["agent", "logs", "ghost"],
+    ] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(3),
+            "{args:?} must exit 3 (not found); stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn a_missing_manifest_exits_with_the_not_found_code() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let missing = ctx.project_dir.join("no-such-adapter-dir");
+    let run = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "m",
+            "--manifest",
+            missing.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(3), "stderr={}", run.stderr);
+}
+
+#[test]
+fn invalid_invocations_exit_with_the_usage_code() {
+    // Code 2 covers BOTH clap's own parse/usage errors (unchanged — clap exits
+    // 2 itself) and the modeled usage diagnostics.
+    let (ctx, state) = registered_mock("alpha");
+    let state_dir = state.project_dir.as_path();
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "duplicate name",
+            vec!["agent", "register", "alpha", "--kind", "mock"],
+        ),
+        (
+            "invalid name",
+            vec!["agent", "register", "BadName", "--kind", "mock"],
+        ),
+        (
+            "unknown kind",
+            vec!["agent", "register", "b", "--kind", "no-such-kind"],
+        ),
+        (
+            "unknown config key",
+            vec!["agent", "config", "set", "alpha", "nope", "1"],
+        ),
+        // clap: an unknown flag, and a missing required adapter selector.
+        ("clap unknown flag", vec!["agent", "list", "--nope"]),
+        ("clap missing adapter", vec!["agent", "register", "z"]),
+    ];
+    for (what, args) in cases {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{what} ({args:?}) must exit 2 (usage); stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn a_malformed_instance_name_exits_with_the_usage_code_on_every_read_command() {
+    // Fix pass (M2), ratified "make it uniformly 2". A malformed name is a USAGE
+    // error (2) on every command, not "not found" (3) on some of them.
+    //
+    // `logs`/`stop`/`show` pass the raw name into an engine call that validates it
+    // (`InstanceName::new` → `InvalidName` → 2). `usage <name>` and `show --json`
+    // instead resolved the instance with a linear `find` over `fleet()` and then
+    // SYNTHESIZED `RegistryError::NotFound`, so the SAME input exited 3 there —
+    // two different codes for one condition, which is exactly what a scripted
+    // caller cannot branch on. Both now validate first.
+    let (ctx, state) = registered_mock("alpha");
+    let state_dir = state.project_dir.as_path();
+    for bad in ["Bad Name", "UPPER", "-leading"] {
+        for args in [
+            vec!["agent", "usage", bad],
+            vec!["agent", "usage", bad, "--json"],
+            vec!["agent", "show", bad],
+            vec!["agent", "show", bad, "--json"],
+            vec!["agent", "logs", bad],
+            vec!["agent", "stop", bad],
+        ] {
+            let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+            assert_eq!(
+                run.code,
+                Some(2),
+                "{args:?} must exit 2 (usage), never 3 (not found); stderr={}",
+                run.stderr
+            );
+        }
+    }
+    // And a WELL-FORMED but unregistered name still exits 3 — the validation
+    // above must not swallow the genuine not-found case.
+    for args in [
+        vec!["agent", "usage", "ghost", "--json"],
+        vec!["agent", "show", "ghost", "--json"],
+    ] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(3),
+            "{args:?} must still exit 3 (not found); stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn an_operation_on_a_wrong_state_instance_exits_with_the_invalid_state_code() {
+    // A never-started instance cannot be stopped/paused/resumed — the uniform
+    // invalid-transition class (code 4).
+    let (ctx, state) = registered_mock("alpha");
+    let state_dir = state.project_dir.as_path();
+    for args in [
+        vec!["agent", "stop", "alpha"],
+        vec!["agent", "pause", "alpha"],
+        vec!["agent", "resume", "alpha"],
+    ] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(4),
+            "{args:?} must exit 4 (invalid state); stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn an_internal_failure_exits_with_the_general_code() {
+    // A structurally INVALID manifest (present, parses, but fails validation)
+    // is the general/internal class — code 1, which is also the catch-all.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let dir = ctx.project_dir.join("bad-adapter");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("adapter.toml"),
+        "contract_version = \"0.1.0\"\n[adapter]\nkind = \"x\"\n",
+    )
+    .unwrap();
+    let run = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "bad",
+            "--manifest",
+            dir.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(
+        run.code,
+        Some(1),
+        "an invalid manifest must exit 1 (general); stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn help_and_version_still_exit_zero() {
+    // clap's `0` for `--help`/`--version` is preserved (never reclassified).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    for args in [vec!["--help"], vec!["--version"], vec!["agent", "--help"]] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(0),
+            "{args:?} must exit 0; stderr={}",
+            run.stderr
+        );
+    }
 }

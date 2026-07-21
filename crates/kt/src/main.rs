@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod exit_code;
 mod install_channel;
 mod ui;
 mod update_check;
@@ -186,6 +187,20 @@ enum AgentCommands {
         /// arrive; exits cleanly (with a note) once the instance stops or pauses
         #[arg(long, short = 'f')]
         follow: bool,
+        /// Emit each captured line as newline-delimited JSON (one self-versioned
+        /// engine `LogLine` per stdout line, NDJSON — AD-14); identical shape for
+        /// one-shot and `--follow`. Notices/diagnostics stay on stderr.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report Usage Ledger token totals (and derived dollar cost) for one
+    /// instance, or Fleet-wide totals when no name is given (FR-22)
+    Usage {
+        /// Optional Agent Instance name; omitted reports the Fleet-wide totals
+        name: Option<String>,
+        /// Emit the usage snapshot as a machine-readable JSON document (AD-14)
+        #[arg(long)]
+        json: bool,
     },
     /// List every Agent Instance in the Fleet
     List {
@@ -242,8 +257,15 @@ enum ConfigCommands {
 #[cfg(not(tarpaulin_include))]
 fn main() {
     if let Err(err) = run_cli() {
+        // Classify the boxed diagnostic into the documented, stable numeric exit
+        // code (story 4-3, FR-26 / PRD §7) BEFORE it is consumed by `ui::error`.
+        // clap's own usage/parse errors already exit `2` and `--help`/`--version`
+        // exit `0` from inside `Cli::parse()`, so they never reach here; this maps
+        // only the runtime diagnostics, with any unmapped error falling to `1`
+        // (preserving the pre-4-3 behavior). See `exit_code::classify`.
+        let code = exit_code::classify(err.as_ref());
         ui::error(err);
-        std::process::exit(1);
+        std::process::exit(code.code());
     }
 }
 
@@ -283,7 +305,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),
             AgentCommands::Send { name, text } => cli::agent::send(&name, &text),
-            AgentCommands::Logs { name, follow } => cli::agent::logs(&name, follow),
+            AgentCommands::Logs { name, follow, json } => cli::agent::logs(&name, follow, json),
+            AgentCommands::Usage { name, json } => cli::agent::usage(name.as_deref(), json),
             AgentCommands::List { json } => cli::agent::list(json),
             AgentCommands::Show { name, json } => cli::agent::show(&name, json),
             AgentCommands::Config { command } => match command {
@@ -398,6 +421,7 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "resume"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "send"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "logs"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "usage"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
@@ -519,32 +543,78 @@ mod tests {
 
     #[test]
     fn test_agent_logs_parse() {
-        // `logs <name>` and `logs <name> --follow`/`-f` parse (story 4-2).
+        // `logs <name>` and `logs <name> --follow`/`-f` parse (story 4-2), plus
+        // `logs <name> --json` and the `--follow --json` combination (story 4-3).
         assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc"]).is_ok());
         assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--follow"]).is_ok());
         assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "-f"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--follow", "--json"]).is_ok());
         // Missing name is a clap error.
         assert!(Cli::try_parse_from(["kt", "agent", "logs"]).is_err());
 
-        // The bare form defaults follow to false; --follow/-f sets it true.
+        // The bare form defaults follow AND json to false; --follow/-f sets follow,
+        // --json sets json.
         let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc"]).unwrap();
         let Some(Commands::Agent {
-            command: AgentCommands::Logs { name, follow },
+            command: AgentCommands::Logs { name, follow, json },
         }) = parsed.command
         else {
             panic!("expected Agent(Logs)");
         };
         assert_eq!(name, "svc");
         assert!(!follow);
+        assert!(!json);
 
         let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc", "-f"]).unwrap();
         let Some(Commands::Agent {
-            command: AgentCommands::Logs { follow, .. },
+            command: AgentCommands::Logs { follow, json, .. },
         }) = parsed.command
         else {
             panic!("expected Agent(Logs)");
         };
         assert!(follow);
+        assert!(!json);
+
+        let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc", "--json"]).unwrap();
+        let Some(Commands::Agent {
+            command: AgentCommands::Logs { json, .. },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Logs)");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn test_agent_usage_parse() {
+        // Story 4-3: `usage` (Fleet-wide), `usage <name>`, and either with `--json`
+        // all parse — the optional positional name mirrors `show`/`list`'s duality.
+        assert!(Cli::try_parse_from(["kt", "agent", "usage"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "usage", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "usage", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "usage", "svc", "--json"]).is_ok());
+
+        // No name → None (the Fleet-wide form); a name → Some.
+        let parsed = Cli::try_parse_from(["kt", "agent", "usage", "--json"]).unwrap();
+        let Some(Commands::Agent {
+            command: AgentCommands::Usage { name, json },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Usage)");
+        };
+        assert_eq!(name, None);
+        assert!(json);
+
+        let parsed = Cli::try_parse_from(["kt", "agent", "usage", "svc"]).unwrap();
+        let Some(Commands::Agent {
+            command: AgentCommands::Usage { name, json },
+        }) = parsed.command
+        else {
+            panic!("expected Agent(Usage)");
+        };
+        assert_eq!(name.as_deref(), Some("svc"));
+        assert!(!json);
     }
 
     #[test]

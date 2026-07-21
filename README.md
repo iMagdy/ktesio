@@ -154,15 +154,18 @@ The agent runner lives under `kt agent`. Every command supports `--help`.
 | `kt agent register <name> --manifest <path>` | Register an instance from an `adapter.toml` manifest adapter |
 | `kt agent list [--json]` | List every Agent Instance in the Fleet |
 | `kt agent show <name> [--json]` | Show one instance's capabilities, runtime status, usage, and budget |
+| `kt agent usage [<name>] [--json]` | Read Usage Ledger totals for one instance, or Fleet-wide |
 | `kt agent start <name>` | Start a registered instance |
 | `kt agent stop <name> [--timeout <secs>]` | Stop a running instance (graceful, then forced after the window) |
 | `kt agent pause <name>` | Pause a running instance (honest per-OS semantics) |
 | `kt agent resume <name>` | Resume a paused instance |
+| `kt agent send <name> <text>` | Send a line of input to a running instance's stdin |
+| `kt agent logs <name> [--follow] [--json]` | Read an instance's retained output (`--json` emits NDJSON, one line per record) |
 | `kt agent remove <name> [--delete\|--retain] [--force]` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
 | `kt agent config set <name> <key> <value>` | Set one config key on the instance layer (validated at write time) |
 | `kt agent config get <name> [<key>] [--json] [--reveal]` | Read the effective config with per-value source (`--reveal` un-masks secrets) |
 
-See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys.
+See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys, and the [exit-code table](docs/commands.md#exit-codes) for the documented numeric codes every command returns.
 
 ## Documentation
 

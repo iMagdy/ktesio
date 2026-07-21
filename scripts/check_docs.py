@@ -43,6 +43,7 @@ AGENT_COMMANDS = {
     "resume",
     "send",
     "logs",
+    "usage",
     "list",
     "show",
     "config",
