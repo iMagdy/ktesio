@@ -32,8 +32,13 @@
 //! implements the graceful step as "give the process the window to exit on its
 //! own, then terminate the job": it waits up to `graceful_window` for the
 //! process to exit, and if it has not, escalates to `TerminateJobObject`
-//! (`forced == true`). If the process exits within the window, the stop is
-//! graceful (`forced == false`). Richer graceful mechanisms (a
+//! (`forced == true`), then CONFIRMS death bounded to
+//! [`crate::ports::KILL_CONFIRM_TIMEOUT`] (fix pass, review of #80 follow-up
+//! — the CRITICAL finding: a thread stuck in kernel-mode I/O is not
+//! terminated until it returns to user mode, so termination can be sent
+//! successfully yet the process still not actually exit for a while — see
+//! that constant's docs). If the process exits within the graceful window,
+//! the stop is graceful (`forced == false`). Richer graceful mechanisms (a
 //! `CTRL_BREAK_EVENT` to the process group, or an adapter-specific shutdown
 //! request) are a later refinement; the no-survivor guarantee is unchanged.
 //!
@@ -85,8 +90,9 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::ports::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec,
-    StopOutcome,
+    spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
+    ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
+    KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 
 /// `STILL_ACTIVE` (259): the exit code a process reports while still running.
@@ -116,6 +122,30 @@ pub struct WindowsProcess {
     adopted: HANDLE,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
+    /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
+    /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
+    /// SPAWNED process whose declared `Capability::Interaction` was
+    /// `Guaranteed`/`BestEffort` on this OS (`SpawnSpec::pipe_stdin`);
+    /// `NoPipe` for an ADOPTED process (a pipe handle cannot be recovered
+    /// from a bare PID — no undocumented API; parity with the Unix backend
+    /// and this module's own pause `[ASSUMPTION]` precedent) or a freshly
+    /// spawned one that was never piped (interaction `Unsupported`);
+    /// `TimedOut` once a bounded write on this handle has exceeded
+    /// [`STDIN_WRITE_TIMEOUT`] and can never be safely retried. `send_input`
+    /// on anything but a `Live` state must therefore fail honestly
+    /// (`EngineError::InteractionUnavailable` /
+    /// `EngineError::InteractionTimedOut`), never silently succeed.
+    stdin: StdinState,
+    /// The output-capture pipeline handle (story 4-2, AD-12; fix pass,
+    /// review of #80), if this handle has one. `Some` for a FRESHLY SPAWNED
+    /// handle whenever the caller gave us somewhere to capture; `None` for
+    /// an ADOPTED process — no live tailer thread survives the engine
+    /// process that spawned it (parity with `stdin`'s `NoPipe`-on-
+    /// adoption). Not a functional gap for `kt agent logs`/`--follow`
+    /// (AC-H): reading only needs the crash-immune raw FILES, which the
+    /// agent process itself keeps writing to directly (never through any
+    /// engine-held handle) for as long as it lives.
+    log_capture: Option<LogCapture>,
 }
 
 // The raw Job / process HANDLEs are owned OS resources this struct is solely
@@ -123,7 +153,16 @@ pub struct WindowsProcess {
 unsafe impl Send for WindowsProcess {}
 
 impl Drop for WindowsProcess {
+    /// Fix pass (review of #80): ALSO signals the output-capture pipeline's
+    /// background tailer thread to stop (one final catch-up pass, then
+    /// exit) — unconditionally, mirroring the Unix backend's identical
+    /// addition. Purely local bookkeeping; the agent process's crash
+    /// resilience comes entirely from the raw capture files being direct,
+    /// engine-independent OS redirects, never from this signal.
     fn drop(&mut self) {
+        if let Some(capture) = &self.log_capture {
+            capture.signal_stop();
+        }
         // Spawned: closing the job handle kills the tree (kill-on-close), then
         // release it. Adopted: SIGKILL-equivalent is not applied on drop for a
         // process we merely re-opened (parity with Unix would kill it; but on
@@ -198,29 +237,86 @@ impl ProcessBackend for WindowsBackend {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
-        match &spec.log_file {
-            Some(path) => {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| BackendError::Spawn {
-                        exec: spec.exec.clone(),
-                        detail: format!("could not open log file {}: {e}", path.display()),
-                    })?;
-                let err_clone = file.try_clone().map_err(|e| BackendError::Spawn {
-                    exec: spec.exec.clone(),
-                    detail: format!("could not duplicate log handle: {e}"),
-                })?;
-                command.stdout(Stdio::from(file));
-                command.stderr(Stdio::from(err_clone));
+        // Story 4-2 (AD-12, AC-E), fix pass (review of #80): stdout/stderr
+        // capture is UNCONDITIONAL and capability-independent — each stream
+        // is redirected DIRECTLY to its OWN regular file (crash-immune, NOT
+        // a pipe) whenever the caller gave us somewhere to write all THREE
+        // capture destinations (every PRODUCTION spawn does; the supervisor
+        // always computes `log_file`/`stderr_log_file`/`attributed_log_path`
+        // together from the SAME Registry path authority). Mirrors the Unix
+        // backend's identical branch — see its comment for the full
+        // rationale (including why `None`/`None`/`None` is a narrow
+        // test-fixture convenience, not a capability gate).
+        debug_assert!(
+            spec.log_file.is_some() == spec.attributed_log_path.is_some()
+                && spec.log_file.is_some() == spec.stderr_log_file.is_some(),
+            "SpawnSpec's three capture-path fields must be all Some or all None together"
+        );
+        let capture = match (
+            &spec.log_file,
+            &spec.stderr_log_file,
+            &spec.attributed_log_path,
+        ) {
+            (Some(stdout_raw), Some(stderr_raw), Some(attributed)) => {
+                Some((stdout_raw.clone(), stderr_raw.clone(), attributed.clone()))
             }
-            None => {
-                command.stdout(Stdio::null());
-                command.stderr(Stdio::null());
+            _ => None,
+        };
+        // Fail FAST (mirrors the pre-story eager log_file-open validation)
+        // if any destination cannot be opened — never a silent no-capture
+        // outcome an operator would only notice from an unexpectedly-empty
+        // log later. `stdout_target`/`stderr_target` are the SAME open
+        // `File`s handed directly to `Stdio::from` below (a successful open
+        // IS the fail-fast proof); the attributed path is validated then
+        // dropped (whichever of the background tailer thread or an inline
+        // `send_engine_line` call reopens it per-append). Mirrors the Unix
+        // backend's identical logic.
+        let (stdout_target, stderr_target) = match &capture {
+            Some((stdout_raw, stderr_raw, attributed)) => {
+                let open = |path: &std::path::Path, label: &str| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map_err(|e| BackendError::Spawn {
+                            exec: spec.exec.clone(),
+                            detail: format!("could not open {label} {}: {e}", path.display()),
+                        })
+                };
+                let stdout_file = open(stdout_raw, "log file")?;
+                let stderr_file = open(stderr_raw, "stderr log file")?;
+                drop(open(attributed, "attributed output log")?);
+                (Some(stdout_file), Some(stderr_file))
             }
-        }
-        command.stdin(Stdio::null());
+            None => (None, None),
+        };
+        // DIRECT, crash-immune redirects (never `Stdio::piped()`): the
+        // agent's `write()` to either stream succeeds or fails based ONLY
+        // on this regular file, never on whether the engine process is even
+        // still alive to read anything.
+        command.stdout(match stdout_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
+        });
+        command.stderr(match stderr_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
+        });
+        // Piped ONLY when the caller (the supervisor, at spawn time) resolved
+        // the declared Capability::Interaction level to Guaranteed/BestEffort
+        // on this OS (story 4.1 fix pass, HIGH finding — review of #79;
+        // supersedes the story's original unconditional `Stdio::piped()`).
+        // An adapter that declares no interaction support gets Stdio::null()
+        // — the pre-story-4.1 safe default — so a process that blocks
+        // reading stdin at startup (a common "sniff for piped input" real-CLI
+        // idiom) sees immediate EOF instead of hanging forever on a pipe
+        // whose write end this engine holds open for its whole supervised
+        // lifetime. Mirrors the Unix backend's identical branch.
+        command.stdin(if spec.pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         // A new process group isolates console signals (so a stray Ctrl-C to the
         // engine's console does not hit the agent). We do NOT create the child
         // suspended: std does not expose the main-thread handle needed to resume
@@ -228,7 +324,7 @@ impl ProcessBackend for WindowsBackend {
         // module docs on the sub-millisecond assign-after-spawn window).
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
-        let child = command.spawn().map_err(|e| BackendError::Spawn {
+        let mut child = command.spawn().map_err(|e| BackendError::Spawn {
             exec: spec.exec.clone(),
             detail: e.to_string(),
         })?;
@@ -256,11 +352,37 @@ impl ProcessBackend for WindowsBackend {
 
         // Assignment succeeded — hand the job handle to the process struct.
         let job = job_guard.into_inner();
+        // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
+        // (story 4.1) — `child.stdin` is `Some` exactly when `spec.pipe_stdin`
+        // was true above (Stdio::piped() populates it; Stdio::null() never
+        // does), so branching on std's own answer is simpler and more robust
+        // than re-deriving it from `spec.pipe_stdin` a second time. An
+        // adopted handle never has one (see `adopt` below).
+        let stdin = match child.stdin.take() {
+            Some(s) => StdinState::Live(s),
+            None => StdinState::NoPipe,
+        };
+        // Story 4-2 (Task 3), fix pass (review of #80): a FRESHLY SPAWNED
+        // handle gets the output-capture pipeline whenever `capture` is
+        // `Some`. `spawn_output_capture` takes only the raw files' PATHS
+        // (never `child.stdout`/`child.stderr` — those stay `None` here,
+        // since neither stream was piped) — the tailer it starts reopens
+        // them by path on every poll, which is what makes this crash-immune.
+        let log_capture = capture.map(|(stdout_raw_path, stderr_raw_path, attributed_log_path)| {
+            spawn_output_capture(
+                stdout_raw_path,
+                stderr_raw_path,
+                attributed_log_path,
+                spec.instance_name.clone(),
+            )
+        });
         Ok(WindowsProcess {
             child: Some(child),
             job,
             adopted: std::ptr::null_mut(),
             pid,
+            stdin,
+            log_capture,
         })
     }
 
@@ -287,9 +409,9 @@ impl ProcessBackend for WindowsBackend {
             sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
 
-        // Escalate. Spawned: terminate the whole job (kills parent + descendants)
-        // and reap the child. Adopted (no job, no child): terminate the opened
-        // process HANDLE with TerminateProcess.
+        // Escalate. Spawned: terminate the whole job (kills parent + descendants).
+        // Adopted (no job, no child): terminate the opened process HANDLE with
+        // TerminateProcess.
         if !handle.job.is_null() {
             let ok = unsafe { TerminateJobObject(handle.job, 1) };
             if ok == 0 {
@@ -306,14 +428,21 @@ impl ProcessBackend for WindowsBackend {
                     detail: format!("TerminateProcess failed (os error {})", last_error()),
                 });
             }
-            // Wait briefly for the adopted process to actually exit.
-            let h = handle.adopted;
-            let _ = unsafe { WaitForSingleObject(h, 5000) };
         }
-        // Reap the direct child if it is ours (adopted: OS handles it).
-        if let Some(child) = handle.child.as_mut() {
-            let _ = child.wait();
-        }
+        // CONFIRM death — bounded to KILL_CONFIRM_TIMEOUT (fix pass, review
+        // of #80 follow-up — the CRITICAL finding; see that constant's docs
+        // for the full mechanism, which applies identically on Windows: a
+        // thread stuck in kernel-mode I/O is not terminated until it returns
+        // to user mode, so `TerminateJobObject`/`TerminateProcess` can be
+        // sent successfully yet the process still does not actually exit
+        // for a while). A single unified polling loop via `reap_if_exited`
+        // (NON-BLOCKING on both the spawned — `try_wait` +
+        // `WaitForSingleObject(_, 0)` — and adopted branches) replaces the
+        // OLD unbounded `child.wait()` (spawned) / a fire-and-forget
+        // `WaitForSingleObject(_, 5000)` whose result was discarded (adopted
+        // — it silently returned `Ok` even if the process was still alive
+        // after its own 5s wait).
+        confirm_death(handle, KILL_CONFIRM_TIMEOUT)?;
         Ok(StopOutcome { forced: true })
     }
 
@@ -384,12 +513,50 @@ impl ProcessBackend for WindowsBackend {
         }
         // Same process. Hold the opened handle for liveness + TerminateProcess
         // (no Job — the process is already running and may be in one already).
+        //
+        // `stdin: StdinState::NoPipe` (story 4.1): an adopted handle has no
+        // recoverable pipe — there is no OS-portable, documented way to
+        // reopen a `ChildStdin` from a bare pid. `send_input` against this
+        // handle fails with `EngineError::InteractionUnavailable`, never
+        // silently succeeding.
+        //
+        // `log_capture: None` (story 4-2, fix pass review of #80): no live
+        // tailer thread survives the engine process that spawned it, so an
+        // adopted handle gets no capture pipeline either. Reading/following
+        // this instance's output still works (AC-H) — it needs only the
+        // crash-immune raw FILES the agent process itself keeps writing to
+        // directly, for as long as it lives.
         Ok(Some(WindowsProcess {
             child: None,
             job: std::ptr::null_mut(),
             adopted: h,
             pid: fingerprint.pid,
+            stdin: StdinState::NoPipe,
+            log_capture: None,
         }))
+    }
+
+    fn has_stdin(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_live()
+    }
+
+    fn stdin_timed_out(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_timed_out()
+    }
+
+    fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError> {
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): bounded via
+        // the shared, portable thread+channel+recv_timeout mechanism — see
+        // `write_stdin_bounded`'s docs. Identical to the Unix backend's body
+        // (this file and `backends/unix/mod.rs` intentionally share ONE
+        // implementation via this call, rather than two separate OS timeout
+        // implementations, since the mechanism has no OS-specific part: a
+        // `ChildStdin` write is portable `std` on both).
+        write_stdin_bounded(&mut handle.stdin, data, STDIN_WRITE_TIMEOUT)
+    }
+
+    fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture> {
+        handle.log_capture.clone()
     }
 }
 
@@ -515,6 +682,39 @@ impl Drop for JobGuard {
 fn last_error() -> u32 {
     // SAFETY: GetLastError is always safe to call and has no preconditions.
     unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+/// Poll `handle` (via the NON-BLOCKING [`WindowsProcess::reap_if_exited`])
+/// until it reports exited, or `timeout` elapses — the bounded
+/// death-confirmation primitive [`WindowsBackend::stop`]'s escalation phase
+/// uses (fix pass, review of #80 follow-up — the CRITICAL finding). Mirrors
+/// the Unix backend's identical `confirm_death` helper.
+///
+/// `timeout` is a PARAMETER (never hardcoded in this function) so it stays
+/// directly unit-testable with a SHORT duration for fast, deterministic
+/// coverage of the bound-enforcement logic itself — mirrors
+/// [`write_stdin_bounded`]'s existing "timeout as a parameter, tested
+/// directly with a short value" precedent (story 4.1 fix pass); production
+/// calls this with [`KILL_CONFIRM_TIMEOUT`]. Returns `Ok(())` once confirmed
+/// dead; [`BackendError::StopUnconfirmed`] if `timeout` elapses first
+/// (naming the ACTUAL `timeout` passed); any other [`BackendError`] from
+/// `reap_if_exited` propagates unchanged.
+fn confirm_death(handle: &mut WindowsProcess, timeout: Duration) -> Result<(), BackendError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.reap_if_exited()?.is_exited() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Release the caller (never keep blocking): the process is NOT
+            // confirmed dead — it may be alive, stuck. The caller
+            // (`Supervisor::stop_inner`) must not claim `stopped`.
+            return Err(BackendError::StopUnconfirmed {
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+        sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
 }
 
 /// Check the engine secrets file's permissions on Windows (story 2-4 AC6, spine

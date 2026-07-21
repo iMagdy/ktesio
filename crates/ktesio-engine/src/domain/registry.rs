@@ -979,11 +979,32 @@ impl Registry {
         self.instance_log_dir(name).join("instance.log")
     }
 
-    /// The per-instance AGENT output log FILE — the spawned process's
-    /// stdout/stderr capture (AD-12 seed). Kept separate from the engine event
-    /// log; full agent-out/agent-err attribution + rotation is Epic 4.
+    /// The per-instance AGENT output log FILE — the spawned process's STDOUT
+    /// capture (AD-12 seed). Kept separate from the engine event log.
+    ///
+    /// Fix pass (review of #80): this is now a DIRECT, crash-immune
+    /// redirect target for the child's stdout ALONE (`Stdio::from(file)`) —
+    /// the write path Epic 3's `drain_usage_for` depends on for its
+    /// billing-critical `KTESIO_USAGE` sentinel read, which is a
+    /// stdout-only convention (`docs/manifest.md`/`docs/architecture.md`).
+    /// Stderr is captured SEPARATELY (see
+    /// [`Self::agent_stderr_log_path`]) rather than merged back into this
+    /// file, so this file's write path never depends on any engine-side
+    /// hop (thread, tailer, or otherwise) — only the OS and the agent
+    /// process itself.
     pub(crate) fn agent_output_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
         self.instance_log_dir(name).join("agent.log")
+    }
+
+    /// The per-instance RAW STDERR capture FILE (fix pass, review of #80) —
+    /// the crash-immune counterpart of [`Self::agent_output_log_path`] for
+    /// the child's stderr: a DIRECT redirect target (`Stdio::from(file)`),
+    /// never a live pipe, so the agent's stderr writes never depend on the
+    /// engine's liveness either. Feeds the attributed capture's background
+    /// tailer (`agent-err` lines); NOT merged into the legacy `agent.log`
+    /// (which stays stdout-only — see that path's docs for why).
+    pub(crate) fn agent_stderr_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("agent-stderr.log")
     }
 
     /// The per-instance BUDGET-BREACH log FILE — the JSON-Lines
@@ -996,6 +1017,35 @@ impl Registry {
     /// record + the seed the future bus reads.
     pub(crate) fn instance_breach_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
         self.instance_log_dir(name).join("breaches.log")
+    }
+
+    /// The per-instance ATTRIBUTED, ROTATED output-capture FILE — the
+    /// CURRENT generation (story 4-2, AD-12). A timestamped, per-stream-
+    /// attributed (`agent-out`/`agent-err`/`engine`) JSON-Lines view of the
+    /// spawned process's output, distinct from [`Self::agent_output_log_path`]
+    /// (`agent.log`): that legacy file stays raw, unattributed, and
+    /// BYTE-IDENTICAL to before this story (CRITICAL SCOPING #3 — Epic 3's
+    /// `drain_usage_for` keeps reading it exactly as today). Bounded to
+    /// [`crate::ports::LOG_ROTATE_MAX_BYTES`] per generation before rotating
+    /// (see [`Self::attributed_output_log_generation_path`]).
+    pub(crate) fn attributed_output_log_path(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.instance_log_dir(name).join("output.log")
+    }
+
+    /// A ROTATED generation of the attributed output log (story 4-2, AD-12) —
+    /// `generation` `1` is the most-recently-rotated predecessor, `2` the
+    /// oldest still retained (AD-12's fixed "10MB × 3": current +
+    /// [`Self::attributed_output_log_path`] + generations `1` and `2`).
+    /// Mirrors `ports::process_backend`'s internal rotation naming exactly
+    /// (`output.log.<n>`) so the read side and the write side agree on
+    /// every generation's path without either depending on the other.
+    pub(crate) fn attributed_output_log_generation_path(
+        &self,
+        name: &InstanceName,
+        generation: u8,
+    ) -> std::path::PathBuf {
+        self.instance_log_dir(name)
+            .join(format!("output.log.{generation}"))
     }
 
     /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;

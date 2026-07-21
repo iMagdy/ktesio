@@ -11,6 +11,10 @@
 .DS_Store
 Thumbs.db
 
+# Python bytecode from the repo's gate scripts (scripts/*.py) — never tracked
+__pycache__/
+*.pyc
+
 # BMAD Method artifacts — kept locally, not tracked in the repo
 /_bmad/
 /_bmad-output/

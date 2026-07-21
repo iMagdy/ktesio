@@ -306,11 +306,25 @@ fn breach_action_stop_drives_the_instance_to_stopped() {
     facade.start("hardstop").unwrap();
 
     // The instance reaches the terminal `stopped` state (the stop Breach Action).
+    // 50s, not 30s: a budget-breach stop always uses the DEFAULT graceful
+    // window (DEFAULT_STOP_WINDOW = 30s -- `stop_with_cause` has no way to
+    // pass a shorter one), and on WINDOWS that window is ALWAYS fully
+    // consumed -- unlike Unix, where SIGTERM's default disposition kills
+    // `fake_agent` (no custom handler; see its own module docs) almost
+    // instantly, Windows sends nothing during the graceful phase (no
+    // CTRL_BREAK_EVENT equivalent is implemented yet), so `--linger-ms
+    // 600000` just keeps running until the FULL 30s elapses and the engine
+    // escalates to TerminateJobObject + up to KILL_CONFIRM_TIMEOUT (5s) to
+    // confirm death. A 30s test deadline races the SAME 30s window with
+    // zero margin -- a coin flip on Windows, not a contention-dependent
+    // flake (confirmed empirically: this exact race, same symptom, on two
+    // separate CI runs). 50s gives ~15s of headroom over the 35s worst-case
+    // critical path, and stays under nextest's own 60s slow-timeout marker.
     wait_for_state(
         state.path(),
         "hardstop",
         LifecycleState::Stopped,
-        Duration::from_secs(30),
+        Duration::from_secs(50),
     );
 
     // The breach is recorded with the stop action.
