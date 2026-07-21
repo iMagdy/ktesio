@@ -1,40 +1,78 @@
-[package]
-name = "ktesio"
-version = "0.5.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/kt",
+    "crates/ktesio-engine",
+    "crates/ktesio-adapter-api",
+    "crates/ktesio-adapters-hermes",
+    "crates/ktesio-conformance",
+]
+
+[workspace.package]
+version = "0.6.0"
 edition = "2021"
-description = "Agentic skills package manager"
+# Minimum supported Rust version. Floor is set by the bundled-SQLite build:
+# rusqlite 0.40.1 → libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in
+# 1.96.1 (builds cleanly there; 1.94.1 fails with E0658). Members inherit via
+# `rust-version.workspace = true`.
+rust-version = "1.96.1"
 license = "PolyForm-Noncommercial-1.0.0"
 homepage = "https://github.com/iMagdy/ktesio"
 repository = "https://github.com/iMagdy/ktesio"
-readme = "README.md"
-keywords = ["agentic", "skills", "package-manager", "cli"]
-categories = ["command-line-utilities", "development-tools"]
 
-[[bin]]
-name = "kt"
-path = "src/main.rs"
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+ktesio-engine = { path = "crates/ktesio-engine", version = "0.1.0" }
+ktesio-adapter-api = { path = "crates/ktesio-adapter-api", version = "0.1.0" }
+
+# External dependencies (single source of truth for versions)
 clap = { version = "4", features = ["derive"] }
+# Async runtime for the engine supervision core (AD-13, Islam-approved in story
+# 1-4). Minimal feature set — NOT "full": rt-multi-thread (the runtime the
+# blocking facade owns), process (spawn/wait child agents), time (the graceful
+# stop window), sync (supervisor channels), macros (#[tokio::test]), net +
+# io-util (story 3-4: the engine-observed loopback forward listener's async TCP +
+# stream copy — loopback HTTP is portable, NO OS cfg). We do NOT enable/require
+# tokio_unstable — process-group control uses nix/windows-sys in the engine
+# backends instead. Referenced by ktesio-engine only (kt uses the blocking
+# facade; adapter-api is pure contract types). MSRV 1.71 << floor 1.96.1.
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros", "net", "io-util"] }
+# Engine-observed metering (AD-7 / FR-19), story 3-4: the loopback forward
+# listener's HTTP substrate. `hyper` is the de-facto LEAN async HTTP building
+# block (server + client + http1); `hyper-util` provides the tokio glue (the
+# legacy client for the outbound forward leg + the auto/graceful server conn);
+# `http-body-util` + `bytes` collect/relay request/response bodies faithfully.
+# NFR-8 architecture justification: this is the SINGLE new HTTP dependency family
+# for the engine-observed interception point — no heavier web framework, and NO
+# TLS stack (v1 forwards to an HTTP upstream; an HTTPS upstream is a documented
+# deferral, keeping the tree lean + free of a system-OpenSSL/ring C build, in the
+# same spirit as bundling SQLite). All build cleanly on MSRV 1.96.1 (verified).
+# Referenced by ktesio-engine ONLY (the listener is engine-internal, AD-2; kt
+# never sees it) — a normal external edge, unaffected by the AD-2 boundary gate.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+# Engine state store (AD-6): bundled SQLite, no system dependency.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+# Cross-platform data-dir resolution; keeps engine path code cfg-free (OS-cfg gate).
+directories = "6"
 console = "0.16"
 miette = { version = "7", features = ["fancy"] }
-indicatif = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TOML deserializer for the manifest-adapter schema (adapter.toml). Owned by
+# ktesio-adapter-api ONLY (AD-3: it owns manifest parsing); the engine + kt
+# consume the parsed form. New dep this story (approved: `toml = "1"`).
+toml = "1"
 thiserror = "2"
-walkdir = "2"
-regex = "1"
-dialoguer = "0.12"
 ureq = { version = "3", features = ["json"] }
-urlencoding = "2"
 semver = "1"
 flate2 = "1"
 sha2 = "0.11"
 tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
 tempfile = "3"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

@@ -1,0 +1,16 @@
+# Pins the workspace to its MSRV so a bare `cargo` (build/test/clippy/fmt) just
+# works — no need to type `cargo +1.96.1`. rustup honors this file for bare
+# `cargo` UNLESS something higher-precedence overrides it: an explicit
+# `+toolchain` argument (e.g. `cargo +stable`, `cargo +1.96.1`), a
+# `RUSTUP_TOOLCHAIN` env var, an active `rustup override`, or a `cargo`-shimming
+# version manager (mise/asdf export `RUSTUP_TOOLCHAIN`). See docs/testing.md.
+#
+# Keep `channel` in lockstep with `rust-version` in the root Cargo.toml
+# [workspace.package]. Floor rationale: the bundled-SQLite build (rusqlite
+# 0.40.1 → libsqlite3-sys 0.38.1) uses cfg_select!, stabilized in 1.96.1; 1.94.1
+# fails with E0658. clippy + rustfmt are pulled in so `cargo clippy` / `cargo
+# fmt` resolve under the pinned toolchain too.
+[toolchain]
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

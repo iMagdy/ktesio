@@ -24,7 +24,11 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
       - name: Check formatting
-        run: cargo fmt --check
+        # Explicit +stable: the root rust-toolchain.toml pins bare `cargo` to the
+        # MSRV (1.96.1); this job intentionally exercises latest stable, and a
+        # +toolchain argument overrides the toolchain file. The dedicated `msrv`
+        # job proves the 1.96.1 floor.
+        run: cargo +stable fmt --all --check
 
   clippy:
     name: clippy
@@ -45,12 +49,34 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # Explicit +stable (see fmt job): pin covers local bare cargo; CI stays
+        # on latest stable here, MSRV floor proven by the `msrv` job.
+        run: cargo +stable clippy --workspace --all-targets -- -D warnings
 
   test:
     name: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 3-OS matrix (spine AD-4, NFR-2): the per-OS ProcessBackend supervision code
+    # (Unix process groups / Windows Job Objects) is UNVERIFIABLE on a single OS —
+    # cfg(windows) code does not even compile on Linux, so the Windows Job-Object
+    # backend's behavior is proven ONLY by the windows-latest runner here. Linux +
+    # macOS prove the Unix backend on both Unixes. Coverage (tarpaulin, Linux-only)
+    # measures the OS-agnostic core + the Unix backend; the Windows backend's
+    # correctness rides on this matrix, its lines cfg-excluded from the Linux
+    # coverage denominator (see docs/testing.md — coverage-honesty reconciliation).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
+    # build is slow; this job builds test binaries, runs the suite, and runs the
+    # doctest pass. 25 gives headroom now that the heavy ktesio-engine integration
+    # tests are SERIALIZED (the `engine-integration-serial` max-threads=1 test-group
+    # in .config/nextest.toml) — the source fix for the x86-ubuntu `adoption` hang
+    # (#106), where concurrent heavy process-spawning wedged the 2-core runner into
+    # an uninterruptible D-state. nextest's per-test kill-timeout (see
+    # .config/nextest.toml) remains the cross-OS per-test hang guard.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -59,14 +85,92 @@ jobs:
       - name: Cache cargo
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
+          # runner.os keys the cache per-OS so the three matrix legs never collide.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Run tests
-        run: cargo test --all-targets
+      - name: Cache cargo-nextest binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-nextest so it is not rebuilt on
+          # every fresh runner — mirrors the semver / tarpaulin binary caches
+          # (AI-1/AI-23). runner.os keys it per-OS. restore-keys lets a partial
+          # match seed ~/.cargo/bin so the install guard below finds it warm.
+          key: ${{ runner.os }}-cargo-nextest-bin
+          path: |
+            ~/.cargo/bin
+          restore-keys: ${{ runner.os }}-cargo-nextest-bin
+      - name: Install cargo-nextest
+        # Repo-consistent install idiom (same as the semver / tarpaulin gates):
+        # `cargo install --locked`, guarded by `command -v` so a cache hit skips
+        # the rebuild. Deliberately NOT a third-party install action — this repo
+        # SHA-pins its actions and installs its cargo tooling from source, so a
+        # tag-pinned install-action would be an inconsistent supply-chain surface.
+        # Explicit +stable (see fmt job): install under the same toolchain the
+        # matrix legs test with.
+        shell: bash
+        run: command -v cargo-nextest >/dev/null 2>&1 || cargo +stable install cargo-nextest --locked
+      - name: Build test binaries (nextest --no-run)
+        # SPLIT build from run (#106): the fused compile+run step could not
+        # attribute a stall to build-vs-run, and a job-timeout cancel discards the
+        # whole job-log blob (BlobNotFound) — so when the 40-min ubuntu leg was
+        # cancelled we were blind to WHERE it stalled. GitHub preserves per-STEP
+        # status even when the job-log blob is lost, so building the test binaries
+        # in their OWN step reveals whether a future stall is in compile or in run.
+        #
+        # nextest replaces `cargo test` for the suite (#106): a slow or hung engine
+        # integration test becomes a NAMED, time-boxed failure with captured logs
+        # (see .config/nextest.toml — slow-timeout terminates a stuck test at
+        # ~4 min) instead of silently burning the job budget. Explicit +stable (see
+        # fmt job): the 3-OS matrix exercises latest stable per OS; the root pin
+        # governs only local bare cargo. MSRV floor: the `msrv` job.
+        #
+        # `rm -f target/debug/fake_agent*` FORCES a fresh rebuild of the `fake_agent`
+        # test helper (kept from the earlier fix). The per-OS `target/` cache can
+        # restore a STALE fake_agent whose newer `--emit-usage`/`--dump` args are
+        # silently ignored (older `--linger-ms`/`--heartbeat-ms` still work) —
+        # failing ONLY the metering integration tests on macOS/Windows while Ubuntu
+        # + local pass. The engine passes the launch args correctly; this is a
+        # test-harness cache artifact, not a product bug. `shell: bash` so `rm` works
+        # on the Windows runner too.
+        #
+        # Then EXPLICITLY rebuild the bin: unlike `cargo test --all-targets` (which
+        # hardlinks the bin to target/debug/fake_agent), `cargo nextest run
+        # --all-targets` only compiles it for its own unit tests and does NOT place
+        # that top-level hardlink. The process-spawning tests resolve the helper at
+        # target/debug/fake_agent (`ktesio_conformance::fake_agent_bin`), so without
+        # this build the first such tests race on the lib's on-demand `cargo build`
+        # fallback (concurrent cargo invocations contend on the build-dir lock —
+        # observed as a flake). The explicit build makes the path deterministic.
+        # `--no-run` compiles every test binary without executing; the run steps
+        # below reuse these artifacts (no double build).
+        shell: bash
+        run: |
+          rm -f target/debug/fake_agent target/debug/fake_agent.exe
+          cargo +stable build -p ktesio-conformance --bin fake_agent
+          cargo +stable nextest run --workspace --all-targets --no-run
+      - name: Run tests (nextest)
+        # Single unified run for all three OSes (#106). The x86-ubuntu `adoption`
+        # hang — concurrent heavy re-exec'd process-spawning wedging the genuine
+        # 2-core runner into an uninterruptible D-state — is fixed AT THE SOURCE by
+        # the `engine-integration-serial` test-group in .config/nextest.toml
+        # (max-threads=1 over `kind(test) & package(ktesio-engine)`), which caps the
+        # heavy engine integration binaries to one at a time WITHOUT skipping any
+        # test (full Linux coverage retained). So no per-OS special-casing, watchdog,
+        # or bisect is needed — a per-binary CI bisect had pinned the hang to the
+        # `adoption` binary. `retries` + `slow-timeout` in that same config still
+        # absorb the windows-latest timing flake and time-box a genuinely stuck test.
+        # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable per
+        # OS; the root pin governs only local bare cargo. MSRV floor: the `msrv` job.
+        run: cargo +stable nextest run --workspace --all-targets
+      - name: Run doctests
+        # nextest does not run doctests, so run them separately to keep the doc
+        # examples gated (`--doc` and `--all-targets` cannot combine in one cargo
+        # invocation). Explicit +stable (see fmt job).
+        run: cargo +stable test --workspace --doc
 
   build:
     name: build
@@ -87,7 +191,9 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-
       - name: Build release binary
-        run: cargo build --release
+        # Explicit +stable (see fmt job): CI build sanity on latest stable; the
+        # root pin governs only local bare cargo.
+        run: cargo +stable build --release
 
   docs:
     name: docs
@@ -100,8 +206,6 @@ jobs:
           fetch-depth: 0
       - name: Validate docs
         run: python3 scripts/check_docs.py
-      - name: Validate Speckit sync dry run
-        run: python3 scripts/speckit_sync_issues.py --feature-dir tests/fixtures/speckit-sync-feature --dry-run
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers
@@ -111,10 +215,145 @@ jobs:
       - name: Build docs site
         run: npm run --prefix docs build
 
-  coverage:
-    name: coverage
+  boundary:
+    name: boundary
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, build, docs]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Check kt against its declared crate graph
+        # Explicit +stable (see fmt job): boundary gate runs on latest stable; the
+        # root rust-toolchain.toml pins only local bare cargo. MSRV floor: `msrv` job.
+        run: cargo +stable check -p ktesio
+      - name: Enforce kt dependency law (AD-2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(cargo +stable tree -p ktesio -e normal,build --all-features)"
+          echo "$tree"
+          # Allowlist, not blocklist: any internal ktesio-* edge other than
+          # ktesio-engine / ktesio-adapter-api fails, so future internal
+          # crates are caught automatically.
+          scan_status=0
+          edges="$(printf '%s\n' "$tree" | grep -oE 'ktesio-[a-z0-9_-]+' | sort -u)" || scan_status=$?
+          if [ "$scan_status" -ge 2 ]; then
+            echo "::error::grep exited ${scan_status} while extracting internal crate edges."
+            exit "$scan_status"
+          fi
+          violations=''
+          if [ -n "$edges" ]; then
+            filter_status=0
+            violations="$(printf '%s\n' "$edges" | grep -Evx 'ktesio-(engine|adapter-api)')" || filter_status=$?
+            if [ "$filter_status" -ge 2 ]; then
+              echo "::error::grep exited ${filter_status} while applying the internal-crate allowlist."
+              exit "$filter_status"
+            fi
+          fi
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo "::error::kt may depend only on ktesio-engine (plus ktesio-adapter-api types); forbidden internal crate edge found."
+            exit 1
+          fi
+          echo "Boundary gate green: internal edges are exactly the allowlisted ktesio-engine / ktesio-adapter-api."
+      - name: Enforce OS-conditional code location (engine backends only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Class pattern: catches #[cfg(unix)], #[cfg(not(windows))],
+          # #[cfg(all(unix, ...))], #[cfg(any(...))], cfg!(...), and
+          # #[cfg_attr(...)] forms naming an OS token.
+          pattern='cfg[!(]?.*(unix|windows|target_os|target_family)'
+          # Allowlist: engine backends (the convention home, spine AD-4) plus
+          # two pre-existing v0.5.0 legacy CLI files (self-update platform
+          # detection) grandfathered until epic 8 relocates/deprecates them
+          # (AC-4 amendment, ratified 2026-07-02). No NEW OS-conditional
+          # code may appear anywhere else.
+          allowlist='^crates/ktesio-engine/src/backends/|^crates/kt/src/update_check\.rs:|^crates/kt/src/cli/self_update\.rs:'
+          scan_status=0
+          hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
+          if [ "$scan_status" -ge 2 ]; then
+            echo "::error::grep exited ${scan_status} while scanning for OS-conditional code."
+            exit "$scan_status"
+          fi
+          violations=''
+          if [ -n "$hits" ]; then
+            filter_status=0
+            violations="$(printf '%s\n' "$hits" | grep -Ev "$allowlist")" || filter_status=$?
+            if [ "$filter_status" -ge 2 ]; then
+              echo "::error::grep exited ${filter_status} while applying the OS-cfg allowlist."
+              exit "$filter_status"
+            fi
+          fi
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo "::error::OS-conditional cfg is allowed only under crates/ktesio-engine/src/backends/ (legacy kt self-update files are grandfathered until epic 8)."
+            exit 1
+          fi
+          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
+      - name: Enforce single currency-formatting module (story 3-3, AD-8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # AD-8: exactly ONE module formats currency. Money becomes a `$X.XX` human
+          # string ONLY in crates/ktesio-engine/src/domain/cost.rs (render_dollars /
+          # render_dollars_bare). Every other module passes Micros + EstimateLabel as
+          # DATA; --json emits integer micros, never a `$` string. This gate FAILS if a
+          # `$`-string-building form appears anywhere else.
+          #
+          # BROADENED alternation (a narrow `\$\{` missed several dollar-string shapes):
+          #   \$ ?\{  — `${...}` AND `$ {...}` (a `$` glued to a format placeholder,
+          #             with or without a space): format!("${x}") / "$ {}"
+          #   \}\$    — `}$` (a placeholder immediately followed by a `$`): "{}$"
+          #   "\$     — a string literal STARTING with `$`: "$", "$0.00", write!(f,"$")
+          #   '\$'    — a bare `$` char literal: '$'
+          pattern='\$ ?\{|\}\$|"\$|'\''\$'\'''
+          # Allowlist (precise, not blanket-by-file): the ONE currency module (the
+          # render home + its unit tests), PLUS the genuinely NON-currency `$` uses the
+          # broadened pattern also matches —
+          #   contains\(.\$  — `.contains('$')` / `.contains("$...` DISCIPLINE READ-checks
+          #                    (they assert a `$` is absent/present on a surface; a read
+          #                    never FORMATS currency, so it cannot hide a regression).
+          #   \$PWD / \$KT_TEST — shell-variable interpolation in a spawned command
+          #                    string (a process backend test), not a dollar figure.
+          # No NEW currency formatting may appear anywhere else in the workspace.
+          allowlist='^crates/ktesio-engine/src/domain/cost\.rs:|contains\(.\$|\$PWD|\$KT_TEST'
+          scan_status=0
+          hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
+          if [ "$scan_status" -ge 2 ]; then
+            echo "::error::grep exited ${scan_status} while scanning for currency formatting."
+            exit "$scan_status"
+          fi
+          violations=''
+          if [ -n "$hits" ]; then
+            filter_status=0
+            violations="$(printf '%s\n' "$hits" | grep -Ev "$allowlist")" || filter_status=$?
+            if [ "$filter_status" -ge 2 ]; then
+              echo "::error::grep exited ${filter_status} while applying the currency allowlist."
+              exit "$filter_status"
+            fi
+          fi
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo "::error::Currency formatting (a \`\$\`-string form: \`\${...}\`, \`\$ {}\`, \`{}\$\`, a \"\$\"-prefixed string, or a '\$' char) is allowed ONLY in crates/ktesio-engine/src/domain/cost.rs (AD-8: one currency module). Pass Micros + EstimateLabel as data and render through render_dollars / render_dollars_bare."
+            exit 1
+          fi
+          echo "Currency gate green: dollar formatting lives only in the one currency module."
+
+  semver:
+    name: semver
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -130,7 +369,299 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Cache cargo-semver-checks binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-semver-checks so the armed gate
+          # does not rebuild it (~10 min) on every fresh runner (AI-1).
+          key: ${{ runner.os }}-cargo-semver-checks-bin
+          path: |
+            ~/.cargo/bin
+      - name: Check public API semver (ktesio-engine, ktesio-adapter-api)
+        shell: bash
+        run: |
+          set -euo pipefail
+          user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          for crate in ktesio-engine ktesio-adapter-api; do
+            status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
+            case "$status" in
+              200)
+                # Install lazily inside the armed branch: skips the ~10-minute
+                # build while the gate is dormant (no published baseline yet).
+                # Explicit +stable (see fmt job): keep the semver gate on latest
+                # stable; the root pin governs only local bare cargo.
+                command -v cargo-semver-checks >/dev/null 2>&1 || cargo +stable install cargo-semver-checks --locked
+                cargo +stable semver-checks check-release -p "$crate"
+                ;;
+              404)
+                echo "::notice::${crate} has no published baseline on crates.io yet; the semver gate arms at first publish (story 7-4)."
+                ;;
+              000|429|5[0-9][0-9])
+                echo "::notice::crates.io returned transient status ${status} for ${crate}; skipping the semver check this run."
+                ;;
+              *)
+                echo "::error::Unexpected crates.io API status ${status} while checking ${crate}."
+                exit 1
+                ;;
+            esac
+          done
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install pinned MSRV toolchain
+        # Floor set by the bundled-SQLite build: rusqlite 0.40.1 →
+        # libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in 1.96.1. Keep in
+        # lockstep with rust-version in the root Cargo.toml [workspace.package].
+        run: rustup toolchain install 1.96.1 --profile minimal
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+      - name: Check workspace builds on the MSRV
+        run: cargo +1.96.1 check --workspace
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, build, docs, boundary, semver]
+    # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
+    # graph WITH coverage instrumentation — a separate fingerprint from the other
+    # jobs' normal-profile target, so nothing is reusable. That one-time cold build
+    # (not the test run) is what repeatedly blew the 20- then 40-min caps (AI-23);
+    # llvm did not help because the cost is compile, not execution. The dedicated
+    # coverage cache below persists the instrumented target so every later run is
+    # warm; 90 is generous headroom because coverage now runs tarpaulin ONCE PER
+    # CRATE (5 sequential runs, #101) instead of one --workspace pass — the split
+    # keeps each instrumented run's live process tree small enough to fit the 7 GB
+    # runner, but the sum of the sequential runs is longer than a single pass.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache cargo (coverage-specific)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # DEDICATED key — not the shared ${{ runner.os }}-cargo-<lock> the other
+          # jobs use. Tarpaulin builds the whole graph with coverage instrumentation
+          # (different rustflags → different fingerprints), so it can NEVER reuse the
+          # other jobs' normal-profile target. Sharing the key also meant coverage
+          # restored useless artifacts and — the key already existing when this job
+          # (which `needs` the others) ran — never SAVED its own instrumented target,
+          # so every run recompiled the graph cold and blew the timeout (AI-23). This
+          # key persists the instrumented target; only the first run builds it cold.
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-coverage-
+      - name: Cache cargo-tarpaulin binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-tarpaulin so coverage does not
+          # rebuild it (~10 min) on every fresh runner (AI-23) — mirrors the
+          # semver job's cargo-semver-checks-bin cache (AI-1). restore-keys lets a
+          # partial-key match seed ~/.cargo/bin so a bumped exact key still warms
+          # from the prior binary instead of a cold rebuild (AI-3: a constant key
+          # can freeze an empty entry).
+          key: ${{ runner.os }}-cargo-tarpaulin-bin
+          path: |
+            ~/.cargo/bin
+          restore-keys: ${{ runner.os }}-cargo-tarpaulin-bin
+      - name: Add llvm coverage tooling
+        # --engine llvm (below) shells out to llvm-profdata / llvm-cov to merge the
+        # profraw output; llvm-tools-preview provides them for the stable toolchain.
+        run: rustup component add llvm-tools-preview
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Enforce coverage
-        run: cargo tarpaulin --fail-under 95
+        # Explicit +stable (see fmt job): coverage runs on latest stable; the root
+        # rust-toolchain.toml pins only local bare cargo. Idempotent install: on a
+        # cache hit the binary is already on PATH, so the `command -v` guard skips
+        # the rebuild (matches the semver gate's guarded install, AI-23).
+        run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
+      - name: Install lcov (per-crate coverage merge, #101)
+        # The per-crate split (#101) writes one LCOV tracefile per crate; lcov
+        # merges them into the workspace-aggregate the --fail-under 95 gate is
+        # enforced on. apt's lcov is enough — only `lcov -a`/`--summary` are used.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lcov
+      - name: Reclaim disk + add swap for the instrumented run
+        # The instrumented build is far heavier than the normal `test` job (coverage
+        # counters + the fleet/adoption tests each spawning several instrumented
+        # children), and the runner "lost communication" ~49 min in — an OOM that
+        # drops the job with no log (AI-23). Two pressures, addressed together:
+        #   * DISK — the instrumented target + profraw sit on `/` (~14 GB free); an
+        #     earlier swap file on /mnt did NOT relieve `/`. Free the big unused
+        #     preinstalled SDKs (~30 GB) so the instrumented target has room.
+        #   * RAM — an 8 GB swap file on the roomy /mnt temp disk lets a spike page
+        #     instead of OOM-ing. (CARGO_PROFILE_DEV_DEBUG=1 below also shrinks the
+        #     instrumented binaries, cutting both RAM and `/` disk — coverage same.)
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h / /mnt; free -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo fallocate -l 8G /mnt/covswap
+          sudo chmod 600 /mnt/covswap
+          sudo mkswap /mnt/covswap
+          sudo swapon /mnt/covswap
+          echo "after:"; df -h / /mnt; free -h
+      - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
+        # WHY the split (#101): a single `cargo tarpaulin --workspace` instruments
+        # the ENTIRE graph (tokio + bundled-SQLite C + a 13-crate hyper stack) and
+        # runs all ~1075 tests instrumented; even after the AI-23 fixes (dedicated
+        # cache, --engine llvm, serial tests, 8 GB swap, disk reclaim, line-tables
+        # debuginfo) the instrumented run's live process tree still OOM'd the 7 GB
+        # runner ("runner lost communication", no log). Running tarpaulin ONCE PER
+        # CRATE (`-p <crate>`) keeps each run's resident set small enough to fit.
+        #
+        # CORRECTNESS (de-risked locally before this landed): tarpaulin reports
+        # coverage for ALL workspace source each built test binary touches, NOT just
+        # the `-p` crate's own source — so a ktesio-engine line covered only by a
+        # `kt` CLI test IS credited under `-p ktesio`. The UNION of the five
+        # per-crate tracefiles therefore reproduces the --workspace result exactly:
+        # locally the merged aggregate is 95.22% (5718/6005), identical to
+        # --workspace to the line (0 lines lost, 0 gained). No report-scope flag is
+        # needed; the merge just needs `lcov --ignore-errors inconsistent` because
+        # lcov 2.x rejects the benign FN-start-line drift tarpaulin emits across
+        # runs (function metadata only — it does not touch DA/LF/LH line data).
+        #
+        # ORDER: lightest → heaviest, ktesio-engine LAST. If the heavy crate still
+        # OOMs the runner, the lighter crates' tracefiles + per-crate numbers are
+        # already printed, so a per-crate OOM is diagnosable (which crate, at what
+        # `free`/`df`) instead of one opaque --workspace failure.
+        #
+        # Flags unchanged from the --workspace gate: --engine llvm (parity with the
+        # local macOS gate, see docs/testing.md), --skip-clean (reuse the cached
+        # instrumented target), --timeout 180 (raise tarpaulin's 60 s per-test cap),
+        # --verbose (progress). Env unchanged (AI-23): RUST_TEST_THREADS=1 runs the
+        # instrumented tests serially; CARGO_PROFILE_DEV_DEBUG=1 builds line-tables-
+        # only debuginfo (smaller instrumented binaries, coverage unchanged). The
+        # merged aggregate replaces tarpaulin's per-run --fail-under 95 with the SAME
+        # workspace >= 95 gate enforced on the union (a per-crate --fail-under would
+        # wrongly fail the lighter crates, which see only part of the workspace).
+        env:
+          RUST_TEST_THREADS: "1"
+          CARGO_PROFILE_DEV_DEBUG: "1"
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Whole-job retry (PR #117): this job's per-test real-time waits (a
+          # child process spawn + a stdin/stdout round trip) were empirically
+          # observed to transiently stall COMPLETELY (not merely run slow) on
+          # this free-tier runner — across otherwise-identical reruns of the
+          # SAME commit, a DIFFERENT, unrelated test failed each time, always
+          # one needing a real child-process round trip, never one on a
+          # fast-fail path with no I/O; a local repro under the identical
+          # tarpaulin/instrumentation config passed instantly. That signature
+          # is runner contention, not a product bug. 3 TOTAL ATTEMPTS (2
+          # retries), bumped from an initial 2 after that first retry still
+          # failed once in practice (a DIFFERENT real-IO test than attempt 1,
+          # not a new bug — the same signature, just unlucky twice on the
+          # SAME runner instance, which a same-job retry does not refresh).
+          # Retrying the WHOLE attempt (never a PER-TEST retry, e.g. nextest's `retries`,
+          # which this repo has already seen silently absorb a real,
+          # reproducible data-loss race — see the 4-2 H1 fix) keeps the gate
+          # meaningful: a genuine coverage regression or a genuine test bug
+          # reproduces on BOTH attempts and still fails the job.
+          run_coverage_attempt() (
+            set -euo pipefail
+            rm -rf cov && mkdir -p cov
+            # Crate list as positional params (portable, no word-split reliance):
+            # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
+            set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes ktesio ktesio-engine
+            for pkg in "$@"; do
+              echo "::group::tarpaulin -p $pkg"
+              echo "--- resources before $pkg ---"
+              free -h || true
+              df -h / || true
+              cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+                -p "$pkg" --out Lcov --output-dir "cov/$pkg"
+              echo "::endgroup::"
+            done
+            # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
+            # is a doc-only stub today (0 coverable lines, no tracefile) -- the ONLY
+            # crate allowed to skip the merge with no lcov.info; it lights up
+            # automatically once epic 6 gives it code. --ignore-errors inconsistent:
+            # tolerate lcov 2.x's benign cross-run FN-start-line drift (line data is
+            # unaffected).
+            #
+            # PR #117 fix pass: this used to skip ANY crate with no lcov.info, not
+            # just hermes. That silently swallowed a real failure mode -- when a
+            # crate's OWN tarpaulin run fails (e.g. ktesio-engine hitting one of this
+            # job's flaky real-IO tests), it produces no lcov.info too, and the old
+            # code merged the aggregate from whatever crates DID succeed anyway. The
+            # resulting gate failure ("merged coverage NN% is below 95%") read like a
+            # genuine coverage shortfall across the whole workspace, when the real
+            # story was "ktesio-engine's measurement is entirely missing, so the
+            # smaller remaining slice can't possibly clear a 95% bar sized for the
+            # full workspace" -- confusing, and it silently accepted a
+            # SUBSET-OF-THE-WORKSPACE gate as if it were the real one. Any crate
+            # OTHER than the known doc-only stub missing its lcov.info now fails the
+            # attempt LOUDLY and immediately, before the misleading percentage math
+            # ever runs -- the retry loop above already treats this exactly like any
+            # other attempt failure.
+            add_args=""
+            for pkg in "$@"; do
+              if [ -s "cov/$pkg/lcov.info" ]; then
+                add_args="$add_args -a cov/$pkg/lcov.info"
+              elif [ "$pkg" = "ktesio-adapters-hermes" ]; then
+                echo "::notice::no coverable lines for $pkg (expected for the doc-only stub); skipping in merge."
+              else
+                echo "::error::$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed (a crashed/failed test suite, not a legitimately-empty crate). Treating this as a failed attempt rather than silently merging a partial, misleading aggregate."
+                exit 1
+              fi
+            done
+            echo "::group::merge tracefiles"
+            # shellcheck disable=SC2086
+            lcov $add_args -o cov/merged.info --ignore-errors inconsistent,inconsistent
+            echo "::endgroup::"
+            # Enforce the SAME workspace >= 95 gate on the MERGED aggregate. Parse the
+            # `(<hit> of <found> lines)` FRACTION from `lcov --summary` (version-stable
+            # across lcov 1.x/2.x) and compute the exact percentage — more robust than
+            # the 1-decimal rounded `NN.N%` near the boundary. `lines_pair` is the two
+            # integers "<hit> <found>"; a single awk both extracts and decides, so
+            # there is no heredoc / read indentation fragility.
+            echo "::group::merged coverage summary"
+            lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
+            echo "::endgroup::"
+            lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
+              | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
+            hit="${lines_pair%% *}"
+            found="${lines_pair##* }"
+            if [ -z "${found:-}" ] || ! [ "${found}" -gt 0 ] 2>/dev/null; then
+              echo "::error::Could not parse merged line coverage from lcov --summary; aborting the coverage gate (#101)."
+              exit 1
+            fi
+            pct="$(awk -v h="$hit" -v f="$found" 'BEGIN { printf "%.4f", (h / f) * 100 }')"
+            echo "Merged workspace coverage: ${pct}% (${hit}/${found} lines) across the per-crate split (#101)."
+            if awk -v p="$pct" 'BEGIN { exit (p + 0 >= 95) ? 0 : 1 }'; then
+              echo "Coverage gate green: merged ${pct}% >= 95% on the per-crate union (#101)."
+            else
+              echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
+              exit 1
+            fi
+          )
+
+          max_attempts=3
+          attempt=1
+          while true; do
+            if run_coverage_attempt; then
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::coverage failed on all $max_attempts attempts — see the comment above this step's script; a genuine coverage regression or test bug reproduces every time, unlike runner contention."
+              exit 1
+            fi
+            echo "::warning::coverage attempt $attempt/$max_attempts failed — retrying (see the comment above this step's script: PR #117 found this job's real-time child-process waits can transiently stall on this runner; a genuine failure reproduces on every attempt)."
+            attempt=$((attempt + 1))
+          done

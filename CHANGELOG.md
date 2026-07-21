@@ -4,6 +4,20 @@ All notable changes to Ktesio are generated from git history when a version tag 
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+## v0.6.0
+
+Ktesio is repositioned as an agent runner: `kt` runs AI agents like services — supervising their lifecycle, metering real token usage, and enforcing dollar budgets.
+
+### Removed
+
+- The legacy skill-manager command surface is **removed** at 0.6.0. The commands `kt init`, `kt install`, `kt search`, `kt upgrade`, `kt publish`, `kt list`, `kt show`, `kt doctor`, `kt uninstall`, and the `kt remove` alias no longer exist; `kt` is no longer a skills package manager.
+
+### Changed
+
+- The single canonical way to operate the Fleet is the agent runner under `kt agent …` — `kt agent list` and `kt agent show <name>` replace the removed top-level `kt list`/`kt show`, alongside `kt agent register`/`start`/`stop`/`pause`/`resume` and `kt agent config …`. See the [command reference](docs/commands.md) for the full agent-runner surface.
+- `kt --help` and the crate metadata now describe the agent runner rather than a skills package manager.
+- Continuity is preserved: the `ktesio` crate name, the `kt` binary, the install channels, and `kt self-update` are unchanged.
+
 ## v0.5.0
 
 Comparison: [v0.4.0...v0.5.0](https://github.com/iMagdy/ktesio/compare/v0.4.0...v0.5.0)
