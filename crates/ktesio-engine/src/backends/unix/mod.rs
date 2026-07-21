@@ -5,7 +5,11 @@
 //! signals the WHOLE group with `killpg`, catching any child processes the agent
 //! itself spawned — the load-bearing mechanism behind AC3 "no process of the
 //! instance survives". Graceful stop is `SIGTERM` to the group; after the window
-//! elapses it escalates to `SIGKILL` to the group.
+//! elapses it escalates to `SIGKILL` to the group, then CONFIRMS death bounded
+//! to [`crate::ports::KILL_CONFIRM_TIMEOUT`] (fix pass, review of #80
+//! follow-up — the CRITICAL finding: see that constant's docs for why
+//! confirmation can no longer assume SIGKILL is always near-instant, and
+//! `ProcessBackend::stop`'s docs for the full mechanism).
 //!
 //! This module is the allowlisted home for OS-conditional code (it is
 //! `#[cfg(unix)]`-gated at its `mod` declaration in `backends/mod.rs`). It uses
@@ -38,8 +42,9 @@ use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::{setsid, Pid};
 
 use crate::ports::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec,
-    StopOutcome,
+    spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
+    ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
+    KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 
 /// How often the graceful-stop wait polls for the process to exit.
@@ -88,6 +93,31 @@ pub struct UnixProcess {
     /// a bare `kill(pid, 0)` alone cannot tell an adopted agent's crash from the OS
     /// recycling its PID to an unrelated process within a reaper interval (AI-10).
     start_time: u64,
+    /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
+    /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
+    /// SPAWNED process whose declared `Capability::Interaction` was
+    /// `Guaranteed`/`BestEffort` on this OS (`SpawnSpec::pipe_stdin`);
+    /// `NoPipe` for an ADOPTED process (a pipe fd cannot be recovered from a
+    /// bare PID on any OS without an undocumented hack this project's
+    /// conventions already reject — parity with the Windows-pause
+    /// `[ASSUMPTION]`) or a freshly spawned one that was never piped
+    /// (interaction `Unsupported`); `TimedOut` once a bounded write on this
+    /// handle has exceeded [`STDIN_WRITE_TIMEOUT`] and can never be safely
+    /// retried. `send_input` on anything but a `Live` state must therefore
+    /// fail honestly (`EngineError::InteractionUnavailable` /
+    /// `EngineError::InteractionTimedOut`), never silently succeed.
+    stdin: StdinState,
+    /// The output-capture pipeline handle (story 4-2, AD-12; fix pass,
+    /// review of #80), if this handle has one. `Some` for a FRESHLY SPAWNED
+    /// handle whenever the caller gave us somewhere to capture
+    /// (`SpawnSpec::log_file`/`stderr_log_file`/`attributed_log_path`);
+    /// `None` for an ADOPTED process — no live tailer thread survives the
+    /// engine process that spawned it (parity with `stdin`'s
+    /// `NoPipe`-on-adoption). This is NOT a functional gap for `kt agent
+    /// logs`/`--follow` (AC-H): reading only needs the crash-immune raw
+    /// FILES, which the agent process itself keeps writing to directly
+    /// (never through any engine-held handle) for as long as it lives.
+    log_capture: Option<LogCapture>,
 }
 
 /// The Unix process backend (AD-4).
@@ -115,31 +145,96 @@ impl ProcessBackend for UnixBackend {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
-        // Redirect stdout+stderr to the per-instance log if one was given
-        // (AD-12 seed); otherwise inherit.
-        match &spec.log_file {
-            Some(path) => {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| BackendError::Spawn {
-                        exec: spec.exec.clone(),
-                        detail: format!("could not open log file {}: {e}", path.display()),
-                    })?;
-                let err_clone = file.try_clone().map_err(|e| BackendError::Spawn {
-                    exec: spec.exec.clone(),
-                    detail: format!("could not duplicate log handle: {e}"),
-                })?;
-                command.stdout(Stdio::from(file));
-                command.stderr(Stdio::from(err_clone));
+        // Story 4-2 (AD-12, AC-E), fix pass (review of #80): stdout/stderr
+        // capture is UNCONDITIONAL and capability-independent — each stream
+        // is redirected DIRECTLY to its OWN regular file (crash-immune, NOT
+        // a pipe: see the module docs on `spawn_output_capture` for why)
+        // whenever the caller gave us somewhere to write all THREE capture
+        // destinations (every PRODUCTION spawn does; the supervisor always
+        // computes `log_file`/`stderr_log_file`/`attributed_log_path`
+        // together from the SAME Registry path authority). This does NOT
+        // gate on `Capability::Interaction` or any other capability —
+        // reading FROM a process is never capability-gated, only writing TO
+        // it (`pipe_stdin` below) is. `None` (all three fields) stays
+        // `Stdio::null()`, unchanged from before this story — a narrow
+        // test-fixture convenience for the small number of unit tests in
+        // this module that assert nothing about captured output, not a
+        // product-facing escape hatch (real spawns never take this
+        // branch).
+        debug_assert!(
+            spec.log_file.is_some() == spec.attributed_log_path.is_some()
+                && spec.log_file.is_some() == spec.stderr_log_file.is_some(),
+            "SpawnSpec's three capture-path fields must be all Some or all None together"
+        );
+        let capture = match (
+            &spec.log_file,
+            &spec.stderr_log_file,
+            &spec.attributed_log_path,
+        ) {
+            (Some(stdout_raw), Some(stderr_raw), Some(attributed)) => {
+                Some((stdout_raw.clone(), stderr_raw.clone(), attributed.clone()))
             }
-            None => {
-                command.stdout(Stdio::null());
-                command.stderr(Stdio::null());
+            _ => None,
+        };
+        // Fail FAST (mirrors the pre-story eager log_file-open validation)
+        // if any destination cannot be opened — never a silent no-capture
+        // outcome an operator would only notice from an unexpectedly-empty
+        // log later. `stdout_target`/`stderr_target` are the SAME open
+        // `File`s handed directly to `Stdio::from` below (a successful open
+        // IS the fail-fast proof — no second reopen needed, unlike the old
+        // dual-stream-into-one-file mechanism this superseded, which needed
+        // a `try_clone` because two streams shared one file); the
+        // attributed path is validated then dropped (whichever of the
+        // background tailer thread or an inline `send_engine_line` call
+        // reopens it per-append — see `append_attributed_lines`'s docs).
+        let (stdout_target, stderr_target) = match &capture {
+            Some((stdout_raw, stderr_raw, attributed)) => {
+                let open = |path: &std::path::Path, label: &str| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map_err(|e| BackendError::Spawn {
+                            exec: spec.exec.clone(),
+                            detail: format!("could not open {label} {}: {e}", path.display()),
+                        })
+                };
+                let stdout_file = open(stdout_raw, "log file")?;
+                let stderr_file = open(stderr_raw, "stderr log file")?;
+                drop(open(attributed, "attributed output log")?);
+                (Some(stdout_file), Some(stderr_file))
             }
-        }
-        command.stdin(Stdio::null());
+            None => (None, None),
+        };
+        // DIRECT, crash-immune redirects (never `Stdio::piped()` — the whole
+        // point of this fix pass): the agent's `write()` to either stream
+        // succeeds or fails based ONLY on this regular file, never on
+        // whether the engine process is even still alive to read anything.
+        command.stdout(match stdout_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
+        });
+        command.stderr(match stderr_target {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
+        });
+        // Piped ONLY when the caller (the supervisor, at spawn time) resolved
+        // the declared Capability::Interaction level to Guaranteed/BestEffort
+        // on this OS (story 4.1 fix pass, HIGH finding — review of #79;
+        // supersedes the story's original unconditional `Stdio::piped()`).
+        // An adapter that declares no interaction support gets Stdio::null()
+        // — the pre-story-4.1 safe default — so a process that blocks
+        // reading stdin at startup (a common "sniff for piped input" real-CLI
+        // idiom) sees immediate EOF instead of hanging forever on a pipe
+        // whose write end this engine holds open for its whole supervised
+        // lifetime. This file stays free of capability LOOKUPS (the
+        // supervisor already resolved the bool into `spec.pipe_stdin`); it
+        // only branches on the resolved value.
+        command.stdin(if spec.pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         // Put the child in its OWN session+process group BEFORE exec, so a later
         // killpg reaches the whole tree. `setsid` fails only if the caller is
@@ -157,7 +252,7 @@ impl ProcessBackend for UnixBackend {
             });
         }
 
-        let child = command.spawn().map_err(|e| BackendError::Spawn {
+        let mut child = command.spawn().map_err(|e| BackendError::Spawn {
             exec: spec.exec.clone(),
             detail: e.to_string(),
         })?;
@@ -168,11 +263,39 @@ impl ProcessBackend for UnixBackend {
         // handle reaps via its owned Child, so it never relies on this for the
         // PID-reuse guard; a read failure degrades to 0, an honest pid-only form).
         let start_time = process_start_time(pid).unwrap_or(0);
+        // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
+        // (story 4.1) — `child.stdin` is `Some` exactly when `spec.pipe_stdin`
+        // was true above (Stdio::piped() populates it; Stdio::null() never
+        // does), so branching on std's own answer is simpler and more robust
+        // than re-deriving it from `spec.pipe_stdin` a second time. An
+        // adopted handle never has one (see `adopt` below).
+        let stdin = match child.stdin.take() {
+            Some(s) => StdinState::Live(s),
+            None => StdinState::NoPipe,
+        };
+        // Story 4-2 (Task 3), fix pass (review of #80): a FRESHLY SPAWNED
+        // handle gets the output-capture pipeline whenever `capture` is
+        // `Some`. `spawn_output_capture` takes only the raw files' PATHS
+        // (never `child.stdout`/`child.stderr` — those stay `None` here,
+        // since neither stream was piped) — the tailer it starts reopens
+        // them by path on every poll, exactly like any later reader would,
+        // which is what makes this crash-immune: nothing depends on a
+        // handle this engine session holds.
+        let log_capture = capture.map(|(stdout_raw_path, stderr_raw_path, attributed_log_path)| {
+            spawn_output_capture(
+                stdout_raw_path,
+                stderr_raw_path,
+                attributed_log_path,
+                spec.instance_name.clone(),
+            )
+        });
         Ok(UnixProcess {
             child: Some(child),
             pgid,
             pid,
             start_time,
+            stdin,
+            log_capture,
         })
     }
 
@@ -216,33 +339,27 @@ impl ProcessBackend for UnixBackend {
             sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
 
-        // (3) Escalate: SIGKILL to the whole group, then reap the child so no
-        // zombie remains. SIGKILL cannot be caught/ignored, so the group dies.
+        // (3) Escalate: SIGKILL to the whole group, then CONFIRM death —
+        // bounded to KILL_CONFIRM_TIMEOUT (fix pass, review of #80
+        // follow-up — the CRITICAL finding; see its docs for the full
+        // mechanism: removing the pipe also removed its incidental
+        // backpressure, so a fast writer can exhaust disk and enter an
+        // OS-level UNINTERRUPTIBLE I/O wait immune to every signal,
+        // including SIGKILL, until the underlying I/O resolves at the
+        // kernel/storage layer). SIGKILL cannot be caught/ignored by a
+        // NORMAL process, so the ONLY reason confirmation would take longer
+        // than a few milliseconds is exactly that stuck-I/O scenario.
+        //
+        // A single unified polling loop via `reap_if_exited` (NON-BLOCKING
+        // on both the spawned — `try_wait` — and adopted — `kill(pid, 0)` +
+        // fingerprint re-check — branches) replaces the OLD unbounded
+        // `child.wait()` (spawned) / already-informally-bounded-but-
+        // dishonest `while pid_is_alive` (adopted, which used to silently
+        // return `Ok` even when still alive after its own 5s poll). Group
+        // members are killed by the SIGKILL below and reaped by init (or,
+        // for a still-stuck leader, will be once the OS condition clears).
         signal_group(handle.pgid, Signal::SIGKILL)?;
-        match handle.child.as_mut() {
-            // Spawned: block until the direct child is reaped (it was just
-            // SIGKILLed, so this is bounded). Group members are killed by the
-            // SIGKILL above and reaped by init.
-            Some(child) => {
-                child.wait().map_err(|e| BackendError::Control {
-                    op: "wait",
-                    detail: e.to_string(),
-                })?;
-            }
-            // Adopted (not our child): we cannot `wait` it, but the SIGKILL to
-            // the group is delivered and its real parent / init reaps it. Poll
-            // liveness briefly so the desired end state ("no process survives")
-            // is confirmed before returning.
-            None => {
-                let kill_deadline = Instant::now() + Duration::from_secs(5);
-                while pid_is_alive(handle.pid) {
-                    if Instant::now() >= kill_deadline {
-                        break;
-                    }
-                    sleep(STOP_POLL_INTERVAL);
-                }
-            }
-        }
+        confirm_death(handle, KILL_CONFIRM_TIMEOUT)?;
         Ok(StopOutcome { forced: true })
     }
 
@@ -313,12 +430,51 @@ impl ProcessBackend for UnixBackend {
         // signal/stop the whole tree. Liveness is kill(pid, 0) RE-checked against
         // `live_start` on every poll (AI-10), so a later PID reuse cannot mask a
         // crash of this adopted process.
+        //
+        // `stdin: StdinState::NoPipe` (story 4.1): an adopted handle has no
+        // recoverable pipe — there is no OS-portable, documented way to
+        // reopen a `ChildStdin` from a bare pid. `send_input` against this
+        // handle fails with `EngineError::InteractionUnavailable`, never
+        // silently succeeding.
+        //
+        // `log_capture: None` (story 4-2, fix pass review of #80): no live
+        // tailer thread survives the engine process that spawned it, so an
+        // adopted handle gets no capture pipeline either. Reading/following
+        // this instance's output still works (AC-H) — it needs only the
+        // crash-immune raw FILES the agent process itself keeps writing to
+        // directly, for as long as it lives, independent of any engine
+        // session.
         Ok(Some(UnixProcess {
             child: None,
             pgid: Pid::from_raw(fingerprint.pid as i32),
             pid: fingerprint.pid,
             start_time: live_start,
+            stdin: StdinState::NoPipe,
+            log_capture: None,
         }))
+    }
+
+    fn has_stdin(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_live()
+    }
+
+    fn stdin_timed_out(&self, handle: &Self::Handle) -> bool {
+        handle.stdin.is_timed_out()
+    }
+
+    fn write_stdin(&self, handle: &mut Self::Handle, data: &[u8]) -> Result<(), BackendError> {
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): bounded via
+        // the shared, portable thread+channel+recv_timeout mechanism — see
+        // `write_stdin_bounded`'s docs. Identical to the Windows backend's
+        // body (this file and `backends/windows/mod.rs` intentionally share
+        // ONE implementation via this call, rather than two separate OS
+        // timeout implementations, since the mechanism has no OS-specific
+        // part: a `ChildStdin` write is portable `std` on both).
+        write_stdin_bounded(&mut handle.stdin, data, STDIN_WRITE_TIMEOUT)
+    }
+
+    fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture> {
+        handle.log_capture.clone()
     }
 }
 
@@ -401,7 +557,21 @@ impl Drop for UnixProcess {
     /// (re-acquired on engine start) likewise SIGKILLs its group on drop, but
     /// cannot `wait` a non-child (the OS/init reaps it); this keeps the
     /// no-survivor guarantee across engine restarts.
+    ///
+    /// Fix pass (review of #80): ALSO signals the output-capture pipeline's
+    /// background tailer thread to stop (one final catch-up pass, then
+    /// exit) — unconditionally, regardless of whether the process itself
+    /// was still alive at this point, so a tailer thread never outlives its
+    /// instance (no per-stop/restart thread leak over a long engine
+    /// session). This is purely a LOCAL bookkeeping signal — it never
+    /// touches the agent process and has NOTHING to do with its crash
+    /// resilience, which comes entirely from the raw capture files being
+    /// direct, engine-independent OS redirects (see `spawn_output_capture`'s
+    /// docs).
     fn drop(&mut self) {
+        if let Some(capture) = &self.log_capture {
+            capture.signal_stop();
+        }
         // If already reaped/exited, nothing to do; otherwise SIGKILL the group.
         if let Ok(ProcessStatus::Alive) = self.reap_if_exited() {
             let _ = killpg(self.pgid, Signal::SIGKILL);
@@ -520,6 +690,40 @@ fn signal_group(pgid: Pid, signal: Signal) -> Result<(), BackendError> {
     }
 }
 
+/// Poll `handle` (via the NON-BLOCKING [`UnixProcess::reap_if_exited`]) until
+/// it reports exited, or `timeout` elapses — the bounded death-confirmation
+/// primitive [`UnixBackend::stop`]'s escalation phase uses (fix pass, review
+/// of #80 follow-up — the CRITICAL finding).
+///
+/// `timeout` is a PARAMETER (never hardcoded in this function) so it stays
+/// directly unit-testable with a SHORT duration for fast, deterministic
+/// coverage of the bound-enforcement logic itself — mirrors
+/// [`write_stdin_bounded`]'s existing "timeout as a parameter, tested
+/// directly with a short value" precedent (story 4.1 fix pass); production
+/// calls this with [`KILL_CONFIRM_TIMEOUT`]. Returns `Ok(())` once confirmed
+/// dead; [`BackendError::StopUnconfirmed`] if `timeout` elapses first
+/// (naming the ACTUAL `timeout` passed, so a short test timeout reports
+/// itself honestly rather than always claiming the production bound); any
+/// other [`BackendError`] from `reap_if_exited` (e.g. an unexpected `wait`
+/// failure) propagates unchanged.
+fn confirm_death(handle: &mut UnixProcess, timeout: Duration) -> Result<(), BackendError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.reap_if_exited()?.is_exited() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Release the caller (never keep blocking): the process is NOT
+            // confirmed dead — it may be alive, stuck. The caller
+            // (`Supervisor::stop_inner`) must not claim `stopped`.
+            return Err(BackendError::StopUnconfirmed {
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+        sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 /// Check that the engine secrets file at `path` is owner-only (mode `0600`),
 /// story 2-4 AC6 (spine AD-10/AD-4 — the OS-specific permission INSPECTION, which
 /// MUST live under `backends/`, the sole allowlisted `#[cfg]` home).
@@ -551,6 +755,7 @@ pub fn check_secrets_file_permissions(path: &std::path::Path) -> Result<(), Secr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{LogLine, LogStream};
     use std::collections::BTreeMap;
 
     /// Resolve the `fake_agent` helper binary via the conformance dev-dependency
@@ -567,6 +772,17 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: std::env::temp_dir(),
             log_file: None,
+            // No output-capture wanted (story 4-2): this helper is used by
+            // tests that assert nothing about captured output, mirroring
+            // `log_file: None`'s existing "don't care" convention exactly.
+            attributed_log_path: None,
+            stderr_log_file: None,
+            instance_name: "test".to_string(),
+            // Preserves this shared helper's pre-fix behavior (piping was
+            // unconditional before the HIGH fix): every test using this
+            // helper spawns with a live stdin pipe, matching what they
+            // already assumed.
+            pipe_stdin: true,
         }
     }
 
@@ -639,16 +855,28 @@ mod tests {
         let log = dir.path().join("instance.log");
         let mut s = spec("echo", &["hello-from-child"]);
         s.log_file = Some(log.clone());
+        s.attributed_log_path = Some(dir.path().join("output.log"));
+        s.stderr_log_file = Some(dir.path().join("stderr.raw"));
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&s).expect("spawn echo");
-        // Wait for it to finish writing + exit.
+        // Wait for it to exit.
         let deadline = Instant::now() + Duration::from_secs(5);
         while !backend.poll(&mut proc).unwrap().is_exited() {
             assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(10));
         }
+        // Fix pass (review of #80): `log_file` is once again a DIRECT,
+        // synchronous OS redirect (`Stdio::from(file)`, not a pipe an
+        // engine-side reader thread drains on its own schedule) — so
+        // "the child process has exited" once again implies "every byte it
+        // wrote is already on disk," with NO reader-thread catch-up window
+        // to poll for (the pre-story-4-2 guarantee, restored). A single
+        // direct read suffices.
         let contents = std::fs::read_to_string(&log).unwrap();
-        assert!(contents.contains("hello-from-child"), "log={contents:?}");
+        assert!(
+            contents.contains("hello-from-child"),
+            "content must be present immediately, no reader-thread lag: {contents:?}"
+        );
     }
 
     #[test]
@@ -813,6 +1041,8 @@ mod tests {
             pgid: Pid::from_raw(fp.pid as i32),
             pid: fp.pid,
             start_time: fp.start_time.wrapping_add(1),
+            stdin: StdinState::NoPipe,
+            log_capture: None,
         };
         assert_eq!(
             backend.poll(&mut recycled).unwrap(),
@@ -844,6 +1074,8 @@ mod tests {
             pgid: Pid::from_raw(pid as i32),
             pid,
             start_time: 0, // no recorded token → bare-liveness fallback
+            stdin: StdinState::NoPipe,
+            log_capture: None,
         };
         assert_eq!(
             backend.poll(&mut degraded).unwrap(),
@@ -866,6 +1098,12 @@ mod tests {
         std::fs::write(&blocker, b"not a dir").unwrap();
         let mut s = spec("sleep", &["30"]);
         s.log_file = Some(blocker.join("inner.log"));
+        // Valid attributed/stderr paths, so `capture` is considered wanted
+        // and the eager validation actually runs (all three fields gate
+        // capture together — see the backend's `spawn()` docs). `log_file`
+        // is opened FIRST, so its failure is what surfaces.
+        s.attributed_log_path = Some(dir.path().join("output.log"));
+        s.stderr_log_file = Some(dir.path().join("stderr.raw"));
         let backend = UnixBackend::new();
         let err = backend.spawn(&s).unwrap_err();
         match err {
@@ -971,6 +1209,10 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             log_file: Some(agent_log.clone()),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
+            pipe_stdin: true,
         };
         s.env.clear();
 
@@ -1045,6 +1287,75 @@ mod tests {
     }
 
     #[test]
+    fn confirm_death_gives_up_honestly_within_the_bound_when_the_process_never_exits() {
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): a
+        // deterministic, FAST proof of the bound-enforcement logic itself —
+        // mirrors this codebase's EXISTING `write_stdin_bounded`-called-
+        // directly-with-a-short-timeout pattern (story 4.1 fix pass), rather
+        // than waiting out the real 5s `KILL_CONFIRM_TIMEOUT` production
+        // bound. No genuine OS-level "immune to SIGKILL" state (the
+        // uninterruptible-I/O-wait this fix pass targets, empirically
+        // confirmed via a dedicated ramdisk experiment — see the story file's
+        // Dev Agent Record) is needed to prove THIS property: `confirm_death`
+        // only calls `reap_if_exited` and does not know or care WHY it keeps
+        // reporting `Alive` — a process that is simply still ALIVE when a
+        // SHORT test timeout elapses exercises the identical code path.
+        // `confirm_death` is called DIRECTLY here (never sending SIGKILL) so
+        // this test proves the WAIT-BOUNDING logic in isolation; the
+        // escalation call site's actual SIGKILL + confirm_death sequencing
+        // is covered by `stop_escalates_to_forced_kill_when_graceful_window_elapses`
+        // above (a NORMAL process, confirmed quickly).
+        let backend = UnixBackend::new();
+        let mut proc = backend
+            .spawn(&spec("sleep", &["30"]))
+            .expect("spawn sleep 30");
+        let start = Instant::now();
+        let err = confirm_death(&mut proc, Duration::from_millis(150)).expect_err(
+            "a still-alive process must not be reported confirmed dead within a short bound",
+        );
+        let elapsed = start.elapsed();
+        match err {
+            BackendError::StopUnconfirmed { timeout_secs } => {
+                // 150ms rounds down to 0 whole seconds — proves the ACTUAL
+                // timeout passed is what gets reported, not a hardcoded 5.
+                assert_eq!(timeout_secs, 0, "reports the timeout actually passed");
+            }
+            other => panic!("expected StopUnconfirmed, got {other}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "must honor the full bound before giving up: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not overshoot substantially: {elapsed:?}"
+        );
+        // Clean up: confirm_death only POLLS, it never signals, so the
+        // process is still alive — actually stop it now.
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn confirm_death_returns_promptly_once_the_process_actually_exits() {
+        // The self-healing / no-compounding counterpart: once the process
+        // DOES exit (here, naturally and quickly via `true`), confirm_death
+        // must return Ok promptly rather than waiting out the full bound —
+        // this is what lets a RETRY `stop()` (Supervisor::stop_inner) or the
+        // crash reaper reconcile a previously-stuck instance quickly once
+        // the underlying condition clears, instead of always paying the
+        // full timeout.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        let start = Instant::now();
+        confirm_death(&mut proc, Duration::from_secs(5)).expect("must confirm death");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a quickly-exiting process must be confirmed well before the bound: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn pause_freezes_the_process_then_resume_wakes_it() {
         // AC1 (Unix guaranteed): spawn `fake_agent --heartbeat-ms 50`, which
         // prints an incrementing `heartbeat <n>` line to its log every ~50ms.
@@ -1064,7 +1375,11 @@ mod tests {
             ],
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
+            pipe_stdin: true,
             log_file: Some(agent_log.clone()),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
         };
         s.env.clear();
 
@@ -1162,6 +1477,10 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             log_file: Some(log.clone()),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
+            pipe_stdin: true,
         };
         s.env.insert("KT_TEST".to_string(), "applied".to_string());
         let backend = UnixBackend::new();
@@ -1171,6 +1490,10 @@ mod tests {
             assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(10));
         }
+        // Fix pass (review of #80): `log_file` is a DIRECT, synchronous OS
+        // redirect again (see `log_file_captures_child_stdout`'s identical
+        // comment) — "exited" already implies "fully written", no
+        // reader-thread catch-up window to poll for.
         let contents = std::fs::read_to_string(&log).unwrap();
         assert!(contents.contains("env=applied"), "log={contents:?}");
         // The working dir is the temp dir (canonicalize to dodge /var→/private/var).
@@ -1181,5 +1504,383 @@ mod tests {
             "log={contents:?} want pwd={}",
             want.display()
         );
+    }
+
+    #[test]
+    fn write_stdin_delivers_a_line_that_is_echoed_into_the_captured_log() {
+        // Story 4.1 Task 1: spawning `fake_agent --echo-stdin` and writing a
+        // line via `write_stdin` produces the echoed `stdin: <line>` in the
+        // captured log — the OS-level plumbing `Supervisor::send_input` relies
+        // on.
+        let dir = tempfile::tempdir().unwrap();
+        let agent_log = dir.path().join("agent.log");
+        let bin = fake_agent_path();
+        let mut s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--echo-stdin".to_string(),
+                "--linger-ms".to_string(),
+                "600000".to_string(),
+            ],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(agent_log.clone()),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
+            pipe_stdin: true,
+        };
+        s.env.clear();
+
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&s).expect("spawn fake_agent --echo-stdin");
+        assert!(
+            backend.has_stdin(&proc),
+            "a freshly spawned handle has a live stdin pipe"
+        );
+        assert!(
+            !backend.stdin_timed_out(&proc),
+            "a freshly spawned handle has not timed out"
+        );
+
+        backend
+            .write_stdin(&mut proc, b"hello-stdin\n")
+            .expect("write_stdin");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&agent_log) {
+                if contents.lines().any(|l| l == "stdin: hello-stdin") {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "echoed stdin line never appeared"
+            );
+            sleep(Duration::from_millis(20));
+        }
+
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn has_stdin_is_true_when_spawned_and_false_once_adopted() {
+        // Story 4.1 AC-D: a freshly spawned handle holds a live stdin pipe;
+        // once re-acquired via `adopt` (simulating a DIFFERENT engine session
+        // after a crash+restart), the pipe cannot be recovered — the adopted
+        // handle must report `has_stdin() == false` so `send_input` fails
+        // honestly (`InteractionUnavailable`) instead of silently succeeding.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn sleep");
+        assert!(backend.has_stdin(&proc), "freshly spawned handle has stdin");
+        assert!(!backend.stdin_timed_out(&proc), "not timed out yet");
+
+        let fp = backend.fingerprint(&proc);
+        let adopter = UnixBackend::new();
+        let adopted = adopter
+            .adopt(&fp)
+            .expect("adopt call ok")
+            .expect("a live matching process must be adopted");
+        assert!(
+            !adopter.has_stdin(&adopted),
+            "an adopted handle has no recoverable stdin pipe"
+        );
+        assert!(
+            !adopter.stdin_timed_out(&adopted),
+            "an adopted handle never had a pipe, so it never timed out either — \
+             distinct from a handle that HAD a live pipe and timed out"
+        );
+
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn write_stdin_without_a_live_pipe_is_a_control_error() {
+        // Defensive path (callers MUST check `has_stdin` first): writing to a
+        // handle with no live pipe (e.g. an adopted handle) is a
+        // `BackendError::Control`, never a panic and never a silent success.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn");
+        let fp = backend.fingerprint(&proc);
+        let adopter = UnixBackend::new();
+        let mut adopted = adopter
+            .adopt(&fp)
+            .expect("adopt call ok")
+            .expect("a live matching process must be adopted");
+        let err = adopter.write_stdin(&mut adopted, b"x\n").unwrap_err();
+        match err {
+            BackendError::Control { op, .. } => assert_eq!(op, "stdin"),
+            other => panic!("expected Control, got {other}"),
+        }
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
+    }
+
+    // ---- Story 4.1 fix pass (CRITICAL finding, review of #79): the bounded
+    // stdin write. These call `write_stdin_bounded` DIRECTLY with a short,
+    // custom timeout (rather than through the `ProcessBackend::write_stdin`
+    // trait method, which hardcodes the real production `STDIN_WRITE_TIMEOUT`
+    // of 5s) so the MECHANISM is proven fast here; the full production
+    // dispatch through `Supervisor::send_input` using the real 5s constant is
+    // proven end-to-end (including the "a different instance is not blocked
+    // beyond the bound" property, which needs the engine's actual shared
+    // lock) by `crates/ktesio-engine/tests/interaction.rs`. ----
+
+    #[test]
+    fn write_stdin_bounded_times_out_on_a_non_draining_pipe_and_marks_the_handle_timed_out() {
+        // A process that never reads its stdin (no --echo-stdin) and a
+        // payload that comfortably exceeds any OS pipe buffer (Linux
+        // defaults to 64KiB; even a generously tuned buffer is nowhere near
+        // 8MB) — so the write blocks once the buffer fills, exactly the
+        // adversarial audit's reproduction. A short 150ms custom timeout
+        // (NOT the production 5s constant) keeps this test fast while still
+        // exercising the real mechanism end to end.
+        let backend = UnixBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_agent_path();
+        let s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec!["--linger-ms".to_string(), "600000".to_string()],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(dir.path().join("agent.log")),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
+            pipe_stdin: true,
+        };
+        let mut proc = backend
+            .spawn(&s)
+            .expect("spawn fake_agent (no --echo-stdin: never reads stdin)");
+        assert!(backend.has_stdin(&proc), "freshly spawned handle has stdin");
+
+        let huge_payload = vec![b'x'; 8 * 1024 * 1024]; // 8MB, far past any pipe buffer
+        let start = Instant::now();
+        let err = write_stdin_bounded(&mut proc.stdin, &huge_payload, Duration::from_millis(150))
+            .expect_err("a write to a non-draining pipe past its buffer must time out");
+        let elapsed = start.elapsed();
+        match err {
+            BackendError::StdinTimedOut { timeout_secs } => assert_eq!(timeout_secs, 0), // 150ms rounds to 0s
+            other => panic!("expected StdinTimedOut, got {other}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the bounded write must return promptly after its OWN short timeout, not hang: {elapsed:?}"
+        );
+
+        // The handle is now durably marked TimedOut: has_stdin is false, and
+        // stdin_timed_out distinguishes this from "never had a pipe".
+        assert!(!backend.has_stdin(&proc), "no longer reports a live pipe");
+        assert!(
+            backend.stdin_timed_out(&proc),
+            "must be distinguishably TimedOut, not merely NoPipe"
+        );
+
+        // Teardown: killing the group unblocks the abandoned write thread
+        // (its blocked write() call gets EPIPE once the reader is gone), so
+        // it cleans itself up in the background; the test does not wait for
+        // it (there is no safe way to join it — see write_stdin_bounded's
+        // docs — and it is harmless to leave running briefly).
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn write_stdin_after_a_timeout_is_a_defensive_control_error_with_no_new_write_attempted() {
+        // Once a handle is TimedOut, a caller that (incorrectly) tries to
+        // write again must get an IMMEDIATE defensive Control error — never
+        // another attempted write, and never a second wait. This is the
+        // backend-level safety net; `Supervisor::send_input` additionally
+        // short-circuits via `stdin_timed_out` before ever reaching here
+        // (proven at the engine level in interaction.rs), but this backend
+        // method must be safe even if called directly.
+        let backend = UnixBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_agent_path();
+        let s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec!["--linger-ms".to_string(), "600000".to_string()],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(dir.path().join("agent.log")),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
+            pipe_stdin: true,
+        };
+        let mut proc = backend.spawn(&s).expect("spawn fake_agent");
+
+        // Force a fast timeout (150ms, not the production 5s) to reach the
+        // TimedOut state quickly.
+        let huge_payload = vec![b'x'; 8 * 1024 * 1024];
+        let first = write_stdin_bounded(&mut proc.stdin, &huge_payload, Duration::from_millis(150));
+        assert!(matches!(first, Err(BackendError::StdinTimedOut { .. })));
+        assert!(backend.stdin_timed_out(&proc));
+
+        // A second attempt (via the PUBLIC trait method this time, which
+        // internally would use the real 5s bound if it attempted a write —
+        // it must not) returns instantly.
+        let start = Instant::now();
+        let second = backend.write_stdin(&mut proc, b"more\n");
+        let elapsed = start.elapsed();
+        match second {
+            Err(BackendError::Control { op, .. }) => assert_eq!(op, "stdin"),
+            other => panic!("expected a defensive Control error, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a write on an already-TimedOut handle must return immediately, not attempt \
+             (and wait out) another doomed write: {elapsed:?}"
+        );
+        assert!(
+            backend.stdin_timed_out(&proc),
+            "must remain TimedOut, not be reset by the defensive no-op"
+        );
+
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    // ---- Story 4-2: capture-path wiring (AC-A, AC-B, AC-E) ----
+
+    #[test]
+    fn spawn_captures_both_streams_attributed_and_stdout_only_in_the_legacy_log() {
+        // Task 3, fix pass (review of #80): spawning fake_agent with output
+        // on BOTH streams produces attributed lines for BOTH in the NEW
+        // attributed capture (agent-out/agent-err) — proving direct,
+        // crash-immune per-stream redirects (`Stdio::from(file)`, never a
+        // pipe) still feed full attribution via the background tailer.
+        //
+        // DELIBERATE CHANGE from this test's pre-fix-pass form (renamed
+        // accordingly): the legacy `agent.log` is now DIRECTLY,
+        // synchronously written by the OS for STDOUT ALONE (never merged
+        // with stderr via any engine-side hop — see `SpawnSpec::log_file`'s
+        // docs for why: `drain_usage_for`'s billing-critical sentinel is a
+        // stdout-only convention, so keeping `agent.log` a PURE, zero-hop
+        // stdout redirect is what fully closes H2, the fix pass's
+        // billing-race finding). Stderr is captured to its OWN separate raw
+        // file (`stderr_log_file`), asserted directly below, rather than
+        // asserting it appears (it no longer does, by design) inside
+        // `agent.log`.
+        let dir = tempfile::tempdir().unwrap();
+        let agent_log = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
+        let output_log = dir.path().join("output.log");
+        let bin = fake_agent_path();
+        let s = SpawnSpec {
+            exec: bin.to_string_lossy().into_owned(),
+            args: vec![
+                "--heartbeat-ms".to_string(),
+                "30".to_string(),
+                "--heartbeat-stderr-ms".to_string(),
+                "30".to_string(),
+                "--linger-ms".to_string(),
+                "600000".to_string(),
+            ],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(agent_log.clone()),
+            attributed_log_path: Some(output_log.clone()),
+            stderr_log_file: Some(stderr_raw.clone()),
+            instance_name: "dual".to_string(),
+            pipe_stdin: false,
+        };
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&s).expect("spawn fake_agent");
+        assert!(
+            backend.log_capture(&proc).is_some(),
+            "a freshly spawned, captured handle has a live log_capture"
+        );
+
+        // Wait for at least one heartbeat on EACH stream to land in its raw
+        // file AND the attributed capture. A generous 10s deadline (rather
+        // than 5s) — this test spawns a real process AND drives a
+        // background tailer thread under whatever CI/parallel-test load is
+        // in effect; the poll is deadline-based (never a fixed sleep), so a
+        // slower runner just takes longer, not a false failure.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let legacy = std::fs::read_to_string(&agent_log).unwrap_or_default();
+            let stderr = std::fs::read_to_string(&stderr_raw).unwrap_or_default();
+            let attributed = std::fs::read_to_string(&output_log).unwrap_or_default();
+            let raw_has_both = legacy.lines().any(|l| l.starts_with("heartbeat "))
+                && stderr.lines().any(|l| l.starts_with("stderr-heartbeat "));
+            let attributed_has_both = attributed.contains("\"stream\":\"agent-out\"")
+                && attributed.contains("\"stream\":\"agent-err\"");
+            if raw_has_both && attributed_has_both {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never observed both streams in both captures; legacy={legacy:?} stderr={stderr:?} attributed={attributed:?}"
+            );
+            sleep(Duration::from_millis(20));
+        }
+
+        // The legacy log NEVER carries stderr content (the deliberate
+        // change this test's rename documents) — even after the deadline
+        // loop above already confirmed BOTH streams are captured
+        // elsewhere, re-affirm this file specifically stays stdout-only.
+        let legacy = std::fs::read_to_string(&agent_log).unwrap();
+        assert!(
+            !legacy.lines().any(|l| l.starts_with("stderr-heartbeat ")),
+            "agent.log must never carry stderr content: {legacy:?}"
+        );
+
+        // The attributed capture parses as well-formed LogLine JSON-Lines,
+        // each carrying exactly the expected attribution.
+        let attributed = std::fs::read_to_string(&output_log).unwrap();
+        for l in attributed.lines() {
+            let parsed: LogLine = serde_json::from_str(l).expect("well-formed LogLine JSON");
+            assert!(matches!(
+                parsed.stream,
+                LogStream::AgentOut | LogStream::AgentErr
+            ));
+            assert_eq!(parsed.instance, "dual");
+        }
+
+        let _ = backend.stop(&mut proc, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn adopted_handle_has_no_log_capture() {
+        // Task 3: an adopted handle gets NO capture pipeline (mirrors
+        // has_stdin_is_true_when_spawned_and_false_once_adopted's precedent
+        // for stdin) — not a functional gap for reading/following (AC-H),
+        // only for the live-write side this handle would need to originate
+        // new capture from.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn sleep");
+        assert!(
+            backend.log_capture(&proc).is_none(),
+            "spec() opts out of capture"
+        );
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
+
+        // Spawn WITH capture this time, then adopt — the adopted copy must
+        // have no log_capture even though the ORIGINAL did.
+        let dir = tempfile::tempdir().unwrap();
+        let s = SpawnSpec {
+            exec: "sleep".to_string(),
+            args: vec!["30".to_string()],
+            env: BTreeMap::new(),
+            working_dir: dir.path().to_path_buf(),
+            log_file: Some(dir.path().join("agent.log")),
+            attributed_log_path: Some(dir.path().join("output.log")),
+            stderr_log_file: Some(dir.path().join("stderr.raw")),
+            instance_name: "svc".to_string(),
+            pipe_stdin: false,
+        };
+        let mut original = backend.spawn(&s).expect("spawn sleep with capture");
+        assert!(backend.log_capture(&original).is_some());
+        let fp = backend.fingerprint(&original);
+        let adopter = UnixBackend::new();
+        let adopted = adopter
+            .adopt(&fp)
+            .expect("adopt call ok")
+            .expect("a live matching process must be adopted");
+        assert!(
+            adopter.log_capture(&adopted).is_none(),
+            "an adopted handle has no recoverable capture pipeline"
+        );
+        let _ = backend.stop(&mut original, Duration::from_secs(2));
     }
 }

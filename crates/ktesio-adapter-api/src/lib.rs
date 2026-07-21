@@ -64,13 +64,23 @@ mod os;
 /// incompatibly. Unlike story 2-4's engine-INTERNAL `SecretResolver` (no bump), this
 /// touches the adapter-FACING contract, so the bump is real — the semver-check CI
 /// job guards it.
-pub const CONTRACT_VERSION: &str = "0.3.0";
+///
+/// Bumped `0.3.0 → 0.4.0` in story 4-1 (FR-24 send input): the manifest
+/// `[interaction]` block's `channel` field firms up from a free-form `String`
+/// to the closed [`manifest::InteractionChannelKind`] enum (single variant
+/// `Stdio` this story) — an unrecognized value now fails to PARSE instead of
+/// being silently accepted-and-ignored. This is an adapter-FACING, additive/
+/// clarifying change (mirrors 3-1's own reasoning): no existing shipped
+/// manifest sets a non-`"stdio"` channel today, so nothing breaks; the
+/// semver-check CI job guards it.
+pub const CONTRACT_VERSION: &str = "0.4.0";
 
 pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
 pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
-    AdapterIdentity, Interaction, Lifecycle, Manifest, ManifestError, Metering, OpTemplate,
+    AdapterIdentity, Interaction, InteractionChannelKind, Lifecycle, Manifest, ManifestError,
+    Metering, OpTemplate,
 };
 pub use metering::MeteringSource;
 pub use os::OsId;
@@ -82,11 +92,11 @@ mod tests {
     #[test]
     fn contract_version_parses_as_semver() {
         // The seed must be a valid semver so 6.6 can build negotiation on it.
-        // Bumped to 0.3.0 in story 3-1 (additive documented self-reported usage
-        // channel on the `[metering]` surface — an additive minor bump under 0.x).
+        // Bumped to 0.4.0 in story 4-1 (the `[interaction]` channel firms up
+        // into a closed enum — an additive/clarifying minor bump under 0.x).
         let parsed = semver::Version::parse(CONTRACT_VERSION).expect("CONTRACT_VERSION is semver");
         assert_eq!(parsed.major, 0);
-        assert_eq!(parsed.minor, 3);
+        assert_eq!(parsed.minor, 4);
         assert_eq!(parsed.patch, 0);
     }
 

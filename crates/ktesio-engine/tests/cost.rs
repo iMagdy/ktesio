@@ -348,11 +348,16 @@ fn breach_action_stop_drives_the_instance_to_stopped_on_a_dollar_cap() {
         .unwrap();
 
     facade.start("dollarstop").unwrap();
+    // 50s, not 30s: see budget.rs's `breach_action_stop_drives_the_instance_to_stopped`
+    // for the full reasoning -- a budget-breach stop always uses the DEFAULT
+    // 30s graceful window, which Windows (unlike Unix's near-instant SIGTERM
+    // default-disposition kill) always fully consumes before escalating, so a
+    // 30s test deadline races that SAME 30s window with zero margin.
     wait_for_state(
         state.path(),
         "dollarstop",
         LifecycleState::Stopped,
-        Duration::from_secs(30),
+        Duration::from_secs(50),
     );
 
     let breaches = facade.budget_breach_events("dollarstop").unwrap();

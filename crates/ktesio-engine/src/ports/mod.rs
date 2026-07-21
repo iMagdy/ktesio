@@ -19,8 +19,12 @@ mod secret_resolver;
 mod state_store;
 mod usage_source;
 
+pub(crate) use process_backend::{
+    spawn_output_capture, write_stdin_bounded, LogCapture, LOG_ROTATE_GENERATIONS,
+};
 pub use process_backend::{
-    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StopOutcome,
+    BackendError, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec, StdinState,
+    StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,

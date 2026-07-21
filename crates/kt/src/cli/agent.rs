@@ -12,21 +12,23 @@
 //! only — conventions). Output discipline (AD-12): command results to stdout,
 //! diagnostics/notices to stderr.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, Micros, RegistryError, RemoveDisposition, SupportLevel,
-    UsageView, FLEET_SCHEMA_VERSION,
+    FleetEntry, FleetListing, FleetTotals, LifecycleState, LogLine, Micros, RegistryError,
+    RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInvalidName,
-    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
-    AgentManifestNotFound, AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource,
-    AgentNotFound, AgentRunningRequiresForce, AgentStore, AgentUnknownConfigKey, AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionTimedOut,
+    AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentIo,
+    AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable,
+    AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
+    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
+    AgentUnknownKind,
 };
 use crate::ui;
 
@@ -176,6 +178,65 @@ impl ShowDocument {
     }
 }
 
+/// The `kt agent usage <name> --json` document (story 4-3, FR-22/FR-26, AD-14).
+///
+/// A versioned wrapper mirroring [`ShowDocument`] exactly, carrying the named
+/// instance's [`UsageView`] — the SAME snapshot type already embedded at
+/// `FleetEntry.usage`, NOT a parallel usage type and NOT the event-stream
+/// `UsageUpdateEvent` delta (a different type, routed to subscribers by story
+/// 7-2). A SINGLE document, never NDJSON: usage is a snapshot, not a stream.
+///
+/// `schema_version` REUSES [`FLEET_SCHEMA_VERSION`] rather than minting a
+/// `usage`-specific constant, because the governing rule across the CLI is that
+/// `schema_version` tracks the serialized CONTENT-TYPE FAMILY, not the command:
+/// the fleet-content commands (`list`/`show`/`usage`) all ride the fleet version,
+/// `config get` has its own, and `logs` uses the engine's `LOG_SCHEMA_VERSION`.
+#[derive(Serialize)]
+struct UsageDocument {
+    /// The Fleet document schema version ([`FLEET_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// The Agent Instance this usage snapshot belongs to.
+    instance: String,
+    /// The instance's Usage Ledger snapshot (tokens by scope + derived dollars).
+    usage: UsageView,
+}
+
+impl UsageDocument {
+    /// Wrap one instance's [`UsageView`], stamping [`FLEET_SCHEMA_VERSION`].
+    fn new(instance: String, usage: UsageView) -> Self {
+        Self {
+            schema_version: FLEET_SCHEMA_VERSION,
+            instance,
+            usage,
+        }
+    }
+}
+
+/// The Fleet-wide `kt agent usage --json` document (no name — story 4-3, FR-22).
+///
+/// The no-name counterpart of [`UsageDocument`], carrying the engine-computed
+/// [`FleetTotals`] aggregate — the SAME type already embedded at
+/// `FleetListing.totals` (reused, never forked), so the Fleet-wide usage scope is
+/// a first-class scriptable surface without the full `list` payload. Rides
+/// [`FLEET_SCHEMA_VERSION`] for the same content-type-family reason.
+#[derive(Serialize)]
+struct FleetUsageDocument {
+    /// The Fleet document schema version ([`FLEET_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// The Fleet-WIDE usage + cost aggregate over every instance.
+    totals: FleetTotals,
+}
+
+impl FleetUsageDocument {
+    /// Wrap the Fleet-wide [`FleetTotals`], stamping [`FLEET_SCHEMA_VERSION`].
+    fn new(totals: FleetTotals) -> Self {
+        Self {
+            schema_version: FLEET_SCHEMA_VERSION,
+            totals,
+        }
+    }
+}
+
 /// Serialize the composed [`FleetListing`] into the pretty `list --json` document (a
 /// versioned wrapper carrying the rows AND the Fleet-WIDE `totals`, story 3-5). Pure
 /// (no engine, no I/O) so it is unit-testable in-process; the CLI just prints the
@@ -192,6 +253,45 @@ fn fleet_json(listing: &FleetListing) -> Result<String, Box<dyn std::error::Erro
 fn show_json(entry: FleetEntry) -> Result<String, Box<dyn std::error::Error>> {
     let document = ShowDocument::new(entry);
     serde_json::to_string_pretty(&document).map_err(|e| serialize_error("instance", e))
+}
+
+/// Serialize one instance's [`UsageView`] into the pretty `usage <name> --json`
+/// document (a versioned [`UsageDocument`]). Pure, for the same reason as
+/// [`fleet_json`] — a SINGLE document (usage is a snapshot, not a stream).
+fn usage_json(instance: String, usage: UsageView) -> Result<String, Box<dyn std::error::Error>> {
+    let document = UsageDocument::new(instance, usage);
+    serde_json::to_string_pretty(&document).map_err(|e| serialize_error("usage", e))
+}
+
+/// Serialize the Fleet-wide [`FleetTotals`] into the pretty `usage --json`
+/// document (a versioned [`FleetUsageDocument`]). Pure, as above.
+fn fleet_usage_json(totals: FleetTotals) -> Result<String, Box<dyn std::error::Error>> {
+    let document = FleetUsageDocument::new(totals);
+    serde_json::to_string_pretty(&document).map_err(|e| serialize_error("Fleet usage", e))
+}
+
+/// Reject a MALFORMED Agent Instance name before a command that resolves the
+/// instance by scanning the Fleet ever looks it up (fix pass, M2).
+///
+/// Most `kt` commands (`logs`, `stop`, `pause`, the human `show`, …) pass the raw
+/// name into an engine call that validates it internally — `InstanceName::new`
+/// inside `Supervisor::read_agent_log` / `Registry::effective_capabilities` — so a
+/// name like `"Bad Name"` surfaces as [`RegistryError::InvalidName`] → exit `2`
+/// (usage). `show --json` and `usage <name>`, however, resolve the instance with a
+/// linear `find` over `fleet()` and then SYNTHESIZE [`RegistryError::NotFound`],
+/// which reported the same malformed input as exit `3`. Validating here — through
+/// the engine's PUBLIC [`ktesio_engine::InstanceName`] newtype, the SAME rule the
+/// engine applies internally, so `kt` re-derives nothing (AD-2) — makes the code
+/// uniformly `2` for every command.
+fn validate_instance_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    ktesio_engine::InstanceName::new(name)
+        .map(|_| ())
+        .map_err(|reason| {
+            map_error(RegistryError::InvalidName {
+                name: name.to_string(),
+                reason,
+            })
+        })
 }
 
 /// Wrap a `serde_json` serialization failure into an [`AgentIo`] diagnostic. Not
@@ -222,6 +322,12 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let facade = engine.blocking();
 
     if json {
+        // Fix pass (M2): VALIDATE the name before the Fleet lookup, so a
+        // MALFORMED name is a usage error (exit 2) rather than being reported as
+        // "not found" (exit 3) merely because no Fleet row could ever match it.
+        // Without this, `show --json` and the human `show` — which validates
+        // inside `effective_capabilities` — disagreed on the same input.
+        validate_instance_name(name)?;
         // Reuse the SAME composition as `list --json` and pick the named entry, so
         // the `show` object is byte-identical to that instance's `list` row. A
         // missing name is the uniform not-found diagnostic (to stderr).
@@ -407,6 +513,14 @@ const METERING_NOTE: &str =
      no budget configured); dollar figures appear only when a Rate is configured \
      (cost.rate.input/output) and are labeled estimates — with no Rate, dollar \
      features are inert.";
+
+/// The guidance printed when the Fleet is EMPTY — shared by `list` and the
+/// Fleet-wide `usage` (fix pass, L3) so both surfaces say the same thing rather
+/// than `usage` silently reporting all-zero totals that look like real, consumed
+/// nothing. `list` prints it to stdout in human mode (`ui::info`) and to stderr
+/// under `--json`; `usage` routes it to stderr in BOTH modes (AD-12).
+const EMPTY_FLEET_HINT: &str =
+    "No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>";
 
 /// The `kt agent list` Budget column HEADER (story 3-3, FR-23/AD-8).
 ///
@@ -655,7 +769,7 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         let document = fleet_json(&listing)?;
         println!("{document}");
         if empty {
-            ui::note("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
+            ui::note(EMPTY_FLEET_HINT);
         }
         // The metering note still rides on stderr (AD-12), keeping stdout pure JSON.
         ui::note(METERING_NOTE);
@@ -663,7 +777,7 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if listing.instances.is_empty() {
-        ui::info("No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>");
+        ui::info(EMPTY_FLEET_HINT);
         return Ok(());
     }
     let entries = &listing.instances;
@@ -725,6 +839,137 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // One stderr note (AD-12): usage is real tokens; dollars appear with a Rate.
     ui::note(METERING_NOTE);
     Ok(())
+}
+
+/// `kt agent usage [<name>] [--json]` — a focused, scriptable read of the Usage
+/// Ledger (story 4-3, FR-22/FR-26).
+///
+/// The two scopes FR-22 names, mirroring `show` (named) / `list` (Fleet-wide):
+/// with `<name>` → that instance's [`UsageView`] snapshot; with NO name → the
+/// Fleet-wide [`FleetTotals`] aggregate. Both are composed from the SAME facade
+/// read (`fleet()` → [`FleetListing::new`]) that `list`/`show` use, so the token
+/// totals equal the Usage Ledger — and each other — EXACTLY (the FR-22 honesty
+/// discipline). This command re-reads nothing and sums nothing itself: the engine
+/// `domain` owns the aggregate (AD-2).
+///
+/// `--json` writes ONE versioned document to stdout and nothing else there (a
+/// [`UsageDocument`] / [`FleetUsageDocument`], both riding [`FLEET_SCHEMA_VERSION`])
+/// — NOT NDJSON; that shape is `logs`-only, for its unbounded stream. The human
+/// form renders a focused table whose dollar figures route through the SINGLE
+/// currency module and stay labeled (AD-8/FR-23); on the wire, dollars are integer
+/// micros + the label, NEVER a `$` string (AD-14). Output discipline (AD-12): the
+/// result → stdout, the metering note → stderr. No secret reaches either surface
+/// (AD-10 — this reads ledger counters only).
+pub fn usage(name: Option<&str>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+    let entries = facade.fleet().map_err(map_error)?;
+
+    match name {
+        // Named: the instance's own UsageView snapshot — the SAME object
+        // `list`/`show --json` already carry at `FleetEntry.usage`. An unknown
+        // name is the uniform not-found diagnostic (stderr, exit 3), exactly as
+        // `show --json` resolves a missing instance.
+        Some(name) => {
+            // Fix pass (M2): VALIDATE first — see `validate_instance_name`. A
+            // malformed name is exit 2 here, uniform with `logs`/`stop`/`show`,
+            // instead of the exit 3 the bare `find` below would otherwise yield.
+            validate_instance_name(name)?;
+            let entry = entries
+                .into_iter()
+                .find(|e| e.name.as_str() == name)
+                .ok_or_else(|| {
+                    map_error(RegistryError::NotFound {
+                        name: name.to_string(),
+                    })
+                })?;
+            if json {
+                let document = usage_json(entry.name.as_str().to_string(), entry.usage)?;
+                println!("{document}");
+            } else {
+                render_usage_instance(&entry);
+            }
+        }
+        // Fleet-wide: the engine-computed aggregate over the SAME rows `list`
+        // sums, via `FleetListing::new` — so this total can never drift from the
+        // one `list` shows (it is literally the same computation).
+        None => {
+            let listing = FleetListing::new(entries);
+            // Fix pass (L3): an EMPTY Fleet gets the same honest guidance `list`
+            // prints, so a Fleet-wide `usage` of all zeros is never mistaken for
+            // "registered instances that consumed nothing". It rides STDERR in
+            // BOTH modes (AD-12), so `--json` stdout stays a pure document.
+            if listing.instances.is_empty() {
+                ui::note(EMPTY_FLEET_HINT);
+            }
+            let totals = listing.totals;
+            if json {
+                let document = fleet_usage_json(totals)?;
+                println!("{document}");
+            } else {
+                // Reuse the SAME honest footer `list` prints (labeled dollars via
+                // the one currency module, an explicit lower-bound note when the
+                // total is partial, `—` rather than a fabricated $0.00).
+                println!("{}", fleet_total_footer(&totals));
+            }
+        }
+    }
+    // The metering note rides on stderr (AD-12) in BOTH modes, so stdout stays a
+    // pure, parseable document under `--json`.
+    ui::note(METERING_NOTE);
+    Ok(())
+}
+
+/// Render one instance's [`UsageView`] as the focused human `usage` table (story
+/// 4-3): tokens by BOTH scopes (cumulative + current-run), the DERIVED dollar cost
+/// per scope, and the active Metering Source.
+///
+/// Every dollar figure routes through the SINGLE currency module via the shared
+/// [`cost_row_value`] (AD-8) and therefore always carries its
+/// `estimated`/`reconciled` label (FR-23); with no Rate configured it renders the
+/// honest inert note instead of a fabricated `$0.00` (AC-B). The `Value` column is
+/// wide (no truncation), so — as in `show` — the label rides INLINE in the cell.
+/// Result → stdout (AD-12).
+fn render_usage_instance(entry: &FleetEntry) {
+    let usage = &entry.usage;
+    let title = format!("Usage for {}", entry.name.as_str());
+    let columns = [
+        ui::TableColumn::new("Field", 14, 22),
+        ui::TableColumn::new("Value", 14, 48),
+    ];
+    let rows = vec![
+        vec![
+            ui::TableCell::plain("Cumulative tokens"),
+            ui::TableCell::plain(format!(
+                "in {} / out {}",
+                usage.cumulative_input_tokens, usage.cumulative_output_tokens
+            )),
+        ],
+        vec![
+            ui::TableCell::plain("Cumulative cost"),
+            ui::TableCell::plain(cost_row_value(
+                usage.cumulative_dollars.zip(usage.estimate_label),
+            )),
+        ],
+        vec![
+            ui::TableCell::plain("Current-run tokens"),
+            ui::TableCell::plain(format!(
+                "in {} / out {}",
+                usage.current_run_input_tokens, usage.current_run_output_tokens
+            )),
+        ],
+        vec![
+            ui::TableCell::plain("Current-run cost"),
+            ui::TableCell::plain(cost_row_value(
+                usage.current_run_dollars.zip(usage.estimate_label),
+            )),
+        ],
+        vec![
+            ui::TableCell::plain("Metering source"),
+            ui::TableCell::plain(entry.metering_source.clone()),
+        ],
+    ];
+    ui::print_table(&title, &columns, &rows);
 }
 
 /// `kt agent start <name>` — start a registered Agent Instance (AC1/AC2).
@@ -848,6 +1093,268 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// `kt agent send <name> <text>` — send text input to a running Agent
+/// Instance's native input channel (story 4.1, FR-24).
+///
+/// Drives `send_input` through the blocking facade. Unlike `pause`/`resume`,
+/// `send` is not a lifecycle transition, so there is no new Lifecycle State to
+/// print — on success only a confirmation goes to stdout. Failure modes,
+/// mapped by [`map_engine_error`]: the instance is not `running`
+/// ([`AgentNotRunning`]); interaction is `unsupported` on this OS, quoting the
+/// Capability Declaration ([`AgentCapabilityUnsupported`]); or the instance is
+/// running but this engine session holds no live stdin pipe for it, e.g. an
+/// ADOPTED instance ([`AgentInteractionUnavailable`]).
+pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+    match facade.send_input(name, text) {
+        Ok(()) => {
+            ui::success(format!(
+                "Sent input to Agent Instance {}",
+                ui::skill_name(name)
+            ));
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
+/// How often `kt agent logs --follow` polls for new output (story 4-2,
+/// Assumption 7) — a reasonable default left unspecified by any source
+/// document, mirroring `STOP_POLL_INTERVAL`'s existing precedent
+/// (`backends/unix/mod.rs`) of a hardcoded short interval rather than a
+/// configurable one.
+const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// How long AC-C's final drain (below) may retry after a non-`running`
+/// transition is observed, before giving up and printing the exit note
+/// (fix pass, M2, review of #80). `Supervisor::transition_with_log_capture`
+/// writes `output.log`'s engine line SYNCHRONOUSLY now (fix pass, H1 — no
+/// background writer thread/channel is involved anymore), but it does so
+/// AFTER first persisting the new state to the DB (`registry.set_state`) —
+/// two separate steps within the SAME call, not one atomic unit. `kt agent
+/// logs --follow` runs in a SEPARATE process from whatever transitions the
+/// instance (e.g. a concurrent `kt agent stop`), so it can observe the NEW
+/// state via `instance_status` (step one) a moment before that OTHER
+/// process has finished the engine-line write (step two) — a real,
+/// cross-process race, distinct from (and independent of) the reader/tailer
+/// mechanics. Retrying briefly here closes it. Mirrors
+/// `crates/ktesio-engine/tests/logs.rs`'s
+/// `follow_drains_and_exits_cleanly_on_stop`'s own accommodation for this
+/// exact race (there, a 3s bound); kept short here since the remaining gap
+/// between the two steps is normally sub-millisecond.
+const FOLLOW_FINAL_DRAIN_BOUND: Duration = Duration::from_secs(2);
+
+/// How often the final-drain retry (above) re-polls while waiting.
+const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// `kt agent logs <name> [--follow]` — read retained logs, optionally
+/// following live output (story 4-2, FR-25, spine AD-12).
+///
+/// One-shot: dumps every currently-retained [`LogLine`] to stdout (this IS
+/// the command's result — AD-12's "stdout of kt is command output"
+/// convention) and returns. `--follow` (AC-B/AC-C): after that initial dump
+/// (mirroring `docker logs -f`'s "show existing, then keep streaming"
+/// convention), loops on [`LOGS_FOLLOW_POLL_INTERVAL`] calling
+/// `read_agent_log_since`, printing new lines as they arrive, and
+/// periodically checking `instance_status`. On a detected rotation (the
+/// engine's returned cursor snaps BELOW the one just passed in), prints one
+/// honest notice rather than silently claiming completeness. On a non-
+/// `running` state, performs a bounded final drain (fix pass, M2 — see
+/// [`FOLLOW_FINAL_DRAIN_BOUND`]; so no line emitted before the transition is
+/// lost) and exits cleanly with a state-appropriate note — a `paused`
+/// instance is not "gone", so it gets an honest "paused" note, not an
+/// error. No special Ctrl-C handling is needed: this is a read-only command
+/// holding no supervising handle, so a SIGINT exit is always safe.
+///
+/// `--json` (story 4-3, AD-14/DC-2) emits **newline-delimited JSON**: one
+/// serialized engine [`LogLine`] per stdout line (compact, not pretty), in the
+/// SAME append order as the human form (never timestamp-sorted — story 4-2
+/// AC-G). NDJSON — not a single wrapping document — because `--follow` is an
+/// unbounded stream a wrapper could never close; each [`LogLine`] already carries
+/// its own `schema_version` ([`ktesio_engine::LOG_SCHEMA_VERSION`]), so per-line
+/// versioning is intrinsic. The shape is identical for one-shot and `--follow`.
+/// Output discipline holds in BOTH modes (DC-3): stdout stays pure NDJSON while
+/// the rotation notice and the follow-exit note ride on stderr (AD-12).
+///
+/// A downstream consumer that STOPS READING (`kt agent logs --json | head -5`)
+/// ends the command CLEANLY with exit `0` in every mode — one-shot, `--follow`,
+/// human, or JSON (fix pass, M1: see [`emit_log_lines`]). It is not an error; the
+/// consumer got what it asked for, and a `--follow` loop stops rather than
+/// spinning against a dead pipe.
+pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let facade = engine.blocking();
+
+    // Fix pass (M1, review of #80): `read_agent_log` returns the byte-cursor
+    // it reached ALONGSIDE its one-shot dump — this primes the follow loop's
+    // cursor directly from the SAME read, with no separate
+    // `read_agent_log_since(name, 0)` priming call whose own lines used to
+    // be silently discarded (a T1→T2 window between the two reads during
+    // which any emitted output was lost before `--follow` ever started
+    // polling).
+    let (lines, mut cursor) = facade.read_agent_log(name).map_err(map_engine_error)?;
+    // Fix pass (M1): a consumer that stopped reading (`| head -5`) ends the command
+    // CLEANLY (exit 0), never a `println!` panic (exit 101) — see `emit_log_lines`.
+    if emit_log_lines(&lines, json)? == EmitOutcome::PipeClosed || !follow {
+        return Ok(());
+    }
+
+    loop {
+        std::thread::sleep(LOGS_FOLLOW_POLL_INTERVAL);
+        let (new_lines, next_cursor) = facade
+            .read_agent_log_since(name, cursor)
+            .map_err(map_engine_error)?;
+        note_if_rotated(next_cursor, cursor, name);
+        if emit_log_lines(&new_lines, json)? == EmitOutcome::PipeClosed {
+            return Ok(());
+        }
+        cursor = next_cursor;
+
+        let status = facade.instance_status(name).map_err(map_engine_error)?;
+        if status.instance.state != LifecycleState::Running {
+            // AC-C: a BOUNDED final drain (fix pass, M2) so nothing emitted
+            // right up to the transition is lost — retries briefly rather
+            // than a single unretried read (see FOLLOW_FINAL_DRAIN_BOUND's
+            // docs for why); RETRIES while a poll comes back empty (the
+            // writer thread has not caught up yet) and stops as soon as
+            // EITHER a poll finds new content or the bound elapses —
+            // never the reverse (stopping on the FIRST empty read would
+            // defeat the retry's whole purpose).
+            let final_deadline = Instant::now() + FOLLOW_FINAL_DRAIN_BOUND;
+            loop {
+                let (more, next_cursor) = facade
+                    .read_agent_log_since(name, cursor)
+                    .map_err(map_engine_error)?;
+                note_if_rotated(next_cursor, cursor, name);
+                if emit_log_lines(&more, json)? == EmitOutcome::PipeClosed {
+                    return Ok(());
+                }
+                cursor = next_cursor;
+                if !more.is_empty() || Instant::now() >= final_deadline {
+                    break;
+                }
+                std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
+            }
+            ui::note(follow_exit_note(name, status.instance.state));
+            return Ok(());
+        }
+    }
+}
+
+/// Render one [`LogLine`] in the human `<at> [<stream>] <text>` form (AC-G: the
+/// caller is responsible for never re-sorting). Pure — the caller writes it.
+fn human_log_line(line: &LogLine) -> String {
+    format!("{} [{}] {}", line.at, line.stream, line.text)
+}
+
+/// Whether the stdout consumer is still reading, as observed by [`emit_log_lines`]
+/// (fix pass, M1).
+///
+/// A closed downstream pipe (`kt agent logs --json | head -5`) is NOT an error: the
+/// consumer got what it asked for. It IS, however, a reason to stop — a `--follow`
+/// loop that kept polling and writing into a dead pipe would spin forever with
+/// nowhere to put its output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmitOutcome {
+    /// Everything was written; keep going.
+    Continue,
+    /// The downstream consumer closed the pipe — stop cleanly (exit `0`).
+    PipeClosed,
+}
+
+/// Emit a batch of [`LogLine`]s to stdout in the append order given (AC-G — never
+/// re-sorted), choosing the surface by `json` (story 4-3): `true` → one compact
+/// NDJSON object per line via [`log_line_json`]; `false` → the human
+/// `<at> [<stream>] <text>` form via [`human_log_line`]. Shared by the one-shot
+/// dump and every `--follow` poll/drain so both modes stay byte-consistent. An
+/// empty batch emits nothing (an empty log is zero stdout lines, not `[]`).
+///
+/// **Broken-pipe discipline (fix pass, M1).** Writes go through a held
+/// [`std::io::StdoutLock`] rather than `println!`, because `println!` PANICS on a
+/// write error and Rust ignores `SIGPIPE` — so `kt agent logs --json | head -5`
+/// used to abort with exit `101`, a code outside the frozen table `docs/commands.md`
+/// documents. An [`std::io::ErrorKind::BrokenPipe`] is therefore reported as
+/// [`EmitOutcome::PipeClosed`], which the caller turns into a clean `Ok(())` (exit
+/// `0`); any OTHER write failure is still a real [`AgentIo`] diagnostic. This is
+/// scoped to the log-streaming path deliberately — no process-wide `SIGPIPE`
+/// disposition change, which would alter behavior for every other command.
+fn emit_log_lines(
+    lines: &[LogLine],
+    json: bool,
+) -> Result<EmitOutcome, Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in lines {
+        let rendered = if json {
+            log_line_json(line)?
+        } else {
+            human_log_line(line)
+        };
+        if let Err(err) = writeln!(out, "{rendered}") {
+            return classify_stdout_write(err);
+        }
+    }
+    // `Stdout` is line-buffered, so each `writeln!` above already surfaced its own
+    // failure; flush anyway so a batch is never left half-visible to the consumer.
+    match out.flush() {
+        Ok(()) => Ok(EmitOutcome::Continue),
+        Err(err) => classify_stdout_write(err),
+    }
+}
+
+/// Map a stdout write failure to either a clean [`EmitOutcome::PipeClosed`] (the
+/// consumer went away — `| head`, a closed terminal) or a real [`AgentIo`]
+/// diagnostic (a genuine I/O failure, e.g. a full disk when stdout is a file).
+fn classify_stdout_write(err: std::io::Error) -> Result<EmitOutcome, Box<dyn std::error::Error>> {
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(EmitOutcome::PipeClosed)
+    } else {
+        Err(AgentIo {
+            message: format!("Failed to write the log output to stdout: {err}"),
+        }
+        .into())
+    }
+}
+
+/// Serialize one [`LogLine`] to a SINGLE compact JSON line (NDJSON — story 4-3):
+/// `serde_json::to_string` (never `to_string_pretty`, which would break the
+/// one-object-per-line invariant). Reuses the engine's already-versioned
+/// [`LogLine`] (its `schema_version` is [`ktesio_engine::LOG_SCHEMA_VERSION`]) — no
+/// new schema constant. Pure and unit-testable; a serialize failure (unreachable
+/// for this plain serde struct) becomes an [`AgentIo`] diagnostic, never a panic.
+fn log_line_json(line: &LogLine) -> Result<String, Box<dyn std::error::Error>> {
+    serde_json::to_string(line).map_err(|e| serialize_error("log line", e))
+}
+
+/// If `next_cursor` snapped BELOW `prior_cursor`, a rotation happened since
+/// the last poll (story 4-2, AC-D/AC-H) — print the one honest notice rather
+/// than silently claim completeness. This is how the CLI detects the
+/// signal `Supervisor::read_agent_log_since` returns via the plain
+/// `(Vec<LogLine>, u64)` shape (no separate boolean field).
+fn note_if_rotated(next_cursor: u64, prior_cursor: u64, name: &str) {
+    if next_cursor < prior_cursor {
+        ui::note(format!(
+            "output rotated; a small window may be missing from the live tail — `kt agent logs {name}` \
+             (without --follow) re-reads everything currently retained"
+        ));
+    }
+}
+
+/// The honest `--follow` exit note for a non-`running` state (AC-C) — a
+/// `paused` instance is not "gone" (so it gets its own wording, never an
+/// error), while every other non-running state gets a generic "no further
+/// output will arrive" note.
+fn follow_exit_note(name: &str, state: LifecycleState) -> String {
+    if state == LifecycleState::Paused {
+        format!("Agent Instance '{name}' is paused; no further output until it is resumed.")
+    } else {
+        format!("Agent Instance '{name}' is {state}; no further output will arrive.")
     }
 }
 
@@ -1470,6 +1977,80 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
         }
         .into(),
+        // Story 4.1 AC-C: `send` targeted an instance that is not `running`.
+        // Not a transition error (there is no transition table entry for
+        // `send`), so it gets its own remediation naming the current state.
+        //
+        // M2 fix (review of #79): the remediation VERB must match the
+        // instance's ACTUAL state. A `paused` instance's correct remediation
+        // is `kt agent resume` — suggesting `kt agent start` there hits a
+        // SECOND, confusing `InvalidTransition` error (start only accepts
+        // registered/stopped/failed), not a helpful fix. Every other
+        // NOT-running state (registered/starting/stopping/stopped/failed)
+        // keeps the original `start` remediation.
+        EngineError::NotRunning { name, state } => {
+            let remediation = if state == "paused" {
+                format!("resume it with: kt agent resume {name}")
+            } else {
+                format!("start it first with: kt agent start {name}")
+            };
+            AgentNotRunning {
+                message: format!(
+                    "Agent Instance '{name}' is not running (current state: {state}); \
+                     {remediation}. List the Fleet with: kt agent list"
+                ),
+            }
+            .into()
+        }
+        // Story 4.1 AC-D: the instance IS running, but this engine session
+        // holds no live stdin pipe for it (most commonly an instance ADOPTED
+        // from a prior engine session). Distinct from CapabilityUnsupported —
+        // the adapter's declaration may truthfully say `interaction:
+        // guaranteed`; it is this session's reach that is limited. State the
+        // single-lifetime boundary honestly rather than implying a bug.
+        EngineError::InteractionUnavailable { name, detail } => AgentInteractionUnavailable {
+            message: format!(
+                "Agent Instance '{name}' cannot receive input right now: {detail}. Durable \
+                 cross-invocation interaction needs a persistent engine session (planned for a \
+                 future release); within a single `kt` process/embedding session this works."
+            ),
+        }
+        .into(),
+        // Story 4.1 fix pass (CRITICAL finding, review of #79): `send`'s
+        // write to this instance's stdin did not complete within the bounded
+        // timeout — the agent may be stuck (not draining its input).
+        // Distinct from InteractionUnavailable: this engine session DID hold
+        // a live pipe and attempted the write; it simply never came back.
+        // The instance's interaction channel is now permanently unusable for
+        // the rest of this session, so the remediation is a fresh start.
+        EngineError::InteractionTimedOut { name, timeout_secs } => AgentInteractionTimedOut {
+            message: format!(
+                "Agent Instance '{name}' is not draining its input within {timeout_secs}s and \
+                 may be stuck. Its interaction channel is now unavailable for the rest of this \
+                 session; restart it for a fresh one: kt agent stop {name} && kt agent start \
+                 {name}"
+            ),
+        }
+        .into(),
+        // Fix pass (review of #80 follow-up — the CRITICAL finding): `stop`
+        // sent SIGKILL but could not confirm the process's death within the
+        // bound — most likely because it is stuck in an OS-level
+        // uninterruptible I/O wait (e.g. disk pressure caused by a fast
+        // writer with no reader-side backpressure). The instance is NOT
+        // `stopped` — it stays `stopping`; point at retrying `stop` (which
+        // will not re-block for the same duration if it is still stuck) and
+        // name the likely cause honestly rather than implying a bug.
+        EngineError::StopUnconfirmed { name, timeout_secs } => AgentStopUnconfirmed {
+            message: format!(
+                "Agent Instance '{name}' was sent SIGKILL but has not been confirmed dead \
+                 within {timeout_secs}s; it may be stuck in an OS-level I/O wait (for example, \
+                 disk pressure). It remains in the 'stopping' state. Try again with: \
+                 kt agent stop {name} — this will not re-block if it is still stuck, and will \
+                 succeed once the process actually exits (which may require relieving disk \
+                 pressure or waiting for the stuck I/O to resolve)."
+            ),
+        }
+        .into(),
         EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -1577,6 +2158,244 @@ mod tests {
             ktesio_engine::ports::StoreError::Backend("db gone".into()),
         ));
         assert!(store.to_string().contains("State store error"));
+    }
+
+    #[test]
+    fn map_engine_error_renders_the_interaction_timed_out_diagnostic() {
+        // Fix pass (CRITICAL finding, review of #79) coverage-closer: unlike
+        // every OTHER `map_engine_error` arm (all reached only indirectly
+        // through full CLI-process-spawning tests in `agent_cli.rs`),
+        // `EngineError::InteractionTimedOut`'s CLI rendering CANNOT be
+        // exercised that way at all — a genuinely stuck write needs a LIVE
+        // pipe, which only exists within the SAME engine session that
+        // spawned it, but a single `kt agent send` invocation opens its OWN
+        // fresh `Engine` and exits after one call; a SEPARATE `kt agent
+        // send` reaching an instance a prior invocation started can only do
+        // so via `adopt_orphans`, which NEVER carries a live pipe (mirrors
+        // the story's OWN Task 8 Deviation 1 finding for
+        // `InteractionUnavailable`'s happy path — the same structural
+        // constraint, one variant further). So this diagnostic's rendering
+        // is unit-tested directly here, mirroring `map_error_includes_
+        // remediation_hints`'s existing direct-call pattern for `map_error`.
+        let err = map_engine_error(EngineError::InteractionTimedOut {
+            name: "stuck".to_string(),
+            timeout_secs: 5,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("stuck"), "names the instance: {msg}");
+        assert!(msg.contains('5'), "names the bound: {msg}");
+        assert!(
+            msg.contains("kt agent stop stuck") && msg.contains("kt agent start stuck"),
+            "points at a restart for a fresh channel: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported") && !msg.contains("declares"),
+            "must never be misattributed to CapabilityUnsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_engine_error_mapper_arm_preserves_its_documented_exit_code() {
+        // Story 4-3 fix pass (H1) — closing a PROVEN gate hole. `exit_code.rs`
+        // pins `classify(AgentInteractionTimedOut) == 6`, and `agent_cli.rs` pins
+        // that `main` wires `classify` to the process status. NOTHING pinned the
+        // middle link: that the timeout PATH actually PRODUCES an
+        // `AgentInteractionTimedOut`. An adversarial pass changed the
+        // `EngineError::InteractionTimedOut` arm of `map_engine_error` to build an
+        // `AgentIo` instead — silently demoting the documented `6` to `1` — and
+        // the whole suite still passed.
+        //
+        // This test closes that seam for EVERY engine-error class that carries a
+        // non-`1` code: it drives the REAL mapper and then the REAL classifier, so
+        // severing any arm changes an asserted number. It is deterministic and
+        // runs on ALL THREE OSes (no process spawn), which matters because codes
+        // `5` and `6` have no cross-OS end-to-end path (`send`/`pause` both need a
+        // genuinely running child, and the surviving-engine harness is Unix-only).
+        use crate::exit_code::{classify, ExitCode};
+
+        let cases: Vec<(&str, EngineError, ExitCode)> = vec![
+            (
+                // 6 — the hole the adversarial pass proved.
+                "InteractionTimedOut",
+                EngineError::InteractionTimedOut {
+                    name: "stuck".to_string(),
+                    timeout_secs: 5,
+                },
+                ExitCode::TimedOut,
+            ),
+            (
+                "InteractionUnavailable",
+                EngineError::InteractionUnavailable {
+                    name: "svc".to_string(),
+                    detail: "no live process handle".to_string(),
+                },
+                ExitCode::Unsupported,
+            ),
+            (
+                "CapabilityUnsupported",
+                EngineError::CapabilityUnsupported {
+                    name: "un".to_string(),
+                    capability: "pause".to_string(),
+                    os: "linux".to_string(),
+                    level: "unsupported".to_string(),
+                },
+                ExitCode::Unsupported,
+            ),
+            (
+                "NotRunning",
+                EngineError::NotRunning {
+                    name: "svc".to_string(),
+                    state: "stopped".to_string(),
+                },
+                ExitCode::InvalidState,
+            ),
+            (
+                "StopUnconfirmed",
+                EngineError::StopUnconfirmed {
+                    name: "svc".to_string(),
+                    timeout_secs: 5,
+                },
+                ExitCode::InvalidState,
+            ),
+            (
+                "InvalidName",
+                EngineError::InvalidName {
+                    name: "Bad Name".to_string(),
+                    reason: ktesio_engine::NameError::BadFirstChar,
+                },
+                ExitCode::Usage,
+            ),
+            (
+                "NotFound",
+                EngineError::NotFound {
+                    name: "ghost".to_string(),
+                },
+                ExitCode::NotFound,
+            ),
+            (
+                "LaunchFailed",
+                EngineError::LaunchFailed {
+                    name: "svc".to_string(),
+                    detail: "exec failed".to_string(),
+                },
+                ExitCode::General,
+            ),
+        ];
+
+        for (what, engine_error, expected) in cases {
+            let mapped = map_engine_error(engine_error);
+            assert_eq!(
+                classify(mapped.as_ref()),
+                expected,
+                "`EngineError::{what}` must still map to a diagnostic that classifies \
+                 as {expected:?} — the exit code is a FROZEN v1 compatibility surface \
+                 (PRD §7). Rendered diagnostic: {mapped}",
+            );
+        }
+    }
+
+    #[test]
+    fn registry_error_mapper_arms_preserve_their_documented_exit_codes() {
+        // The `map_error` half of the same seam (fix pass, H1): the registry-shaped
+        // diagnostics `register`/`remove`/`show --json`/`usage` raise.
+        use crate::exit_code::{classify, ExitCode};
+
+        let cases: Vec<(&str, RegistryError, ExitCode)> = vec![
+            (
+                "InvalidName",
+                RegistryError::InvalidName {
+                    name: "Bad Name".to_string(),
+                    reason: ktesio_engine::NameError::BadFirstChar,
+                },
+                ExitCode::Usage,
+            ),
+            (
+                "DuplicateName",
+                RegistryError::DuplicateName {
+                    name: "alpha".to_string(),
+                },
+                ExitCode::Usage,
+            ),
+            (
+                "NotFound",
+                RegistryError::NotFound {
+                    name: "ghost".to_string(),
+                },
+                ExitCode::NotFound,
+            ),
+            (
+                "RunningRequiresForce",
+                RegistryError::RunningRequiresForce {
+                    name: "svc".to_string(),
+                },
+                ExitCode::InvalidState,
+            ),
+        ];
+
+        for (what, registry_error, expected) in cases {
+            let mapped = map_error(registry_error);
+            assert_eq!(
+                classify(mapped.as_ref()),
+                expected,
+                "`RegistryError::{what}` must still classify as {expected:?} \
+                 (frozen exit-code surface, PRD §7). Rendered: {mapped}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_name_is_a_usage_error_not_a_not_found() {
+        // Fix pass (M2): `usage <name>` and `show --json` resolve the instance by
+        // scanning `fleet()`, so a malformed name used to be reported as NotFound
+        // (3) while `logs`/`stop`/`show` reported the same input as a usage error
+        // (2). `validate_instance_name` is what makes it uniformly 2.
+        use crate::exit_code::{classify, ExitCode};
+
+        for bad in ["Bad Name", "", "UPPER", "-leading-dash", "has space"] {
+            let err = validate_instance_name(bad).expect_err("malformed name must be rejected");
+            assert_eq!(
+                classify(err.as_ref()),
+                ExitCode::Usage,
+                "`{bad}` must be a usage error (2); rendered: {err}",
+            );
+        }
+        // A well-formed name passes through untouched (no existence check here —
+        // that stays the caller's Fleet lookup).
+        for good in ["alpha", "a", "a-b_c9", "0start"] {
+            assert!(validate_instance_name(good).is_ok(), "`{good}` is valid");
+        }
+    }
+
+    #[test]
+    fn map_engine_error_renders_the_stop_unconfirmed_diagnostic() {
+        // Fix pass (review of #80 follow-up — the CRITICAL finding)
+        // coverage-closer: mirrors `map_engine_error_renders_the_
+        // interaction_timed_out_diagnostic`'s reasoning exactly —
+        // `EngineError::StopUnconfirmed` needs a process GENUINELY stuck in
+        // an OS-level uninterruptible I/O wait (disk exhaustion), which a
+        // full CLI-process-spawning test cannot safely or deterministically
+        // induce (and must never attempt against the real host disk — see
+        // the fix pass's mandatory ramdisk-only empirical proof). So this
+        // diagnostic's rendering is unit-tested directly here instead.
+        let err = map_engine_error(EngineError::StopUnconfirmed {
+            name: "stuck".to_string(),
+            timeout_secs: 5,
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("stuck"), "names the instance: {msg}");
+        assert!(msg.contains('5'), "names the bound: {msg}");
+        assert!(
+            msg.contains("SIGKILL") && msg.contains("I/O wait"),
+            "names the honest likely cause, not a generic failure: {msg}"
+        );
+        assert!(
+            msg.contains("'stopping'"),
+            "states the instance's actual (non-terminal) state honestly: {msg}"
+        );
+        assert!(
+            msg.contains("kt agent stop stuck"),
+            "points at retrying stop rather than a generic remediation: {msg}"
+        );
     }
 
     #[test]

@@ -312,6 +312,115 @@ pub enum EngineError {
         source: BackendError,
     },
 
+    /// `send` was targeted at an instance NOT in [`LifecycleState::Running`]
+    /// (story 4.1, AC-C). Unlike a lifecycle verb, `send` is not itself a
+    /// state transition, so this is a dedicated pre-flight check rather than
+    /// [`EngineError::InvalidTransition`] — there is no transition being
+    /// attempted. Checked BEFORE the capability-support read (mirrors the
+    /// "transition gate before any side effect" convention). Names the
+    /// instance + its current state.
+    ///
+    /// [`LifecycleState::Running`]: super::lifecycle::LifecycleState::Running
+    #[error("Agent Instance '{name}' is not running (current state: {state}); start it first")]
+    NotRunning {
+        /// The instance `send` targeted.
+        name: String,
+        /// The instance's current Lifecycle State (wire form, e.g. `"paused"`).
+        state: String,
+    },
+
+    /// `send` was targeted at an instance that IS genuinely
+    /// [`LifecycleState::Running`](super::lifecycle::LifecycleState::Running)
+    /// (its Capability Declaration may truthfully say `interaction:
+    /// guaranteed`) but this engine session holds no live stdin pipe for it
+    /// (story 4.1, AC-D) — most notably an instance ADOPTED from a prior
+    /// engine session (AD-5), which has no OS-portable, documented way to
+    /// recover a pipe file descriptor from a bare PID. Distinct from
+    /// [`EngineError::CapabilityUnsupported`]: it is this engine session's
+    /// REACH that is limited, never the adapter's declared capability, so
+    /// this must NEVER be misattributed to `CapabilityUnsupported` and must
+    /// NEVER resolve to a silent success. Also distinct from
+    /// [`EngineError::InteractionTimedOut`]: THIS variant means "no pipe was
+    /// EVER recoverable in this session" (no handle held at all, or an
+    /// adopted/never-piped handle); that one means "we HAD a live pipe,
+    /// attempted the write, and it did not come back in time." Names the
+    /// instance + the honest underlying cause.
+    #[error("Agent Instance '{name}' cannot receive input right now: {detail}")]
+    InteractionUnavailable {
+        /// The instance `send` targeted.
+        name: String,
+        /// The honest underlying reason (e.g. no live pipe held in this
+        /// engine session) — never a misattribution to the adapter's
+        /// Capability Declaration.
+        detail: String,
+    },
+
+    /// A [`Supervisor::send_input`](super::supervisor::Supervisor::send_input)
+    /// write did not complete within the bounded stdin-write timeout (story
+    /// 4.1 fix pass — the CRITICAL finding, review of #79: a genuinely stuck
+    /// agent that never drains its input could otherwise block the write
+    /// forever, freezing the ENTIRE engine — every instance shares ONE
+    /// supervisor lock, so no other `start`/`stop`/`pause`/`send`/the
+    /// crash-detection reaper could proceed until the write returned; an
+    /// adversarial audit reproduced this empirically against the original
+    /// unbounded `write_all`). Distinct from
+    /// [`EngineError::InteractionUnavailable`] (that variant means "no pipe
+    /// was EVER recoverable" — no handle held, an adopted instance, or one
+    /// whose declared interaction is unsupported); this means "we HAD a live
+    /// pipe, attempted the write, and it did not come back in time." The
+    /// instance's interaction channel is now PERMANENTLY broken for the
+    /// remainder of this engine session (until it is stopped and started
+    /// again, which opens an entirely fresh pipe) — every SUBSEQUENT `send`
+    /// on the same instance returns this immediately, without attempting
+    /// another doomed write (a cheap check, no new I/O). Names the instance +
+    /// the bound that elapsed.
+    #[error(
+        "Agent Instance '{name}' is not draining its input within {timeout_secs}s (it may be \
+         stuck); this engine session's interaction channel for it is now unavailable — stop and \
+         start it again for a fresh one"
+    )]
+    InteractionTimedOut {
+        /// The instance `send` targeted.
+        name: String,
+        /// The bound (seconds) that elapsed before the write was abandoned.
+        timeout_secs: u64,
+    },
+
+    /// A [`Supervisor::stop`](super::supervisor::Supervisor::stop) call sent
+    /// SIGKILL (or the platform equivalent) but could not CONFIRM the
+    /// process's death within the bounded window (fix pass, review of #80
+    /// follow-up — the CRITICAL finding: see
+    /// [`crate::ports::KILL_CONFIRM_TIMEOUT`]'s docs for the full mechanism —
+    /// removing the pipe from agent output capture, review of #80's earlier
+    /// crash-safety fix, also removed the incidental backpressure it
+    /// provided, so a fast writer can exhaust disk and enter an OS-level
+    /// uninterruptible I/O wait immune to every signal, including SIGKILL).
+    ///
+    /// The instance remains [`LifecycleState::Stopping`](super::lifecycle::LifecycleState::Stopping)
+    /// — NOT `Stopped` (that would be a lie we cannot back up) and NOT a
+    /// fabricated new terminal state — until a LATER reconciliation confirms
+    /// the process has actually exited: either a RETRY `stop()` call (which
+    /// performs a cheap, non-blocking liveness check rather than re-running
+    /// the whole SIGTERM/SIGKILL/confirm sequence — see
+    /// [`Supervisor::stop`](super::supervisor::Supervisor::stop)'s docs) or
+    /// the crash-detection reaper's own next poll, whichever observes the
+    /// exit first. Mirrors [`EngineError::InteractionTimedOut`]'s shape
+    /// (story 4.1 fix pass) for an analogous "we hit a bounded resilience
+    /// wait and gave up honestly" case, applied to `stop` instead of `send`.
+    /// Names the instance + the bound that elapsed.
+    #[error(
+        "Agent Instance '{name}' was sent SIGKILL but has not been confirmed dead within \
+         {timeout_secs}s (it may be stuck in an OS-level I/O wait, e.g. disk pressure); it \
+         remains 'stopping' — a later `stop` retry will check again without re-blocking if it \
+         is still stuck, and will succeed once the process actually exits"
+    )]
+    StopUnconfirmed {
+        /// The instance `stop` targeted.
+        name: String,
+        /// The bound (seconds) that elapsed before confirmation was abandoned.
+        timeout_secs: u64,
+    },
+
     /// A [`StateStore`](crate::ports::StateStore) operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

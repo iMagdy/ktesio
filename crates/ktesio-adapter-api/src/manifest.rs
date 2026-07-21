@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::capability::CapabilityDeclaration;
@@ -111,13 +111,64 @@ pub struct Metering {
     pub source: MeteringSource,
 }
 
+/// The declared interaction channel kind (spine AD-12, story 4.1).
+///
+/// A CLOSED set: the manifest's `[interaction]` `channel` is validated at
+/// PARSE time (an unrecognized value is REJECTED, mirroring
+/// [`crate::MeteringSource`]'s closed-enum handling), rather than merely
+/// carried as a free-form string. The serde wire form is kebab-case so an
+/// `adapter.toml` `[interaction]` section reads naturally:
+///
+/// ```toml
+/// [interaction]
+/// channel = "stdio"
+/// ```
+///
+/// Single variant this story (`Stdio`) — in v1 the ONLY implemented
+/// interaction channel is the spawned child's OS stdin pipe: every adapter
+/// that can actually run (the native mock or a manifest adapter) is spawned
+/// through the identical `ProcessBackend`/`SpawnSpec` mechanism, so there is
+/// no second channel to model yet. Mirrors the "seed, not freeze" discipline
+/// [`crate::Capability`]/[`crate::SupportLevel`] already follow: additively
+/// extensible, NOT built to negotiate a set here. A future channel (e.g.
+/// Hermes' own native channel mapping, epic 6) adds a second variant only
+/// once a real second implementation exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InteractionChannelKind {
+    /// The spawned child's OS stdin pipe — the only implemented channel (v1).
+    Stdio,
+}
+
+impl InteractionChannelKind {
+    /// The kebab-case wire name, matching the serde form and manifest value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InteractionChannelKind::Stdio => "stdio",
+        }
+    }
+}
+
+impl std::fmt::Display for InteractionChannelKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The `[interaction]` block (channel wiring).
+///
+/// OPTIONAL (unchanged): an adapter that omits `[interaction]` entirely still
+/// gets the AD-12 default — the engine unconditionally pipes stdin for every
+/// spawned process (story 4.1 Task 1), regardless of what (or whether) this
+/// section says. Declaring the section only firms up, documentarily, WHICH
+/// channel the adapter author expects; the engine does not branch on it (v1
+/// has exactly one implemented channel).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Interaction {
-    /// The interaction channel (e.g. `"stdio"`). Free-form this story; the
-    /// channel model firms up with the interaction epic.
-    pub channel: String,
+    /// The interaction channel. A closed enum (story 4.1) — an unrecognized
+    /// value is rejected at PARSE time rather than silently accepted.
+    pub channel: InteractionChannelKind,
 }
 
 /// Why a manifest is invalid (spine AD-3; `thiserror`, never `miette`).
@@ -176,15 +227,41 @@ impl Manifest {
     pub fn from_toml_str(input: &str) -> Result<Self, ManifestError> {
         toml::from_str(input).map_err(|e| {
             let message = e.message().to_string();
-            // The one enum in the schema is the `[metering]` source. `toml`
-            // reports an out-of-range value as "unknown variant `x`, expected
-            // ..." without naming the section; attribute it to `[metering]` so
-            // the diagnostic names the section (AC2/AC4), matching every other
-            // rejection. This is the only field whose value is a closed enum.
-            let detail = if message.starts_with("unknown variant")
-                && (message.contains("self-reported") || message.contains("engine-observed"))
+            // Two enums in the schema reject an out-of-range value at PARSE
+            // time: the `[metering]` source and (story 4.1) the
+            // `[interaction]` channel. `toml` reports each as "unknown
+            // variant `x`, expected ..." without naming the section; attribute
+            // it to the right section so the diagnostic names it (AC2/AC4),
+            // matching every other rejection.
+            //
+            // M3 fix (review of #79): disambiguate using the message's
+            // "expected ..." clause — the FAILING FIELD's own valid values —
+            // never by whether the OFFENDING value happens to ALSO be a
+            // valid variant name of the OTHER enum. The original logic
+            // string-matched the whole message against both enums' variant
+            // names, so `[interaction] channel = "self-reported"` (an
+            // INVALID channel — the only valid one is "stdio" — that also
+            // happens to be a valid MeteringSource variant NAME) produced
+            // the message `unknown variant \`self-reported\`, expected
+            // \`stdio\`` and was misattributed to `[metering]`, because
+            // "self-reported" appears in the message (as the REJECTED
+            // value), even though `[metering]`'s own valid values
+            // ("self-reported" / "engine-observed") are never what's
+            // "expected" here. Splitting on "expected" and checking only
+            // the tail (the field's own valid-values clause) makes this
+            // robust regardless of what the offending value happens to spell.
+            let expected_clause = message
+                .split_once("expected")
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+            let detail = if !message.starts_with("unknown variant") {
+                message
+            } else if expected_clause.contains("self-reported")
+                || expected_clause.contains("engine-observed")
             {
                 format!("the `[metering]` section has an invalid `source`: {message}")
+            } else if expected_clause.contains("stdio") {
+                format!("the `[interaction]` section has an invalid `channel`: {message}")
             } else {
                 message
             };
@@ -398,7 +475,10 @@ channel = "stdio"
         assert_eq!(start.args, vec!["--serve".to_string()]);
         assert_eq!(start.env.get("DEMO_MODE").map(String::as_str), Some("1"));
         assert!(lc.stop.is_some());
-        assert_eq!(m.interaction.as_ref().unwrap().channel, "stdio");
+        assert_eq!(
+            m.interaction.as_ref().unwrap().channel,
+            InteractionChannelKind::Stdio
+        );
     }
 
     #[test]
@@ -586,6 +666,125 @@ channel = "stdio"
         assert!(err.to_string().contains("[metering]"), "got {err}");
         assert!(err.to_string().contains("none"), "got {err}");
         assert!(err.to_string().contains("source"), "got {err}");
+    }
+
+    #[test]
+    fn invalid_interaction_channel_fails_to_parse_naming_interaction() {
+        // Story 4.1 AC-E: `[interaction].channel` is a closed enum (single
+        // variant `Stdio` this story), so an unrecognized value (e.g. "http")
+        // fails at PARSE, not merely accepted-and-ignored. Mirrors
+        // `invalid_metering_source_fails_to_parse_naming_metering`: the raw
+        // serde message does not name the section, so `from_toml_str`
+        // attributes it to `[interaction]`.
+        let toml = VALID.replace("channel = \"stdio\"", "channel = \"http\"");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(err.to_string().contains("[interaction]"), "got {err}");
+        assert!(err.to_string().contains("http"), "got {err}");
+        assert!(err.to_string().contains("channel"), "got {err}");
+    }
+
+    #[test]
+    fn invalid_interaction_channel_that_is_a_valid_metering_source_name_still_names_interaction() {
+        // M3 fix (review of #79): `[interaction].channel = "self-reported"`
+        // is an INVALID channel value (the only valid one is "stdio") that
+        // ALSO happens to be a valid `MeteringSource` variant NAME. The
+        // original section-naming logic disambiguated by matching the
+        // OFFENDING VALUE against both enums' known variants, so this
+        // specific value was misattributed to `[metering]` even though the
+        // field that actually failed to parse is `[interaction].channel` —
+        // `[metering].source` was never touched by this edit. The fix
+        // disambiguates using the message's "expected ..." clause (the
+        // FAILING FIELD's own valid values) instead of the rejected value.
+        let toml = VALID.replace("channel = \"stdio\"", "channel = \"self-reported\"");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(
+            err.to_string().contains("[interaction]"),
+            "must name [interaction] (the field that actually failed to parse), got {err}"
+        );
+        assert!(
+            !err.to_string().contains("[metering]"),
+            "must NOT be misattributed to [metering] merely because the offending value \
+             is also a valid MeteringSource variant name, got {err}"
+        );
+        assert!(err.to_string().contains("self-reported"), "got {err}");
+        assert!(err.to_string().contains("channel"), "got {err}");
+    }
+
+    #[test]
+    fn invalid_metering_source_that_is_a_valid_interaction_channel_name_still_names_metering() {
+        // The mirror direction of the M3 fix: `[metering].source = "stdio"`
+        // is an INVALID source (only "self-reported"/"engine-observed" are
+        // valid) that ALSO happens to be the one valid
+        // `InteractionChannelKind` variant name. Must still name
+        // `[metering]`, never `[interaction]` — confirms the "expected ..."
+        // clause disambiguation is symmetric, not merely patched for the
+        // one direction M3 called out.
+        let toml = VALID.replace("source = \"self-reported\"", "source = \"stdio\"");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(err.to_string().contains("[metering]"), "got {err}");
+        assert!(
+            !err.to_string().contains("[interaction]"),
+            "must NOT be misattributed to [interaction], got {err}"
+        );
+        assert!(err.to_string().contains("stdio"), "got {err}");
+        assert!(err.to_string().contains("source"), "got {err}");
+    }
+
+    #[test]
+    fn unknown_variant_error_from_an_unrelated_enum_is_passed_through_unattributed() {
+        // Coverage-closing (fix pass, review of #79): `from_toml_str`'s
+        // section-naming only recognizes TWO specific "unknown variant"
+        // shapes (`[metering].source` / `[interaction].channel`). A THIRD
+        // enum in the schema — `SupportLevel` (`[capabilities.*]`'s
+        // guaranteed/best-effort/unsupported) — can ALSO produce an "unknown
+        // variant" message (e.g. a typo'd support level), and its valid
+        // values overlap with NEITHER metering's nor interaction's. This
+        // must fall through to the raw, UNMODIFIED message (never crash,
+        // never be misattributed to either section) — the fallback branch
+        // the M3 restructuring's `if/else if/else if/else` chain still needs
+        // reachable and correct.
+        let toml = VALID.replace(
+            "linux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"best-effort\"",
+            "linux = \"sometimes\"\nmacos = \"guaranteed\"\nwindows = \"best-effort\"",
+        );
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+        assert!(
+            !err.to_string().contains("[metering]"),
+            "an unrelated enum's bad value must not be misattributed to [metering], got {err}"
+        );
+        assert!(
+            !err.to_string().contains("[interaction]"),
+            "an unrelated enum's bad value must not be misattributed to [interaction], got {err}"
+        );
+        assert!(err.to_string().contains("sometimes"), "got {err}");
+    }
+
+    #[test]
+    fn absent_interaction_section_still_validates_defaulting_to_stdio_at_the_engine_layer() {
+        // AC-E: `[interaction]` stays OPTIONAL — omitting it entirely is still
+        // valid (the engine's unconditional stdin pipe, Task 1, IS the
+        // default; this type only firms up the value when the section is
+        // present).
+        let toml = VALID.replace("[interaction]\nchannel = \"stdio\"\n", "");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.interaction.is_none());
+    }
+
+    #[test]
+    fn interaction_channel_kind_as_str_and_display_agree() {
+        // Mirrors MeteringSource's `serde_round_trips_both_variants` sanity
+        // check: the seed-enum `as_str()`/`Display` pair (currently one
+        // variant) stays in lockstep.
+        assert_eq!(InteractionChannelKind::Stdio.as_str(), "stdio");
+        assert_eq!(
+            InteractionChannelKind::Stdio.to_string(),
+            InteractionChannelKind::Stdio.as_str()
+        );
     }
 
     #[test]
