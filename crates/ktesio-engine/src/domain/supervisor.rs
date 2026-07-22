@@ -181,6 +181,118 @@ fn plan_drain(bytes: &[u8], cursor: u64, mode: DrainMode) -> DrainPlan {
     }
 }
 
+/// The outcome of ONE incremental read of an instance's agent-output log for a
+/// usage drain (AI-63) — the input `drain_usage_for` feeds to the UNCHANGED
+/// [`plan_drain`].
+///
+/// **Why this exists (the billing-critical stall it fixes):** the metered
+/// `agent.log` is NEVER rotated (Epic 4 shipped rotation only for the off-lock
+/// attributed `output.log`, not this file). The previous `drain_usage_for` did
+/// `std::fs::read(&path)` — reading the ENTIRE file into memory — on EVERY
+/// crash-reaper tick (~250ms, per running instance), while BOTH global locks
+/// (Registry + Supervisor) were held. For a long-running agent the file grows
+/// without bound, so that whole-file read grows without bound and every fleet
+/// operation stalls longer the longer the engine runs. [`read_usage_tail`] reads
+/// ONLY `[cursor, len)` — the bytes appended since the last drain — which is all
+/// [`plan_drain`] ever looked at anyway (it inspects only `bytes[cursor..]` and
+/// `bytes.len()`); the already-consumed `[0, cursor)` prefix was pure waste.
+#[derive(Debug, PartialEq, Eq)]
+enum UsageTail {
+    /// The log could not be opened / stat'd / read this pass — a best-effort
+    /// skip, BYTE-FOR-BYTE the old `let Ok(bytes) = std::fs::read(..) else
+    /// { return }`: the cursor is left untouched and the next pass retries (the
+    /// DB is the source of truth). Ingest nothing.
+    Unavailable,
+    /// The file is SHORTER than the cursor (a truncate/rotation — the M2 guard).
+    /// The SAME decision as [`DrainPlan::Shrunk`]: snap the cursor to `new_cursor`
+    /// (the new length) and ingest nothing this pass — NEVER re-read from 0 under
+    /// the same live `run_id` (that re-ingests already-counted lines → a
+    /// double-count → an INFLATED bill). Detected HERE rather than in
+    /// [`plan_drain`] because a shrink is exactly the case where `len - cursor`
+    /// would underflow, so it must be caught before computing how many tail bytes
+    /// to read.
+    Shrunk {
+        /// The file's new (shorter) length — the value the cursor snaps to.
+        new_cursor: u64,
+    },
+    /// `bytes` is exactly the on-disk region `[cursor, len)` — BYTE-FOR-BYTE what
+    /// the old code's `bytes[cursor..]` whole-file slice held, obtained WITHOUT
+    /// reading (or allocating) the already-consumed `[0, cursor)` prefix. Fed
+    /// straight to [`plan_drain`] with a 0 base (see [`Supervisor::drain_usage_for`]).
+    Tail {
+        /// The tail bytes `[cursor, len)`; empty when nothing new was appended.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Read ONLY the new tail (`[cursor, len)`) of the agent-output log at `path`
+/// for a usage drain (AI-63) — the incremental replacement for the previous
+/// whole-file `std::fs::read`. This is PURE I/O; the CONSUMPTION decision stays
+/// in the unchanged, adversarially-reviewed [`plan_drain`] (Epic 3, spine AD-7).
+///
+/// Mirrors [`crate::ports`]'s off-lock `tail_new_lines` (the proven
+/// attributed-log tailer) — open, stat the length, seek to the cursor, read only
+/// `len - cursor` bytes, guard the shrink case:
+/// * open fails (a missing/unreadable file) ⇒ [`UsageTail::Unavailable`] — the
+///   same best-effort skip the old `std::fs::read` `Err(_)` arm made;
+/// * `len < cursor` ⇒ [`UsageTail::Shrunk`] — the M2 guard, snap forward + ingest
+///   nothing, matching [`DrainPlan::Shrunk`] exactly;
+/// * `len == cursor` ⇒ an EMPTY [`UsageTail::Tail`] (the reaper's common case:
+///   nothing appended since the last tick) — [`plan_drain`] then returns
+///   [`DrainPlan::Nothing`], exactly as the old whole-file path did at end-of-log,
+///   and no `seek`/`read` syscall is issued;
+/// * otherwise seek to `cursor` and read EXACTLY `len - cursor` bytes — the tail.
+///
+/// **Why the tail is byte-identical to the old whole-file slice:** it is
+/// literally the same on-disk region `[cursor, len)` of the same file.
+/// [`plan_drain`] only ever inspected `bytes[cursor..]` and `bytes.len()`; the
+/// `[0, cursor)` prefix it never touched is precisely what this skips reading.
+/// So the block later handed to `usage_source.drain` and the resulting
+/// `usage_cursor` are UNCHANGED for every input — see [`Supervisor::drain_usage_for`]
+/// for the (tail-relative range + absolute cursor) coordinate translation.
+///
+/// **Snapshot semantics:** the read is capped to the length stat'd at entry
+/// (`read_exact` of exactly `len - cursor` bytes), so any bytes the live agent
+/// appends AFTER the stat are simply left for the next pass — a stable per-pass
+/// snapshot, exactly like the old `std::fs::read` captured whatever existed at
+/// its call. The rare shrink BETWEEN the stat and the read makes `read_exact`
+/// fall short ⇒ [`UsageTail::Unavailable`] (skip, retry next pass; the cursor is
+/// untouched, so no miscount).
+///
+/// **No per-pass byte/line cap (deliberate — unlike `tail_new_lines`):** see
+/// [`Supervisor::drain_usage_for`]'s docs for why capping this read would risk a
+/// billing regression (the Terminal drain is single-shot, so a capped remainder
+/// would be permanently stranded → an under-count, reintroducing H1).
+fn read_usage_tail(path: &Path, cursor: u64) -> UsageTail {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return UsageTail::Unavailable;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return UsageTail::Unavailable;
+    };
+    if len < cursor {
+        // M2 shrink guard — matches plan_drain's `cursor > len` branch.
+        return UsageTail::Shrunk { new_cursor: len };
+    }
+    let want = len - cursor; // no underflow: `len >= cursor` guaranteed above.
+    if want == 0 {
+        // Nothing appended since the last drain — the reaper's common case.
+        // Skip the seek/read entirely; plan_drain on an empty tail is `Nothing`.
+        return UsageTail::Tail { bytes: Vec::new() };
+    }
+    if file.seek(SeekFrom::Start(cursor)).is_err() {
+        return UsageTail::Unavailable;
+    }
+    let mut buf = vec![0u8; want as usize];
+    if file.read_exact(&mut buf).is_err() {
+        // A transient read hiccup (or a shrink racing the stat above) — skip this
+        // pass, cursor untouched, retry next pass. No bytes ingested ⇒ no miscount.
+        return UsageTail::Unavailable;
+    }
+    UsageTail::Tail { bytes: buf }
+}
+
 /// What one `Supervisor::read_agent_log_since` poll should do, decided purely
 /// from `(bytes, cursor)` (story 4-2, Task 5, AC-D/AC-H/AC-G). MIRRORS (does
 /// NOT literally reuse) [`plan_drain`]'s shrink-guard + "consume only up to
@@ -959,6 +1071,32 @@ impl Supervisor {
             }
             None => (crate::ports::StopOutcome { forced: false }, None),
         };
+        // AI-63 follow-on (billing under-count at STOP, owner-approved): a FINAL
+        // TERMINAL rescue drain AFTER `backend.stop` has CONFIRMED the process
+        // dead and BEFORE `self.running.remove` below drops the handle + cursor.
+        //
+        // The pre-kill drain (above, before `backend.stop`) runs while the agent is
+        // still ALIVE, so a usage line the agent flushes in the window between that
+        // drain and the kill would otherwise be stranded: the cursor never advances
+        // past it and the handle is removed right after with no further drain (a
+        // permanent UNDER-count). Reaching HERE means death is CONFIRMED — the
+        // `BackendError::StopUnconfirmed` case `?`-returned ABOVE without removing
+        // the handle (it is retained for later reconciliation), so this rescue drain
+        // NEVER runs on a still-live process. With the process provably dead,
+        // `agent.log` is STABLE (it can never grow again), so this Terminal drain
+        // reads it to its now-final EOF, capturing exactly the tail the pre-kill
+        // drain missed — with NO unbounded-growth / under-lock-stall concern (the
+        // file is finite and final).
+        //
+        // No double-count: `drain_usage_for` is cursor-based — the pre-kill drain
+        // advanced `usage_cursor` to what it consumed, so this pass ingests ONLY
+        // bytes that arrived AFTER it (the two drains are disjoint by cursor; the DB
+        // dedup is a backstop, not the primary guard). The `Supervised` entry MUST
+        // still be in `self.running` for its cursor/run_id/metering_source to be
+        // read — hence strictly BEFORE `self.running.remove`. This mirrors the crash
+        // reaper's proven drain-AFTER-observed-exit (see `poll_once`). Best-effort,
+        // like the pre-kill drain — a drain hiccup never blocks the stop.
+        self.drain_usage_for(registry, &name, DrainMode::Terminal);
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
         self.running.remove(&name);
@@ -2174,35 +2312,66 @@ impl Supervisor {
             None => return,
         };
         let path = registry.agent_output_log_path(name);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
-        };
-        // Decide (purely) what this pass reads: a shrink anomaly (M2), nothing yet,
-        // or a byte range to consume + the resulting cursor (H1 terminal-tail rule).
-        match plan_drain(&bytes, cursor, mode) {
-            DrainPlan::Shrunk { new_cursor } => {
-                // M2: the file is shorter than where we last read — do NOT restart
-                // from 0 (that double-counts). Snap the cursor to the new end and
-                // ingest nothing this pass.
+        // AI-63 (billing-critical stall fix): read ONLY the tail written since the
+        // last drain (`[cursor, len)`) — NEVER the whole never-rotated `agent.log`.
+        // `read_usage_tail` returns the SAME bytes the old whole-file read's
+        // `bytes[cursor..]` slice held (and catches the M2 shrink, where
+        // `len - cursor` would underflow), so the BILLING decision below —
+        // `plan_drain` on those exact tail bytes — is byte-identical to before.
+        // See `read_usage_tail`'s docs for the full equivalence + snapshot proof.
+        let tail = match read_usage_tail(&path, cursor) {
+            // Read error: best-effort skip, cursor untouched, retry next pass —
+            // identical to the old `let Ok(bytes) = std::fs::read(..) else { return }`.
+            UsageTail::Unavailable => return,
+            // M2 shrink guard: snap the cursor to the file's new (shorter) length
+            // and ingest nothing — identical to the old `DrainPlan::Shrunk { .. }`
+            // arm (never re-read from 0 under the same live `run_id` → no
+            // double-count → no inflated bill).
+            UsageTail::Shrunk { new_cursor } => {
                 if let Some(s) = self.running.get_mut(name) {
                     s.usage_cursor = new_cursor;
                 }
+                return;
             }
-            DrainPlan::Nothing => {}
-            DrainPlan::Consume { range, new_cursor } => {
-                let block = String::from_utf8_lossy(&bytes[range]);
+            UsageTail::Tail { bytes } => bytes,
+        };
+        // `tail` == the old code's `bytes[cursor..]`. Feeding it to `plan_drain`
+        // with a 0 base makes the SAME `(bytes, cursor, mode)` decision on the same
+        // bytes, just in tail-relative coordinates: the returned `range` slices
+        // `tail` directly (0-based), and the returned count is added to `cursor` to
+        // recover the ABSOLUTE cursor. The MidRun (up-to-last-newline) and Terminal
+        // (whole tail, incl. a newline-less final line — H1) rules are computed
+        // purely from these bytes, so BOTH are preserved unchanged.
+        match plan_drain(&tail, 0, mode) {
+            DrainPlan::Consume {
+                range,
+                new_cursor: consumed,
+            } => {
+                let block = String::from_utf8_lossy(&tail[range]);
                 let parsed = self.usage_source.drain(&block);
-                // Advance the cursor FIRST (past the consumed lines) so a mid-batch
-                // record failure does not re-ingest earlier lines on the next pass —
-                // the DB dedup key is the ultimate guard, but not re-reading keeps it
-                // cheap.
+                // Advance the cursor FIRST (to the ABSOLUTE offset past the consumed
+                // tail) so a mid-batch record failure does not re-ingest earlier
+                // lines on the next pass — the DB dedup key is the ultimate guard,
+                // but not re-reading keeps it cheap. `cursor + consumed` equals the
+                // old whole-file path's `new_cursor` (which was `cursor + consumed`)
+                // exactly.
                 if let Some(s) = self.running.get_mut(name) {
-                    s.usage_cursor = new_cursor;
+                    s.usage_cursor = cursor + consumed;
                 }
                 for usage in parsed {
                     self.ingest_usage(registry, name, &run_id, &metering_source, &usage);
                 }
             }
+            // Nothing to consume this pass (an empty tail, or a MidRun tail with no
+            // newline yet) — leave the cursor where it is, exactly as before.
+            DrainPlan::Nothing => {}
+            // Unreachable by construction: `plan_drain` returns `Shrunk` only when
+            // its `cursor` argument exceeds the slice length, and the base here is
+            // 0 (`0 > len` is impossible). The REAL shrink is handled above in
+            // `read_usage_tail`, where the file length is known WITHOUT a whole-file
+            // read. Leave the cursor untouched (nothing was ingested, so no
+            // miscount) — a billing path must never panic.
+            DrainPlan::Shrunk { .. } => {}
         }
     }
 
@@ -4404,6 +4573,235 @@ mod tests {
             plan_drain(bytes, 4, DrainMode::Terminal),
             DrainPlan::Nothing
         );
+    }
+
+    // ---- AI-63: incremental usage-tail read (drain_usage_for no longer reads the
+    //      whole never-rotated agent.log on every reaper tick under the global lock).
+    //      These prove (1) the read is bounded by NEW bytes not total size, and
+    //      (2)/(3)/(4) the three billing semantics — MidRun tail, Terminal newline-
+    //      less tail, and the M2 shrink guard — are byte-identical via the new path.
+
+    /// THE fix proof: a large already-consumed prefix is NOT re-read. The per-pass
+    /// read is bounded by the NEW bytes (`len - cursor`), never the total file size.
+    #[test]
+    fn read_usage_tail_reads_only_the_new_bytes_not_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.log");
+        // A big already-drained prefix (what the OLD code re-read every 250ms) plus
+        // one small fresh usage line — the only bytes a drain should now touch.
+        let prefix = vec![b'x'; 5 * 1024 * 1024]; // 5 MiB already consumed
+        let fresh = b"KTESIO_USAGE {\"sequence\":0,\"input_tokens\":1,\"output_tokens\":2}\n";
+        let mut content = prefix.clone();
+        content.extend_from_slice(fresh);
+        std::fs::write(&path, &content).unwrap();
+        let cursor = prefix.len() as u64;
+
+        let UsageTail::Tail { bytes } = read_usage_tail(&path, cursor) else {
+            panic!("expected a Tail read");
+        };
+        // Read EXACTLY the new tail, not the 5 MiB prefix.
+        assert_eq!(
+            bytes.len(),
+            fresh.len(),
+            "read must be bounded by NEW bytes"
+        );
+        assert_eq!(bytes.as_slice(), fresh.as_slice());
+        // ...and it is byte-identical to the slice the OLD whole-file read produced.
+        let whole = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes.as_slice(),
+            &whole[cursor as usize..],
+            "the tail must equal the old code's bytes[cursor..] slice"
+        );
+    }
+
+    /// (2) MidRun across MULTIPLE sequential drains: each pass reads only the tail
+    /// appended since the last cursor, and the cursor advances identically to the
+    /// old whole-file path — proving incremental draining loses nothing.
+    #[test]
+    fn read_usage_tail_incremental_across_multiple_drains_matches_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.log");
+
+        // Drain 1: two complete lines.
+        std::fs::write(&path, b"a\nb\n").unwrap();
+        assert_eq!(
+            select_new(&path, 0, DrainMode::MidRun),
+            (Some(b"a\nb\n".to_vec()), 4)
+        );
+        assert_eq!(
+            select_new(&path, 0, DrainMode::MidRun),
+            select_old(&path, 0, DrainMode::MidRun)
+        );
+        // The read at cursor 4 sees only the NEW bytes (none yet) — an empty tail.
+        assert_eq!(
+            read_usage_tail(&path, 4),
+            UsageTail::Tail { bytes: Vec::new() }
+        );
+
+        // Drain 2: append two more lines; draining from cursor 4 consumes ONLY them.
+        std::fs::write(&path, b"a\nb\nc\nd\n").unwrap();
+        let got = read_usage_tail(&path, 4);
+        assert_eq!(
+            got,
+            UsageTail::Tail {
+                bytes: b"c\nd\n".to_vec()
+            },
+            "only the new tail"
+        );
+        assert_eq!(
+            select_new(&path, 4, DrainMode::MidRun),
+            (Some(b"c\nd\n".to_vec()), 8)
+        );
+        assert_eq!(
+            select_new(&path, 4, DrainMode::MidRun),
+            select_old(&path, 4, DrainMode::MidRun)
+        );
+
+        // A partial trailing line (no newline yet) waits — MidRun consumes nothing.
+        std::fs::write(&path, b"a\nb\nc\nd\nhalf").unwrap();
+        assert_eq!(select_new(&path, 8, DrainMode::MidRun), (None, 8));
+        assert_eq!(
+            select_new(&path, 8, DrainMode::MidRun),
+            select_old(&path, 8, DrainMode::MidRun)
+        );
+    }
+
+    /// (3) Terminal newline-less tail (the H1 fix): the process is dead, so a final
+    /// usage line flushed WITHOUT a trailing newline is consumed to end-of-log via
+    /// the incremental read too — never stranded.
+    #[test]
+    fn new_read_path_terminal_consumes_a_newline_less_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.log");
+        let head = b"old\n"; // already consumed
+        let newline_less_tail = b"KTESIO_USAGE {\"sequence\":0}"; // no trailing \n
+        let mut content = head.to_vec();
+        content.extend_from_slice(newline_less_tail);
+        std::fs::write(&path, &content).unwrap();
+        let cursor = head.len() as u64;
+        let end = content.len() as u64;
+        // From a cursor past "old\n", Terminal consumes the whole newline-less tail
+        // to end-of-log (H1) — never stranding the final usage line.
+        assert_eq!(
+            select_new(&path, cursor, DrainMode::Terminal),
+            (Some(newline_less_tail.to_vec()), end)
+        );
+        assert_eq!(
+            select_new(&path, cursor, DrainMode::Terminal),
+            select_old(&path, cursor, DrainMode::Terminal),
+            "Terminal newline-less tail must be byte-identical via the incremental read"
+        );
+        // Contrast: MidRun would strand that partial line (no newline) — unchanged.
+        assert_eq!(select_new(&path, cursor, DrainMode::MidRun), (None, cursor));
+    }
+
+    /// (4) M2 shrink guard: a file shorter than the cursor (truncate/rotation) snaps
+    /// the cursor to the new length and ingests NOTHING — never re-reads from 0
+    /// (which would double-count → an inflated bill).
+    #[test]
+    fn read_usage_tail_shrink_snaps_the_cursor_and_reads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.log");
+        std::fs::write(&path, b"short").unwrap(); // len 5, cursor claims 100
+        assert_eq!(
+            read_usage_tail(&path, 100),
+            UsageTail::Shrunk { new_cursor: 5 }
+        );
+        // Same decision as the old whole-file path, in both modes, ingesting nothing.
+        assert_eq!(select_new(&path, 100, DrainMode::MidRun), (None, 5));
+        assert_eq!(
+            select_new(&path, 100, DrainMode::MidRun),
+            select_old(&path, 100, DrainMode::MidRun)
+        );
+        assert_eq!(select_new(&path, 100, DrainMode::Terminal), (None, 5));
+        assert_eq!(
+            select_new(&path, 100, DrainMode::Terminal),
+            select_old(&path, 100, DrainMode::Terminal)
+        );
+    }
+
+    /// A missing/unreadable log is a best-effort skip (cursor untouched), exactly
+    /// like the old `std::fs::read` `Err(_)` arm.
+    #[test]
+    fn read_usage_tail_missing_file_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.log");
+        assert_eq!(read_usage_tail(&path, 0), UsageTail::Unavailable);
+        assert_eq!(
+            select_new(&path, 7, DrainMode::MidRun),
+            (None, 7),
+            "cursor untouched"
+        );
+        assert_eq!(
+            select_new(&path, 7, DrainMode::MidRun),
+            select_old(&path, 7, DrainMode::MidRun)
+        );
+    }
+
+    /// The exhaustive equivalence harness: for a battery of (content, cursor, mode)
+    /// states, the block consumed AND the resulting cursor are byte-identical
+    /// between the OLD whole-file path and the NEW incremental path. This is the
+    /// reviewer's "counts are unchanged" oracle — falsifying it means the fix
+    /// changed billing, and this test would fail.
+    #[test]
+    fn new_read_path_matches_whole_file_path_over_a_battery_of_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.log");
+        let contents: &[&[u8]] = &[
+            b"",
+            b"\n",
+            b"a\nb\n",
+            b"a\nb\nhalf-written",
+            b"KTESIO_USAGE {\"sequence\":0,\"input_tokens\":10,\"output_tokens\":20}\n",
+            b"KTESIO_USAGE {\"sequence\":0,\"input_tokens\":10,\"output_tokens\":20}", // no nl
+            b"line-with-no-newline-at-all",
+        ];
+        for content in contents {
+            std::fs::write(&path, content).unwrap();
+            let len = content.len() as u64;
+            // Cursors at, around, and beyond the length (the last exercises shrink).
+            for cursor in [0u64, 1, len.saturating_sub(1), len, len + 1, len + 1000] {
+                for mode in [DrainMode::MidRun, DrainMode::Terminal] {
+                    assert_eq!(
+                        select_new(&path, cursor, mode),
+                        select_old(&path, cursor, mode),
+                        "divergence at content={content:?} cursor={cursor} mode={mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The NEW selection logic, mirroring `drain_usage_for`'s incremental path
+    /// (minus the ingest side effect): returns the block that would be handed to
+    /// `usage_source.drain` and the resulting ABSOLUTE `usage_cursor`.
+    fn select_new(path: &Path, cursor: u64, mode: DrainMode) -> (Option<Vec<u8>>, u64) {
+        match read_usage_tail(path, cursor) {
+            UsageTail::Unavailable => (None, cursor),
+            UsageTail::Shrunk { new_cursor } => (None, new_cursor),
+            UsageTail::Tail { bytes } => match plan_drain(&bytes, 0, mode) {
+                DrainPlan::Consume {
+                    range,
+                    new_cursor: consumed,
+                } => (Some(bytes[range].to_vec()), cursor + consumed),
+                DrainPlan::Nothing | DrainPlan::Shrunk { .. } => (None, cursor),
+            },
+        }
+    }
+
+    /// The OLD selection logic, mirroring the PRE-AI-63 `drain_usage_for` (whole-file
+    /// `std::fs::read` + `plan_drain(&bytes, cursor, mode)`) — the reference the new
+    /// path must match byte-for-byte.
+    fn select_old(path: &Path, cursor: u64, mode: DrainMode) -> (Option<Vec<u8>>, u64) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return (None, cursor);
+        };
+        match plan_drain(&bytes, cursor, mode) {
+            DrainPlan::Shrunk { new_cursor } => (None, new_cursor),
+            DrainPlan::Nothing => (None, cursor),
+            DrainPlan::Consume { range, new_cursor } => (Some(bytes[range].to_vec()), new_cursor),
+        }
     }
 
     // ---- Story 4-2: read_agent_log_since's follow-cursor planning (AC-D/AC-H) ----
