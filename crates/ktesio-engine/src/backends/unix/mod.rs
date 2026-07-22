@@ -1547,7 +1547,14 @@ mod tests {
             .write_stdin(&mut proc, b"hello-stdin\n")
             .expect("write_stdin");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // AI-67: this stdin -> child-read -> echo -> capture round trip is one
+        // of the two backend polls that miss DETERMINISTICALLY under `cargo
+        // tarpaulin` instrumentation (assertion "echoed stdin line never
+        // appeared"). Scale to 120s ONLY under coverage (`--cfg=tarpaulin`,
+        // well under tarpaulin's 180s per-test `--timeout`); plain `nextest`
+        // keeps the fast 5s bound. `cfg!(tarpaulin)` is a coverage-tool cfg,
+        // NOT an OS cfg, so it is outside the AD-4 OS-`cfg` boundary gate.
+        let deadline = Instant::now() + Duration::from_secs(if cfg!(tarpaulin) { 120 } else { 5 });
         loop {
             if let Ok(contents) = std::fs::read_to_string(&agent_log) {
                 if contents.lines().any(|l| l == "stdin: hello-stdin") {
@@ -1791,12 +1798,16 @@ mod tests {
         );
 
         // Wait for at least one heartbeat on EACH stream to land in its raw
-        // file AND the attributed capture. A generous 10s deadline (rather
-        // than 5s) — this test spawns a real process AND drives a
-        // background tailer thread under whatever CI/parallel-test load is
-        // in effect; the poll is deadline-based (never a fixed sleep), so a
-        // slower runner just takes longer, not a false failure.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // file AND the attributed capture. This test spawns a real process AND
+        // drives a background tailer thread; the poll is deadline-based (never
+        // a fixed sleep), so a slower runner just takes longer, not a false
+        // failure. AI-67: this dual-stream-through-a-background-tailer wait is
+        // the second backend poll that misses DETERMINISTICALLY under `cargo
+        // tarpaulin` (assertion "never observed both streams in both
+        // captures"), so scale to 120s ONLY under coverage (`--cfg=tarpaulin`,
+        // under tarpaulin's 180s per-test `--timeout`); plain `nextest` keeps
+        // the 10s bound. `cfg!(tarpaulin)` is a coverage cfg, not an OS cfg.
+        let deadline = Instant::now() + Duration::from_secs(if cfg!(tarpaulin) { 120 } else { 10 });
         loop {
             let legacy = std::fs::read_to_string(&agent_log).unwrap_or_default();
             let stderr = std::fs::read_to_string(&stderr_raw).unwrap_or_default();

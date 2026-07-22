@@ -100,21 +100,44 @@ fn agent_log_path(base: &Path, name: &str) -> PathBuf {
         .join("agent.log")
 }
 
+/// Wall-clock budget for the real-child-process IO poll waits in this file.
+///
+/// AI-67: under `cargo tarpaulin`'s LLVM source-coverage instrumentation, a
+/// real child-process IO round trip (engine dispatch + a real child, BOTH
+/// instrumented) runs orders of magnitude slower, so the deadlines tuned for
+/// plain `cargo nextest` are missed DETERMINISTICALLY on the coverage job.
+/// Gate the inflation on `cfg!(tarpaulin)` (the coverage build passes
+/// `--cfg=tarpaulin`) so ONLY the instrumented run gets the generous budget;
+/// the normal `nextest` job keeps its fast, tight `plain_secs` bound untouched
+/// (proven by `cargo nextest`, which compiles WITHOUT `--cfg=tarpaulin`).
+///
+/// 120s comfortably exceeds the observed instrumented latency (the whole
+/// interaction binary runs ~87s instrumented, serially under
+/// `RUST_TEST_THREADS=1`; a single poll is a fraction of that) yet stays under
+/// tarpaulin's 180s per-test `--timeout` AND nextest's 240s terminate-after,
+/// so a genuine miss still fires THIS poll's own assertion (the useful
+/// "never observed ..." message) rather than an opaque outer timeout kill.
+///
+/// `cfg!(tarpaulin)` is a coverage-tool cfg (set by cargo-tarpaulin), NOT an
+/// OS-conditional cfg, so it sits outside the AD-4 backends-only OS-`cfg`
+/// boundary gate — and it is a plain value chosen at compile time, with no
+/// `#[cfg]` attribute at all.
+fn io_deadline(plain_secs: u64) -> Duration {
+    Duration::from_secs(if cfg!(tarpaulin) { 120 } else { plain_secs })
+}
+
 /// Poll `agent_log` until it contains a line EQUAL to `wanted` — committed,
 /// observable state, never a wall-clock sleep-then-assert (the Epic-2-retro
 /// AI-35/38 lesson every later story mirrors).
 fn wait_for_stdin_line(agent_log: &Path, wanted: &str) {
-    // 20s, not 5s: this polls real IPC through a fully-instrumented round trip
-    // (engine dispatch + a real child process, both instrumented under
-    // `cargo tarpaulin`) on the coverage job's resource-constrained ubuntu
-    // runner. 5s was comfortably sufficient under plain `cargo nextest` (the
-    // full 860-test suite completes in well under a minute) but 4 tests in
-    // this file failed here, deterministically, the first time this branch
-    // ran through the coverage job -- tarpaulin's per-line instrumentation
-    // overhead compounds across every hop of this round trip, unlike the
-    // narrow fixed-boundary races elsewhere in this codebase (e.g.
-    // READINESS_WINDOW). This is a throughput margin, not a race window.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Polls a real IPC round trip (engine dispatch + a real child process,
+    // both instrumented under `cargo tarpaulin`). A prior fix bumped the flat
+    // bound 5s -> 20s, but even 20s is missed DETERMINISTICALLY on the coverage
+    // job (4 tests in this file) because tarpaulin's per-line instrumentation
+    // overhead compounds across every hop of the round trip. `io_deadline`
+    // scales the bound to 120s ONLY under instrumentation; plain `nextest`
+    // keeps the fast 20s bound. This is a throughput margin, not a race window.
+    let deadline = Instant::now() + io_deadline(20);
     loop {
         if let Ok(contents) = std::fs::read_to_string(agent_log) {
             if contents.lines().any(|l| l == wanted) {
@@ -455,7 +478,12 @@ fn proc_pid_is_zombie(pid: u32) -> bool {
 }
 
 fn wait_until_gone(pid: u32, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // Real process-teardown wait (same shape / same AI-67 instrumentation
+    // exposure as the other polls). Only the adoption test calls this, and that
+    // test is runtime-skipped on Linux CI (#109) — so it does NOT actually run
+    // under the coverage job today; scaled through `io_deadline` purely for
+    // uniformity + future-proofing should the skip ever be lifted.
+    let deadline = Instant::now() + io_deadline(8);
     while pid_alive(pid) {
         assert!(Instant::now() < deadline, "{what} (pid {pid} still alive)");
         std::thread::sleep(Duration::from_millis(30));
@@ -464,7 +492,11 @@ fn wait_until_gone(pid: u32, what: &str) {
 
 /// Read the pid `fake_agent` announced (`ready pid=<n>`) from its agent.log.
 fn wait_for_agent_pid(agent_log: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Close sibling of `wait_for_stdin_line`: a real spawn -> child-startup ->
+    // "ready pid=" round trip. The non-skipped `..._sniffs_stdin_at_startup...`
+    // test DOES exercise this under the coverage job, and its 10s bound is
+    // thinner than the 20s that already fails there, so AI-67 scales it too.
+    let deadline = Instant::now() + io_deadline(10);
     loop {
         if let Ok(contents) = std::fs::read_to_string(agent_log) {
             if let Some(line) = contents.lines().find(|l| l.contains("ready pid=")) {
