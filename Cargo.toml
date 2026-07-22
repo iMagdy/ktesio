@@ -21,7 +21,13 @@ homepage = "https://github.com/iMagdy/ktesio"
 repository = "https://github.com/iMagdy/ktesio"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
+# `tarpaulin_include`: the existing coverage include/exclude cfg. `tarpaulin`:
+# the cfg cargo-tarpaulin sets on every instrumented build (`--cfg=tarpaulin`),
+# used ONLY by test code (AI-67) to scale a few real-child-process-IO poll
+# deadlines under coverage instrumentation. Declaring both here keeps the
+# normal (`--cfg=tarpaulin`-free) `clippy -D warnings` build from tripping
+# `unexpected_cfgs`; it is a lint declaration only — no runtime/product effect.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(tarpaulin)'] }
 
 [workspace.dependencies]
 # Internal crates
