@@ -100,10 +100,11 @@ fn agent_log_path(base: &Path, name: &str) -> PathBuf {
         .join("agent.log")
 }
 
-/// Wall-clock budget for the real-child-process IO poll waits in this file.
+/// Wall-clock budget for the real-child-process SPAWN / TEARDOWN poll waits in
+/// this file — `wait_for_agent_pid` and `wait_until_gone`, the only two callers.
 ///
 /// AI-67: under `cargo tarpaulin`'s LLVM source-coverage instrumentation, a
-/// real child-process IO round trip (engine dispatch + a real child, BOTH
+/// real child-process round trip (engine dispatch + a real child, BOTH
 /// instrumented) runs orders of magnitude slower, so the deadlines tuned for
 /// plain `cargo nextest` are missed DETERMINISTICALLY on the coverage job.
 /// Gate the inflation on `cfg!(tarpaulin)` (the coverage build passes
@@ -111,12 +112,16 @@ fn agent_log_path(base: &Path, name: &str) -> PathBuf {
 /// the normal `nextest` job keeps its fast, tight `plain_secs` bound untouched
 /// (proven by `cargo nextest`, which compiles WITHOUT `--cfg=tarpaulin`).
 ///
-/// 120s comfortably exceeds the observed instrumented latency (the whole
-/// interaction binary runs ~87s instrumented, serially under
-/// `RUST_TEST_THREADS=1`; a single poll is a fraction of that) yet stays under
-/// tarpaulin's 180s per-test `--timeout` AND nextest's 240s terminate-after,
-/// so a genuine miss still fires THIS poll's own assertion (the useful
-/// "never observed ..." message) rather than an opaque outer timeout kill.
+/// This inflation is a THROUGHPUT margin and nothing more: it buys time for a
+/// round trip that DOES still complete under instrumentation, only slowly. It
+/// deliberately no longer covers `wait_for_stdin_line` — that helper's round
+/// trip does not complete under instrumentation AT ALL, a tool incompatibility
+/// no deadline value can fix (see the AI-67 block below it).
+///
+/// 120s stays under tarpaulin's 180s per-test `--timeout` AND nextest's 240s
+/// terminate-after, so a genuine miss still fires THIS poll's own assertion
+/// (the useful "never observed ..." message) rather than an opaque outer
+/// timeout kill.
 ///
 /// `cfg!(tarpaulin)` is a coverage-tool cfg (set by cargo-tarpaulin), NOT an
 /// OS-conditional cfg, so it sits outside the AD-4 backends-only OS-`cfg`
@@ -130,14 +135,15 @@ fn io_deadline(plain_secs: u64) -> Duration {
 /// observable state, never a wall-clock sleep-then-assert (the Epic-2-retro
 /// AI-35/38 lesson every later story mirrors).
 fn wait_for_stdin_line(agent_log: &Path, wanted: &str) {
-    // Polls a real IPC round trip (engine dispatch + a real child process,
-    // both instrumented under `cargo tarpaulin`). A prior fix bumped the flat
-    // bound 5s -> 20s, but even 20s is missed DETERMINISTICALLY on the coverage
-    // job (4 tests in this file) because tarpaulin's per-line instrumentation
-    // overhead compounds across every hop of the round trip. `io_deadline`
-    // scales the bound to 120s ONLY under instrumentation; plain `nextest`
-    // keeps the fast 20s bound. This is a throughput margin, not a race window.
-    let deadline = Instant::now() + io_deadline(20);
+    // Flat 20s, NOT scaled through `io_deadline`. Every caller of this helper is
+    // one of the four AI-67 stdin-round-trip tests below, and all four are
+    // `#[ignore]`d under `cargo tarpaulin` — so this poll never runs under
+    // instrumentation and an inflated bound would be unreachable dead weight
+    // that also misdescribes the failure ("merely slow" rather than "never
+    // completes"). Keeping the honest 20s means that if a FUTURE test ever calls
+    // this helper without carrying the same skip, it fails fast and loudly at
+    // 20s instead of silently burning 120s per call on the coverage job.
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(contents) = std::fs::read_to_string(agent_log) {
             if contents.lines().any(|l| l == wanted) {
@@ -153,7 +159,59 @@ fn wait_for_stdin_line(agent_log: &Path, wanted: &str) {
     }
 }
 
+// ---- AI-67: the four stdin-round-trip tests are IGNORED under `cargo tarpaulin` ----
+//
+// WHY (root cause, pinned — NOT a timing margin). The four tests marked below
+// prove delivery by writing to a running `fake_agent` child's stdin and polling
+// for the ECHO the child writes back to its agent.log. Under `cargo tarpaulin`'s
+// LLVM source-coverage instrumentation the CHILD IS INSTRUMENTED TOO and the
+// echo never comes back at all: each of the four burned its FULL deadline on
+// every run, on every fresh runner (at a 120s bound the interaction binary ran
+// ~487s ≈ 4 x 120s), and each panicked inside the POLL helper — `send_input`
+// itself returned `Ok`, so the write landed and only the round trip is broken.
+// Three competing hypotheses (runner contention, the engine usage-drain lock,
+// deadline margin) were tested and falsified. No deadline value can fix a round
+// trip that never completes, so the coverage job is simply not a place these
+// four can run.
+//
+// NOT a blanket "stdin cannot be tested under coverage" claim. The backend unit
+// test `write_stdin_delivers_a_line_that_is_echoed_into_the_captured_log`
+// completes the SAME echo round trip under instrumentation at a 120s bound and
+// PASSES — it drives the backend directly, with no Engine/Supervisor dispatch
+// layer also instrumented in the path. That test is what keeps the OS-level
+// stdin plumbing credited under coverage, and its inflation is load-bearing and
+// stays. What is unavailable under instrumentation is specifically the FULL
+// engine-dispatch round trip these four need.
+//
+// WHY `#[cfg_attr(tarpaulin, ignore = ...)]` AND NOT A RUNTIME EARLY-RETURN.
+// This repo's hard-won story-4-3 lesson is that a runtime early-return is
+// reported by the harness as **PASSED**, so CI shows green for assertions that
+// never ran — which is exactly why the OS-limited tests in
+// `crates/kt/tests/agent_cli.rs` carry a visible `_unix` name SUFFIX. Here the
+// condition is known at COMPILE time, so the stronger form of that same honesty
+// is available: `#[ignore]` is the harness's own first-class skip. The test is
+// listed as `... ignored, <reason>` and counted in a SEPARATE "N ignored" tally,
+// never as a pass, and the reason string travels with it into the CI log. A name
+// suffix was deliberately NOT added on top: unlike the `_unix` tests, these four
+// DO run, unskipped and fully asserted, in the primary 3-OS `test` job — the
+// caveat belongs to one measurement job, not to the tests' identity.
+//
+// COVERAGE HONESTY. What these four uniquely exercise is the `send_input`
+// delivery path end to end. That path is still gated on all three OSes by the
+// plain `cargo nextest` `test` job, which compiles WITHOUT `--cfg=tarpaulin` and
+// runs them normally and reliably; only the coverage NUMBER loses their credit.
+//
+// FRAGILITY NOTE for a future maintainer: adding `--ignored` (or a `--run-types`
+// that includes ignored tests) to the coverage job's tarpaulin invocation in
+// `.github/workflows/ci.yml` would silently re-enable all four and put the job
+// back into the same deterministic red.
+
 #[test]
+#[cfg_attr(
+    tarpaulin,
+    ignore = "AI-67: the instrumented fake_agent child never completes the stdin round trip under \
+              cargo tarpaulin; fully exercised by the plain 3-OS test job"
+)]
 fn send_input_delivers_text_to_a_running_manifest_adapter_agent() {
     // AC-A + AC-F: one continuous engine session — register a manifest
     // adapter pointing `[lifecycle.start]` at `fake_agent --echo-stdin`,
@@ -204,6 +262,11 @@ fn send_input_delivers_text_to_a_running_manifest_adapter_agent() {
 }
 
 #[test]
+#[cfg_attr(
+    tarpaulin,
+    ignore = "AI-67: the instrumented fake_agent child never completes the stdin round trip under \
+              cargo tarpaulin; fully exercised by the plain 3-OS test job"
+)]
 fn send_input_works_identically_across_two_adapter_registrations() {
     // AC-A's "the same command works on both the mock adapter and a manifest
     // adapter" — VERIFIED (see the story's Dev Notes): `resolve_start_launch`
@@ -393,6 +456,11 @@ fn send_input_on_a_running_row_with_no_in_memory_handle_is_interaction_unavailab
 }
 
 #[test]
+#[cfg_attr(
+    tarpaulin,
+    ignore = "AI-67: the instrumented fake_agent child never completes the stdin round trip under \
+              cargo tarpaulin; fully exercised by the plain 3-OS test job"
+)]
 fn send_input_best_effort_still_delivers() {
     // Completeness (not an epics.md-explicit AC, but the exhaustive dispatch
     // needs it covered): a manifest declaring `interaction: best-effort`
@@ -492,10 +560,13 @@ fn wait_until_gone(pid: u32, what: &str) {
 
 /// Read the pid `fake_agent` announced (`ready pid=<n>`) from its agent.log.
 fn wait_for_agent_pid(agent_log: &Path) -> u32 {
-    // Close sibling of `wait_for_stdin_line`: a real spawn -> child-startup ->
-    // "ready pid=" round trip. The non-skipped `..._sniffs_stdin_at_startup...`
-    // test DOES exercise this under the coverage job, and its 10s bound is
-    // thinner than the 20s that already fails there, so AI-67 scales it too.
+    // A real spawn -> child-startup -> "ready pid=" round trip. UNLIKE
+    // `wait_for_stdin_line`, this one genuinely COMPLETES under instrumentation
+    // (it needs only the child to reach startup and write its own log line — no
+    // stdin echo back through an instrumented reader), it is merely slow. The
+    // non-skipped `..._sniffs_stdin_at_startup...` test DOES exercise it under
+    // the coverage job on its thin 10s bound, so AI-67's inflation is still
+    // load-bearing HERE and stays.
     let deadline = Instant::now() + io_deadline(10);
     loop {
         if let Ok(contents) = std::fs::read_to_string(agent_log) {
@@ -748,6 +819,11 @@ source = "self-reported"
 }
 
 #[test]
+#[cfg_attr(
+    tarpaulin,
+    ignore = "AI-67: the instrumented fake_agent child never completes the stdin round trip under \
+              cargo tarpaulin; fully exercised by the plain 3-OS test job"
+)]
 fn a_stuck_instances_send_times_out_and_does_not_block_a_different_instances_send_beyond_the_bound()
 {
     // CRITICAL finding fix: the engine has ONE global `Mutex<Supervisor>`
