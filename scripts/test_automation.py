@@ -141,6 +141,23 @@ class ReleaseDocsTests(unittest.TestCase):
         # both the `rm` and the explicit rebuild so neither is dropped.
         self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
         self.assertIn("cargo +stable build -p ktesio-conformance --bin fake_agent", ci)
+        # The COVERAGE job needs the very same guard, for the same reason, and a
+        # workspace-wide assertIn cannot tell the two jobs apart — so scope this
+        # pair to the coverage step's own script. The stale-helper defect has now
+        # bitten twice: first the test job (macOS/Windows metering), then the
+        # coverage job, whose `target/` cache key is Cargo.lock-derived, so a
+        # helper-only change cannot bust it and the frozen binary silently
+        # ignores flags added since (unknown args are `_ => {}`), making the
+        # spawning tests wait out deadlines for output that can never arrive.
+        coverage_step = ci[ci.index("- name: Enforce coverage") :]
+        self.assertIn(
+            "rm -f target/debug/fake_agent target/debug/fake_agent.exe",
+            coverage_step,
+        )
+        self.assertIn(
+            "cargo +stable build -p ktesio-conformance --bin fake_agent",
+            coverage_step,
+        )
         self.assertIn(
             "command -v cargo-nextest >/dev/null 2>&1 "
             "|| cargo +stable install cargo-nextest --locked",

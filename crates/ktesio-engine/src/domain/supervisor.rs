@@ -4910,14 +4910,12 @@ mod tests {
         // handful of bytes never fills any of them) and `write_all` + `flush`
         // return immediately. Nothing here waits on the child for anything.
         //
-        // AI-67 (coverage): that "no round trip" property is the whole point.
-        // The four AC-level proofs in `crates/ktesio-engine/tests/interaction.rs`
-        // that own this arm end to end are `#[ignore]`d under `cargo tarpaulin`
-        // (an instrumented child never completes the echo), so under coverage
-        // this arm had NO exerciser at all. This one runs everywhere, including
-        // instrumented — the AI-67 investigation itself recorded that
-        // `send_input` returned `Ok` under tarpaulin and only the echo back was
-        // broken.
+        // That "no round trip" property is also what makes this the CHEAPEST
+        // exerciser of the arm: the four AC-level proofs in
+        // `crates/ktesio-engine/tests/interaction.rs` own it end to end, but
+        // they each pay a real child echo, and a pure unit test that needs
+        // nothing back from the child cannot be destabilised by anything
+        // happening inside it.
         //
         // Bonus (branch, not line): the two sends straddle AC-F's trailing-
         // newline branch — "hello" takes the `push(b'\n')` side, "world\n" the
@@ -4976,9 +4974,9 @@ mod tests {
         // OSes. It does NOT close the CLI half (the `kt` process exiting 6),
         // which still rests on the mapper pin.
         //
-        // AI-67 (coverage): unlike the `#[ignore]`d interaction.rs proofs, this
-        // one needs nothing FROM the child — only that it keeps NOT reading —
-        // so instrumentation cannot break it.
+        // Robustness: unlike the interaction.rs proofs, this one needs nothing
+        // FROM the child — only that it keeps NOT reading — so no property of
+        // the child's own output can make it fail.
         let (_state, _manifest, registry) = setup_fake("stuck", &["--linger-ms", "600000"]);
         let mut sup = Supervisor::with_backoff(fast_backoff());
         sup.start(&registry, "stuck").unwrap();
@@ -5000,9 +4998,9 @@ mod tests {
         }
         // No upper wall-clock bound is asserted on that call: "bounded, not
         // indefinite" is interaction.rs's property to prove (it also needs the
-        // engine's shared lock and a second instance), and a 2x-margin timing
-        // assertion is precisely the shape AI-67 had to unwind. What this test
-        // owns is the ARM, and the arm is proven by the returned value.
+        // engine's shared lock and a second instance), and a tight-margin
+        // timing assertion here would buy nothing but flake surface. What this
+        // test owns is the ARM, and the arm is proven by the returned value.
 
         let start = Instant::now();
         let err = sup

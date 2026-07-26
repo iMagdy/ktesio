@@ -555,25 +555,46 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Coverage runs the whole suite under `cargo tarpaulin` LLVM
-          # instrumentation. AI-67 root cause (owner-ratified): instrumentation
-          # makes a real child-process IO round trip ~100x slower, so a small
-          # fixed pool of ~6 real-IO tests missed their HARD-CODED wall-clock
-          # deadlines DETERMINISTICALLY -- every failure was a deadline-miss
-          # assert ("never observed ... in agent.log" / "echoed stdin line never
-          # appeared"), on every fresh runner, with runner resources flat and
-          # healthy (NOT an OOM, NOT contention). The fix lives in the TESTS:
-          # those few deadlines now scale up under `cfg!(tarpaulin)` ONLY (see
-          # crates/ktesio-engine/tests/interaction.rs and
-          # crates/ktesio-engine/src/backends/unix/mod.rs), clearing the
-          # instrumented latency while plain `cargo nextest` keeps its fast bounds.
+          # STALE `fake_agent` GUARD -- the ROOT CAUSE of this job's long red
+          # streak, and the SAME defect class already fixed in the `test` job (see
+          # its "Build test binaries" step, which carries the fuller write-up).
+          # This job's `target/` cache key is derived from
+          # `hashFiles('**/Cargo.lock')`, so a change touching ONLY the
+          # `fake_agent` test helper CANNOT bust it: the entry stays frozen at
+          # whatever helper was built the last time Cargo.lock moved, which here
+          # predated the `--echo-stdin` / `--heartbeat-stderr-ms` flags.
+          # `fake_agent`'s arg parser ignores unknown args (`_ => {}`), so the
+          # stale binary silently never echoes stdin and never writes stderr, and
+          # the tests then wait out their deadlines for output that can never
+          # arrive -- surfacing as deadline-miss asserts ("never observed ... in
+          # agent.log" / "echoed stdin line never appeared") that LOOK like slow
+          # IO but are a missing feature. Compounding it: tarpaulin compiles the
+          # helper only as a `--test` artifact and never uplifts it to
+          # target/debug/fake_agent, while `ktesio_conformance::fake_agent_bin()`
+          # accepts that path when the file merely EXISTS (no freshness check) --
+          # so the frozen copy is exactly what every spawning test runs.
           #
-          # Because that failure is DETERMINISTIC (not flaky), the former 3-attempt
-          # whole-job retry wrapper (PR #117, built on a since-disproven "runner
-          # contention" theory) could never converge -- each attempt re-hit the same
-          # deadline. It has been REMOVED; the coverage steps below run exactly ONCE.
-          # (The per-crate split, swap, and disk reclaim below are a SEPARATE OOM
-          # mitigation and stay untouched.)
+          # Proven, not inferred: swapping the pre-6afac99 helper in locally
+          # reproduces the exact CI assertion with NO instrumentation at all,
+          # while a freshly built helper passes under real tarpaulin in 0.35s.
+          # Instrumentation latency was NOT the cause.
+          #
+          # `rm` + an EXPLICIT build (not just `rm`) for the same reason the test
+          # job needs both: nothing in the tarpaulin path ever places that
+          # top-level hardlink, so without the build the spawning tests would race
+          # on the lib's on-demand `cargo build` fallback (concurrent cargo
+          # invocations contend on the build-dir lock -- an observed flake). The
+          # plain profile also keeps the helper OUT of the coverage denominator,
+          # which is the documented posture (docs/testing.md: `fake_agent` runs
+          # only as a spawned subprocess and is excluded from coverage).
+          rm -f target/debug/fake_agent target/debug/fake_agent.exe
+          cargo +stable build -p ktesio-conformance --bin fake_agent
+          # NO RETRY WRAPPER. The former 3-attempt whole-job retry (PR #117, built
+          # on a since-disproven "runner contention" theory) could never converge:
+          # the failure above is DETERMINISTIC, so every attempt re-hit it. It
+          # stays removed -- the coverage steps below run exactly ONCE. (The
+          # per-crate split, swap, and disk reclaim are a SEPARATE OOM mitigation
+          # and stay untouched.)
           rm -rf cov && mkdir -p cov
           # Crate list as positional params (portable, no word-split reliance):
           # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
