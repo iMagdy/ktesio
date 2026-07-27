@@ -4562,6 +4562,98 @@ mod tests {
     }
 
     #[test]
+    fn read_agent_log_reports_a_damaged_generation_as_a_typed_error_naming_the_file() {
+        // `kt agent logs` is the only window a user has into what an agent
+        // actually said, so a damaged log must FAIL LOUDLY and name the exact
+        // file. The dangerous alternative is not a panic — it is a silent skip:
+        // dropping an unparseable line (or an unreadable generation) would return
+        // a shorter, plausible-looking log and hide agent output the user is
+        // reading precisely because something went wrong. All three damage sites
+        // are asserted because they are three separate arms on the read path, and
+        // each one names a DIFFERENT path (a rotated generation vs the current
+        // one), which is the part that makes the diagnostic actionable.
+        let corrupt_line = "{not valid json}\n";
+
+        // (1) The CURRENT generation contains an unparseable line.
+        {
+            let (_state, _manifest, registry) =
+                setup_fake("badcurrent", &["--linger-ms", "600000"]);
+            let name = InstanceName::new("badcurrent").unwrap();
+            std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+            let current = registry.attributed_output_log_path(&name);
+            std::fs::write(&current, corrupt_line).unwrap();
+
+            let err = Supervisor::read_agent_log(&registry, "badcurrent").unwrap_err();
+            match err {
+                EngineError::Log { name, path, detail } => {
+                    assert_eq!(name, "badcurrent");
+                    assert_eq!(path, current.to_string_lossy());
+                    // The line NUMBER is what makes this fixable by hand.
+                    assert!(detail.contains("corrupt output-log line 1"), "{detail}");
+                }
+                other => panic!("expected EngineError::Log, got {other:?}"),
+            }
+        }
+
+        // (2) A ROTATED generation contains an unparseable line — the error must
+        // name THAT generation's path, not the current one, or the user deletes
+        // the wrong file.
+        {
+            let (_state, _manifest, registry) = setup_fake("badgen", &["--linger-ms", "600000"]);
+            let name = InstanceName::new("badgen").unwrap();
+            std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+            let rotated = registry.attributed_output_log_generation_path(&name, 1);
+            std::fs::write(&rotated, corrupt_line).unwrap();
+            // A perfectly good current generation must NOT rescue the read.
+            std::fs::write(
+                registry.attributed_output_log_path(&name),
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&log_line(
+                        "badgen",
+                        LogStream::Engine,
+                        "fine",
+                        "2026-07-15T00:00:00Z"
+                    ))
+                    .unwrap()
+                ),
+            )
+            .unwrap();
+
+            let err = Supervisor::read_agent_log(&registry, "badgen").unwrap_err();
+            match err {
+                EngineError::Log { path, .. } => {
+                    assert_eq!(path, rotated.to_string_lossy());
+                }
+                other => panic!("expected EngineError::Log, got {other:?}"),
+            }
+        }
+
+        // (3) The CURRENT log path is unreadable for a reason OTHER than "missing"
+        // — a directory sits where the file belongs. A missing file is a legitimate
+        // empty log (asserted elsewhere); this must NOT be quietly folded into that
+        // case, because "no output yet" and "your log is broken" are different
+        // answers to the user's question.
+        {
+            let (_state, _manifest, registry) = setup_fake("blocked", &["--linger-ms", "600000"]);
+            let name = InstanceName::new("blocked").unwrap();
+            std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+            let current = registry.attributed_output_log_path(&name);
+            std::fs::create_dir(&current).unwrap();
+
+            let err = Supervisor::read_agent_log(&registry, "blocked").unwrap_err();
+            match err {
+                EngineError::Log { name, path, detail } => {
+                    assert_eq!(name, "blocked");
+                    assert_eq!(path, current.to_string_lossy());
+                    assert!(!detail.is_empty(), "the OS detail must be preserved");
+                }
+                other => panic!("expected EngineError::Log, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn read_agent_log_concatenates_generations_oldest_to_newest() {
         // AC-A/AC-G: hand-craft the 3 generations directly (deterministic,
         // no real rotation/process needed) and assert the read order is
