@@ -4562,6 +4562,98 @@ mod tests {
     }
 
     #[test]
+    fn read_agent_log_reports_a_damaged_generation_as_a_typed_error_naming_the_file() {
+        // `kt agent logs` is the only window a user has into what an agent
+        // actually said, so a damaged log must FAIL LOUDLY and name the exact
+        // file. The dangerous alternative is not a panic — it is a silent skip:
+        // dropping an unparseable line (or an unreadable generation) would return
+        // a shorter, plausible-looking log and hide agent output the user is
+        // reading precisely because something went wrong. All three damage sites
+        // are asserted because they are three separate arms on the read path, and
+        // each one names a DIFFERENT path (a rotated generation vs the current
+        // one), which is the part that makes the diagnostic actionable.
+        let corrupt_line = "{not valid json}\n";
+
+        // (1) The CURRENT generation contains an unparseable line.
+        {
+            let (_state, _manifest, registry) =
+                setup_fake("badcurrent", &["--linger-ms", "600000"]);
+            let name = InstanceName::new("badcurrent").unwrap();
+            std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+            let current = registry.attributed_output_log_path(&name);
+            std::fs::write(&current, corrupt_line).unwrap();
+
+            let err = Supervisor::read_agent_log(&registry, "badcurrent").unwrap_err();
+            match err {
+                EngineError::Log { name, path, detail } => {
+                    assert_eq!(name, "badcurrent");
+                    assert_eq!(path, current.to_string_lossy());
+                    // The line NUMBER is what makes this fixable by hand.
+                    assert!(detail.contains("corrupt output-log line 1"), "{detail}");
+                }
+                other => panic!("expected EngineError::Log, got {other:?}"),
+            }
+        }
+
+        // (2) A ROTATED generation contains an unparseable line — the error must
+        // name THAT generation's path, not the current one, or the user deletes
+        // the wrong file.
+        {
+            let (_state, _manifest, registry) = setup_fake("badgen", &["--linger-ms", "600000"]);
+            let name = InstanceName::new("badgen").unwrap();
+            std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+            let rotated = registry.attributed_output_log_generation_path(&name, 1);
+            std::fs::write(&rotated, corrupt_line).unwrap();
+            // A perfectly good current generation must NOT rescue the read.
+            std::fs::write(
+                registry.attributed_output_log_path(&name),
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&log_line(
+                        "badgen",
+                        LogStream::Engine,
+                        "fine",
+                        "2026-07-15T00:00:00Z"
+                    ))
+                    .unwrap()
+                ),
+            )
+            .unwrap();
+
+            let err = Supervisor::read_agent_log(&registry, "badgen").unwrap_err();
+            match err {
+                EngineError::Log { path, .. } => {
+                    assert_eq!(path, rotated.to_string_lossy());
+                }
+                other => panic!("expected EngineError::Log, got {other:?}"),
+            }
+        }
+
+        // (3) The CURRENT log path is unreadable for a reason OTHER than "missing"
+        // — a directory sits where the file belongs. A missing file is a legitimate
+        // empty log (asserted elsewhere); this must NOT be quietly folded into that
+        // case, because "no output yet" and "your log is broken" are different
+        // answers to the user's question.
+        {
+            let (_state, _manifest, registry) = setup_fake("blocked", &["--linger-ms", "600000"]);
+            let name = InstanceName::new("blocked").unwrap();
+            std::fs::create_dir_all(registry.instance_log_dir(&name)).unwrap();
+            let current = registry.attributed_output_log_path(&name);
+            std::fs::create_dir(&current).unwrap();
+
+            let err = Supervisor::read_agent_log(&registry, "blocked").unwrap_err();
+            match err {
+                EngineError::Log { name, path, detail } => {
+                    assert_eq!(name, "blocked");
+                    assert_eq!(path, current.to_string_lossy());
+                    assert!(!detail.is_empty(), "the OS detail must be preserved");
+                }
+                other => panic!("expected EngineError::Log, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn read_agent_log_concatenates_generations_oldest_to_newest() {
         // AC-A/AC-G: hand-craft the 3 generations directly (deterministic,
         // no real rotation/process needed) and assert the read order is
@@ -4898,5 +4990,136 @@ mod tests {
             matches!(err, EngineError::Backend { .. }),
             "expected Backend, got {err:?}"
         );
+    }
+
+    #[test]
+    fn send_input_writes_into_a_live_stdin_pipe_that_the_agent_never_reads_and_reports_success() {
+        // `send_input`'s SUCCESS arm (`Ok(()) => Ok(())`) at Supervisor level,
+        // reachable WITHOUT any stdin round trip: `fake_agent` is spawned with
+        // NEITHER `--echo-stdin` NOR `--sniff-stdin-at-startup`, so it provably
+        // never reads a byte of its piped stdin — the write simply lands in the
+        // OS pipe buffer (64KiB on Linux, 16KiB on macOS, 4KiB on Windows; a
+        // handful of bytes never fills any of them) and `write_all` + `flush`
+        // return immediately. Nothing here waits on the child for anything.
+        //
+        // That "no round trip" property is also what makes this the CHEAPEST
+        // exerciser of the arm: the four AC-level proofs in
+        // `crates/ktesio-engine/tests/interaction.rs` own it end to end, but
+        // they each pay a real child echo, and a pure unit test that needs
+        // nothing back from the child cannot be destabilised by anything
+        // happening inside it.
+        //
+        // Bonus (branch, not line): the two sends straddle AC-F's trailing-
+        // newline branch — "hello" takes the `push(b'\n')` side, "world\n" the
+        // already-terminated side.
+        let (_state, _manifest, registry) = setup_fake("liveio", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "liveio").unwrap();
+
+        sup.send_input(&registry, "liveio", "hello")
+            .expect("a small write into a live, unfilled stdin pipe must succeed");
+        sup.send_input(&registry, "liveio", "world\n")
+            .expect("an already-newline-terminated write must succeed the same way");
+
+        // Teardown.
+        let _ = sup.stop(&registry, "liveio", Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn send_input_past_the_stdin_pipe_buffer_times_out_and_poisons_the_handle_until_restart() {
+        // Two `send_input` arms in one flow, sharing the ONE expensive wait
+        // (`STDIN_WRITE_TIMEOUT`, 5s — the product's own bound, paid once):
+        //
+        //   1. `Err(BackendError::StdinTimedOut { .. })` =>
+        //      `EngineError::InteractionTimedOut` — the mapping arm.
+        //   2. The `self.backend.stdin_timed_out(..)` PRE-FLIGHT early return —
+        //      a handle whose prior write timed out is permanently poisoned for
+        //      the rest of this engine session (`StdinState::TimedOut` is never
+        //      recoverable; only a stop+start builds a fresh pipe), so a SECOND
+        //      send must fail fast with no new write attempted.
+        //
+        // The two arms are told apart WITHOUT any timing argument: the ordering
+        // inside `send_input` puts `stdin_timed_out` BEFORE `has_stdin`, and a
+        // `TimedOut` state is not `Live`, so if arm 2 were absent the second
+        // send would land on the `has_stdin` check and return the materially
+        // DIFFERENT `InteractionUnavailable`. Getting `InteractionTimedOut`
+        // back is therefore positive proof that the pre-flight branch ran.
+        //
+        // DETERMINISM (Epic-2-retro AI-35/38 — never sleep to await state).
+        // There is no sleep and no polling here. `fake_agent` without
+        // `--echo-stdin`/`--sniff-stdin-at-startup` provably never drains its
+        // stdin, and 8MB comfortably outruns every OS pipe buffer, so the write
+        // blocks with certainty rather than by luck; the 5s is the engine's own
+        // bounded `recv_timeout` elapsing, not a test guessing at a duration.
+        // Every assertion is on a RETURNED value. This is exactly the
+        // "deterministic stuck-agent harness ... a `fake_agent` flag that
+        // provably never drains stdin plus a deliberately-filled pipe, no
+        // sleeps" that the Epic 4 retrospective left open as AI-69.
+        //
+        // INDEPENDENT VALUE BEYOND COVERAGE (AI-69). The retro recorded that
+        // exit code 6 / `InteractionTimedOut` has NO end-to-end assertion on any
+        // OS — it was pinned only by the `kt` crate's mapper/classifier unit
+        // test, composed with the separate end-to-end proofs of codes 0-4. This
+        // closes the ENGINE half of that gap: the real `Supervisor`, the real
+        // backend, a real non-draining child, and a real bounded write actually
+        // producing `InteractionTimedOut` — deterministically and on all three
+        // OSes. It does NOT close the CLI half (the `kt` process exiting 6),
+        // which still rests on the mapper pin.
+        //
+        // Robustness: unlike the interaction.rs proofs, this one needs nothing
+        // FROM the child — only that it keeps NOT reading — so no property of
+        // the child's own output can make it fail.
+        let (_state, _manifest, registry) = setup_fake("stuck", &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "stuck").unwrap();
+
+        // Far past any realistic OS pipe buffer, so the write blocks once the
+        // buffer fills — the adversarial audit's original reproduction vehicle.
+        let huge_payload = "x".repeat(8 * 1024 * 1024);
+        let err = sup
+            .send_input(&registry, "stuck", &huge_payload)
+            .expect_err("a write past the buffer of a never-draining pipe must time out");
+        match err {
+            EngineError::InteractionTimedOut { name, timeout_secs } => {
+                assert_eq!(name, "stuck");
+                // Pinned to the product constant the arm forwards, not a
+                // literal restated here.
+                assert_eq!(timeout_secs, crate::ports::STDIN_WRITE_TIMEOUT.as_secs());
+            }
+            other => panic!("expected InteractionTimedOut, got {other:?}"),
+        }
+        // No upper wall-clock bound is asserted on that call: "bounded, not
+        // indefinite" is interaction.rs's property to prove (it also needs the
+        // engine's shared lock and a second instance), and a tight-margin
+        // timing assertion here would buy nothing but flake surface. What this
+        // test owns is the ARM, and the arm is proven by the returned value.
+
+        let start = Instant::now();
+        let err = sup
+            .send_input(&registry, "stuck", "second attempt")
+            .expect_err("a poisoned handle must reject every later send");
+        let elapsed = start.elapsed();
+        match err {
+            EngineError::InteractionTimedOut { name, timeout_secs } => {
+                assert_eq!(name, "stuck");
+                assert_eq!(timeout_secs, crate::ports::STDIN_WRITE_TIMEOUT.as_secs());
+            }
+            other => panic!("expected a fast-path InteractionTimedOut, got {other:?}"),
+        }
+        // The fast path does no I/O at all, so it returns in microseconds. The
+        // bound is deliberately the FULL production timeout rather than a tight
+        // one: with ~6 orders of magnitude of headroom it cannot flake, even
+        // under coverage instrumentation, yet it still fails loudly on the one
+        // regression it is here to catch — a second doomed bounded write.
+        assert!(
+            elapsed < crate::ports::STDIN_WRITE_TIMEOUT,
+            "the poisoned-handle fast path must not wait out a second bounded write: {elapsed:?}"
+        );
+
+        // Teardown: killing the group closes the pipe's read end, so the
+        // abandoned 8MB write thread (never joinable by design — see
+        // `write_stdin_bounded`'s docs) unblocks with EPIPE and exits on its
+        // own; this test does not wait for it.
+        let _ = sup.stop(&registry, "stuck", Some(Duration::from_millis(200)));
     }
 }

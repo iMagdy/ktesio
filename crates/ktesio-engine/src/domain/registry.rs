@@ -2045,6 +2045,63 @@ source = "self-reported"
     }
 
     #[test]
+    fn resolve_secrets_walks_past_non_string_leaves_without_failing_the_start() {
+        // resolve_secrets iterates EVERY leaf of the effective config on EVERY
+        // start, and only a STRING leaf can be a `secret:` reference. Non-string
+        // leaves are not exotic — a budgeted instance has integer token ceilings
+        // and a boolean-ish flag is a hand-edit away — so the skip arm is on the
+        // hot start path for ordinary configs. If it mis-handled them, budgeting an
+        // agent would break starting it. Assert the walk both SKIPS them and still
+        // finds a secret sitting after them in dotted-key order.
+        let env_key = "KTESIO_REG_NON_STRING_LEAF_TEST_KEY";
+        let prev = std::env::var_os(env_key);
+        std::env::set_var(env_key, "resolved-cleartext");
+
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        reg.set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+        // `set_config` stores every value as a TOML string, so a genuine
+        // non-string leaf has to come from parsed TOML — exactly how a
+        // hand-edited config.toml or a kind-default layer supplies one.
+        // `budget.*` sorts BEFORE `model`, so it is walked first.
+        let typed = ConfigLayer::parse(
+            SourceLayer::InvocationOverride,
+            "<test>",
+            "[budget.tokens]\ncumulative = 500\n",
+        )
+        .unwrap();
+
+        let eff = reg.effective_config(&name, typed).unwrap();
+        // The ceiling really is a non-string leaf (not a quoted "500"), otherwise
+        // this test would not exercise the skip at all.
+        assert!(
+            matches!(
+                eff.value("budget.tokens.cumulative"),
+                Some(toml::Value::Integer(500))
+            ),
+            "expected an integer leaf, got {:?}",
+            eff.value("budget.tokens.cumulative")
+        );
+
+        let secrets = reg.resolve_secrets(&eff).unwrap();
+        assert_eq!(
+            secrets.get("model").map(|s| s.expose_secret()),
+            Some("resolved-cleartext")
+        );
+        assert!(
+            !secrets.contains_key("budget.tokens.cumulative"),
+            "a non-string leaf must contribute nothing to the secret map"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(env_key, v),
+            None => std::env::remove_var(env_key),
+        }
+    }
+
+    #[test]
     fn resolve_secrets_unresolved_is_a_typed_error_naming_the_name() {
         // A `secret:NAME` unresolved by env + the (absent) secrets file is a typed
         // SecretError::Unresolved naming NAME + resolvers, NEVER a value; reveal

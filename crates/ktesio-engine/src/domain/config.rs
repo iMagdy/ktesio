@@ -1978,6 +1978,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_budget_and_cap_ignore_a_leaf_of_the_wrong_toml_type() {
+        // The sibling of the malformed-VALUE degrade above: a leaf of the wrong
+        // TOML TYPE entirely (a bool, a float, an array — shapes the `set` path can
+        // never produce, but a hand-edited config can) must also read as ABSENT.
+        // This is the safe direction only because absent means "no ceiling to
+        // enforce"; the dangerous failure would be coercing `true` into a ceiling
+        // of 1 (or a float `0.5` into 0), which would throttle or instantly breach
+        // an agent the operator never budgeted. Both the token and the dollar
+        // resolvers are pinned, since they coerce independently.
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "[budget.tokens]\nper_run = true\ncumulative = 1.5\n\
+             [budget.dollars]\ncumulative = false\n\
+             [cost.rate]\ninput = [1, 2]\n",
+        ));
+
+        let (budget, _) = resolve_token_budget(&eff);
+        assert_eq!(budget.per_run, None, "a boolean is not a token ceiling");
+        assert_eq!(budget.cumulative, None, "a float is not a token ceiling");
+
+        let (rate, cap, _) = resolve_cost(&eff);
+        assert_eq!(cap.cumulative, None, "a boolean is not a dollar cap");
+        // A Rate needs BOTH directions; an array input leaf reads as absent, so the
+        // Rate stays inert rather than half-configured.
+        assert!(
+            rate.is_none(),
+            "a non-scalar rate leaf must not configure a Rate"
+        );
+    }
+
+    #[test]
     fn resolve_token_budget_accepts_a_numeric_string_ceiling() {
         // A quoted numeric value (a hand-edited string leaf) still resolves to the
         // ceiling (defensive coercion).

@@ -554,114 +554,118 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "1"
         shell: bash
         run: |
-          set -uo pipefail
-          # Whole-job retry (PR #117): this job's per-test real-time waits (a
-          # child process spawn + a stdin/stdout round trip) were empirically
-          # observed to transiently stall COMPLETELY (not merely run slow) on
-          # this free-tier runner — across otherwise-identical reruns of the
-          # SAME commit, a DIFFERENT, unrelated test failed each time, always
-          # one needing a real child-process round trip, never one on a
-          # fast-fail path with no I/O; a local repro under the identical
-          # tarpaulin/instrumentation config passed instantly. That signature
-          # is runner contention, not a product bug. 3 TOTAL ATTEMPTS (2
-          # retries), bumped from an initial 2 after that first retry still
-          # failed once in practice (a DIFFERENT real-IO test than attempt 1,
-          # not a new bug — the same signature, just unlucky twice on the
-          # SAME runner instance, which a same-job retry does not refresh).
-          # Retrying the WHOLE attempt (never a PER-TEST retry, e.g. nextest's `retries`,
-          # which this repo has already seen silently absorb a real,
-          # reproducible data-loss race — see the 4-2 H1 fix) keeps the gate
-          # meaningful: a genuine coverage regression or a genuine test bug
-          # reproduces on BOTH attempts and still fails the job.
-          run_coverage_attempt() (
-            set -euo pipefail
-            rm -rf cov && mkdir -p cov
-            # Crate list as positional params (portable, no word-split reliance):
-            # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
-            set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes ktesio ktesio-engine
-            for pkg in "$@"; do
-              echo "::group::tarpaulin -p $pkg"
-              echo "--- resources before $pkg ---"
-              free -h || true
-              df -h / || true
-              cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
-                -p "$pkg" --out Lcov --output-dir "cov/$pkg"
-              echo "::endgroup::"
-            done
-            # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
-            # is a doc-only stub today (0 coverable lines, no tracefile) -- the ONLY
-            # crate allowed to skip the merge with no lcov.info; it lights up
-            # automatically once epic 6 gives it code. --ignore-errors inconsistent:
-            # tolerate lcov 2.x's benign cross-run FN-start-line drift (line data is
-            # unaffected).
-            #
-            # PR #117 fix pass: this used to skip ANY crate with no lcov.info, not
-            # just hermes. That silently swallowed a real failure mode -- when a
-            # crate's OWN tarpaulin run fails (e.g. ktesio-engine hitting one of this
-            # job's flaky real-IO tests), it produces no lcov.info too, and the old
-            # code merged the aggregate from whatever crates DID succeed anyway. The
-            # resulting gate failure ("merged coverage NN% is below 95%") read like a
-            # genuine coverage shortfall across the whole workspace, when the real
-            # story was "ktesio-engine's measurement is entirely missing, so the
-            # smaller remaining slice can't possibly clear a 95% bar sized for the
-            # full workspace" -- confusing, and it silently accepted a
-            # SUBSET-OF-THE-WORKSPACE gate as if it were the real one. Any crate
-            # OTHER than the known doc-only stub missing its lcov.info now fails the
-            # attempt LOUDLY and immediately, before the misleading percentage math
-            # ever runs -- the retry loop above already treats this exactly like any
-            # other attempt failure.
-            add_args=""
-            for pkg in "$@"; do
-              if [ -s "cov/$pkg/lcov.info" ]; then
-                add_args="$add_args -a cov/$pkg/lcov.info"
-              elif [ "$pkg" = "ktesio-adapters-hermes" ]; then
-                echo "::notice::no coverable lines for $pkg (expected for the doc-only stub); skipping in merge."
-              else
-                echo "::error::$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed (a crashed/failed test suite, not a legitimately-empty crate). Treating this as a failed attempt rather than silently merging a partial, misleading aggregate."
-                exit 1
-              fi
-            done
-            echo "::group::merge tracefiles"
-            # shellcheck disable=SC2086
-            lcov $add_args -o cov/merged.info --ignore-errors inconsistent,inconsistent
+          set -euo pipefail
+          # STALE `fake_agent` GUARD -- the ROOT CAUSE of this job's long red
+          # streak, and the SAME defect class already fixed in the `test` job (see
+          # its "Build test binaries" step, which carries the fuller write-up).
+          # This job's `target/` cache key is derived from
+          # `hashFiles('**/Cargo.lock')`, so a change touching ONLY the
+          # `fake_agent` test helper CANNOT bust it: the entry stays frozen at
+          # whatever helper was built the last time Cargo.lock moved, which here
+          # predated the `--echo-stdin` / `--heartbeat-stderr-ms` flags.
+          # `fake_agent`'s arg parser ignores unknown args (`_ => {}`), so the
+          # stale binary silently never echoes stdin and never writes stderr, and
+          # the tests then wait out their deadlines for output that can never
+          # arrive -- surfacing as deadline-miss asserts ("never observed ... in
+          # agent.log" / "echoed stdin line never appeared") that LOOK like slow
+          # IO but are a missing feature. Compounding it: tarpaulin compiles the
+          # helper only as a `--test` artifact and never uplifts it to
+          # target/debug/fake_agent, while `ktesio_conformance::fake_agent_bin()`
+          # accepts that path when the file merely EXISTS (no freshness check) --
+          # so the frozen copy is exactly what every spawning test runs.
+          #
+          # Proven, not inferred: swapping the pre-6afac99 helper in locally
+          # reproduces the exact CI assertion with NO instrumentation at all,
+          # while a freshly built helper passes under real tarpaulin in 0.35s.
+          # Instrumentation latency was NOT the cause.
+          #
+          # `rm` + an EXPLICIT build (not just `rm`) for the same reason the test
+          # job needs both: nothing in the tarpaulin path ever places that
+          # top-level hardlink, so without the build the spawning tests would race
+          # on the lib's on-demand `cargo build` fallback (concurrent cargo
+          # invocations contend on the build-dir lock -- an observed flake). The
+          # plain profile also keeps the helper OUT of the coverage denominator,
+          # which is the documented posture (docs/testing.md: `fake_agent` runs
+          # only as a spawned subprocess and is excluded from coverage).
+          rm -f target/debug/fake_agent target/debug/fake_agent.exe
+          cargo +stable build -p ktesio-conformance --bin fake_agent
+          # NO RETRY WRAPPER. The former 3-attempt whole-job retry (PR #117, built
+          # on a since-disproven "runner contention" theory) could never converge:
+          # the failure above is DETERMINISTIC, so every attempt re-hit it. It
+          # stays removed -- the coverage steps below run exactly ONCE. (The
+          # per-crate split, swap, and disk reclaim are a SEPARATE OOM mitigation
+          # and stay untouched.)
+          rm -rf cov && mkdir -p cov
+          # Crate list as positional params (portable, no word-split reliance):
+          # lightest → heaviest, ktesio-engine LAST (see the WHY comment above).
+          set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes ktesio ktesio-engine
+          for pkg in "$@"; do
+            echo "::group::tarpaulin -p $pkg"
+            echo "--- resources before $pkg ---"
+            free -h || true
+            df -h / || true
+            cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+              -p "$pkg" --out Lcov --output-dir "cov/$pkg"
             echo "::endgroup::"
-            # Enforce the SAME workspace >= 95 gate on the MERGED aggregate. Parse the
-            # `(<hit> of <found> lines)` FRACTION from `lcov --summary` (version-stable
-            # across lcov 1.x/2.x) and compute the exact percentage — more robust than
-            # the 1-decimal rounded `NN.N%` near the boundary. `lines_pair` is the two
-            # integers "<hit> <found>"; a single awk both extracts and decides, so
-            # there is no heredoc / read indentation fragility.
-            echo "::group::merged coverage summary"
-            lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
-            echo "::endgroup::"
-            lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
-              | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
-            hit="${lines_pair%% *}"
-            found="${lines_pair##* }"
-            if [ -z "${found:-}" ] || ! [ "${found}" -gt 0 ] 2>/dev/null; then
-              echo "::error::Could not parse merged line coverage from lcov --summary; aborting the coverage gate (#101)."
-              exit 1
-            fi
-            pct="$(awk -v h="$hit" -v f="$found" 'BEGIN { printf "%.4f", (h / f) * 100 }')"
-            echo "Merged workspace coverage: ${pct}% (${hit}/${found} lines) across the per-crate split (#101)."
-            if awk -v p="$pct" 'BEGIN { exit (p + 0 >= 95) ? 0 : 1 }'; then
-              echo "Coverage gate green: merged ${pct}% >= 95% on the per-crate union (#101)."
-            else
-              echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
-              exit 1
-            fi
-          )
-
-          max_attempts=3
-          attempt=1
-          while true; do
-            if run_coverage_attempt; then
-              break
-            fi
-            if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "::error::coverage failed on all $max_attempts attempts — see the comment above this step's script; a genuine coverage regression or test bug reproduces every time, unlike runner contention."
-              exit 1
-            fi
-            echo "::warning::coverage attempt $attempt/$max_attempts failed — retrying (see the comment above this step's script: PR #117 found this job's real-time child-process waits can transiently stall on this runner; a genuine failure reproduces on every attempt)."
-            attempt=$((attempt + 1))
           done
+          # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
+          # is a doc-only stub today (0 coverable lines, no tracefile) -- the ONLY
+          # crate allowed to skip the merge with no lcov.info; it lights up
+          # automatically once epic 6 gives it code. --ignore-errors inconsistent:
+          # tolerate lcov 2.x's benign cross-run FN-start-line drift (line data is
+          # unaffected).
+          #
+          # PR #117 fix pass: this used to skip ANY crate with no lcov.info, not
+          # just hermes. That silently swallowed a real failure mode -- when a
+          # crate's OWN tarpaulin run fails (e.g. ktesio-engine hitting one of this
+          # job's real-IO tests), it produces no lcov.info too, and the old
+          # code merged the aggregate from whatever crates DID succeed anyway. The
+          # resulting gate failure ("merged coverage NN% is below 95%") read like a
+          # genuine coverage shortfall across the whole workspace, when the real
+          # story was "ktesio-engine's measurement is entirely missing, so the
+          # smaller remaining slice can't possibly clear a 95% bar sized for the
+          # full workspace" -- confusing, and it silently accepted a
+          # SUBSET-OF-THE-WORKSPACE gate as if it were the real one. Any crate
+          # OTHER than the known doc-only stub missing its lcov.info now fails the
+          # gate LOUDLY and immediately, before the misleading percentage math
+          # ever runs.
+          add_args=""
+          for pkg in "$@"; do
+            if [ -s "cov/$pkg/lcov.info" ]; then
+              add_args="$add_args -a cov/$pkg/lcov.info"
+            elif [ "$pkg" = "ktesio-adapters-hermes" ]; then
+              echo "::notice::no coverable lines for $pkg (expected for the doc-only stub); skipping in merge."
+            else
+              echo "::error::$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed (a crashed/failed test suite, not a legitimately-empty crate). Failing the coverage gate rather than silently merging a partial, misleading aggregate."
+              exit 1
+            fi
+          done
+          echo "::group::merge tracefiles"
+          # shellcheck disable=SC2086
+          lcov $add_args -o cov/merged.info --ignore-errors inconsistent,inconsistent
+          echo "::endgroup::"
+          # Enforce the SAME workspace >= 95 gate on the MERGED aggregate. Parse the
+          # `(<hit> of <found> lines)` FRACTION from `lcov --summary` (version-stable
+          # across lcov 1.x/2.x) and compute the exact percentage — more robust than
+          # the 1-decimal rounded `NN.N%` near the boundary. `lines_pair` is the two
+          # integers "<hit> <found>"; a single awk both extracts and decides, so
+          # there is no heredoc / read indentation fragility.
+          echo "::group::merged coverage summary"
+          lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
+          echo "::endgroup::"
+          lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
+            | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
+          hit="${lines_pair%% *}"
+          found="${lines_pair##* }"
+          if [ -z "${found:-}" ] || ! [ "${found}" -gt 0 ] 2>/dev/null; then
+            echo "::error::Could not parse merged line coverage from lcov --summary; aborting the coverage gate (#101)."
+            exit 1
+          fi
+          pct="$(awk -v h="$hit" -v f="$found" 'BEGIN { printf "%.4f", (h / f) * 100 }')"
+          echo "Merged workspace coverage: ${pct}% (${hit}/${found} lines) across the per-crate split (#101)."
+          if awk -v p="$pct" 'BEGIN { exit (p + 0 >= 95) ? 0 : 1 }'; then
+            echo "Coverage gate green: merged ${pct}% >= 95% on the per-crate union (#101)."
+          else
+            echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
+            exit 1
+          fi
