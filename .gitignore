@@ -15,9 +15,9 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# BMAD Method artifacts — kept locally, not tracked in the repo
+# BMAD Method tooling — the installed method itself stays local (it is a
+# vendored toolchain, not this project's work product).
 /_bmad/
-/_bmad-output/
 /.agents/skills/bmad-*/
 /.claude/skills/bmad-*/
 /.github/agents/bmad-*
