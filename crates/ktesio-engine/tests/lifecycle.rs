@@ -332,6 +332,103 @@ source = "self-reported"
 }
 
 #[test]
+fn stop_rescues_a_usage_line_flushed_during_the_kill_window() {
+    // AI-63 follow-on (billing UNDER-count at STOP, owner-approved). The stop path
+    // drains self-reported usage TERMINAL-mode BEFORE `backend.stop` kills the
+    // process — while the agent is still ALIVE. A usage line the agent flushes in
+    // the window AFTER that pre-kill drain but BEFORE its death was lost: the
+    // cursor never advanced past it and the handle was removed right after with no
+    // further drain. The fix adds a post-kill rescue drain (AFTER `backend.stop`
+    // CONFIRMS death, BEFORE `running.remove`). This proves the rescued line lands.
+    //
+    // Deterministic "flush during the kill window": an `sh` agent that emits the
+    // usage line ONLY from its SIGTERM trap (POSIX `trap`) — nothing at startup —
+    // so the line appears strictly AFTER the pre-kill drain (which ran before
+    // `backend.stop` even sent SIGTERM) and BEFORE death. Discrimination is exact:
+    // without the rescue drain the line is NEVER drained (the pre-kill drain missed
+    // it; the reaper is locked out of the supervisor for the whole stop; and the
+    // instance leaves `running` the instant stop finishes) → 0 events; with it → 1.
+    // The rescue drain commits SYNCHRONOUSLY inside stop (under the supervisor
+    // lock), so the event is durable before `stop` returns — asserted directly, no
+    // polling, no sleep.
+    //
+    // `sh`/`trap`/SIGTERM are POSIX, so this runs on the Unix hosts only — skipped
+    // at RUNTIME on Windows via the data-driven OS id (mirrors
+    // `stop_escalates_to_forced_kill_and_records_it`; NO `#[cfg]`, this file is
+    // outside the backends allowlist). The rescue drain the fix adds is OS-agnostic
+    // engine code — the identical path runs on the windows-latest matrix.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // The single usage line the agent flushes from its SIGTERM trap (the fixed
+    // 10-in / 20-out sentinels, so the ledger total is an exact-match assertion).
+    let emit_path = manifest.path().join("emit.txt");
+    std::fs::write(
+        &emit_path,
+        "KTESIO_USAGE {\"sequence\":0,\"input_tokens\":10,\"output_tokens\":20}\n",
+    )
+    .unwrap();
+    // A manifest whose start exec is `sh -c 'trap "cat <emit>" TERM; sleep 60'`:
+    // emit ONLY on SIGTERM, then fall through the interrupted `sleep` so `sh` exits
+    // promptly (a graceful, confirmed-death stop). `{script:?}` renders a correctly
+    // escaped TOML string; the temp path carries no quotes/backslashes.
+    let script = format!("trap 'cat {}' TERM; sleep 60", emit_path.display());
+    let body = format!(
+        r#"
+contract_version = "0.1.0"
+
+[adapter]
+kind = "emitter"
+
+[lifecycle.start]
+exec = "sh"
+args = ["-c", {script:?}]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+    );
+    std::fs::write(manifest.path().join("adapter.toml"), body).unwrap();
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "emitter",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let started = facade.start("emitter").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // Nothing emitted yet (only the SIGTERM trap emits), so the pre-kill drain sees
+    // an empty log. A generous window lets `sh` run the trap + `cat` and exit well
+    // within it (the emit lands in the pre-kill-drain → confirmed-death window).
+    let stopped = facade
+        .stop("emitter", Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+
+    // The rescued line is committed: exactly one event's worth of tokens. Without
+    // the post-kill rescue drain this would be 0 (the line was dropped).
+    let fleet = facade.fleet().unwrap();
+    let entry = fleet.iter().find(|e| e.name.as_str() == "emitter").unwrap();
+    assert_eq!(
+        entry.usage.cumulative_input_tokens, 10,
+        "the usage line flushed during the kill window must be rescued by the \
+         post-kill terminal drain (dropped before the fix)"
+    );
+    assert_eq!(entry.usage.cumulative_output_tokens, 20);
+}
+
+#[test]
 fn native_adapter_has_no_launch_command_is_reported_clearly() {
     // The native builtin `mock` has no launch command this story (a real
     // launchable agent is supplied via a manifest). Starting it reports that
