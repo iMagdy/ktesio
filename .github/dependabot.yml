@@ -43,6 +43,21 @@ updates:
     labels:
       - dependencies
       - docs
+    ignore:
+      # TypeScript 7 removed the compiler API Next.js builds against:
+      #   "TypeScript 7.0.2 does not provide the compiler API required by
+      #    Next.js. Enable experimental.useTypeScriptCli in your Next.js
+      #    config to use the TypeScript CLI, or install TypeScript 6 instead."
+      # Because the whole /docs ecosystem is ONE group, a typescript major
+      # does not fail alone — it takes the entire grouped PR red with it, which
+      # is exactly how PR #127 (13 updates) died. Ignoring the major keeps the
+      # other twelve landing on schedule. Minors and patches still flow.
+      # LIFT THIS when Next.js supports the TypeScript 7 compiler API (or when
+      # adopting experimental.useTypeScriptCli is a deliberate choice) — see
+      # docs/package.json, which pins typescript to ^6.
+      - dependency-name: typescript
+        update-types:
+          - version-update:semver-major
     groups:
       docs-dependencies:
         patterns:
