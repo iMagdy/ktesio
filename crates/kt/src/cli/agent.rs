@@ -2947,4 +2947,361 @@ mod tests {
         };
         render_capabilities("demo", &full);
     }
+
+    // ---- `budget_cell`: the FR-23 / AD-8 budget rendering contract ----
+
+    /// A [`BudgetView`] with every scope explicitly chosen, so each test states
+    /// exactly which dimensions it is asserting about (no hidden defaults).
+    #[allow(clippy::too_many_arguments)]
+    fn budget_view(
+        per_run: Option<(u64, u64)>,
+        cumulative: Option<(u64, u64)>,
+        per_run_dollars: Option<(Micros, Micros)>,
+        cumulative_dollars: Option<(Micros, Micros)>,
+        estimate_label: Option<EstimateLabel>,
+        breach_action: ktesio_engine::BreachAction,
+    ) -> BudgetView {
+        BudgetView {
+            per_run_limit: per_run.map(|(limit, _)| limit),
+            per_run_remaining: per_run.map(|(_, remaining)| remaining),
+            cumulative_limit: cumulative.map(|(limit, _)| limit),
+            cumulative_remaining: cumulative.map(|(_, remaining)| remaining),
+            per_run_cost_cap: per_run_dollars.map(|(cap, _)| cap),
+            per_run_dollars_remaining: per_run_dollars.map(|(_, remaining)| remaining),
+            cumulative_cost_cap: cumulative_dollars.map(|(cap, _)| cap),
+            cumulative_dollars_remaining: cumulative_dollars.map(|(_, remaining)| remaining),
+            estimate_label,
+            breach_action,
+        }
+    }
+
+    #[test]
+    fn budget_cell_renders_the_per_run_scope_before_the_cumulative_scope() {
+        // AC9: both token scopes render as `remaining/ceiling tok`, per-run FIRST
+        // (the narrower guardrail leads), comma-joined, with the Breach Action in
+        // trailing parens. ORDER is part of the surface: `list` truncates from the
+        // right, so a reordering would silently drop the per-run scope — the one a
+        // user is most likely watching mid-run — instead of the cumulative one.
+        let budget = budget_view(
+            Some((100, 80)),
+            Some((500, 380)),
+            None,
+            None,
+            None,
+            ktesio_engine::BreachAction::Pause,
+        );
+
+        assert_eq!(
+            budget_cell(Some(&budget), DollarLabel::Inline),
+            "run 80/100 tok, cum 380/500 tok (pause)"
+        );
+    }
+
+    #[test]
+    fn budget_cell_keeps_the_estimate_label_out_of_the_truncatable_list_cell() {
+        // FR-23 / AD-8: no unlabeled dollar figure reaches a human, and the label
+        // must survive truncation. `show` has a wide Value column, so the
+        // qualifier rides INLINE in the cell; `list`'s Budget column is narrow and
+        // truncatable, so the SAME cell must render the cap BARE and the qualifier
+        // lives in the column header instead. Asserting both surfaces together is
+        // what makes this a contract test: dropping the label from `Inline` OR
+        // leaking it into `InHeader` (where truncation could strip it) both fail.
+        let budget = budget_view(
+            None,
+            None,
+            Some((Micros(500_000), Micros(200_000))),
+            Some((Micros(2_000_000), Micros(1_250_000))),
+            Some(EstimateLabel::Estimated),
+            ktesio_engine::BreachAction::Stop,
+        );
+
+        assert_eq!(
+            budget_cell(Some(&budget), DollarLabel::Inline),
+            "run $0.20/$0.50 (estimated), cum $1.25/$2.00 (estimated) (stop)"
+        );
+        assert_eq!(
+            budget_cell(Some(&budget), DollarLabel::InHeader),
+            "run $0.20/$0.50, cum $1.25/$2.00 (stop)"
+        );
+        // …and the qualifier the InHeader cell omits really is carried by the
+        // header that surface uses, so it is displaced, never lost.
+        assert!(
+            BUDGET_LIST_HEADER.contains("est. $"),
+            "{BUDGET_LIST_HEADER}"
+        );
+    }
+
+    #[test]
+    fn budget_cell_omits_the_dollar_dimension_when_no_rate_is_configured() {
+        // AC-B: a Cost Cap with no Rate is INERT — the engine leaves the dollar
+        // fields absent, and the cell must then show tokens only. It must NEVER
+        // fabricate a `$0.00` cap out of the missing Rate.
+        let budget = budget_view(
+            None,
+            Some((500, 380)),
+            None,
+            None,
+            None,
+            ktesio_engine::BreachAction::Pause,
+        );
+
+        let cell = budget_cell(Some(&budget), DollarLabel::Inline);
+        assert_eq!(cell, "cum 380/500 tok (pause)");
+        assert!(!cell.contains('$'), "no Rate must mean no dollar figure");
+    }
+
+    #[test]
+    fn budget_cell_with_no_configured_scope_still_names_the_breach_action() {
+        // Defensive arm: a BudgetView that reached the renderer with an action but
+        // no scope must still say what would happen on breach, rather than render
+        // an empty cell that reads as "no guardrail". An absent budget is a
+        // DIFFERENT thing and keeps the honest `—` seed — assert both so the two
+        // cannot be conflated.
+        let actionless = budget_view(
+            None,
+            None,
+            None,
+            None,
+            None,
+            ktesio_engine::BreachAction::Warn,
+        );
+
+        assert_eq!(
+            budget_cell(Some(&actionless), DollarLabel::Inline),
+            "(warn)"
+        );
+        assert_eq!(
+            budget_cell(None, DollarLabel::Inline),
+            FleetEntry::METERING_SEED_CELL
+        );
+    }
+
+    // ---- Log streaming: broken-pipe discipline + the follow exit note ----
+
+    #[test]
+    fn a_broken_stdout_pipe_stops_cleanly_while_a_real_io_failure_still_diagnoses() {
+        // Fix-pass M1 contract: `kt agent logs --json | head -5` must exit 0. Rust
+        // ignores SIGPIPE and `println!` PANICS on a write error, which produced
+        // exit 101 — a code outside the FROZEN table in docs/commands.md. The
+        // BrokenPipe arm is what keeps that promise, and it must NOT swallow other
+        // write failures (a full disk when stdout is redirected to a file is a
+        // real error the user needs to see), so both halves are asserted here.
+        use crate::exit_code::{classify, ExitCode};
+
+        let closed = classify_stdout_write(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "consumer went away",
+        ))
+        .expect("a closed consumer is a clean stop, not an error");
+        assert_eq!(closed, EmitOutcome::PipeClosed);
+
+        let failed = classify_stdout_write(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left on device",
+        ))
+        .expect_err("a genuine write failure must stay an error");
+        assert!(
+            failed.downcast_ref::<AgentIo>().is_some(),
+            "a real stdout write failure must surface as AgentIo: {failed}"
+        );
+        assert!(failed.to_string().contains("no space left on device"));
+        assert_eq!(classify(failed.as_ref()), ExitCode::General);
+    }
+
+    #[test]
+    fn the_follow_exit_note_tells_a_paused_instance_apart_from_a_terminal_one() {
+        // AC-C: `--follow` ends with a NOTE, never an error, when the instance is
+        // not running — but the two cases mean different things to the reader. A
+        // paused instance can still produce output later, so its note must point at
+        // resuming; every terminal state must say the stream is over. Collapsing
+        // the two would tell a user watching a paused agent that nothing more will
+        // ever arrive, which is false.
+        let paused = follow_exit_note("demo", LifecycleState::Paused);
+        assert_eq!(
+            paused,
+            "Agent Instance 'demo' is paused; no further output until it is resumed."
+        );
+
+        for terminal in [
+            LifecycleState::Stopped,
+            LifecycleState::Failed,
+            LifecycleState::Registered,
+        ] {
+            let note = follow_exit_note("demo", terminal);
+            assert_eq!(
+                note,
+                format!("Agent Instance 'demo' is {terminal}; no further output will arrive.")
+            );
+            assert!(
+                note.contains("no further output will arrive"),
+                "{terminal}: {note}"
+            );
+        }
+    }
+
+    // ---- The remaining mapper arms (the "middle link" of the exit-code chain) ----
+
+    #[test]
+    fn config_error_mapper_arms_preserve_their_documented_exit_codes() {
+        // The `map_config_error` half of the seam that
+        // `every_engine_error_mapper_arm_preserves_its_documented_exit_code`
+        // closes for `map_engine_error`: nothing pinned that a config-surface
+        // condition PRODUCES the diagnostic its exit code is documented against.
+        // A bad name is a USAGE error (2) — scripts branch on it to tell "you
+        // typed it wrong" from "it isn't there" — while a store failure is a
+        // general/internal error (1). Retargeting either arm changes an asserted
+        // number here.
+        use crate::exit_code::{classify, ExitCode};
+
+        let invalid = map_config_error(ConfigError::InvalidName {
+            name: "Bad Name".to_string(),
+            reason: "must not contain spaces".to_string(),
+        });
+        assert_eq!(classify(invalid.as_ref()), ExitCode::Usage);
+        assert!(invalid.to_string().contains("Bad Name"));
+        // The remediation must state the rule, not just that it was broken.
+        assert!(invalid.to_string().contains("^[a-z0-9][a-z0-9_-]*$"));
+
+        let store = map_config_error(ConfigError::Store {
+            name: "demo".to_string(),
+            detail: "database is locked".to_string(),
+        });
+        assert_eq!(classify(store.as_ref()), ExitCode::General);
+        assert!(
+            store.downcast_ref::<AgentStore>().is_some(),
+            "a store failure must surface as AgentStore: {store}"
+        );
+        assert!(store.to_string().contains("database is locked"));
+    }
+
+    #[test]
+    fn a_failed_secret_reveal_diagnoses_without_leaking_the_secret_value() {
+        // FR-14 (story 2-4, AC-C/AC11): `config get --reveal` re-resolves secrets
+        // LIVE, and a resolution failure is a stderr diagnostic — never a crash and
+        // never a leak. The engine's detail is contracted to name the NAME and the
+        // resolvers tried but no value; `kt` appends the remediation. This test
+        // pins the leak half explicitly: a value that happened to be in scope must
+        // not appear in the rendered diagnostic, and the message must tell the user
+        // the two places a secret can come from.
+        let mapped = map_config_error(ConfigError::SecretReveal {
+            detail: "secret 'OPENAI_API_KEY' not found (tried: environment, secrets file)"
+                .to_string(),
+        });
+
+        let rendered = mapped.to_string();
+        assert!(rendered.contains("OPENAI_API_KEY"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-live-"),
+            "a reveal failure must never echo a secret value: {rendered}"
+        );
+        // Both documented resolvers are named, so the user knows where to put it.
+        assert!(rendered.contains("environment variable"), "{rendered}");
+        assert!(rendered.contains("secrets file"), "{rendered}");
+        assert!(rendered.contains("--reveal"), "{rendered}");
+    }
+
+    #[test]
+    fn a_snapshot_write_failure_names_the_path_and_says_nothing_started() {
+        // NFR-1: an I/O diagnostic must name WHAT failed, WHERE, and what to do.
+        // The effective-config snapshot is written on the way into `start`, so a
+        // failure leaves the instance in its prior state — the message must say so
+        // ("start it again"), otherwise a user cannot tell whether a half-started
+        // instance is now running. Both mappers raise this condition, so both are
+        // pinned.
+        use crate::exit_code::{classify, ExitCode};
+
+        for mapped in [
+            map_error(RegistryError::SnapshotWrite {
+                name: "demo".to_string(),
+                path: "/x/agents/demo/config.snapshot.toml".to_string(),
+                detail: "permission denied".to_string(),
+            }),
+            map_engine_error(EngineError::Snapshot {
+                name: "demo".to_string(),
+                path: "/x/agents/demo/config.snapshot.toml".to_string(),
+                detail: "permission denied".to_string(),
+            }),
+        ] {
+            let rendered = mapped.to_string();
+            assert!(rendered.contains("demo"), "{rendered}");
+            assert!(
+                rendered.contains("/x/agents/demo/config.snapshot.toml"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("permission denied"), "{rendered}");
+            assert!(rendered.contains("start it again"), "{rendered}");
+            assert!(
+                mapped.downcast_ref::<AgentIo>().is_some(),
+                "a snapshot write failure must surface as AgentIo: {rendered}"
+            );
+            assert_eq!(classify(mapped.as_ref()), ExitCode::General);
+        }
+    }
+
+    #[test]
+    fn the_remaining_engine_error_arms_map_to_their_documented_diagnostic_types() {
+        // Completes `every_engine_error_mapper_arm_preserves_its_documented_exit_code`
+        // over the arms it left out. These all classify as `1` today, so the exit
+        // code alone would NOT catch a severed arm (the catch-all also returns 1) —
+        // the DIAGNOSTIC TYPE is therefore the assertion that bites. The type is
+        // the contract surface: `exit_code.rs`'s frozen table is written in terms
+        // of these diagnostics, so re-pointing an arm at a different one silently
+        // moves that condition to a different row of the table (and, the moment any
+        // of them is given a non-1 code, to a different exit status).
+        use crate::exit_code::{classify, ExitCode};
+
+        let unresolved = map_engine_error(EngineError::AdapterUnresolved {
+            name: "demo".to_string(),
+            detail: "no adapter registered for kind 'ghost'".to_string(),
+        });
+        assert!(
+            unresolved.downcast_ref::<AgentLaunchFailed>().is_some(),
+            "an unresolved adapter is a LAUNCH failure: {unresolved}"
+        );
+        assert!(unresolved.to_string().contains("ghost"));
+
+        let log = map_engine_error(EngineError::Log {
+            name: "demo".to_string(),
+            path: "/x/agents/demo/agent.log".to_string(),
+            detail: "no space left on device".to_string(),
+        });
+        assert!(log.downcast_ref::<AgentIo>().is_some(), "{log}");
+        assert!(log.to_string().contains("/x/agents/demo/agent.log"));
+        assert!(log.to_string().contains("disk space"));
+
+        // NFR-6: the metering detail is traffic-free, and the arm promises the
+        // start was a no-op so the user knows nothing was half-applied.
+        let metering = map_engine_error(EngineError::ObservedMetering {
+            name: "demo".to_string(),
+            detail: "could not bind the loopback listener".to_string(),
+        });
+        assert!(
+            metering.downcast_ref::<AgentConfig>().is_some(),
+            "{metering}"
+        );
+        assert!(metering.to_string().contains("Nothing was changed"));
+
+        let backend = map_engine_error(EngineError::Backend {
+            name: "demo".to_string(),
+            source: ktesio_engine::ports::BackendError::Spawn {
+                exec: "/usr/bin/ghost".to_string(),
+                detail: "No such file or directory".to_string(),
+            },
+        });
+        assert!(backend.downcast_ref::<AgentIo>().is_some(), "{backend}");
+        assert!(backend.to_string().contains("/usr/bin/ghost"));
+
+        let store = map_engine_error(EngineError::Store(
+            ktesio_engine::ports::StoreError::CorruptRow {
+                name: "demo".to_string(),
+                detail: "unrecognized lifecycle state 'quantum'".to_string(),
+            },
+        ));
+        assert!(store.downcast_ref::<AgentStore>().is_some(), "{store}");
+        assert!(store.to_string().contains("quantum"));
+
+        for mapped in [unresolved, log, metering, backend, store] {
+            assert_eq!(classify(mapped.as_ref()), ExitCode::General);
+        }
+    }
 }

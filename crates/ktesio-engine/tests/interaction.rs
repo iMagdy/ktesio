@@ -104,16 +104,22 @@ fn agent_log_path(base: &Path, name: &str) -> PathBuf {
 /// observable state, never a wall-clock sleep-then-assert (the Epic-2-retro
 /// AI-35/38 lesson every later story mirrors).
 fn wait_for_stdin_line(agent_log: &Path, wanted: &str) {
-    // 20s, not 5s: this polls real IPC through a fully-instrumented round trip
-    // (engine dispatch + a real child process, both instrumented under
-    // `cargo tarpaulin`) on the coverage job's resource-constrained ubuntu
-    // runner. 5s was comfortably sufficient under plain `cargo nextest` (the
-    // full 860-test suite completes in well under a minute) but 4 tests in
-    // this file failed here, deterministically, the first time this branch
-    // ran through the coverage job -- tarpaulin's per-line instrumentation
-    // overhead compounds across every hop of this round trip, unlike the
-    // narrow fixed-boundary races elsewhere in this codebase (e.g.
-    // READINESS_WINDOW). This is a throughput margin, not a race window.
+    // 20s, not 5s: this polls a real IPC round trip (engine dispatch + a real
+    // child process) on whatever CI runner is in effect, so the bound is a
+    // generous THROUGHPUT margin, not a race window — a slower machine just
+    // takes longer, it does not flip the result.
+    //
+    // Historical note, so nobody re-inflates this again: the coverage job's long
+    // red streak was blamed on `cargo tarpaulin` instrumentation making this
+    // round trip too slow for any fixed deadline, and this helper carried a
+    // `cfg!(tarpaulin)`-gated 120s bound (and later a blanket skip) on that
+    // theory. Both are REVERTED. The real cause was environmental: the coverage
+    // job restored a STALE cached `fake_agent` that predated `--echo-stdin` and
+    // silently ignored the flag, so the echo this poll waits for could never
+    // arrive no matter how long it waited. That is fixed at the source in
+    // `.github/workflows/ci.yml` (the coverage job now rebuilds the helper, as
+    // the `test` job already did). A fresh helper completes this round trip
+    // under real tarpaulin in well under a second.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(contents) = std::fs::read_to_string(agent_log) {

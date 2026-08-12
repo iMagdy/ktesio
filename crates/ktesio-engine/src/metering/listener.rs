@@ -587,6 +587,37 @@ mod tests {
     }
 
     #[test]
+    fn an_http_upstream_that_is_not_a_valid_uri_is_refused_before_binding() {
+        // The scheme checks above are prefix tests, so a value can clear
+        // `http://` and still be structurally unusable. That case must be caught
+        // HERE, at start, rather than at the first forwarded request: the listener
+        // starts on the way into `start`, so accepting a URI hyper can never build
+        // would leave a bound loopback socket that 502s every call the agent makes
+        // — an agent that looks running but can never reach its provider. The
+        // no-leak discipline still applies: the reason must not echo the URL (it
+        // can carry a key in a query string).
+        let rt = test_runtime();
+        for bad in ["http://exa mple.com", "http://[not-an-address"] {
+            let err = match ObservedListener::start(rt.handle(), bad.to_string()) {
+                Err(e) => e,
+                Ok(_) => panic!("upstream {bad:?} must be refused, but a listener started"),
+            };
+            assert!(
+                matches!(err, ListenerError::BadUpstream { .. }),
+                "upstream {bad:?} must be refused, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("not a valid URI"),
+                "the reason must name the parse failure, not the scheme: {err}"
+            );
+            assert!(
+                !err.to_string().contains(bad),
+                "error must not echo the upstream URL: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn https_upstream_names_the_documented_deferral() {
         // The https:// deferral is surfaced honestly (a clear v1 reason), not a
         // generic parse error.

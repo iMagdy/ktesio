@@ -1422,6 +1422,40 @@ file = { path = "../escape.toml", key = "k" }
     }
 
     #[test]
+    fn apply_file_target_write_failure_is_a_typed_error_not_a_panic() {
+        // The sibling of the blocked-PARENT case above, and the one that actually
+        // exercises the write: the parent directory resolves fine, but the target
+        // FILE path is occupied by a directory, so `fs::write` itself fails. This
+        // is the shape a stale Agent Home takes after a manifest changes a file
+        // target's name, and it happens on the START path — so it MUST be a typed
+        // FileRender naming the key/path (the supervisor then rejects the start
+        // before the `starting` transition, leaving the instance in its prior
+        // state) rather than a panic that would take the engine down.
+        let mapping = ConfigMapping::new().with("model", ConfigTarget::file("agent.toml", "k"));
+        let effective = effective_from_instance("model = \"gpt-4\"\n");
+        let tmp = tempfile::tempdir().unwrap();
+        // A DIRECTORY where the rendered config file must go.
+        std::fs::create_dir(tmp.path().join("agent.toml")).unwrap();
+
+        let err = apply_config_mapping(
+            &mut empty_launch(),
+            &mapping,
+            &effective,
+            &no_secrets(),
+            tmp.path(),
+        )
+        .unwrap_err();
+
+        let ConfigApplyError::FileRender { key, path, detail } = &err;
+        assert_eq!(key, "agent.toml");
+        assert_eq!(path, "agent.toml");
+        assert!(!detail.is_empty(), "the OS detail must be preserved");
+        // The blocking directory is left exactly as it was — a failed render must
+        // not delete or replace whatever is already in the Agent Home.
+        assert!(tmp.path().join("agent.toml").is_dir());
+    }
+
+    #[test]
     fn apply_two_file_keys_where_a_prefix_collides_overwrites_to_a_table() {
         // set_dotted_string's collision branch: two native keys into the SAME file
         // where one is a prefix of the other (`a` then `a.b`). The engine-authored

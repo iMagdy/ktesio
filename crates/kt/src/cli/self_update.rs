@@ -1194,4 +1194,142 @@ mod tests {
 
         assert!(error.message.contains("Could not read release archive"));
     }
+
+    /// A payload that does not compress away, so truncating or corrupting the
+    /// archive really does damage the entry BODY rather than vanishing into the
+    /// container's framing.
+    fn incompressible_binary(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                // A cheap LCG — deterministic (no rand dep) but high-entropy
+                // enough that deflate cannot shrink it to nothing.
+                ((i as u64)
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1)
+                    >> 33) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_truncated_tar_gz_download_fails_instead_of_yielding_a_partial_binary() {
+        // A download cut short mid-transfer still has a readable gzip/tar HEADER,
+        // so the entry for `kt` is found and extraction begins — the failure only
+        // surfaces while reading the entry BODY. The contract that matters is that
+        // this is an ERROR, not a short read: returning the bytes received so far
+        // would hand `replace_current_exe` a truncated executable and brick the
+        // user's `kt`. (The checksum gate would also catch this, but only because
+        // extraction refused to invent a body first — both layers must hold.)
+        let target = ReleaseTarget {
+            triple: "x86_64-unknown-linux-gnu",
+            extension: "tar.gz",
+            binary_name: "kt",
+        };
+        let full = tar_gz_with_binary("kt", &incompressible_binary(64 * 1024));
+        let truncated = full[..full.len() / 4].to_vec();
+
+        let error = extract_binary(&truncated, &target).unwrap_err();
+
+        assert!(
+            error.message.contains("Could not extract kt"),
+            "{}",
+            error.message
+        );
+        // Sanity: the SAME archive intact extracts fine, so the failure is the
+        // truncation and not a broken fixture.
+        assert_eq!(
+            extract_binary(&full, &target).unwrap(),
+            incompressible_binary(64 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_corrupted_zip_entry_fails_the_integrity_check_on_extract() {
+        // The Windows release asset is a zip, whose per-entry CRC-32 is the
+        // container's own integrity check. A bit flipped in the compressed data
+        // leaves the central directory (and therefore `by_index`) intact, so the
+        // corruption can ONLY be caught while reading the entry out. Extraction
+        // must fail rather than return silently-wrong bytes for `kt.exe`.
+        let target = ReleaseTarget {
+            triple: "x86_64-pc-windows-msvc",
+            extension: "zip",
+            binary_name: "kt.exe",
+        };
+        let payload = incompressible_binary(32 * 1024);
+        let mut archive = zip_with_binary("kt.exe", &payload);
+        // Flip a bit well inside the local file DATA (past the 30-byte local
+        // header + the file name), leaving the trailing central directory whole.
+        let corrupt_at = archive.len() / 2;
+        archive[corrupt_at] ^= 0xFF;
+
+        let error = extract_binary(&archive, &target).unwrap_err();
+
+        assert!(
+            error.message.contains("Could not extract kt.exe"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            extract_binary(&zip_with_binary("kt.exe", &payload), &target).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn test_a_failed_checksum_never_reaches_the_installer() {
+        // The ordering IS the security property: verify_checksum runs BEFORE
+        // extract_binary and before replace_current_exe, so a tampered or
+        // corrupted download can never touch the installed executable. Asserting
+        // only the error message (as the mismatch test does) would still pass if
+        // someone moved the verification AFTER the install — this pins the
+        // installer as untouched.
+        let archive = tar_gz_with_binary("kt", b"tampered kt binary");
+        let asset_url =
+            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
+        let checksum_url = format!("{asset_url}.sha256");
+        let release = FakeReleaseClient::new("v0.4.0")
+            .with_download(&asset_url, archive)
+            .with_download(
+                &checksum_url,
+                format!("{}  archive.tar.gz\n", "a".repeat(64)).into_bytes(),
+            );
+        let installer = FakeBinaryInstaller::default();
+
+        let error = run_with_channel(
+            InstallChannel::Manual,
+            Path::new("/usr/local/bin/kt"),
+            "0.3.1",
+            &platform("linux", "x86_64"),
+            &FakeRunner::default(),
+            &release,
+            &installer,
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("Checksum verification failed"));
+        assert!(
+            installer.replacements.borrow().is_empty(),
+            "a checksum failure must leave the installed binary untouched"
+        );
+    }
+
+    #[test]
+    fn test_checksum_accepts_an_uppercase_digest_from_the_sha256_file() {
+        // Release tooling varies: `sha256sum` emits lowercase, several Windows and
+        // CI helpers emit uppercase, and the file may carry a trailing
+        // `  <filename>` field. Verification is case-insensitive on purpose — a
+        // regression here would reject a perfectly good release as tampered, which
+        // looks like a security incident rather than a formatting nit.
+        let archive = b"release archive bytes";
+        let digest = sha256_hex(archive);
+        let uppercase = format!("{}  ktesio.tar.gz\n", digest.to_ascii_uppercase());
+
+        verify_checksum(archive, uppercase.as_bytes(), "ktesio.tar.gz").unwrap();
+
+        // A digest of the right SHAPE but the wrong value is still rejected, so the
+        // case-insensitivity above is not masking a "anything 64 hex chars" hole.
+        let wrong = format!("{}  ktesio.tar.gz\n", "A".repeat(64));
+        let error = verify_checksum(archive, wrong.as_bytes(), "ktesio.tar.gz").unwrap_err();
+        assert!(error.message.contains("Checksum verification failed"));
+    }
 }

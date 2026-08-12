@@ -201,6 +201,31 @@ pub fn probe_inert_start(adapter: &MockAdapter) -> AdapterError {
 /// tests run under every harness. Panics with a clear message only if the build
 /// itself fails.
 ///
+/// # EXISTENCE IS NOT FRESHNESS — the caller's job, and CI's
+///
+/// This function returns the candidate the moment the file EXISTS. It does not
+/// check whether that file was built from the current source, and deliberately
+/// so: the on-demand build below is a LAST RESORT, not a routine path. Under
+/// `cargo nextest` every test runs in its own process, so a check that decided
+/// "stale, rebuild" would fire in many processes at once and serialise them all
+/// on cargo's build-directory lock — an observed, reproducible flake (it is why
+/// the CI `test` job builds the helper explicitly instead of letting the tests
+/// race here).
+///
+/// The consequence is a trap worth naming, because it has bitten this repo
+/// TWICE: a `target/` directory restored from an actions/cache whose key is
+/// derived from `Cargo.lock` can hand back a `fake_agent` built before a flag
+/// was added. `parse()` in the helper ignores unknown args (`_ => {}`), so a
+/// stale binary does not fail — it silently does LESS, and the tests waiting on
+/// the output that flag was supposed to produce burn their deadlines and report
+/// a timing-shaped failure that has nothing to do with timing.
+///
+/// The guard therefore lives in `.github/workflows/ci.yml`, in BOTH jobs that
+/// run these tests (`test` and `coverage`): `rm -f target/debug/fake_agent*`
+/// followed by an explicit `cargo build -p ktesio-conformance --bin fake_agent`
+/// before the suite. `scripts/test_automation.py` asserts both jobs still carry
+/// it. Any NEW job that spawns agents must carry it too.
+///
 /// Kept a plain runtime path computation — no OS-conditional compilation (the
 /// executable suffix comes from [`std::env::consts::EXE_SUFFIX`], a runtime
 /// constant, so the OS-cfg gate stays green).
