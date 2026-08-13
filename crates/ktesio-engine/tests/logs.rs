@@ -582,6 +582,33 @@ fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64) -> u64 {
     }
 }
 
+/// Poll `agent.log` until one of its lines satisfies `predicate`, returning the
+/// WHOLE file once it does.
+///
+/// The counterpart of `wait_for_usage_rows` for the log file rather than the
+/// ledger. `agent.log` is written by a LIVE child process, so "the line is not
+/// there yet" is not "the line will never be there" — a bare `read_to_string`
+/// races whatever the child has not flushed. Synchronising on the ledger does
+/// NOT synchronise this file: they are independent streams.
+fn wait_for_agent_log_line(
+    agent_log: &Path,
+    what: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let contents = std::fs::read_to_string(agent_log).unwrap_or_default();
+        if contents.lines().any(&predicate) {
+            return contents;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what} in agent.log: {contents:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn usage_row_count(state_dir: &Path, name: &str) -> u64 {
     let conn = rusqlite::Connection::open(state_dir.join("state.db")).expect("open state db");
     conn.query_row(
@@ -656,16 +683,26 @@ fn legacy_agent_log_is_byte_identical_to_pre_story_content() {
     // (a) agent.log byte-identity: the exact raw lines, unmodified — no
     // JSON envelope, no attribution token, no timestamp prefix anywhere.
     let agent_log = agent_log_path(state.path(), "svc");
-    let contents = std::fs::read_to_string(&agent_log).unwrap();
+    // WAIT for the heartbeat rather than reading agent.log straight through.
+    // `fake_agent` writes the ready line, then EVERY usage line, and only THEN
+    // arms its heartbeat clock — so `heartbeat 0` lands one full --heartbeat-ms
+    // interval (40ms here) AFTER the last usage line. `wait_for_usage_rows`
+    // above synchronises on committed LEDGER rows, and the engine's drain pass
+    // can commit all three inside that 40ms window, so a bare read here raced
+    // the first beat: observed RED on macos-latest CI and GREEN on re-run with
+    // no code change (PR #48). The beat is the LAST of the three line kinds
+    // asserted below, so once it lands the ready + usage lines are necessarily
+    // already on disk — waiting for it settles the whole file.
+    let contents = wait_for_agent_log_line(
+        &agent_log,
+        "a heartbeat line, verbatim and unwrapped",
+        |l| l == "heartbeat 0",
+    );
     assert!(
         contents
             .lines()
             .any(|l| l.starts_with("fake_agent ready pid=")),
         "the raw ready line must appear verbatim: {contents:?}"
-    );
-    assert!(
-        contents.lines().any(|l| l == "heartbeat 0"),
-        "a heartbeat line must appear verbatim, with no wrapping: {contents:?}"
     );
     assert!(
         !contents.contains("schema_version"),
