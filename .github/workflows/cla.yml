@@ -21,10 +21,41 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: CLA Assistant
+        # The `allowlist` below matches GitHub LOGINS, and only logins. That is
+        # enough for a human or a bot with an account, but NOT for a commit whose
+        # author email resolves to no GitHub user at all: the action reports
+        # "Committers of Pull Request number N have to sign the CLA", there is no
+        # login for the allowlist to match, and no allowlist entry can ever fix
+        # it. Automated commits authored as `Claude <noreply@anthropic.com>` hit
+        # exactly this, on PRs the OWNER opened, failing a gate the owner is
+        # already allowlisted for.
+        #
+        # So exempt the owner's own pull requests here, at the trigger, rather
+        # than in `allowlist`. The intent is unchanged — `iMagdy` was always
+        # meant to be exempt (see the allowlist) — this just makes it effective
+        # when the PR's COMMITTER identity differs from its AUTHOR identity.
+        #
+        # ACCEPTED TRADE-OFF, deliberately written down: this keys on who OPENED
+        # the PR, not on who wrote each commit. An owner-opened PR that carries
+        # commits from an OUTSIDE contributor now skips the CLA check for those
+        # commits too. That is a real loosening. It is acceptable because the CLA
+        # runs for every non-owner-opened PR, which is the contribution path that
+        # actually needs it; if outside work ever starts arriving via
+        # owner-opened PRs, this guard must be revisited.
+        #
+        # The step is skipped, not the job, so the `cla` check still reports and
+        # reports GREEN instead of vanishing from the PR's status list.
+        #
+        # NB `pull_request_target` runs the workflow file from the BASE branch,
+        # so this takes effect for pull requests opened AFTER it merges — not for
+        # the pull request that introduces it.
         if: >-
-          github.event.comment.body == 'recheck' ||
-          github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' ||
-          github.event_name == 'pull_request_target'
+          github.event.pull_request.user.login != github.repository_owner &&
+          (
+            github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' ||
+            github.event_name == 'pull_request_target'
+          )
         uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
