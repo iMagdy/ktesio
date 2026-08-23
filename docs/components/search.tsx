@@ -1,6 +1,6 @@
 'use client';
 
-import { create } from '@orama/orama';
+import { create } from 'zbsearch';
 import { useDocsSearch } from 'fumadocs-core/search/client';
 import {
   SearchDialog,
@@ -15,7 +15,7 @@ import {
 } from 'fumadocs-ui/components/dialog/search';
 import { useI18n } from 'fumadocs-ui/contexts/i18n';
 
-function initOrama() {
+function initDB() {
   return create({
     language: 'english',
     schema: {
@@ -27,7 +27,7 @@ function initOrama() {
 export default function KtesioSearchDialog(props: SharedProps) {
   const { locale } = useI18n();
   const { query, search, setSearch } = useDocsSearch({
-    initOrama,
+    initDB,
     locale,
     type: 'static',
   });
