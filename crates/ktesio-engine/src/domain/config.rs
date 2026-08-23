@@ -125,6 +125,28 @@ pub const METERING_UPSTREAM_BASE_URL_KEY: &str = "metering.upstream_base_url";
 /// always wins (the invocation layer is strongest).
 pub const METERING_BASE_URL_KEY: &str = "metering.base_url";
 
+/// The RESERVED engine-namespace unified-config key the engine INJECTS the
+/// managed Memory Backing directory path into at start (story 5-1, FR-15 /
+/// spine AD-11 Delivery clause). The engine writes the absolute managed-directory
+/// path here as an INVOCATION-OVERRIDE leaf at start for an instance with a
+/// `filesystem` Memory Backing attached, and the adapter's EXISTING `[config]`
+/// mapping (story 2-2) delivers it into the agent's native mechanism — the
+/// adapter declares e.g. `[config."memory.dir"] env = "MEMORY_DIR"`, pointing its
+/// agent at the managed memory location. A KNOWN key so a mapping can target it,
+/// but the OPERATOR does NOT set it — the path is ENGINE-computed (the sole path
+/// authority) and known only once the Agent Home exists. Delivery is OFFERED, not
+/// imposed: whether the agent receives the value is the adapter's declared
+/// choice, and an unmapped key stays a silent no-op (story 2-2 Decision 6) —
+/// which is why the engine says so aloud at start when nothing targets this key
+/// (DC-10), and why the public backing read reports it too. Reusing the existing
+/// config-mapping means NO new Adapter Contract surface (no `CONTRACT_VERSION`
+/// bump), exactly like `metering.base_url`. A hand-set value in a lower layer is
+/// harmless — the engine's start-time override always wins (the invocation layer
+/// is strongest). The injected value is a DELIVERY MECHANISM, not operator
+/// configuration: it is deliberately never written to the effective-config
+/// snapshot (3-4's honest-provenance split, extended by 5-1's CORRECTION).
+pub const MEMORY_DIR_KEY: &str = "memory.dir";
+
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
 /// delivered verbatim (the mapping into an agent's native mechanism is 2-2,
@@ -577,6 +599,12 @@ const KNOWN_KEYS: &[&str] = &[
     // Contract surface (no CONTRACT_VERSION bump).
     METERING_UPSTREAM_BASE_URL_KEY,
     METERING_BASE_URL_KEY,
+    // Story 5-1 (Memory Backing, AD-11 Delivery clause): the engine-injected managed
+    // memory directory path the adapter's mapping delivers. Engine-namespace (NOT
+    // `agent.*` pass-through); does NOT touch the Adapter Contract surface (no
+    // CONTRACT_VERSION bump). The operator never sets it — it is a delivery
+    // mechanism, not operator configuration, and is never persisted into the snapshot.
+    MEMORY_DIR_KEY,
 ];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
@@ -1654,7 +1682,7 @@ mod tests {
         // `model` + the three story-3-2 Token-Budget keys + the four story-3-3 dollar
         // keys (Rate ×2 + Cost Cap ×2) + the two story-3-4 engine-observed metering
         // keys (the operator-set upstream URL + the engine-injected loopback base_url)
-        // are the known set.
+        // + the story 5-1 engine-injected managed-memory key are the known set.
         assert_eq!(
             KNOWN_KEYS,
             &[
@@ -1668,6 +1696,7 @@ mod tests {
                 "budget.dollars.cumulative",
                 "metering.upstream_base_url",
                 "metering.base_url",
+                "memory.dir",
             ]
         );
         // Story 3-4: both metering keys are known (a mapping can target them) and
@@ -1675,6 +1704,16 @@ mod tests {
         assert!(is_known_key("metering.upstream_base_url"));
         assert!(is_known_key("metering.base_url"));
         assert!(validate_write("metering.upstream_base_url", "http://127.0.0.1:1234").is_ok());
+    }
+
+    #[test]
+    fn memory_dir_is_known_but_is_a_delivery_mechanism_not_operator_config() {
+        // Story 5-1 (AD-11 Delivery clause): the reserved key is KNOWN so an
+        // adapter's mapping can target it — but the operator never sets it (the
+        // engine injects it at start), and it deliberately does NOT touch the
+        // Adapter Contract surface (no CONTRACT_VERSION bump, DC-5).
+        assert!(is_known_key("memory.dir"));
+        assert!(!is_pass_through("memory.dir"));
     }
 
     #[test]

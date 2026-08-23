@@ -205,6 +205,37 @@ kt agent remove my-agent --force
 
 `--delete` and `--retain` are mutually exclusive; when neither is given, the safe default is to retain.
 
+## `kt agent memory attach <name> --kind <kind>`
+
+Attach a Memory Backing to an Agent Instance: an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically — whatever the agent's native memory story does.
+
+```bash
+kt agent memory attach demo --kind filesystem
+```
+
+Arguments:
+
+- `<name>` — the Agent Instance to attach the backing to.
+- `--kind <kind>` — the backing kind. This release accepts `filesystem`; the full vocabulary grows without a breaking change.
+
+The engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless.
+
+Output: a confirmation line naming the instance and kind, then the managed directory path alone on the final stdout line (scripts can read the last line); diagnostics go to stderr.
+
+`memory.dir` is an engine-reserved delivery key, never operator configuration — do not set it yourself. Any hand-set value is stripped where it matters: the engine removes it from the operator layers when resolving what applies at start, so it can be delivered only by the engine itself (when a `filesystem` backing is attached) and never lands in the persisted start snapshot as applied configuration.
+
+Attach and detach require the instance to be in a terminal state (`registered`, `stopped`, or `failed`) — a Memory Backing cannot be hot-swapped under a live agent, and there is no `--force` escape. Re-attaching the same kind is an idempotent success; attaching a different kind over an existing one is rejected until you detach.
+
+## `kt agent memory detach <name>`
+
+Detach an Agent Instance's Memory Backing.
+
+```bash
+kt agent memory detach demo
+```
+
+Detach is metadata-only: the attachment is removed, but the managed directory **and its contents remain on disk** — your data is never silently deleted, and re-attaching later re-adopts the existing contents. The same terminal-state requirement applies as `attach`.
+
 ## `kt agent config set <name> <key> <value>`
 
 Set one config key on the Agent Instance layer. Validated at write time.
@@ -264,7 +295,7 @@ Every `kt` command returns one of these numeric exit codes, so failures can be b
 | `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter declaring no capabilities or no metering source, a failed self-update |
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
-| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, or a stop that could not be confirmed |
+| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
 | `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
 

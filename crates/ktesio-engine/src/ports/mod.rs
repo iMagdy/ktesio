@@ -11,13 +11,19 @@
 //! (`engine-observed`): it is fed by the loopback forward listener
 //! (`crate::metering`) and, being event-driven rather than a log-tail drainer,
 //! mints its [`ParsedUsage`] directly while yielding the SAME shape into the SAME
-//! commit choke point. The remaining port (`MemoryBacking`) arrives with the story
-//! that needs it (entity-timing) — no speculative port trees.
+//! commit choke point. Story 5-1 landed the Memory Backing surface (AD-11) as the
+//! [`memory_backing`] module: deliberately NOT a trait (A-8 — the `filesystem`
+//! implementation is pure path authority inside the engine), the module and its
+//! types ARE the seam richer backings land behind later. No speculative port
+//! trees beyond it.
 
+mod memory_backing;
 mod process_backend;
 mod secret_resolver;
 mod state_store;
 mod usage_source;
+
+pub use memory_backing::{MemoryBacking, MemoryBackingKind, MemoryBackingStatus};
 
 pub(crate) use process_backend::{
     spawn_output_capture, write_stdin_bounded, LogCapture, LOG_ROTATE_GENERATIONS,

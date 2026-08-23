@@ -30,6 +30,14 @@ use ktesio_adapter_api::{
 /// (the cross-boundary parity test guards it).
 pub const MOCK_MODEL_ENV_VAR: &str = "MODEL";
 
+/// The builtin `mock`'s code-declared env target for the RESERVED
+/// [`MEMORY_DIR_KEY`] leaf (story 5-1, Task 5.4 lockstep): the engine injects the
+/// managed Memory Backing directory path at `memory.dir` at start, and the mock
+/// maps it to this ENV var so the descriptor has a declared native mechanism.
+/// MUST stay in lockstep with the conformance `MockAdapter` — the parity test
+/// (`conformance_mock_fixture_matches_builtin_shape`) fails if only one moves.
+pub const MOCK_MEMORY_ENV_VAR: &str = "KTESIO_MEMORY_DIR";
+
 /// Resolve a native `kind` to a boxed builtin adapter, or `None` if unknown.
 ///
 /// The table is intentionally tiny this story (only `mock`). Native agents like
@@ -101,10 +109,18 @@ impl AgentAdapter for BuiltinMock {
     }
 
     /// The code-declared unified→native config mapping (story 2-2): `model` → the
-    /// ENV var [`MOCK_MODEL_ENV_VAR`]. Mirrors the conformance `MockAdapter` so the
-    /// fixture stays a faithful stand-in (the parity test guards it).
+    /// ENV var [`MOCK_MODEL_ENV_VAR`], plus — since story 5-1 (Task 5.4 lockstep) —
+    /// the reserved `memory.dir` key → [`MOCK_MEMORY_ENV_VAR`] so a filesystem
+    /// Memory Backing has a declared native mechanism. Mirrors the conformance
+    /// `MockAdapter` so the fixture stays a faithful stand-in (the parity test
+    /// guards it).
     fn config_mapping(&self) -> ConfigMapping {
-        ConfigMapping::new().with("model", ConfigTarget::env(MOCK_MODEL_ENV_VAR))
+        ConfigMapping::new()
+            .with("model", ConfigTarget::env(MOCK_MODEL_ENV_VAR))
+            .with(
+                crate::domain::MEMORY_DIR_KEY,
+                ConfigTarget::env(MOCK_MEMORY_ENV_VAR),
+            )
     }
 
     // Lifecycle ops use the trait's inert default bodies (execution is 1-4).
@@ -129,15 +145,24 @@ mod tests {
     }
 
     #[test]
-    fn builtin_mock_declares_the_model_env_mapping() {
+    fn builtin_mock_declares_the_model_and_memory_env_mappings() {
         // Story 2-2 (AC3/AC8): the builtin mock code-declares `model` → env
-        // `MODEL`, the single documented-key rule the inert-mock proof asserts on.
+        // `MODEL`. Story 5-1 adds the reserved `memory.dir` → env
+        // `KTESIO_MEMORY_DIR` mapping so a filesystem Memory Backing has a
+        // declared native mechanism.
         let adapter = native("mock").unwrap();
         let mapping = adapter.config_mapping();
-        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping.len(), 2);
         assert_eq!(
             mapping.target("model").unwrap().env_var(),
             Some(MOCK_MODEL_ENV_VAR)
+        );
+        assert_eq!(
+            mapping
+                .target(crate::domain::MEMORY_DIR_KEY)
+                .unwrap()
+                .env_var(),
+            Some(MOCK_MEMORY_ENV_VAR)
         );
         // An unmapped documented key has no rule (delivered nowhere — a no-op).
         assert!(mapping.target("temperature").is_none());

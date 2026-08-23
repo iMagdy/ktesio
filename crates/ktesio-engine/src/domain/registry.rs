@@ -20,7 +20,10 @@ use ktesio_adapter_api::{
 
 use crate::adapter::{self, AdapterRef, ResolvedAdapter, StartLaunch};
 use crate::paths::EnginePaths;
-use crate::ports::{CompositeSecretResolver, SecretError, SpawnRecord, StateStore, StoreError};
+use crate::ports::{
+    CompositeSecretResolver, MemoryBacking, MemoryBackingKind, MemoryBackingStatus, SecretError,
+    SpawnRecord, StateStore, StoreError,
+};
 use crate::store::SqliteStore;
 use crate::time::now_rfc3339;
 
@@ -571,6 +574,166 @@ impl Registry {
     /// List the whole Fleet, ordered by name (delegates to the store).
     pub fn list(&self) -> Result<Vec<AgentInstance>, RegistryError> {
         Ok(self.store.list_instances()?)
+    }
+
+    // ---- Memory Backing attachments (story 5-1, spine AD-11) ----
+    //
+    // The registry owns BOTH halves of a memory attach — path authority (the
+    // managed directory inside the Agent Home) and the SQLite state — so the
+    // operation lives here, not on the supervisor. Ordering copies `remove`'s
+    // discipline: validate the name → look up (→ NotFound) → STATE GUARD → only
+    // then any side effect. Attach/detach are NOT lifecycle verbs and are never
+    // added to the transition table (AD-15) — the guard is pure persisted-state
+    // validation with no live process required (DC-3), and there is deliberately
+    // NO force escape: AD-11 forbids hot-swap outright.
+
+    /// Attach a Memory Backing of `kind` to the named instance (story 5-1,
+    /// AC1/AC3). Permitted ONLY from a TERMINAL persisted state
+    /// (`registered`/`stopped`/`failed`); every non-terminal state is refused
+    /// ([`RegistryError::MemoryBackingHotSwap`] — no `--force`, AD-11).
+    ///
+    /// Side effects, in order, AFTER every fallible check passes:
+    /// 1. for [`MemoryBackingKind::Filesystem`] — create the managed directory
+    ///    (`<Agent Home>/memory`, one idempotent `create_dir_all`, no recursion);
+    /// 2. persist the attachment row.
+    ///
+    /// If the row write fails after the directory exists, the directory is LEFT
+    /// in place — it is inert and idempotent, and inventing a rollback that
+    /// deletes operator-shaped data is exactly what a supervisor must not do.
+    ///
+    /// Idempotence (A-6): re-attaching the SAME kind is an idempotent success
+    /// (the row's original timestamp stands; the directory is self-healed if a
+    /// hand-delete removed it). Attaching a DIFFERENT kind over an existing one
+    /// is rejected ([`RegistryError::MemoryBackingKindConflict`]) — detach first.
+    ///
+    /// Returns the engine-computed managed directory path (path authority): `kt`
+    /// displays it but never constructs it (DC-1). For a non-`filesystem` kind
+    /// the path is returned uncreated (only `filesystem` materializes it).
+    pub fn attach_memory(
+        &self,
+        name: &str,
+        kind: MemoryBackingKind,
+    ) -> Result<std::path::PathBuf, RegistryError> {
+        // (1) Validate the name shape so a malformed name yields InvalidName
+        // rather than a confusing NotFound.
+        let name = InstanceName::new(name).map_err(|reason| RegistryError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+
+        // (2) Look up the instance (→ NotFound when unregistered).
+        let instance = self.lookup(&name)?;
+
+        // (3) State guard: terminal states only (pure persisted-state check).
+        ensure_terminal_for_memory_backing(&name, &instance.state)?;
+
+        let dir = self.paths.agent_memory_dir(&name);
+
+        // (4) Conflict / idempotence check against the EXISTING attachment —
+        // still before any side effect.
+        if let Some(existing) = self.store.get_memory_backing(&name)? {
+            if existing.kind != kind {
+                return Err(RegistryError::MemoryBackingKindConflict {
+                    name: name.as_str().to_string(),
+                    attached: existing.kind.as_str().to_string(),
+                    requested: kind.as_str().to_string(),
+                });
+            }
+            // Same kind again: idempotent success. Still self-heal the managed
+            // directory (a manual delete must not wedge future starts), but do
+            // NOT rewrite the row — the original attached_at stands.
+            if kind == MemoryBackingKind::Filesystem {
+                ensure_managed_memory_dir(&dir, name.as_str())?;
+            }
+            return Ok(dir);
+        }
+
+        // (5) Side effects, in order. If step 6 fails, step 5's directory stays
+        // (inert + idempotent; see this method's docs — no data-deleting rollback).
+        if kind == MemoryBackingKind::Filesystem {
+            ensure_managed_memory_dir(&dir, name.as_str())?;
+        }
+        let backing = MemoryBacking {
+            name: name.clone(),
+            kind,
+            attached_at: now_rfc3339(),
+        };
+        self.store.upsert_memory_backing(&backing)?;
+        Ok(dir)
+    }
+
+    /// Detach the named instance's Memory Backing (story 5-1, AC3/DC-7). Same
+    /// validate → look up → terminal-guard order as [`Registry::attach_memory`].
+    ///
+    /// METADATA ONLY (A-4): this clears the attachment row and NOTHING else —
+    /// the managed directory and its contents REMAIN on disk. Rationale: (a) it
+    /// is operator data — silent deletion is a surprise a supervisor must never
+    /// spring; (b) it avoids adding a second unbounded tree removal under the
+    /// engine locks (AD-17); (c) it matches `kt agent remove`'s shipped default
+    /// where retention is the default and deletion is opt-in. A future
+    /// `detach --delete` is a deliberate deferral, not an oversight. Re-attaching
+    /// later simply re-adopts the existing contents. Detaching when nothing is
+    /// attached is a successful no-op.
+    pub fn detach_memory(&self, name: &str) -> Result<(), RegistryError> {
+        let name = InstanceName::new(name).map_err(|reason| RegistryError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let instance = self.lookup(&name)?;
+        ensure_terminal_for_memory_backing(&name, &instance.state)?;
+        self.store.clear_memory_backing(&name)?;
+        Ok(())
+    }
+
+    /// Read the instance's Memory Backing through the public API (story 5-1,
+    /// Task 4.5): `None` when nothing is attached; otherwise the kind, the
+    /// engine-computed managed directory, and the DC-10 delivery fact — whether
+    /// the adapter's declared `[config]` mapping targets the reserved key, i.e.
+    /// whether the injected path will actually reach the agent (Q-1 honesty
+    /// rule). Shaped for reuse by story 5-2's status surface.
+    ///
+    /// Computing the delivery fact resolves the adapter's declared mapping (from
+    /// the persisted snapshot facts — no manifest re-parse beyond what the start
+    /// path itself does). A corrupt/unreadable home surfaces as
+    /// [`RegistryError::Io`], exactly like every other snapshot read.
+    pub fn memory_status(&self, name: &str) -> Result<Option<MemoryBackingStatus>, RegistryError> {
+        let name = InstanceName::new(name).map_err(|reason| RegistryError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        // Confirm existence FIRST so an unknown instance is NotFound, not None
+        // (None honestly means "exists, nothing attached").
+        self.lookup(&name)?;
+        let Some(backing) = self.store.get_memory_backing(&name)? else {
+            return Ok(None);
+        };
+
+        let dir = self.paths.agent_memory_dir(&name);
+        let declared = self.memory_key_declared(&name)?;
+        Ok(Some(MemoryBackingStatus {
+            kind: backing.kind,
+            dir,
+            declared,
+        }))
+    }
+
+    /// Whether the instance's adapter declares a `[config]` target for the
+    /// reserved memory key (the DC-10 fact, shared by [`Registry::memory_status`]
+    /// here and by the supervisor's start-time notice).
+    fn memory_key_declared(&self, name: &InstanceName) -> Result<bool, RegistryError> {
+        let (kind, manifest_path, _) = self.adapter_launch_facts(name)?;
+        let mapping =
+            adapter::resolve_config_mapping(&kind, manifest_path.as_deref()).map_err(|e| {
+                RegistryError::Io {
+                    name: name.as_str().to_string(),
+                    path: manifest_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("<native adapter '{kind}'>")),
+                    source: std::io::Error::other(e.to_string()),
+                }
+            })?;
+        Ok(mapping.target(super::config::MEMORY_DIR_KEY).is_some())
     }
 
     // ---- Supervisor collaboration surface (story 1.4; crate-internal) ----
@@ -1125,6 +1288,24 @@ impl Registry {
     pub(crate) fn paths(&self) -> &EnginePaths {
         &self.paths
     }
+
+    // ---- Memory Backing collaboration surface (story 5-1; crate-internal) ----
+
+    /// The attached [`MemoryBacking`] for an instance, or `None` — read by the
+    /// supervisor's start path (in its pre-transition block) to build the
+    /// descriptor override + run the DC-10 honesty check.
+    pub(crate) fn memory_backing(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Option<MemoryBacking>, RegistryError> {
+        Ok(self.store.get_memory_backing(name)?)
+    }
+
+    /// The managed memory directory through path authority (the supervisor's
+    /// defensive start-time self-heal target).
+    pub(crate) fn agent_memory_dir(&self, name: &InstanceName) -> std::path::PathBuf {
+        self.paths.agent_memory_dir(name)
+    }
 }
 
 /// Create `dir` (and parents) if absent, mapping failures to [`RegistryError::Io`].
@@ -1134,6 +1315,52 @@ fn ensure_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
         path: dir.to_string_lossy().into_owned(),
         source,
     })
+}
+
+/// Create the MANAGED memory directory, refusing to follow a pre-existing
+/// symlink at that path (story 5-1 review).
+///
+/// The managed directory is an engine-authority artifact INSIDE the Agent Home;
+/// if `<home>/memory` already exists as a symlink, creating "through" it would
+/// aim every managed write — and the path delivered to the agent — wherever the
+/// link points, escaping the home's containment. Unlike [`ensure_dir`] (shared
+/// with the state dir and Agent Home roots, which an operator may legitimately
+/// place on another volume via a symlink), this path is engine-owned, so the
+/// refusal costs nothing legitimate.
+fn ensure_managed_memory_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.is_symlink() {
+            return Err(RegistryError::Io {
+                name: name.to_string(),
+                path: dir.to_string_lossy().into_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "the managed memory directory path is a symlink; refusing to follow it \
+                     (remove the symlink so the engine can own this path)",
+                ),
+            });
+        }
+    }
+    ensure_dir(dir, name)
+}
+
+/// The Memory Backing terminal-state guard (story 5-1, A-5): attach/detach are
+/// permitted ONLY from a TERMINAL persisted state (`registered`/`stopped`/
+/// `failed`) and refused in every non-terminal one (`running`, `starting`,
+/// `stopping`, `paused`). Pure state-machine validation from the persisted row —
+/// no live process is consulted (DC-3), so it is deterministically testable via
+/// seeded rows exactly like `remove`'s running-guard.
+fn ensure_terminal_for_memory_backing(
+    name: &InstanceName,
+    state: &LifecycleState,
+) -> Result<(), RegistryError> {
+    match state {
+        LifecycleState::Registered | LifecycleState::Stopped | LifecycleState::Failed => Ok(()),
+        other => Err(RegistryError::MemoryBackingHotSwap {
+            name: name.as_str().to_string(),
+            state: other.as_str().to_string(),
+        }),
+    }
 }
 
 /// Parse the embedded engine-defaults TOML into the AD-9 ENGINE-DEFAULTS layer
@@ -2657,5 +2884,322 @@ source = "self-reported"
             "got {err:?}"
         );
         assert!(reg.list().unwrap().is_empty());
+    }
+
+    // ---- Story 5-1: Memory Backing attach/detach/read (AD-11) ----
+
+    /// Seed an instance in an arbitrary state directly into the store (no home
+    /// materialization) — the exact `remove_running_without_force_is_rejected`
+    /// pattern (DC-3: the guard is pure persisted-state validation).
+    fn seed_in_state(reg: &Registry, n: &str, state: LifecycleState) -> InstanceName {
+        let iname = InstanceName::new(n).unwrap();
+        let now = now_rfc3339();
+        reg.seed_instance(&AgentInstance {
+            name: iname.clone(),
+            kind: "mock".to_string(),
+            state,
+            agent_home: reg
+                .paths()
+                .agent_home(&iname)
+                .to_string_lossy()
+                .into_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .unwrap();
+        iname
+    }
+
+    #[test]
+    fn attach_creates_the_managed_directory_and_the_read_reports_it() {
+        // AC1 + DC-1: the directory is created INSIDE the Agent Home at the
+        // engine-computed path (returned by the engine — never computed by the
+        // caller), and the public read reports kind + path.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+
+        let dir = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap();
+        let expected = reg
+            .paths()
+            .agent_home(&InstanceName::new("demo").unwrap())
+            .join(crate::paths::MEMORY_DIR);
+        assert_eq!(dir, expected);
+        assert!(dir.is_dir(), "managed directory should exist");
+
+        let status = reg.memory_status("demo").unwrap().unwrap();
+        assert_eq!(status.kind, MemoryBackingKind::Filesystem);
+        assert_eq!(status.dir, dir);
+        // The builtin mock declares a mapping for the reserved key (story 5-1
+        // lockstep), so delivery IS declared for this adapter.
+        assert!(status.declared, "mock maps memory.dir → env");
+    }
+
+    #[test]
+    fn re_attaching_the_same_kind_is_an_idempotent_success() {
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let first = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap();
+        // Read the attached_at, re-attach, and confirm the row did NOT change.
+        let before = reg
+            .store
+            .get_memory_backing(&InstanceName::new("demo").unwrap())
+            .unwrap();
+        let second = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            reg.store
+                .get_memory_backing(&InstanceName::new("demo").unwrap())
+                .unwrap(),
+            before,
+            "re-attach must not rewrite the row"
+        );
+    }
+
+    #[test]
+    fn attaching_a_different_kind_over_an_existing_one_is_rejected() {
+        // A-6: kinds never hot-swap; detach first. Nothing changes on rejection.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        reg.attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap();
+        let err = reg
+            .attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap_err();
+        match &err {
+            RegistryError::MemoryBackingKindConflict {
+                name,
+                attached,
+                requested,
+            } => {
+                assert_eq!(name, "demo");
+                assert_eq!(attached, "filesystem");
+                assert_eq!(requested, "native");
+            }
+            other => panic!("expected MemoryBackingKindConflict, got {other:?}"),
+        }
+        // The original attachment stands untouched.
+        assert_eq!(
+            reg.memory_status("demo").unwrap().unwrap().kind,
+            MemoryBackingKind::Filesystem
+        );
+    }
+
+    #[test]
+    fn attach_on_every_non_terminal_state_is_rejected_and_changes_nothing() {
+        // AC3 + DC-3: the guard reads ONLY the persisted Lifecycle State — seeded
+        // rows, no live process — and a rejection leaves NO side effect (no
+        // directory, no row). Terminal-only per A-5: registered/stopped/failed are
+        // permitted; running/starting/stopping/paused are all refused.
+        for state in [
+            LifecycleState::Running,
+            LifecycleState::Starting,
+            LifecycleState::Stopping,
+            LifecycleState::Paused,
+        ] {
+            let (tmp, reg) = open_temp();
+            let label = state.as_str();
+            let iname = seed_in_state(&reg, "live", state);
+
+            let err = reg
+                .attach_memory("live", MemoryBackingKind::Filesystem)
+                .unwrap_err();
+            match &err {
+                RegistryError::MemoryBackingHotSwap {
+                    name,
+                    state: reported,
+                } => {
+                    assert_eq!(name, "live");
+                    assert_eq!(reported, label);
+                }
+                other => panic!("expected MemoryBackingHotSwap for {label}, got {other:?}"),
+            }
+            // NO side effect: neither the directory nor the row exists.
+            assert!(
+                !reg.paths().agent_memory_dir(&iname).exists(),
+                "{label}: guard must reject BEFORE creating the directory"
+            );
+            assert!(
+                reg.store.get_memory_backing(&iname).unwrap().is_none(),
+                "{label}: guard must reject BEFORE persisting the row"
+            );
+            drop(tmp);
+        }
+    }
+
+    #[test]
+    fn detach_on_every_non_terminal_state_is_rejected() {
+        for state in [
+            LifecycleState::Running,
+            LifecycleState::Starting,
+            LifecycleState::Stopping,
+            LifecycleState::Paused,
+        ] {
+            let (_tmp, reg) = open_temp();
+            seed_in_state(&reg, "live", state);
+            let err = reg.detach_memory("live").unwrap_err();
+            assert!(
+                matches!(&err, RegistryError::MemoryBackingHotSwap { name, state: s }
+                    if name == "live" && s == state.as_str()),
+                "detach must refuse {state:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_succeeds_from_stopped_and_failed_terminal_states() {
+        for state in [LifecycleState::Stopped, LifecycleState::Failed] {
+            let (_tmp, reg) = open_temp();
+            seed_in_state(&reg, "svc", state);
+            let dir = reg
+                .attach_memory("svc", MemoryBackingKind::Filesystem)
+                .unwrap();
+            assert!(
+                dir.is_dir(),
+                "{state}: attach permitted from a terminal state"
+            );
+            // The attachment ROW persisted (store-level read; the delivery-fact
+            // read needs the adapter snapshot, which a seeded row's home
+            // deliberately lacks — real instances get that coverage in the
+            // register()-based tests below and in tests/memory.rs).
+            assert_eq!(
+                reg.store
+                    .get_memory_backing(&InstanceName::new("svc").unwrap())
+                    .unwrap()
+                    .expect("row persisted")
+                    .kind,
+                MemoryBackingKind::Filesystem
+            );
+        }
+    }
+
+    #[test]
+    fn detach_clears_the_attachment_but_leaves_directory_contents() {
+        // A-4 / DC-7: detach is metadata-only; operator data survives untouched
+        // and a later re-attach re-adopts it.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let dir = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap();
+        std::fs::write(dir.join("memory.txt"), b"operator data").unwrap();
+
+        reg.detach_memory("demo").unwrap();
+        assert!(reg.memory_status("demo").unwrap().is_none(), "row cleared");
+        assert_eq!(
+            std::fs::read(dir.join("memory.txt")).unwrap(),
+            b"operator data",
+            "detach must never touch the managed directory contents"
+        );
+
+        // Re-attaching re-adopts the existing contents (same directory).
+        let again = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap();
+        assert_eq!(again, dir);
+        assert!(dir.join("memory.txt").is_file());
+    }
+
+    #[test]
+    fn detaching_when_nothing_is_attached_is_a_successful_noop() {
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        reg.detach_memory("demo").unwrap();
+        assert!(reg.memory_status("demo").unwrap().is_none());
+    }
+
+    #[test]
+    fn attaching_to_a_native_backing_records_the_row_without_creating_the_directory() {
+        // Only `filesystem` materializes a managed directory; `native` is the
+        // delegation marker (reserved for story 5-2's behavior) — the vocabulary
+        // ships now so 5-2 adds behavior without an enum-shape break.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let dir = reg
+            .attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap();
+        assert!(!dir.exists(), "native attaches no directory");
+        assert_eq!(
+            reg.memory_status("demo").unwrap().unwrap().kind,
+            MemoryBackingKind::Native
+        );
+    }
+
+    #[test]
+    fn memory_ops_report_not_found_for_unregistered_names() {
+        let (_tmp, reg) = open_temp();
+        let err = reg
+            .attach_memory("ghost", MemoryBackingKind::Filesystem)
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::NotFound { name } if name == "ghost"));
+        let err = reg.detach_memory("ghost").unwrap_err();
+        assert!(matches!(err, RegistryError::NotFound { name } if name == "ghost"));
+        assert!(reg
+            .memory_status("ghost")
+            .unwrap_err()
+            .to_string()
+            .contains("ghost"));
+    }
+
+    #[test]
+    fn memory_status_surfaces_an_unresolvable_mapping_as_io_not_a_panic() {
+        // The DC-10 delivery fact resolves the adapter's declared mapping; when
+        // that resolution FAILS (here: the manifest file vanished after
+        // registration), the read must surface the typed Io error — never panic
+        // and never report a fabricated delivered/undelivered fact.
+        let (_tmp, reg) = open_temp();
+        let manifest_dir = TempDir::new().unwrap();
+        write_manifest_dir(manifest_dir.path(), VALID_MANIFEST);
+        reg.register_with_adapter(
+            "m",
+            &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+        )
+        .unwrap();
+        reg.attach_memory("m", MemoryBackingKind::Filesystem)
+            .unwrap();
+
+        std::fs::remove_file(manifest_dir.path().join(crate::adapter::MANIFEST_FILE)).unwrap();
+
+        let err = reg.memory_status("m").unwrap_err();
+        assert!(matches!(err, RegistryError::Io { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn memory_ops_reject_malformed_names_as_invalid_name() {
+        let (_tmp, reg) = open_temp();
+        let err = reg
+            .attach_memory("Bad Name", MemoryBackingKind::Filesystem)
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidName { .. }));
+        let err = reg.detach_memory("Bad Name").unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidName { .. }));
+        assert!(matches!(
+            reg.memory_status("Bad Name").unwrap_err(),
+            RegistryError::InvalidName { .. }
+        ));
+    }
+
+    #[test]
+    fn memory_read_reports_undelivered_for_an_adapter_without_the_reserved_mapping() {
+        // DC-10: the delivery fact distinguishes declared vs undeclared mappings.
+        // The VALID_MANIFEST fixture declares no `[config]` section → empty
+        // mapping → the reserved key is NOT targeted.
+        let (_tmp, reg) = open_temp();
+        let manifest_dir = TempDir::new().unwrap();
+        write_manifest_dir(manifest_dir.path(), VALID_MANIFEST);
+        reg.register_with_adapter(
+            "m",
+            &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+        )
+        .unwrap();
+        reg.attach_memory("m", MemoryBackingKind::Filesystem)
+            .unwrap();
+        let status = reg.memory_status("m").unwrap().unwrap();
+        assert!(!status.declared, "no declared target ⇒ not delivered");
     }
 }
