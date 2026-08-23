@@ -43,15 +43,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use ktesio_adapter_api::{Capability, OsId, SupportLevel};
+use ktesio_adapter_api::{Capability, ConfigMapping, OsId, SupportLevel};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
 use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
-    assemble_usage_event, BackendError, LogCapture, ObservedUsageSource, ParsedUsage,
-    ProcessBackend, ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource,
-    KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
+    assemble_usage_event, BackendError, LogCapture, MemoryBackingKind, ObservedUsageSource,
+    ParsedUsage, ProcessBackend, ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec,
+    UsageSource, KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -597,11 +597,74 @@ impl Supervisor {
         // pass-through leaves are delivered VERBATIM (AC6). The Agent Home already
         // exists (created at registration); file targets render into it here.
         let home = registry.agent_home(&name);
-        let effective = registry
+        let mut effective = registry
             .effective_config(&name, crate::domain::ConfigLayer::empty())
             .map_err(|e| config_to_engine(&name, e))?;
+        // (2b-memory-spoof) The reserved `memory.dir` key is a DELIVERY
+        // MECHANISM, never operator configuration (story 5-1's CORRECTION; docs:
+        // "the operator never set this key"). Strip any hand-set value from the
+        // operator layers — mirroring the reserved-identity `name` drop — so it
+        // can reach neither the mapping application nor the snapshot. Without
+        // this, an operator-supplied value would flow through whenever NO
+        // backing is attached (the engine override layer is absent then) and
+        // masquerade as engine-delivered memory. Only the invocation-override
+        // layer built further below may supply this key.
+        let _ = effective.remove(super::config::MEMORY_DIR_KEY);
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-memory) MANAGED MEMORY BACKING (story 5-1, spine AD-11). Read the
+        // attached backing (one DB read) and — for a `filesystem` kind — ensure
+        // the managed directory exists: ONE idempotent `create_dir_all`, no
+        // recursion, no copy/seed/restore of CONTENTS ever (DC-7 — byte-identical
+        // survival comes from non-interference; this is also the AD-17 bounded-work
+        // rule: identical cost to `ensure_log_dir` below). Both happen HERE, in
+        // the pre-transition block: every fallible step precedes any state change,
+        // so a failure rejects the start with no spurious transition. This is the
+        // defensive SELF-HEAL — attach already created it; a manual delete must
+        // not wedge future starts.
+        let memory_backing = registry.memory_backing(&name).map_err(registry_to_engine)?;
+        let memory_dir = memory_backing
+            .as_ref()
+            .filter(|backing| backing.kind == MemoryBackingKind::Filesystem)
+            .map(|_| registry.agent_memory_dir(&name));
+        if let Some(dir) = &memory_dir {
+            // Strict UTF-8 BEFORE anything else: this path is DELIVERED to the
+            // agent at the reserved key (`invocation_overrides` stringifies it),
+            // and a lossy coercion there would hand the agent a mangled path
+            // while every local check still passed. A non-UTF-8 state-dir path
+            // is effectively impossible for a sane install; if one shows up, it
+            // fails LOUD here, pre-transition, with no side effect.
+            if dir.to_str().is_none() {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: dir.to_string_lossy().into_owned(),
+                    detail: "the managed memory directory path is not valid UTF-8, so it \
+                             cannot be delivered safely at the reserved 'memory.dir' key"
+                        .to_string(),
+                });
+            }
+            // Symlink refusal mirrors the attach-side guard (registry's
+            // ensure_managed_memory_dir): never follow a link out of the Agent
+            // Home — e.g. one planted between attach and start.
+            if std::fs::symlink_metadata(dir)
+                .map(|m| m.is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: dir.to_string_lossy().into_owned(),
+                    detail: "the managed memory directory path is a symlink; refusing to \
+                             follow it"
+                        .to_string(),
+                });
+            }
+            std::fs::create_dir_all(dir).map_err(|e| EngineError::Log {
+                name: name.as_str().to_string(),
+                path: dir.to_string_lossy().into_owned(),
+                detail: format!("could not ensure the managed memory directory: {e}"),
+            })?;
+        }
 
         // (2b-observed) ENGINE-OBSERVED metering (story 3-4, AC-A/AC6): for an
         // `engine-observed` instance, START the loopback forward listener HERE
@@ -618,16 +681,38 @@ impl Supervisor {
         let observed_listener =
             self.start_observed_listener(&name, &metering_source, &effective)?;
         // The effective config the MAPPING applies: for an observed instance it
-        // carries the engine-injected loopback base_url as an override (so the mapping
-        // delivers it); otherwise it is the plain operator config. The SNAPSHOT (2c)
-        // below stays on the plain `effective` (the operator config), so the ephemeral
-        // loopback URL is NOT persisted as "what applied" — honest provenance.
-        let mapping_effective = match observed_listener.as_ref() {
-            Some(listener) => registry
-                .effective_config(&name, base_url_override(listener.base_url()))
+        // carries the engine-injected loopback base_url (story 3-4), and for a
+        // filesystem-backed instance the engine-computed managed memory dir at the
+        // reserved `memory.dir` key (story 5-1) — both INVOCATION overrides (the
+        // strongest layer, AD-9), so a hand-set lower-layer value cannot win. The
+        // SNAPSHOT (2c) below stays on the plain `effective` (the operator config),
+        // so NEITHER injected value is persisted as "what applied" — honest
+        // provenance (3-4's rule; 5-1's CORRECTION extends it: `memory.dir` is a
+        // delivery mechanism, not operator configuration).
+        let mapping_effective = match invocation_overrides(
+            observed_listener.as_ref().map(ObservedListener::base_url),
+            memory_dir.as_deref(),
+        ) {
+            Some(layer) => registry
+                .effective_config(&name, layer)
                 .map_err(|e| config_to_engine(&name, e))?,
             None => effective.clone(),
         };
+
+        // (2b-memory-delivery) DC-10 honesty (AD-11 Delivery clause): when a
+        // `filesystem` backing is attached but the resolved mapping declares NO
+        // target for the reserved key, say so ONCE on stderr (AD-12) — naming the
+        // instance, the managed path, and the fact that the agent will not receive
+        // it. The start still SUCCEEDS: the directory guarantee holds regardless,
+        // and refusing an otherwise-healthy agent because its adapter maps no
+        // memory key would be a regression. Deliberately NOT generalized to other
+        // unmapped keys (story 2-2 Decision 6 stands; memory is special only
+        // because the operator took an explicit attach action and is owed the
+        // truth about its effect). Pure decision fn (unit-tested); this eprintln
+        // is the only emission site.
+        if let Some(notice) = memory_delivery_notice(memory_dir.as_deref(), &mapping, &name) {
+            eprintln!("[ktesio] {notice}");
+        }
 
         // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
         // the mapping application (story 2-4, spine AD-10, AC-A/AC9). This is where
@@ -2909,26 +2994,76 @@ impl Default for Supervisor {
     }
 }
 
-/// Build the INVOCATION-OVERRIDE config layer that injects the engine-observed
-/// loopback `base_url` into the mapping (story 3-4, AC6). The engine writes the
-/// listener's `http://127.0.0.1:<port>` at the reserved
-/// [`METERING_BASE_URL_KEY`](crate::domain::METERING_BASE_URL_KEY) so the
-/// adapter's EXISTING config-mapping (2-2) delivers it into the agent's native
-/// mechanism. Because it is the INVOCATION layer (the strongest — AD-9), it always
-/// wins over any hand-set lower-layer value; and because the mapping reads it as an
-/// ordinary string leaf, NO new contract surface is introduced (no
-/// `CONTRACT_VERSION` bump). Pure — builds a one-key TOML table.
-fn base_url_override(base_url: &str) -> ConfigLayer {
+/// Build the INVOCATION-OVERRIDE config layer injecting the engine-computed
+/// START-TIME values the adapter's EXISTING config-mapping (2-2) delivers into
+/// the agent's native mechanism:
+///
+/// * `base_url` — the engine-observed loopback listener address
+///   `http://127.0.0.1:<port>` at the reserved [`METERING_BASE_URL_KEY`]
+///   (`metering.base_url`, story 3-4, AC6);
+/// * `memory_dir` — the managed Memory Backing directory path at the reserved
+///   [`MEMORY_DIR_KEY`] (`memory.dir`, story 5-1, AD-11 Delivery clause).
+///
+/// Both keys are documented in [`config`] with the same contract: ENGINE-computed,
+/// engine-INJECTED as an invocation override (the strongest layer — AD-9 — so a
+/// hand-set lower-layer value can never win), KNOWN so a mapping can target them,
+/// OPERATOR-does-NOT-set, and explicitly NOT touching the Adapter Contract surface
+/// (no `CONTRACT_VERSION` bump). Because the mapping reads them as ordinary string
+/// leaves, NO new contract surface is introduced.
+///
+/// Returns `None` when neither value applies (the overwhelmingly common start) so
+/// the caller keeps using the plain operator config. Pure — builds a TOML table.
+///
+/// [`METERING_BASE_URL_KEY`]: crate::domain::METERING_BASE_URL_KEY
+/// [`MEMORY_DIR_KEY`]: crate::domain::MEMORY_DIR_KEY
+fn invocation_overrides(base_url: Option<&str>, memory_dir: Option<&Path>) -> Option<ConfigLayer> {
+    if base_url.is_none() && memory_dir.is_none() {
+        return None;
+    }
     let mut table = toml::value::Table::new();
-    // A DOTTED key (`metering.base_url`) is a nested table in TOML; build the nested
-    // shape so `resolve` flattens it to the dotted leaf the mapping targets.
-    let mut metering = toml::value::Table::new();
-    metering.insert(
-        "base_url".to_string(),
-        toml::Value::String(base_url.to_string()),
-    );
-    table.insert("metering".to_string(), toml::Value::Table(metering));
-    ConfigLayer::from_table(table)
+    if let Some(url) = base_url {
+        // A DOTTED key (`metering.base_url`) is a nested table in TOML; build the
+        // nested shape so `resolve` flattens it to the dotted leaf the mapping targets.
+        let mut metering = toml::value::Table::new();
+        metering.insert("base_url".to_string(), toml::Value::String(url.to_string()));
+        table.insert("metering".to_string(), toml::Value::Table(metering));
+    }
+    if let Some(dir) = memory_dir {
+        // Same dotted-key construction for `memory.dir`.
+        let mut memory = toml::value::Table::new();
+        memory.insert(
+            "dir".to_string(),
+            toml::Value::String(dir.to_string_lossy().into_owned()),
+        );
+        table.insert("memory".to_string(), toml::Value::Table(memory));
+    }
+    Some(ConfigLayer::from_table(table))
+}
+
+/// The DC-10 delivery-honesty decision (story 5-1): given the attached
+/// filesystem backing's managed dir (present only when one is attached) and the
+/// resolved config mapping, return the ONE stderr notice to emit when the
+/// adapter declares no target for the reserved key. `None` means nothing to say
+/// — either no filesystem backing is attached, or the mapping DOES target the
+/// key and delivery is genuinely declared. Pure + deterministic (unit-tested);
+/// the caller owns the stderr emission.
+fn memory_delivery_notice(
+    memory_dir: Option<&Path>,
+    mapping: &ConfigMapping,
+    name: &InstanceName,
+) -> Option<String> {
+    let dir = memory_dir?;
+    if mapping.target(super::config::MEMORY_DIR_KEY).is_some() {
+        return None;
+    }
+    Some(format!(
+        "{}: a 'filesystem' Memory Backing is attached (managed directory: {}), but this \
+         adapter declares no config mapping for the reserved key 'memory.dir', so the \
+         agent will NOT receive the path. Add [config.\"memory.dir\"] env = \"...\" to its \
+         manifest to deliver it.",
+        name.as_str(),
+        dir.display(),
+    ))
 }
 
 /// A best-effort, HUMAN-READABLE one-line rendering of a [`TransitionEvent`]
@@ -5223,10 +5358,11 @@ mod tests {
     // ---- Story 3-4: engine-observed base_url injection + source selection ----
 
     #[test]
-    fn base_url_override_builds_the_reserved_metering_leaf() {
-        // AC6: the engine injects the loopback URL at the reserved `metering.base_url`
-        // key as an INVOCATION override, so the adapter's config-mapping delivers it.
-        let layer = base_url_override("http://127.0.0.1:54321");
+    fn invocation_overrides_build_the_reserved_metering_leaf() {
+        // AC6 (story 3-4): the engine injects the loopback URL at the reserved
+        // `metering.base_url` key as an INVOCATION override, so the adapter's
+        // config-mapping delivers it.
+        let layer = invocation_overrides(Some("http://127.0.0.1:54321"), None).unwrap();
         let resolved = crate::domain::resolve([
             crate::domain::ConfigLayer::empty(),
             crate::domain::ConfigLayer::empty(),
@@ -5240,6 +5376,93 @@ mod tests {
             Some("http://127.0.0.1:54321"),
             "the loopback URL lands at the reserved metering.base_url leaf"
         );
+    }
+
+    #[test]
+    fn invocation_overrides_build_the_reserved_memory_dir_leaf() {
+        // Story 5-1: the managed memory dir lands at the reserved `memory.dir`
+        // leaf as an INVOCATION override.
+        let layer =
+            invocation_overrides(None, Some(Path::new("/state/agents/demo/memory"))).unwrap();
+        let resolved = crate::domain::resolve([
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            layer,
+        ]);
+        assert_eq!(
+            resolved
+                .value_display(crate::domain::MEMORY_DIR_KEY)
+                .as_deref(),
+            Some("/state/agents/demo/memory"),
+            "the managed dir lands at the reserved memory.dir leaf"
+        );
+        // And a hand-set lower-layer value CANNOT win (AD-9 invocation precedence).
+        let lower = crate::domain::ConfigLayer::parse(
+            crate::domain::SourceLayer::Instance,
+            "<test>",
+            "[memory]\ndir = \"/operator/set\"\n",
+        )
+        .unwrap();
+        let resolved = crate::domain::resolve([
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            lower,
+            invocation_overrides(None, Some(Path::new("/engine/computed/memory"))).unwrap(),
+        ]);
+        assert_eq!(
+            resolved
+                .value_display(crate::domain::MEMORY_DIR_KEY)
+                .as_deref(),
+            Some("/engine/computed/memory"),
+        );
+    }
+
+    #[test]
+    fn invocation_overrides_compose_both_and_are_none_for_neither() {
+        // Both engine-injected values compose into ONE layer; neither → None so
+        // the caller keeps the plain operator config.
+        let combined =
+            invocation_overrides(Some("http://127.0.0.1:1"), Some(Path::new("/m"))).unwrap();
+        let resolved = crate::domain::resolve([
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            crate::domain::ConfigLayer::empty(),
+            combined,
+        ]);
+        assert_eq!(
+            resolved
+                .value_display(crate::domain::METERING_BASE_URL_KEY)
+                .as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+        assert_eq!(
+            resolved
+                .value_display(crate::domain::MEMORY_DIR_KEY)
+                .as_deref(),
+            Some("/m")
+        );
+        assert!(invocation_overrides(None, None).is_none());
+    }
+
+    #[test]
+    fn memory_delivery_notice_fires_only_when_attached_but_unmapped() {
+        // DC-10 decision table: attached + unmapped ⇒ the notice names the
+        // instance + path + the reserved key; mapped or unattached ⇒ silence.
+        let name = InstanceName::new("svc").unwrap();
+        let dir = Path::new("/state/agents/svc/memory");
+        let unmapped = ConfigMapping::new(); // declares nothing
+        let notice = memory_delivery_notice(Some(dir), &unmapped, &name).unwrap();
+        assert!(notice.contains("svc"), "{notice}");
+        assert!(notice.contains(dir.to_string_lossy().as_ref()), "{notice}");
+        assert!(notice.contains("memory.dir"), "{notice}");
+
+        let mapped = ConfigMapping::new().with(
+            crate::domain::MEMORY_DIR_KEY,
+            ktesio_adapter_api::ConfigTarget::env("SVC_MEMORY_DIR"),
+        );
+        assert!(memory_delivery_notice(Some(dir), &mapped, &name).is_none());
+        assert!(memory_delivery_notice(None, &unmapped, &name).is_none());
     }
 
     #[test]

@@ -154,3 +154,17 @@ pub struct AgentInteractionTimedOut {
 pub struct AgentStopUnconfirmed {
     pub message: String,
 }
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::memory_hot_swap))]
+pub struct AgentMemoryHotSwap {
+    pub message: String,
+}
+
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::memory_kind_conflict))]
+pub struct AgentMemoryKindConflict {
+    pub message: String,
+}

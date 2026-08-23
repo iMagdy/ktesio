@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, LifecycleState, LogLine, Micros, RegistryError,
-    RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
+    FleetEntry, FleetListing, FleetTotals, LifecycleState, LogLine, MemoryBackingKind, Micros,
+    RegistryError, RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -26,9 +26,9 @@ use crate::error::{
     AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionTimedOut,
     AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentIo,
     AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable,
-    AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
-    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
-    AgentUnknownKind,
+    AgentMemoryHotSwap, AgentMemoryKindConflict, AgentNoCapabilities, AgentNoMeteringSource,
+    AgentNotFound, AgentNotRunning, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore,
+    AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -1668,6 +1668,71 @@ fn render_effective_config(
     ui::print_table(&title, &columns, &rows);
 }
 
+/// `kt agent memory attach <name> --kind <kind>` — attach a Memory Backing to
+/// an Agent Instance (story 5-1, FR-15, spine AD-11).
+///
+/// The instance name is validated FIRST (the shipped 4-3 M2 convention: a
+/// malformed name is a usage error, exit `2`, uniformly), then the `--kind`
+/// token against what THIS release implements (`filesystem` only — story 5-2
+/// owns `native`; an unrecognized token is the [`AgentUnknownKind`]-shaped
+/// usage error naming the accepted value). The engine does everything else
+/// through path authority: it creates the managed directory inside the Agent
+/// Home and persists the attachment; this command only displays the path the
+/// ENGINE returned (DC-1 — `kt` never joins "memory" itself). Human output only
+/// in this story (A-3/DC-6): a confirmation naming the instance, the kind, and
+/// the managed path on stdout; diagnostics on stderr (AD-12). No `--json`.
+pub fn memory_attach(name: &str, kind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the name BEFORE anything else so a malformed name exits 2
+    // uniformly (never 3 via a lookup miss), per the test-pinned convention.
+    validate_instance_name(name)?;
+    let backing_kind = match kind {
+        "filesystem" => MemoryBackingKind::Filesystem,
+        other => {
+            return Err(AgentUnknownKind {
+                message: format!(
+                "Unknown Memory Backing kind '{other}'. This release accepts: --kind filesystem."
+            ),
+            }
+            .into())
+        }
+    };
+    let engine = open_engine()?;
+    match engine.blocking().attach_memory(name, backing_kind) {
+        Ok(dir) => {
+            ui::success(format!(
+                "Attached {} Memory Backing to Agent Instance {}",
+                kind,
+                ui::skill_name(name)
+            ));
+            // Command result to stdout: the managed path, received from the
+            // engine (DC-1) — never constructed here.
+            println!("{}", dir.display());
+            Ok(())
+        }
+        Err(err) => Err(map_error(err)),
+    }
+}
+
+/// `kt agent memory detach <name>` — detach an Agent Instance's Memory Backing
+/// (story 5-1). METADATA ONLY: the managed directory and its contents remain on
+/// disk (operator data is never silently deleted); a later re-attach re-adopts
+/// them. Same terminal-state guard as attach — no hot-swap, no force escape.
+pub fn memory_detach(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    validate_instance_name(name)?;
+    let engine = open_engine()?;
+    match engine.blocking().detach_memory(name) {
+        Ok(()) => {
+            ui::success(format!(
+                "Detached the Memory Backing from Agent Instance {} (the managed directory \
+                 and its contents remain on disk)",
+                ui::skill_name(name)
+            ));
+            Ok(())
+        }
+        Err(err) => Err(map_error(err)),
+    }
+}
+
 /// Translate a [`ConfigError`] (story 2-1) into a `miette` diagnostic with a
 /// remediation hint (NFR-1). The unknown-key class (AC-B) carries the offending
 /// key + the nearest-key suggestion the engine computed; the shared name/store
@@ -1866,6 +1931,29 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Adapter '{adapter}' declares no capabilities. Add a `[capabilities]` section \
                  declaring at least one capability."
+            ),
+        }
+        .into(),
+        // Story 5-1: the two Memory Backing guards. Both are invalid-STATE
+        // rejections (exit `4`, DC-4) — no new exit-code number was minted — and
+        // neither has a force escape (AD-11 forbids hot-swap outright, unlike
+        // remove's RunningRequiresForce).
+        RegistryError::MemoryBackingHotSwap { name, state } => AgentMemoryHotSwap {
+            message: format!(
+                "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped. \
+                 Attach/detach need a terminal state (registered, stopped, or failed). Bring it \
+                 to a terminal state first: kt agent stop {name} from running or paused"
+            ),
+        }
+        .into(),
+        RegistryError::MemoryBackingKindConflict {
+            name,
+            attached,
+            requested,
+        } => AgentMemoryKindConflict {
+            message: format!(
+                "Agent Instance '{name}' already has a '{attached}' Memory Backing attached; \
+                 detach it before attaching '{requested}': kt agent memory detach {name}"
             ),
         }
         .into(),
@@ -2327,6 +2415,26 @@ mod tests {
                 "RunningRequiresForce",
                 RegistryError::RunningRequiresForce {
                     name: "svc".to_string(),
+                },
+                ExitCode::InvalidState,
+            ),
+            (
+                // Story 5-1 (DC-4): the hot-swap guard joins code 4 — no new
+                // exit-code number was minted.
+                "MemoryBackingHotSwap",
+                RegistryError::MemoryBackingHotSwap {
+                    name: "svc".to_string(),
+                    state: "running".to_string(),
+                },
+                ExitCode::InvalidState,
+            ),
+            (
+                // Story 5-1 (DC-4): a kind conflict is likewise invalid state.
+                "MemoryBackingKindConflict",
+                RegistryError::MemoryBackingKindConflict {
+                    name: "svc".to_string(),
+                    attached: "filesystem".to_string(),
+                    requested: "native".to_string(),
                 },
                 ExitCode::InvalidState,
             ),

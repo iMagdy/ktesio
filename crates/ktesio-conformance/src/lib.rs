@@ -37,6 +37,19 @@ pub const MOCK_KIND: &str = "mock";
 /// the two fixtures against drift.
 pub const MOCK_MODEL_ENV_VAR: &str = "MODEL";
 
+/// The mock's code-declared config-mapping KEY for the engine-injected managed
+/// Memory Backing directory (story 5-1, Task 5.4 lockstep): the reserved
+/// `memory.dir` unified key. Duplicated as a literal because this crate depends
+/// only on `ktesio-adapter-api` (never on the engine); the cross-boundary parity
+/// test fails if either side drifts.
+pub const MOCK_MEMORY_DIR_KEY: &str = "memory.dir";
+
+/// The mock's code-declared config-mapping target for [`MOCK_MEMORY_DIR_KEY`]:
+/// the ENV var the engine-injected managed memory path is delivered through.
+/// MUST match the shipping engine builtin's `MOCK_MEMORY_ENV_VAR` (the parity
+/// test guards drift).
+pub const MOCK_MEMORY_ENV_VAR: &str = "KTESIO_MEMORY_DIR";
+
 /// A native [`AgentAdapter`] fixture with a per-OS Capability Declaration.
 ///
 /// Declares `pause` as **guaranteed** on Linux/macOS and **best-effort** on
@@ -104,11 +117,14 @@ impl AgentAdapter for MockAdapter {
     }
 
     /// The code-declared unified→native config mapping (story 2-2): `model` → the
-    /// ENV var [`MOCK_MODEL_ENV_VAR`]. Mirrors the shipping engine `BuiltinMock`
-    /// so this fixture stays a faithful stand-in (the engine's cross-boundary
-    /// parity test guards the two against drift).
+    /// ENV var [`MOCK_MODEL_ENV_VAR`], plus — since story 5-1 — the reserved
+    /// `memory.dir` key → [`MOCK_MEMORY_ENV_VAR`]. Mirrors the shipping engine
+    /// `BuiltinMock` so this fixture stays a faithful stand-in (the engine's
+    /// cross-boundary parity test guards the two against drift).
     fn config_mapping(&self) -> ConfigMapping {
-        ConfigMapping::new().with("model", ConfigTarget::env(MOCK_MODEL_ENV_VAR))
+        ConfigMapping::new()
+            .with("model", ConfigTarget::env(MOCK_MODEL_ENV_VAR))
+            .with(MOCK_MEMORY_DIR_KEY, ConfigTarget::env(MOCK_MEMORY_ENV_VAR))
     }
 
     // Lifecycle ops intentionally use the trait's default (unavailable) bodies:
@@ -270,15 +286,20 @@ mod tests {
     }
 
     #[test]
-    fn mock_declares_the_model_env_config_mapping() {
+    fn mock_declares_the_model_and_memory_env_config_mappings() {
         // Story 2-2: the fixture mirrors the shipping builtin's `model` → env
-        // `MODEL` mapping (the engine parity test guards the two against drift).
+        // `MODEL` mapping. Story 5-1 adds the reserved `memory.dir` → env
+        // `KTESIO_MEMORY_DIR` (the engine parity test guards both against drift).
         let mock = MockAdapter::new();
         let mapping = mock.config_mapping();
-        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping.len(), 2);
         assert_eq!(
             mapping.target("model").unwrap().env_var(),
             Some(MOCK_MODEL_ENV_VAR)
+        );
+        assert_eq!(
+            mapping.target(MOCK_MEMORY_DIR_KEY).unwrap().env_var(),
+            Some(MOCK_MEMORY_ENV_VAR)
         );
     }
 
