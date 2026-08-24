@@ -5326,8 +5326,9 @@ fn memory_attach_prints_the_engine_managed_path_and_creates_it() {
 
 #[test]
 fn an_unknown_memory_kind_exits_with_the_usage_code() {
-    // DC-4: an unsupported `--kind` token is a USAGE error (2), naming the
-    // accepted value (`native` is story 5-2's behavior, not this release's).
+    // DC-4: an unsupported `--kind` token is a USAGE error (2), naming BOTH
+    // accepted values (story 5-2 widened the accepted set to filesystem+native;
+    // the diagnostic tracks the set).
     let (ctx, state) = registered_mock("demo");
     let run = run_kt_agent(
         &["agent", "memory", "attach", "demo", "--kind", "teleporting"],
@@ -5336,9 +5337,94 @@ fn an_unknown_memory_kind_exits_with_the_usage_code() {
     );
     assert_eq!(run.code, Some(2), "stderr={}", run.stderr);
     assert!(
-        run.stderr.contains("filesystem"),
-        "names the accepted value; stderr={}",
+        run.stderr.contains("filesystem") && run.stderr.contains("native"),
+        "names both accepted values; stderr={}",
         run.stderr
+    );
+}
+
+#[test]
+fn memory_attach_native_is_metadata_only_and_states_the_delegation_boundary() {
+    // Story 5-2, AC1 at the CLI + DC-6: attaching `native` succeeds, prints the
+    // NFR-7 boundary sentence (delegation, Agent Home persistence only), and
+    // prints a path that is NOT created on disk (the computed location only).
+    // The LAST stdout line stays the engine-reported path (DC-1 discipline).
+    let (ctx, state) = registered_mock("nat");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "nat", "--kind", "native"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("Attached") && run.stdout.contains("native"),
+        "names the kind; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("only Agent Home persistence"),
+        "states the delegation boundary; stdout={}",
+        run.stdout
+    );
+
+    // The reported location is the COMPUTED memory dir inside the Agent Home,
+    // and it was NOT created.
+    let reported = run
+        .stdout
+        .lines()
+        .last()
+        .expect("attach prints the computed location")
+        .trim()
+        .to_string();
+    assert!(
+        reported.contains(
+            &state_dir
+                .join("agents")
+                .join("nat")
+                .to_string_lossy()
+                .to_string()
+        ),
+        "the reported location is inside the Agent Home: {reported}"
+    );
+    assert!(
+        !Path::new(&reported).exists(),
+        "a native backing must not create anything at the reported location"
+    );
+
+    // Idempotent re-attach of the same kind succeeds (A-6) and still creates
+    // nothing.
+    let again = run_kt_agent(
+        &["agent", "memory", "attach", "nat", "--kind", "native"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(again.code, Some(0), "stderr={}", again.stderr);
+    assert!(!Path::new(&reported).exists());
+
+    // The kind-conflict guard works in BOTH directions now that the CLI can
+    // request either kind natively (A-6): native over an attached filesystem → 4.
+}
+
+#[test]
+fn memory_attach_filesystem_states_the_managed_directory_guarantee() {
+    // Story 5-2, DC-6: the filesystem attach confirmation ALSO states its NFR-7
+    // boundary — the managed-directory guarantee — so both kinds' outputs name
+    // what is guaranteed versus delegated.
+    let (ctx, state) = registered_mock("fs");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "fs", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("managed directory") && run.stdout.contains("byte-identically"),
+        "states the managed-directory guarantee; stdout={}",
+        run.stdout
     );
 }
 
@@ -5434,6 +5520,28 @@ fn attaching_a_different_kind_than_the_attached_one_exits_with_the_invalid_state
     assert_eq!(run.code, Some(4), "stderr={}", run.stderr);
     assert!(
         run.stderr.contains("'native'") && run.stderr.contains("detach"),
+        "names both kinds + the remediation; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn attaching_native_over_an_attached_filesystem_exits_with_the_invalid_state_code() {
+    // Story 5-2: the CLI can now request `native` directly, so exercise the
+    // conflict guard in the OTHER direction too (filesystem attached, native
+    // requested → 4, detach remediation, no hot-swap).
+    let (ctx, state) = registered_mock("demo");
+    let state_dir = state.project_dir.as_path();
+    force_attach_kind(state_dir, "demo", "filesystem");
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "native"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(4), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("'filesystem'") && run.stderr.contains("detach"),
         "names both kinds + the remediation; stderr={}",
         run.stderr
     );

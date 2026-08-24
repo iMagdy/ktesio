@@ -207,24 +207,38 @@ kt agent remove my-agent --force
 
 ## `kt agent memory attach <name> --kind <kind>`
 
-Attach a Memory Backing to an Agent Instance: an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically — whatever the agent's native memory story does.
+Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
+
+- **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Ktesio guarantees only that the Agent Home itself persists. Attaching it creates no directory.
 
 ```bash
 kt agent memory attach demo --kind filesystem
+kt agent memory attach demo --kind native
 ```
 
 Arguments:
 
 - `<name>` — the Agent Instance to attach the backing to.
-- `--kind <kind>` — the backing kind. This release accepts `filesystem`; the full vocabulary grows without a breaking change.
+- `--kind <kind>` — the backing kind: `filesystem` or `native`. The full vocabulary grows without a breaking change.
 
-The engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless.
+The confirmation names the kind and prints one boundary sentence stating exactly what is guaranteed versus delegated, then the managed directory path alone on the final stdout line (scripts can read the last line); diagnostics go to stderr. For `native`, that path is the computed location only — nothing was created there.
 
-Output: a confirmation line naming the instance and kind, then the managed directory path alone on the final stdout line (scripts can read the last line); diagnostics go to stderr.
+For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 
 `memory.dir` is an engine-reserved delivery key, never operator configuration — do not set it yourself. Any hand-set value is stripped where it matters: the engine removes it from the operator layers when resolving what applies at start, so it can be delivered only by the engine itself (when a `filesystem` backing is attached) and never lands in the persisted start snapshot as applied configuration.
 
 Attach and detach require the instance to be in a terminal state (`registered`, `stopped`, or `failed`) — a Memory Backing cannot be hot-swapped under a live agent, and there is no `--force` escape. Re-attaching the same kind is an idempotent success; attaching a different kind over an existing one is rejected until you detach.
+
+### Portability: moving an Agent Home to another machine
+
+Both backing kinds travel with the Agent Home — the attachment lives in the state database inside the state dir, and `filesystem` contents are plain files under `<home>/memory`. To move an instance to another machine:
+
+1. **Stop first.** Attach/detach aside, copy from a quiescent state: bring the instance to a terminal state (`registered`, `stopped`, or `failed`).
+2. **Copy the whole state dir**, preserving the relative layout (`state.db`, `secrets.toml` if present, and everything under `agents/`). Do not reorganize or rename anything inside it.
+3. **Open at the same relative location on the target machine** (or set `KTESIO_STATE_DIR` to the copied root).
+
+The `filesystem` memory tree arrives byte-identical and the instance runs with memory intact; the delegation recorded for a `native` backing travels too. One caveat: a state database written by a NEWER Ktesio version refuses to open on an older one with a clear schema-version error — upgrade before copying forward.
 
 ## `kt agent memory detach <name>`
 
@@ -235,6 +249,13 @@ kt agent memory detach demo
 ```
 
 Detach is metadata-only: the attachment is removed, but the managed directory **and its contents remain on disk** — your data is never silently deleted, and re-attaching later re-adopts the existing contents. The same terminal-state requirement applies as `attach`.
+
+## Memory guarantees at a glance
+
+| Kind | Ktesio guarantees | Delegated to the agent |
+| --- | --- | --- |
+| `filesystem` | The managed directory exists, its contents survive restarts byte-identically, and it travels with the Agent Home | What the agent does with the delivered path |
+| `native` | Only that the Agent Home persists | All memory semantics (storage, retrieval, lifecycle) |
 
 ## `kt agent config set <name> <key> <value>`
 

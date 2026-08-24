@@ -230,12 +230,14 @@ enum AgentCommands {
 
 #[derive(Subcommand)]
 enum MemoryCommands {
-    /// Attach a Memory Backing to an Agent Instance (creates the managed
-    /// directory inside its Agent Home; requires a terminal state — no hot-swap)
+    /// Attach a Memory Backing to an Agent Instance (requires a terminal state —
+    /// no hot-swap). `filesystem` creates the managed directory inside the Agent
+    /// Home; `native` records the delegation (Ktesio guarantees only Agent Home
+    /// persistence) and creates nothing.
     Attach {
         /// Name of the Agent Instance
         name: String,
-        /// The Memory Backing kind to attach (this release accepts: filesystem)
+        /// The Memory Backing kind to attach (accepted: filesystem, native)
         #[arg(long)]
         kind: String,
     },

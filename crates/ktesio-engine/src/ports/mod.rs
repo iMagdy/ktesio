@@ -23,7 +23,7 @@ mod secret_resolver;
 mod state_store;
 mod usage_source;
 
-pub use memory_backing::{MemoryBacking, MemoryBackingKind, MemoryBackingStatus};
+pub use memory_backing::{GuaranteeLevel, MemoryBacking, MemoryBackingKind, MemoryBackingStatus};
 
 pub(crate) use process_backend::{
     spawn_output_capture, write_stdin_bounded, LogCapture, LOG_ROTATE_GENERATIONS,
