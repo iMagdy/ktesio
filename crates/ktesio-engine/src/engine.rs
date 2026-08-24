@@ -862,8 +862,10 @@ impl Engine {
     /// hot-swap outright).
     ///
     /// REGISTRY LOCK ONLY (AD-17): unlike `start`/`stop`, this never takes the
-    /// supervisor lock — it is one bounded directory creation + one DB write,
-    /// so it cannot widen the fleet-wide stall.
+    /// supervisor lock — it is one bounded DB write plus, for a `filesystem`
+    /// backing, one bounded directory creation (a non-filesystem kind is pure
+    /// delegation metadata and creates nothing), so it cannot widen the
+    /// fleet-wide stall.
     pub async fn attach_memory(
         &self,
         name: &str,
@@ -902,10 +904,12 @@ impl Engine {
 
     /// Read an instance's Memory Backing status through the public API (story
     /// 5-1, Task 4.5): `None` when nothing is attached; otherwise the kind, the
-    /// engine-computed managed directory, and whether the adapter's declared
+    /// engine-computed managed directory, whether the adapter's declared
     /// config mapping targets the reserved key (the DC-10 delivery fact — the
-    /// path is OFFERED at every start; receiving it is the adapter's declared
-    /// choice).
+    /// path is OFFERED at every start for a `filesystem` backing; receiving it
+    /// is the adapter's declared choice; a non-filesystem backing delivers
+    /// nothing and reads `declared: false`), and the typed guarantee level
+    /// (story 5-2).
     pub async fn memory_status(
         &self,
         name: &str,

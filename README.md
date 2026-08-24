@@ -164,7 +164,7 @@ The agent runner lives under `kt agent`. Every command supports `--help`.
 | `kt agent remove <name> [--delete\|--retain] [--force]` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
 | `kt agent config set <name> <key> <value>` | Set one config key on the instance layer (validated at write time) |
 | `kt agent config get <name> [<key>] [--json] [--reveal]` | Read the effective config with per-value source (`--reveal` un-masks secrets) |
-| `kt agent memory attach <name> --kind <kind>` | Attach an engine-managed memory directory inside the Agent Home (terminal state required) |
+| `kt agent memory attach <name> --kind <kind>` | Attach a Memory Backing (`filesystem`: engine-managed directory, or `native`: delegation — terminal state required) |
 | `kt agent memory detach <name>` | Detach the backing; the managed directory and its contents remain on disk |
 
 See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys, and the [exit-code table](docs/commands.md#exit-codes) for the documented numeric codes every command returns.

@@ -734,3 +734,121 @@ fn a_native_backing_never_injects_the_reserved_key_or_creates_the_directory_at_s
     );
     facade.stop("nat", Some(Duration::from_secs(5))).unwrap();
 }
+
+// ---- Story 5-2, AC2: portability — a copied Agent Home serves memory intact ----
+
+#[test]
+fn a_copied_agent_home_serves_a_byte_identical_memory_tree_and_reports_the_backing() {
+    // THE portability proof (AC2, DC-5): the documented copy procedure is
+    // "stop first, copy the whole state dir, same relative layout" — and it
+    // must Just Work because an Agent Home is a plain tree relative to
+    // `state_base` and the backing row rides inside state.db. No copy/sync
+    // feature code exists; this test IS the proof that none is needed.
+    //
+    // Both kinds are covered: the filesystem home carries its memory/ contents
+    // BYTE-identically; the native home carries only the delegation row (and
+    // still creates no directory on machine B).
+    let state_a = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"], None);
+
+    // Machine A: register + attach BOTH kinds' instances and populate memory.
+    let engine = open(&state_a);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let fs_dir = facade
+        .attach_memory("svc", MemoryBackingKind::Filesystem)
+        .unwrap();
+    facade.start("svc").unwrap();
+    std::fs::write(fs_dir.join("notes.txt"), b"operator data v1").unwrap();
+    std::fs::create_dir_all(fs_dir.join("nested/deeper")).unwrap();
+    std::fs::write(
+        fs_dir.join("nested/deeper/blob.bin"),
+        [0xFF, 0x00, 0xFE, 0x42],
+    )
+    .unwrap();
+    let payload = snapshot_tree(&fs_dir);
+    assert_eq!(payload.len(), 2);
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+
+    facade.register("delegated", "mock").unwrap();
+    facade
+        .attach_memory("delegated", MemoryBackingKind::Native)
+        .unwrap();
+
+    // THE COPY: stop-first already held (both instances terminal); the whole
+    // state dir moves to a second root with its relative layout preserved.
+    let state_b = TempDir::new().unwrap();
+    for entry in std::fs::read_dir(state_a.path()).unwrap().flatten() {
+        let target = state_b.path().join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+
+    // Drop A BEFORE opening B so two engines never hold one SQLite file.
+    drop(engine);
+
+    // Machine B: open the copied state and verify everything traveled.
+    let engine_b = open(&state_b);
+    let facade_b = engine_b.blocking();
+
+    // The attachment rows survived inside state.db (DC-2), with their typed
+    // guarantee levels (story 5-2).
+    let fs_status = facade_b.memory_status("svc").unwrap().expect("row travels");
+    assert_eq!(fs_status.kind, MemoryBackingKind::Filesystem);
+    assert_eq!(
+        fs_status.guarantee,
+        ktesio_engine::GuaranteeLevel::ManagedDirByteDurable
+    );
+    let native_status = facade_b
+        .memory_status("delegated")
+        .unwrap()
+        .expect("row travels");
+    assert_eq!(native_status.kind, MemoryBackingKind::Native);
+    assert_eq!(
+        native_status.guarantee,
+        ktesio_engine::GuaranteeLevel::HomePersistenceOnly
+    );
+    assert!(
+        !native_status.dir.exists(),
+        "machine B must not materialize a directory for a delegation marker"
+    );
+
+    // The filesystem memory tree is BYTE-identical at the recomputed path.
+    let fs_dir_b = fs_status.dir;
+    assert_eq!(
+        snapshot_tree(&fs_dir_b),
+        payload,
+        "the copied home serves the exact bytes"
+    );
+
+    // And machine B runs the instance cleanly against the traveled memory.
+    let started = facade_b.start("svc").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+    assert_eq!(
+        snapshot_tree(&fs_dir_b),
+        payload,
+        "start leaves bytes alone"
+    );
+    facade_b.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}
+
+/// Copy a directory tree preserving relative structure (test-local helper for
+/// the portability proof; deliberately NOT shared machinery — DC-5 ships no
+/// copy feature).
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap().flatten() {
+        let target = dst.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}

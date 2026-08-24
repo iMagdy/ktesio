@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use ktesio_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, LifecycleState, LogLine, MemoryBackingKind, Micros,
-    RegistryError, RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
+    FleetEntry, FleetListing, FleetTotals, GuaranteeLevel, LifecycleState, LogLine,
+    MemoryBackingKind, Micros, RegistryError, RemoveDisposition, SupportLevel, UsageView,
+    FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
 
@@ -1669,28 +1670,34 @@ fn render_effective_config(
 }
 
 /// `kt agent memory attach <name> --kind <kind>` — attach a Memory Backing to
-/// an Agent Instance (story 5-1, FR-15, spine AD-11).
+/// an Agent Instance (story 5-1, FR-15, spine AD-11; `native` behavior is
+/// story 5-2).
 ///
 /// The instance name is validated FIRST (the shipped 4-3 M2 convention: a
 /// malformed name is a usage error, exit `2`, uniformly), then the `--kind`
-/// token against what THIS release implements (`filesystem` only — story 5-2
-/// owns `native`; an unrecognized token is the [`AgentUnknownKind`]-shaped
-/// usage error naming the accepted value). The engine does everything else
-/// through path authority: it creates the managed directory inside the Agent
-/// Home and persists the attachment; this command only displays the path the
-/// ENGINE returned (DC-1 — `kt` never joins "memory" itself). Human output only
-/// in this story (A-3/DC-6): a confirmation naming the instance, the kind, and
-/// the managed path on stdout; diagnostics on stderr (AD-12). No `--json`.
+/// token against what THIS release implements (both vocabulary kinds —
+/// `filesystem` since 5-1, `native` since 5-2; an unrecognized token is the
+/// [`AgentUnknownKind`]-shaped usage error naming the accepted values). The
+/// engine does everything else through path authority: it creates the managed
+/// directory inside the Agent Home for `filesystem` (for `native` nothing is
+/// created — the delegation is metadata) and persists the attachment; this
+/// command only displays the path the ENGINE returned (DC-1 — `kt` never joins
+/// "memory" itself). Human output only (A-3/DC-6): a confirmation naming the
+/// instance, the kind, its NFR-7 guarantee sentence, and the managed path on
+/// stdout; diagnostics on stderr (AD-12). No `--json` (story 5-2 Q-1 ratified:
+/// the wire surface is deferred to Epic 6).
 pub fn memory_attach(name: &str, kind: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the name BEFORE anything else so a malformed name exits 2
     // uniformly (never 3 via a lookup miss), per the test-pinned convention.
     validate_instance_name(name)?;
     let backing_kind = match kind {
         "filesystem" => MemoryBackingKind::Filesystem,
+        "native" => MemoryBackingKind::Native,
         other => {
             return Err(AgentUnknownKind {
                 message: format!(
-                "Unknown Memory Backing kind '{other}'. This release accepts: --kind filesystem."
+                "Unknown Memory Backing kind '{other}'. This release accepts: --kind filesystem, \
+                 --kind native."
             ),
             }
             .into())
@@ -1704,8 +1711,16 @@ pub fn memory_attach(name: &str, kind: &str) -> Result<(), Box<dyn std::error::E
                 kind,
                 ui::skill_name(name)
             ));
+            // NFR-7 boundary statement (DC-6): one sentence naming what is
+            // guaranteed versus delegated, worded once in the engine so every
+            // surface agrees.
+            println!(
+                "{}",
+                GuaranteeLevel::for_kind(backing_kind).boundary_statement()
+            );
             // Command result to stdout: the managed path, received from the
-            // engine (DC-1) — never constructed here.
+            // engine (DC-1) — never constructed here. For `native` this is the
+            // COMPUTED location only (nothing was created).
             println!("{}", dir.display());
             Ok(())
         }

@@ -90,11 +90,78 @@ pub struct MemoryBacking {
     pub attached_at: String,
 }
 
+/// The guarantee level an attached Memory Backing provides (story 5-2, Q-2
+/// ratified: a TYPED field, not a rendered string — it stays an engine-API type
+/// only until Epic 6 freezes its wire form alongside the deferred `--json`
+/// memory surface).
+///
+/// The vocabulary names what Ktesio actually stands behind for each kind
+/// (NFR-7's guarantees-vs-delegation boundary), so an operator read can state
+/// the boundary without parsing prose:
+///
+/// * [`GuaranteeLevel::ManagedDirByteDurable`] — the engine-managed directory
+///   exists (created at attach, self-healed at start) and its contents survive
+///   stop/start cycles and engine restarts byte-identically; it travels with
+///   the Agent Home.
+/// * [`GuaranteeLevel::HomePersistenceOnly`] — pure delegation: memory
+///   semantics belong to the agent's native mechanism; Ktesio guarantees only
+///   that the Agent Home itself persists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuaranteeLevel {
+    /// `filesystem`: engine-managed directory, byte-durable across restarts,
+    /// travels with the Agent Home (story 5-1's shipped behavior).
+    ManagedDirByteDurable,
+    /// `native`: delegation marker — only Agent Home persistence is
+    /// guaranteed; memory semantics belong to the agent (story 5-2).
+    HomePersistenceOnly,
+}
+
+impl GuaranteeLevel {
+    /// Snake_case wire form used in diagnostics and human output.
+    ///
+    /// Kept in lockstep with the variant set (same string discipline as
+    /// [`MemoryBackingKind::as_str`]) so a future Epic-6 wire freeze reuses it
+    /// verbatim.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GuaranteeLevel::ManagedDirByteDurable => "managed_dir_byte_durable",
+            GuaranteeLevel::HomePersistenceOnly => "home_persistence_only",
+        }
+    }
+
+    /// The one-sentence NFR-7 boundary statement for this level — THE sentence
+    /// both attach confirmations and docs render (DC-6), worded once here so
+    /// every surface says exactly the same thing.
+    pub fn boundary_statement(&self) -> &'static str {
+        match self {
+            GuaranteeLevel::ManagedDirByteDurable => {
+                "Ktesio guarantees the managed directory: it exists, survives restarts \
+                 byte-identically, and travels with the Agent Home."
+            }
+            GuaranteeLevel::HomePersistenceOnly => {
+                "Ktesio guarantees only Agent Home persistence; memory semantics belong to \
+                 the agent."
+            }
+        }
+    }
+
+    /// The level implied by a backing kind — the single mapping point between
+    /// the two vocabularies (total over the closed FR-16 set).
+    pub fn for_kind(kind: MemoryBackingKind) -> Self {
+        match kind {
+            MemoryBackingKind::Filesystem => GuaranteeLevel::ManagedDirByteDurable,
+            MemoryBackingKind::Native => GuaranteeLevel::HomePersistenceOnly,
+        }
+    }
+}
+
 /// The public read of an instance's Memory Backing (story 5-1, Task 4.5): what
-/// is attached, where the engine-managed directory lives (path authority), and
+/// is attached, where the engine-managed directory lives (path authority),
 /// the DC-10 delivery fact — whether the adapter's declared `[config]` mapping
 /// targets the reserved key, i.e. whether the injected path will actually reach
-/// the agent. Shaped for reuse by story 5-2's status/effective-config surface,
+/// the agent (a filesystem-only question; a non-filesystem backing delivers
+/// nothing, so `declared` is always `false` there) — and story 5-2's typed
+/// guarantee level. Shaped for reuse by future status surfaces,
 /// not for one call site.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryBackingStatus {
@@ -107,11 +174,20 @@ pub struct MemoryBackingStatus {
     /// Whether the instance's adapter DECLARES a config mapping for the reserved
     /// key ([`crate::domain::MEMORY_DIR_KEY`]) — the Q-1 honesty rule: delivery
     /// is offered, not imposed, and an operator must be able to learn which it
-    /// is. `false` means the start still succeeds but the agent will NOT receive
-    /// the path (a stderr notice says so at start). Named for what it reports —
-    /// a declared TARGET, not proof of runtime receipt (the agent may ignore the
-    /// delivered value; only story 5-2's richer status could observe that).
+    /// is. For a `filesystem` backing, `false` means the start still succeeds
+    /// but the agent will NOT receive the path (a stderr notice says so at
+    /// start). For a NON-filesystem backing it is always `false`: nothing is
+    /// delivered at all, so there is no delivery to declare (never read it as a
+    /// promise or a decline — see the struct docs). Named for what it reports —
+    /// a declared TARGET, not proof of runtime receipt (the agent may ignore
+    /// the delivered value; only a richer status surface could observe that).
     pub declared: bool,
+    /// The guarantee level this backing provides (story 5-2, Q-2 ratified typed
+    /// field) — the machine-readable form of the NFR-7 boundary. Derived from
+    /// the kind via [`GuaranteeLevel::for_kind`]; kept as its own field so
+    /// Epic 6's wire freeze has a stable key and richer future kinds can map
+    /// differently.
+    pub guarantee: GuaranteeLevel,
 }
 
 #[cfg(test)]
@@ -133,5 +209,48 @@ mod tests {
         assert_eq!(MemoryBackingKind::from_wire("bogus"), None);
         assert_eq!(MemoryBackingKind::from_wire(""), None);
         assert_eq!(MemoryBackingKind::from_wire("Filesystem"), None);
+    }
+
+    #[test]
+    fn guarantee_level_maps_every_kind_and_round_trips_its_str() {
+        // The kind→level mapping is total over the closed FR-16 vocabulary and
+        // each level's wire form round-trips (same discipline as the kind).
+        let all = [MemoryBackingKind::Filesystem, MemoryBackingKind::Native];
+        for kind in all {
+            let level = GuaranteeLevel::for_kind(kind);
+            assert_eq!(
+                GuaranteeLevel::for_kind(kind),
+                level,
+                "the mapping must be pure"
+            );
+            assert!(!level.as_str().is_empty());
+            assert!(!level.boundary_statement().is_empty());
+            assert!(level.boundary_statement().ends_with('.'));
+        }
+        assert_eq!(
+            GuaranteeLevel::for_kind(MemoryBackingKind::Filesystem),
+            GuaranteeLevel::ManagedDirByteDurable
+        );
+        assert_eq!(
+            GuaranteeLevel::for_kind(MemoryBackingKind::Native),
+            GuaranteeLevel::HomePersistenceOnly
+        );
+        assert_ne!(
+            GuaranteeLevel::ManagedDirByteDurable,
+            GuaranteeLevel::HomePersistenceOnly
+        );
+    }
+
+    #[test]
+    fn boundary_statements_name_the_boundary_distinctly() {
+        // NFR-7 wording pins: the filesystem sentence promises the managed
+        // directory; the native sentence delegates and names Agent Home
+        // persistence as ALL Ktesio guarantees.
+        let fs = GuaranteeLevel::ManagedDirByteDurable.boundary_statement();
+        assert!(fs.contains("managed directory"));
+        assert!(fs.contains("byte-identically"));
+        let native = GuaranteeLevel::HomePersistenceOnly.boundary_statement();
+        assert!(native.contains("only Agent Home persistence"));
+        assert!(native.contains("belong to the agent"));
     }
 }

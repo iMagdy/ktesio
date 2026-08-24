@@ -21,8 +21,8 @@ use ktesio_adapter_api::{
 use crate::adapter::{self, AdapterRef, ResolvedAdapter, StartLaunch};
 use crate::paths::EnginePaths;
 use crate::ports::{
-    CompositeSecretResolver, MemoryBacking, MemoryBackingKind, MemoryBackingStatus, SecretError,
-    SpawnRecord, StateStore, StoreError,
+    CompositeSecretResolver, GuaranteeLevel, MemoryBacking, MemoryBackingKind, MemoryBackingStatus,
+    SecretError, SpawnRecord, StateStore, StoreError,
 };
 use crate::store::SqliteStore;
 use crate::time::now_rfc3339;
@@ -687,15 +687,21 @@ impl Registry {
 
     /// Read the instance's Memory Backing through the public API (story 5-1,
     /// Task 4.5): `None` when nothing is attached; otherwise the kind, the
-    /// engine-computed managed directory, and the DC-10 delivery fact — whether
+    /// engine-computed managed directory, the DC-10 delivery fact — whether
     /// the adapter's declared `[config]` mapping targets the reserved key, i.e.
     /// whether the injected path will actually reach the agent (Q-1 honesty
-    /// rule). Shaped for reuse by story 5-2's status surface.
+    /// rule) — and story 5-2's typed guarantee level. Shaped for reuse by
+    /// future status surfaces.
     ///
     /// Computing the delivery fact resolves the adapter's declared mapping (from
     /// the persisted snapshot facts — no manifest re-parse beyond what the start
     /// path itself does). A corrupt/unreadable home surfaces as
     /// [`RegistryError::Io`], exactly like every other snapshot read.
+    ///
+    /// For a NON-`filesystem` kind nothing is ever delivered at start, so the
+    /// resolution is SKIPPED and `declared` reads `false` honestly: not "the
+    /// adapter declined", but "no delivery is offered to decline" (story 5-2,
+    /// DC-2 — `declared` must never read as a promise for a native backing).
     pub fn memory_status(&self, name: &str) -> Result<Option<MemoryBackingStatus>, RegistryError> {
         let name = InstanceName::new(name).map_err(|reason| RegistryError::InvalidName {
             name: name.to_string(),
@@ -709,11 +715,16 @@ impl Registry {
         };
 
         let dir = self.paths.agent_memory_dir(&name);
-        let declared = self.memory_key_declared(&name)?;
+        let declared = if backing.kind == MemoryBackingKind::Filesystem {
+            self.memory_key_declared(&name)?
+        } else {
+            false
+        };
         Ok(Some(MemoryBackingStatus {
             kind: backing.kind,
             dir,
             declared,
+            guarantee: GuaranteeLevel::for_kind(backing.kind),
         }))
     }
 
@@ -2987,6 +2998,80 @@ source = "self-reported"
         assert_eq!(
             reg.memory_status("demo").unwrap().unwrap().kind,
             MemoryBackingKind::Filesystem
+        );
+    }
+
+    #[test]
+    fn native_attach_persists_the_row_without_a_directory_and_status_reports_delegation() {
+        // Story 5-2, AC1 + DC-1/DC-2: the registry round-trip for `native` —
+        // metadata only. The row persists (visible on the public read), NO
+        // managed directory is created (the delegation marker is not a
+        // directory), `declared` reads FALSE honestly (nothing is delivered, so
+        // there is no mapping fact to resolve), and the typed guarantee level
+        // names the delegation boundary.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+
+        let dir = reg
+            .attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap();
+        assert!(!dir.exists(), "native attaches metadata, never a directory");
+
+        let status = reg.memory_status("demo").unwrap().unwrap();
+        assert_eq!(status.kind, MemoryBackingKind::Native);
+        assert_eq!(status.dir, dir);
+        assert!(
+            !dir.exists(),
+            "memory_status must not materialize anything for native"
+        );
+        assert!(
+            !status.declared,
+            "nothing is delivered for native — declared must not read as a promise"
+        );
+        assert_eq!(
+            status.guarantee,
+            crate::ports::GuaranteeLevel::HomePersistenceOnly
+        );
+
+        // The filesystem contrast on the SAME surface: same struct, opposite
+        // guarantee + a resolved delivery fact.
+        let (_tmp2, reg2) = open_temp();
+        reg2.register("fs", "mock").unwrap();
+        let fs_dir = reg2
+            .attach_memory("fs", MemoryBackingKind::Filesystem)
+            .unwrap();
+        assert!(fs_dir.is_dir());
+        let fs_status = reg2.memory_status("fs").unwrap().unwrap();
+        assert!(fs_status.declared);
+        assert_eq!(
+            fs_status.guarantee,
+            crate::ports::GuaranteeLevel::ManagedDirByteDurable
+        );
+    }
+
+    #[test]
+    fn native_idempotent_re_attach_stays_metadata_only() {
+        // Same-kind re-attach for native: idempotent success, row untouched,
+        // and STILL no directory (the filesystem self-heal branch must not
+        // leak into the native path).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        reg.attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap();
+        let before = reg
+            .store
+            .get_memory_backing(&InstanceName::new("demo").unwrap())
+            .unwrap();
+        let again = reg
+            .attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap();
+        assert!(!again.exists(), "re-attach of native creates no directory");
+        assert_eq!(
+            reg.store
+                .get_memory_backing(&InstanceName::new("demo").unwrap())
+                .unwrap(),
+            before,
+            "re-attach must not rewrite the row"
         );
     }
 
