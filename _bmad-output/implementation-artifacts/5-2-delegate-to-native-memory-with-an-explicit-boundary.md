@@ -5,7 +5,7 @@ baseline_ref: origin/main (PR #138 merged — "feat(engine): attach a managed fi
 
 # Story 5.2: Delegate to native memory with an explicit boundary
 
-Status: ready-for-dev
+Status: ready-for-dev → in-progress (dev started 2026-08-24; rulings ratified)
 
 <!-- Context engineered 2026-08-24 (headless BMAD run). Ground truth verified against `origin/main` @ ff1f669, which already carries story 5-1's Memory Backing surface: the `native` vocabulary variant (`ports/memory_backing.rs`), the attach/detach/status surface, SCHEMA_V5 persistence, and the DC-10 honesty machinery. This story ADDS BEHAVIOR to an existing enum variant — no schema or enum-shape break is needed by design. -->
 
@@ -39,10 +39,10 @@ Verbatim from `_bmad-output/planning-artifacts/epics.md` lines 510–523 (Story 
 - **DC-6 (boundary stated in command output — NFR-7).** Attach confirmation for BOTH kinds names its guarantee level in one sentence: filesystem → managed-directory guarantee (exists, survives restarts byte-identically, travels with the home); native → "Ktesio guarantees only Agent Home persistence; memory semantics belong to the agent." Docs updated in the same change (`docs/commands.md` memory sections + README table row wording), per the standing docs-currency gate.
 - **DC-7 (frozen contracts respected).** No new exit codes (attach-native success → 0; guards → existing 4; unknown kind → 2 — the classifier arms from 5‑1 cover both diagnostics already). No `#[cfg]` gates outside `backends/`. No test sleeps; poll committed state (existing conventions).
 
-## Open questions for Islam (ratify BEFORE dev — none block context engineering)
+## Ratified decisions (Islam, 2026-08-24)
 
-- **Q-1:** status/--json scope. 5‑1 deferred any `--json` memory surface to "5-2 together with `native`, as ONE intentional announced key-set edit" (its DC-6). Options: (a) ship `kt agent memory status` (or fold into `show --json`) WITH a frozen JSON doc this story, or (b) keep human output only and defer the wire freeze to Epic 6 when Hermes forces real consumers. AC1 only demands "recorded and visible" — human-visible satisfies it literally.
-- **Q-2:** the `GuaranteeLevel` typed field vs a rendered statement string on `MemoryBackingStatus` (DC-2) — typed survives Epic 6 freezing better; string is zero-shape-risk.
+- **Q-1 → DEFER (option b).** Keep human output only in 5.2; no `--json` memory surface ships, and the wire-format freeze moves to Epic 6 where Hermes' real consumers force the shape. AC1 is satisfied by the human-visible delegation statement (DC-2/DC-6). The "ONE intentional announced key-set edit" from 5‑1's DC-6 is therefore ALSO deferred with it — recorded here so Epic 6 inherits the obligation.
+- **Q-2 → TYPED FIELD.** `MemoryBackingStatus` gains a typed `guarantee: GuaranteeLevel` enum (`HomePersistenceOnly`, `ManagedDirByteDurable`) rather than a rendered string. It stays an engine-API type only for now (no serde/wire exposure per Q-1); Epic 6 freezes its wire form when JSON lands.
 
 ## Tasks / Subtasks (dependency-ordered; each names its AC/DC)
 
