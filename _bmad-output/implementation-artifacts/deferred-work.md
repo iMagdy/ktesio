@@ -25,3 +25,8 @@ Findings surfaced incidentally during quick-dev reviews that are out of scope fo
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Integration test helpers (fake-manifest writer, dump polling, tree snapshotting in tests/memory.rs) duplicate shapes already living in sibling integration files rather than a shared test-support utility.
   evidence: Same pattern grew per-file across registration/lifecycle/pause/interaction/logs/metering; each story copied the smallest shape it needed. Cost compounds across Epics 6–7 when manifest fixtures evolve (e.g. contract_version bumps touch N copies). Candidate: a `tests/support/` module (or `ktesio-conformance` test-fixture exports) once Epic 6's conformance kit forces the shape anyway.
+
+## Deferred from: code review of 5-2-delegate-to-native-memory-with-an-explicit-boundary (2026-08-24)
+
+- DC-3 detach/status wording not extended to name the delegation sentence — deferred to Epic 6's status surface: detach is kind-blind metadata removal and the story's ratified human surface is attach-only (NFR-7 sentences live in attach confirmations + docs).
+- Reverse conflict direction (filesystem requested over an attached native backing) untested at both registry and CLI layers — one symmetric `!=` comparison; forward direction (native over filesystem) is covered at both. Candidate: a symmetry test with AI-63(b) work.

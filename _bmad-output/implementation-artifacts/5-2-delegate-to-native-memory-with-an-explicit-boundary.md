@@ -66,3 +66,16 @@ Verbatim from `_bmad-output/planning-artifacts/epics.md` lines 510–523 (Story 
 - Start-path non-injection for native is already implemented AND tested (`supervisor.rs` filters on `Filesystem`; `tests/memory.rs::a_native_backing_never_injects…`). Do not regress it.
 - Deferred-work items from 5‑1 (TOCTOU attach-vs-start, migration crash-atomicity, store-vs-registry idempotence split, shared test-support module) stay OUT of this story — they belong to AI-63(b)/focused follow-ups. Do not widen scope.
 - Story 5-1 artifact (`5-1-attach-a-managed-filesystem-memory-backing.md`, Status: done) is the authoritative record of the shipped design decisions this story builds on (Q-1 ruling: mapping-declared-only delivery; A-8: the module IS the port).
+
+### Review Findings
+
+<!-- BMAD review 2026-08-24 over ff1f669..f854544. NOTE: all three configured
+     review subagents (blind-hunter / edge-case-hunter / verification-gap)
+     returned empty responses after six launch attempts across three launch
+     modes, so the lenses were executed inline by the parent reviewer instead
+     — same diff scope, documented deviation. -->
+
+- [x] [Review][Patch] `MemoryBackingStatus::declared` doc contradicts native semantics [crates/ktesio-engine/src/ports/memory_backing.rs:171-179, 160-164] — FIXED 2026-08-24: field doc now distinguishes filesystem (`false` = adapter will not receive) from non-filesystem (`false` = nothing is offered); struct doc notes the delivery fact is a filesystem-only question.
+- [x] [Review][Patch] Engine facade docs still say attach creates the managed directory unconditionally [crates/ktesio-engine/src/engine.rs:~855-870] — FIXED 2026-08-24: `attach_memory` doc now scopes the directory creation to `filesystem` (non-filesystem = pure delegation metadata); `Engine::memory_status` doc covers the native `declared: false` semantics + the typed guarantee.
+- [ ] [Review][Defer] DC-3 detach/status wording not extended to name the delegation sentence [crates/kt/src/cli/agent.rs memory_detach; docs/commands.md detach section] — deferred to Epic 6's status surface: detach is kind-blind metadata removal and the story's ratified human surface is attach-only.
+- [x] [Review][Defer] Reverse conflict direction (filesystem requested over attached native) untested at both layers [registry.rs attaching_a_different_kind_over_an_existing_one_is_rejected; agent_cli.rs] — deferred to AI-63(b)/symmetry follow-up: guard is one symmetric `!=` comparison, forward direction covered at both layers.
