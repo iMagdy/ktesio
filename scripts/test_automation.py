@@ -323,6 +323,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/ktesio-engine/src/backends/", ci)
+        # OS-cfg allowlist covers honestly-unix-gated engine integration tests
+        # (AI-35 disclosure convention) alongside the backends home.
+        self.assertIn("^crates/ktesio-engine/tests/", ci)
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
         # It scans for the BROADENED set of dollar-string-building forms (`${`, `$ {`,
         # `}$`, a `"$`-prefixed string, and a bare `'$'` char) and allowlists the

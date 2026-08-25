@@ -278,9 +278,12 @@ jobs:
           # Allowlist: engine backends (the convention home, spine AD-4) plus
           # two pre-existing v0.5.0 legacy CLI files (self-update platform
           # detection) grandfathered until epic 8 relocates/deprecates them
-          # (AC-4 amendment, ratified 2026-07-02). No NEW OS-conditional
-          # code may appear anywhere else.
-          allowlist='^crates/ktesio-engine/src/backends/|^crates/kt/src/update_check\.rs:|^crates/kt/src/cli/self_update\.rs:'
+          # (AC-4 amendment, ratified 2026-07-02), plus engine integration
+          # TESTS: symlink containment (memory.rs, story 5-1) and adoption
+          # process-spawning suites are honestly unix-gated there under the
+          # AI-35 disclosure convention ("the test does not exist on Windows"
+          # rather than passing vacuously); no production code may use cfg.
+          allowlist='^crates/ktesio-engine/src/backends/|^crates/kt/src/update_check\.rs:|^crates/kt/src/cli/self_update\.rs:|^crates/ktesio-engine/tests/'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -298,7 +301,7 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/ktesio-engine/src/backends/ (legacy kt self-update files are grandfathered until epic 8)."
+            echo "::error::OS-conditional cfg is allowed only under crates/ktesio-engine/src/backends/ and crates/ktesio-engine/tests/ (legacy kt self-update files are grandfathered until epic 8)."
             exit 1
           fi
           echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
