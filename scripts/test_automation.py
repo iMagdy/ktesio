@@ -319,7 +319,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo +stable check -p ktesio", ci)
         self.assertIn("cargo +stable tree -p ktesio -e normal,build --all-features", ci)
         # Boundary gate is an allowlist: only these internal edges may exist.
-        self.assertIn("ktesio-(engine|adapter-api)", ci)
+        self.assertIn("ktesio-(engine|adapter-api|adapters-hermes)", ci)
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/ktesio-engine/src/backends/", ci)
