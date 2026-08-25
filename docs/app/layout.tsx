@@ -11,7 +11,7 @@ export const metadata: Metadata = {
   openGraph: {
     description:
       'Developer documentation for Ktesio, a Rust CLI for installing and sharing reusable agent skills.',
-    images: ['/assets/ktesio-banner.jpg'],
+    images: ['/assets/ktesio-banner.png'],
     siteName: 'Ktesio Docs',
     title: 'Ktesio Docs',
     type: 'website',
