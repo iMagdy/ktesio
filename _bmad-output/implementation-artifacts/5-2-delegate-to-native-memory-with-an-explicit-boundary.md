@@ -5,7 +5,7 @@ baseline_ref: origin/main (PR #138 merged — "feat(engine): attach a managed fi
 
 # Story 5.2: Delegate to native memory with an explicit boundary
 
-Status: done — MERGED to main 2026-08-24 as e0e9f6c (PR #139, squash; issue #83 closed). Implemented 67f3be9, BMAD review passed with 2 doc patches 863e08b (0 decision-needed, 2 defer).
+Status: done (implemented 67f3be9, BMAD review passed 2026-08-24 with 2 doc patches 863e08b; 0 decision-needed, 2 defer)
 
 <!-- Context engineered 2026-08-24 (headless BMAD run). Ground truth verified against `origin/main` @ ff1f669, which already carries story 5-1's Memory Backing surface: the `native` vocabulary variant (`ports/memory_backing.rs`), the attach/detach/status surface, SCHEMA_V5 persistence, and the DC-10 honesty machinery. This story ADDS BEHAVIOR to an existing enum variant — no schema or enum-shape break is needed by design. -->
 
