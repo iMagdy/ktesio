@@ -244,8 +244,8 @@ jobs:
           tree="$(cargo +stable tree -p ktesio -e normal,build --all-features)"
           echo "$tree"
           # Allowlist, not blocklist: any internal ktesio-* edge other than
-          # ktesio-engine / ktesio-adapter-api fails, so future internal
-          # crates are caught automatically.
+          # ktesio-engine / ktesio-adapter-api / ktesio-adapters-hermes fails,
+          # so future internal crates are caught automatically.
           scan_status=0
           edges="$(printf '%s\n' "$tree" | grep -oE 'ktesio-[a-z0-9_-]+' | sort -u)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -255,7 +255,7 @@ jobs:
           violations=''
           if [ -n "$edges" ]; then
             filter_status=0
-            violations="$(printf '%s\n' "$edges" | grep -Evx 'ktesio-(engine|adapter-api)')" || filter_status=$?
+            violations="$(printf '%s\n' "$edges" | grep -Evx 'ktesio-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
             if [ "$filter_status" -ge 2 ]; then
               echo "::error::grep exited ${filter_status} while applying the internal-crate allowlist."
               exit "$filter_status"
@@ -263,10 +263,10 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::kt may depend only on ktesio-engine (plus ktesio-adapter-api types); forbidden internal crate edge found."
+            echo "::error::kt may depend only on ktesio-engine (plus ktesio-adapter-api types and the ktesio-adapters-hermes builtin); forbidden internal crate edge found."
             exit 1
           fi
-          echo "Boundary gate green: internal edges are exactly the allowlisted ktesio-engine / ktesio-adapter-api."
+          echo "Boundary gate green: internal edges are exactly the allowlisted ktesio-engine / ktesio-adapter-api / ktesio-adapters-hermes."
       - name: Enforce OS-conditional code location (engine backends only)
         shell: bash
         run: |
@@ -608,12 +608,12 @@ jobs:
               -p "$pkg" --out Lcov --output-dir "cov/$pkg"
             echo "::endgroup::"
           done
-          # Merge the per-crate tracefiles into the workspace aggregate. `hermes`
-          # is a doc-only stub today (0 coverable lines, no tracefile) -- the ONLY
-          # crate allowed to skip the merge with no lcov.info; it lights up
-          # automatically once epic 6 gives it code. --ignore-errors inconsistent:
-          # tolerate lcov 2.x's benign cross-run FN-start-line drift (line data is
-          # unaffected).
+          # Merge the per-crate tracefiles into the workspace aggregate. The
+          # `hermes` crate is a tiny mapping-only lib (no coverable logic of its
+          # own) -- it may legitimately produce no lcov.info; it is the ONLY crate
+          # allowed to skip the merge with no lcov.info. --ignore-errors
+          # inconsistent: tolerate lcov 2.x's benign cross-run FN-start-line drift
+          # (line data is unaffected).
           #
           # PR #117 fix pass: this used to skip ANY crate with no lcov.info, not
           # just hermes. That silently swallowed a real failure mode -- when a
@@ -634,7 +634,7 @@ jobs:
             if [ -s "cov/$pkg/lcov.info" ]; then
               add_args="$add_args -a cov/$pkg/lcov.info"
             elif [ "$pkg" = "ktesio-adapters-hermes" ]; then
-              echo "::notice::no coverable lines for $pkg (expected for the doc-only stub); skipping in merge."
+              echo "::notice::no coverable lines for $pkg (expected for the mapping-only hermes lib); skipping in merge."
             else
               echo "::error::$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed (a crashed/failed test suite, not a legitimately-empty crate). Failing the coverage gate rather than silently merging a partial, misleading aggregate."
               exit 1

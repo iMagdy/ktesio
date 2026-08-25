@@ -261,6 +261,7 @@ pub fn fake_agent_bin() -> std::path::PathBuf {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let status = std::process::Command::new(cargo)
         .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
+        .env_remove("RUSTC_WRAPPER") // a shimmed PATH must not break the build
         .status();
     match status {
         Ok(s) if s.success() && candidate.exists() => candidate,

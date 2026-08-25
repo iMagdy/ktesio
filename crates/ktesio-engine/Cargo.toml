@@ -13,6 +13,10 @@ publish = false
 
 [dependencies]
 ktesio-adapter-api = { workspace = true }
+# The builtin native-adapter table (AD-3) carries the launchable `hermes`
+# adapter (story 6-2). kt itself still depends only on engine + adapter-api
+# (the AD-2 boundary gate's allowlist covers this edge).
+ktesio-adapters-hermes = { workspace = true }
 # State store (AD-6): rusqlite with bundled SQLite (WAL, synchronous=NORMAL,
 # foreign_keys=ON). No system SQLite dependency; first build compiles it.
 rusqlite = { workspace = true }
