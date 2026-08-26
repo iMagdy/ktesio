@@ -21,12 +21,12 @@ kt agent register my-agent --manifest ./my-agent
 Arguments and options:
 
 - `<name>` — Fleet-unique instance name matching `^[a-z0-9][a-z0-9_-]*$`.
-- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`). Mutually exclusive with `--manifest`.
+- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`, `hermes`). Mutually exclusive with `--manifest`.
 - `--manifest <path>` — a manifest adapter loaded from a directory (or an `adapter.toml` file). Mutually exclusive with `--kind`.
 
 Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
 
-The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process.
+The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
 
 ## `kt agent list [--json]`
 

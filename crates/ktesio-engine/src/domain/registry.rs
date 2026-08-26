@@ -780,11 +780,13 @@ impl Registry {
     /// The snapshotted launch is the supervisor's PRIMARY start-spec source —
     /// using it removes the fragile start-time manifest re-read (a hosted-runner
     /// filesystem quirk returned empty `args` on re-read, so the agent spawned
-    /// with no args). It is `None` for a native adapter (no launch command) OR a
-    /// snapshot written before the launch was persisted; in that case the
-    /// supervisor falls back to [`crate::adapter::resolve_start_launch`] using the
-    /// kind + manifest path (which keeps erroring `NativeHasNoLaunch` for a
-    /// native adapter, and re-reads the manifest for a legacy snapshot).
+    /// with no args). It is `None` for an inert native adapter (`mock` — no
+    /// launch command) OR a snapshot written before the launch was persisted;
+    /// in that case the supervisor falls back to
+    /// [`crate::adapter::resolve_start_launch`] using the kind + manifest path
+    /// (which resolves a launchable native builtin's code-declared launch since
+    /// story 6-2, keeps erroring `NativeHasNoLaunch` for inert natives like
+    /// `mock`, and re-reads the manifest for a legacy snapshot).
     pub(crate) fn adapter_launch_facts(
         &self,
         name: &InstanceName,
