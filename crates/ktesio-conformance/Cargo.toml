@@ -14,5 +14,10 @@ publish = false
 [dependencies]
 ktesio-adapter-api = { workspace = true }
 
+# Story 6-2: the `hermes_shim` PATH-shim bin re-execs the fake_agent fixture.
+[[bin]]
+name = "hermes_shim"
+path = "src/bin/hermes_shim.rs"
+
 [lints]
 workspace = true

@@ -26,7 +26,9 @@ use crate::domain::{
     cost_micros, AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome,
     RestartPolicy, RunId, UsageEvent, UsageTotals,
 };
-use crate::ports::{ProcessFingerprint, SpawnRecord, StateStore, StoreError};
+use crate::ports::{
+    MemoryBacking, MemoryBackingKind, ProcessFingerprint, SpawnRecord, StateStore, StoreError,
+};
 
 /// Current schema version applied by this build.
 ///
@@ -37,8 +39,11 @@ use crate::ports::{ProcessFingerprint, SpawnRecord, StateStore, StoreError};
 /// per-event effective-Rate columns (`input_micros_per_1m`/`output_micros_per_1m`)
 /// so historical dollars keep the Rate in force when consumed — no retroactive
 /// repricing (AC-A). A NULL rate means "no Rate configured at commit" → that event
-/// contributes $0 to the derived cost.
-const SCHEMA_VERSION: i64 = 4;
+/// contributes $0 to the derived cost. v5 (story 5-1, AD-11): the
+/// `agent_memory_backing` table — one Memory Backing attachment row per instance
+/// as TYPED columns (never a JSON blob, DC-2), UNIQUE on the instance FK with
+/// `ON DELETE CASCADE`.
+const SCHEMA_VERSION: i64 = 5;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -124,6 +129,26 @@ CREATE UNIQUE INDEX idx_usage_events_dedup
 const SCHEMA_V4: &str = "\
 ALTER TABLE usage_events ADD COLUMN input_micros_per_1m INTEGER;
 ALTER TABLE usage_events ADD COLUMN output_micros_per_1m INTEGER;
+";
+
+/// Schema v5 DDL (story 5-1): the Memory Backing attachment table (spine
+/// AD-11/AD-6).
+///
+/// ADDITIVE: one new table, no existing column touched, so v1..v4 → v5 preserves
+/// every row. `agent_runtime` (`SCHEMA_V2`) is the exact structural precedent —
+/// one row per instance, UNIQUE FK, cascade. The attachment is METADATA only
+/// (kind + when); the managed directory itself is a FILE inside the Agent Home
+/// (AD-6 "memory dirs … are files inside the Agent Home — never blobs in the
+/// DB"), and its CONTENTS are operator data the engine never copies or deletes.
+/// `ON DELETE CASCADE` + `foreign_keys=ON` (set per-connection in `configure`)
+/// makes removing an instance drop its attachment automatically.
+const SCHEMA_V5: &str = "\
+CREATE TABLE agent_memory_backing (
+    id           INTEGER PRIMARY KEY,
+    instance_id  INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    attached_at  TEXT NOT NULL
+);
 ";
 
 /// A SQLite-backed state store over a single connection.
@@ -256,6 +281,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 4 {
         conn.execute_batch(SCHEMA_V4).map_err(backend)?;
+    }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5).map_err(backend)?;
     }
 
     if version < SCHEMA_VERSION {
@@ -826,6 +854,60 @@ impl StateStore for SqliteStore {
             .map_err(backend)?;
         Ok(())
     }
+
+    // ---- Memory Backing attachments (story 5-1, AD-11/AD-6) ----
+
+    fn upsert_memory_backing(&self, backing: &MemoryBacking) -> Result<(), StoreError> {
+        // Resolve the instance row id (the FK). An absent instance is NotFound.
+        let id = self
+            .instance_id(&backing.name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: backing.name.as_str().to_string(),
+            })?;
+        // Insert-or-replace on the UNIQUE instance_id, in one statement (AD-6:
+        // one transaction per mutation). Exactly ONE backing per instance.
+        self.conn
+            .execute(
+                "INSERT INTO agent_memory_backing (instance_id, kind, attached_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(instance_id) DO UPDATE SET \
+                 kind = excluded.kind, attached_at = excluded.attached_at",
+                rusqlite::params![id, backing.kind.as_str(), backing.attached_at],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn clear_memory_backing(&self, name: &InstanceName) -> Result<(), StoreError> {
+        // Idempotent: clearing an absent attachment (or an absent instance) is
+        // success — the desired end state (no attachment) already holds. This is
+        // METADATA only: the managed directory on disk is never touched here.
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(());
+        };
+        self.conn
+            .execute(
+                "DELETE FROM agent_memory_backing WHERE instance_id = ?1",
+                [id],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn get_memory_backing(&self, name: &InstanceName) -> Result<Option<MemoryBacking>, StoreError> {
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(None);
+        };
+        self.conn
+            .query_row(
+                "SELECT kind, attached_at FROM agent_memory_backing WHERE instance_id = ?1",
+                [id],
+                |row| Ok(row_to_memory_backing(name.clone(), row)),
+            )
+            .optional()
+            .map_err(backend)?
+            .transpose()
+    }
 }
 
 /// Build a [`SpawnRecord`] from a result row (the `pid, start_time,
@@ -851,6 +933,25 @@ fn row_to_spawn_record(
         restart_policy,
         restart_count: restart_count.max(0) as u32,
         last_known_cause,
+    })
+}
+
+/// Build a [`MemoryBacking`] from a result row (the `kind, attached_at` columns),
+/// decoding the kind wire form (story 5-1).
+fn row_to_memory_backing(
+    name: InstanceName,
+    row: &rusqlite::Row<'_>,
+) -> Result<MemoryBacking, StoreError> {
+    let kind_raw: String = row.get("kind").map_err(backend)?;
+    let attached_at: String = row.get("attached_at").map_err(backend)?;
+    let kind = MemoryBackingKind::from_wire(&kind_raw).ok_or_else(|| StoreError::CorruptRow {
+        name: name.as_str().to_string(),
+        detail: format!("unknown memory backing kind '{kind_raw}'"),
+    })?;
+    Ok(MemoryBacking {
+        name,
+        kind,
+        attached_at,
     })
 }
 
@@ -2081,5 +2182,192 @@ mod tests {
                 .unwrap(),
             Micros::ZERO
         );
+    }
+
+    // ---- Story 5-1: the Memory Backing attachment table (AD-11/AD-6) ----
+
+    fn backing(n: &str, kind: MemoryBackingKind, at: &str) -> MemoryBacking {
+        MemoryBacking {
+            name: name(n),
+            kind,
+            attached_at: at.to_string(),
+        }
+    }
+
+    #[test]
+    fn migration_v4_db_upgrades_to_v5_preserving_rows() {
+        // Task 3.4: a DB written at schema v4 (no agent_memory_backing table)
+        // upgrades to v5 on open — the step migration ADDS the table WITHOUT
+        // dropping pre-existing instances/usage rows. Mirrors the v3→v4 test.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch("PRAGMA user_version = 4").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO usage_events \
+                 (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, sequence) \
+                 VALUES (?1, 'run-old', 10, 20, 'self-reported', '2026-07-06T00:00:00Z', 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Reopen: migrator steps 4 → 5; user_version == 5 and every prior row survives.
+        let store = SqliteStore::open(&db).unwrap();
+        // PINNED LITERAL (AI-66 #5): assert the actual version, never the
+        // constant the migrator stamps from — comparing to SCHEMA_VERSION would
+        // pass even if the stamp and the constant drifted together.
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        assert!(store.get_instance(&name("legacy")).unwrap().is_some());
+        assert_eq!(
+            store.usage_totals(&name("legacy")).unwrap(),
+            UsageTotals {
+                input_tokens: 10,
+                output_tokens: 20,
+            }
+        );
+        // The new table exists and is usable on the migrated DB.
+        store
+            .upsert_memory_backing(&backing("legacy", MemoryBackingKind::Filesystem, "t"))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_memory_backing(&name("legacy"))
+                .unwrap()
+                .map(|b| b.kind),
+            Some(MemoryBackingKind::Filesystem)
+        );
+    }
+
+    #[test]
+    fn memory_backing_round_trips_and_clears_idempotently() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        assert!(store.get_memory_backing(&name("demo")).unwrap().is_none());
+
+        let attached = backing(
+            "demo",
+            MemoryBackingKind::Filesystem,
+            "2026-07-30T00:00:00Z",
+        );
+        store.upsert_memory_backing(&attached).unwrap();
+        assert_eq!(
+            store.get_memory_backing(&name("demo")).unwrap(),
+            Some(attached)
+        );
+
+        store.clear_memory_backing(&name("demo")).unwrap();
+        assert!(store.get_memory_backing(&name("demo")).unwrap().is_none());
+        // Clearing an absent attachment is idempotent success.
+        store.clear_memory_backing(&name("demo")).unwrap();
+    }
+
+    #[test]
+    fn upsert_memory_backing_replaces_the_row_on_re_attach() {
+        // UNIQUE(instance_id): a re-attach REPLACES kind + timestamp (exactly one row).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_memory_backing(&backing(
+                "demo",
+                MemoryBackingKind::Filesystem,
+                "2026-07-30T00:00:00Z",
+            ))
+            .unwrap();
+        store
+            .upsert_memory_backing(&backing(
+                "demo",
+                MemoryBackingKind::Native,
+                "2026-08-01T00:00:00Z",
+            ))
+            .unwrap();
+        let got = store.get_memory_backing(&name("demo")).unwrap().unwrap();
+        assert_eq!(got.kind, MemoryBackingKind::Native);
+        assert_eq!(got.attached_at, "2026-08-01T00:00:00Z");
+    }
+
+    #[test]
+    fn upsert_memory_backing_for_missing_instance_is_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .upsert_memory_backing(&backing("ghost", MemoryBackingKind::Filesystem, "t"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn corrupt_memory_kind_row_is_reported() {
+        // A stored kind the domain cannot decode is flagged CorruptRow on read.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let id = store.instance_id(&name("demo")).unwrap().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_memory_backing (instance_id, kind, attached_at) \
+                 VALUES (?1, 'teleporting', '2026-07-30T00:00:00Z')",
+                [id],
+            )
+            .unwrap();
+        let err = store.get_memory_backing(&name("demo")).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::CorruptRow { name, detail }
+                if name == "demo" && detail.contains("teleporting")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn memory_backing_cascades_on_instance_delete() {
+        // Removing the instance drops its attachment row (FK ON DELETE CASCADE +
+        // foreign_keys=ON from configure — asserted here, never assumed).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_memory_backing(&backing(
+                "demo",
+                MemoryBackingKind::Filesystem,
+                "2026-07-30T00:00:00Z",
+            ))
+            .unwrap();
+        store.delete_instance(&name("demo")).unwrap();
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_memory_backing", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "attachment row must cascade-delete");
     }
 }

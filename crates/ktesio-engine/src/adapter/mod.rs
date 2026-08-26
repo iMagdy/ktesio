@@ -44,7 +44,7 @@ use crate::domain::{pass_through_tail, EffectiveConfig};
 
 use thiserror::Error;
 
-pub use builtin::native_config_mapping;
+pub use builtin::{native_config_mapping, native_launch};
 
 /// The canonical `adapter.toml` filename inside a manifest-adapter directory.
 pub const MANIFEST_FILE: &str = "adapter.toml";
@@ -226,8 +226,10 @@ pub enum LaunchResolveError {
         path: String,
     },
 
-    /// The adapter is a native builtin with no launch command. Native builtins
-    /// (e.g. `mock`) carry no process to spawn this story; a launchable agent is
+    /// The adapter is a native builtin with no launch command (e.g. `mock`, the
+    /// inert conformance stand-in). Launchable native builtins (`hermes` since
+    /// story 6-2) declare their start launch in code and resolve before this
+    /// error can fire. A launchable agent without a code-declared launch is
     /// supplied as a manifest adapter whose `[lifecycle.start]` exec points at
     /// the real program (AD-3). Names the kind.
     #[error(
@@ -257,25 +259,31 @@ pub enum LaunchResolveError {
 }
 
 /// Resolve the `start` launch for an adapter, given its persisted snapshot
-/// facts (story 1.4).
+/// facts (story 1.4; native launch support story 6-2).
 ///
 /// * A **manifest** adapter (`manifest_path` is `Some`) re-reads its
 ///   `adapter.toml` and returns the `[lifecycle.start]` template's exec/args/env
 ///   (reusing [`ktesio_adapter_api::Manifest`] — the same parser registration
 ///   used). This is where 1-3's stored `OpTemplate` is finally EXECUTED (AD-3).
-/// * A **native** adapter (`manifest_path` is `None`) has no launch command this
-///   story (the builtin `mock` is inert) → [`LaunchResolveError::NativeHasNoLaunch`].
+/// * A **native** adapter (`manifest_path` is `None`) resolves from the builtin
+///   table's code-declared launch ([`builtin::native_launch`]): launchable kinds
+///   (e.g. `hermes`) yield their foreground gateway launch; inert kinds (e.g.
+///   `mock`) still error with
+///   [`LaunchResolveError::NativeHasNoLaunch`].
 ///
 /// PARSE only — executes nothing here (the supervisor spawns).
 pub fn resolve_start_launch(
     kind: &str,
     manifest_path: Option<&Path>,
 ) -> Result<StartLaunch, LaunchResolveError> {
-    let Some(manifest_path) = manifest_path else {
-        return Err(LaunchResolveError::NativeHasNoLaunch {
+    if manifest_path.is_none() {
+        // Native: consult the builtin table's code-declared launch before
+        // declaring the kind unstartable (story 6-2).
+        return builtin::native_launch(kind).ok_or_else(|| LaunchResolveError::NativeHasNoLaunch {
             kind: kind.to_string(),
         });
-    };
+    }
+    let manifest_path = manifest_path.unwrap();
     let text = std::fs::read_to_string(manifest_path).map_err(|e| {
         LaunchResolveError::ManifestUnreadable {
             path: manifest_path.to_string_lossy().into_owned(),
@@ -615,13 +623,17 @@ fn resolve_native(kind: &str) -> Result<ResolvedAdapter, AdapterResolveError> {
     let adapter = builtin::native(kind).ok_or_else(|| AdapterResolveError::UnknownKind {
         kind: kind.to_string(),
     })?;
+    // Story 6-2: a launchable native builtin (e.g. `hermes`) declares its start
+    // launch in code; `mock` stays inert (`None` — start still errors
+    // NativeHasNoLaunch). Capturing it here persists the SAME registration-time
+    // snapshot a manifest adapter gets, so the start path needs no special case.
+    let launch = builtin::native_launch(kind);
     Ok(ResolvedAdapter {
         kind: adapter.kind().to_string(),
         declaration: adapter.capabilities().clone(),
         metering_source: adapter.metering_source(),
         manifest_path: None,
-        // A native builtin has no launch command (start yields NativeHasNoLaunch).
-        launch: None,
+        launch,
     })
 }
 
@@ -960,9 +972,9 @@ source = "self-reported"
 
     #[test]
     fn resolve_native_adapter_has_no_launch_snapshot() {
-        // A native builtin carries no launch (start yields NativeHasNoLaunch). Its
-        // snapshot launch is None, so the start path falls back to the re-read —
-        // which keeps erroring NativeHasNoLaunch (native adapters still can't start).
+        // The inert native builtin (`mock`) carries no launch (start yields
+        // NativeHasNoLaunch). Its snapshot launch is None, so the start path
+        // falls back to the re-read — which keeps erroring NativeHasNoLaunch.
         let resolved = resolve(&AdapterRef::Native("mock".to_string())).unwrap();
         assert!(
             resolved.launch().is_none(),
@@ -971,14 +983,40 @@ source = "self-reported"
     }
 
     #[test]
+    fn resolve_native_hermes_captures_its_code_declared_launch() {
+        // Story 6-2 (DC-1): a launchable native builtin captures its start
+        // launch at REGISTRATION — the same persisted snapshot a manifest
+        // adapter gets, so the supervisor's preferred path spawns it with no
+        // special case.
+        let resolved = resolve(&AdapterRef::Native("hermes".to_string())).unwrap();
+        let launch = resolved
+            .launch()
+            .expect("hermes declares a code-declared start launch");
+        assert_eq!(launch.exec, builtin::HERMES_EXEC);
+        assert_eq!(launch.args, ["gateway", "run", "--external-supervisor"]);
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
     fn resolve_start_launch_native_has_no_launch_command() {
-        // A native adapter (manifest_path None) has no launch command this story.
+        // An inert native adapter (manifest_path None) still has no launch
+        // command; hermes resolves instead (story 6-2).
         let err = resolve_start_launch("mock", None).unwrap_err();
         assert!(
             matches!(&err, LaunchResolveError::NativeHasNoLaunch { kind } if kind == "mock"),
             "got {err}"
         );
         assert!(err.to_string().contains("no launch command"));
+    }
+
+    #[test]
+    fn resolve_start_launch_resolves_the_hermes_builtin_launch() {
+        // Story 6-2: resolve_start_launch consults the builtin table BEFORE
+        // erroring, so a native hermes instance starts from the same fallback
+        // seam a legacy snapshot would use.
+        let launch = resolve_start_launch("hermes", None).expect("hermes carries a launch");
+        assert_eq!(launch.exec, "hermes");
+        assert_eq!(launch.args, vec!["gateway", "run", "--external-supervisor"]);
     }
 
     #[test]

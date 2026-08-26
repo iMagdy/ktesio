@@ -5,7 +5,7 @@ baseline_ref: origin/main (PR #120 merged — "ci(coverage): fix the real root c
 
 # Story 5.1: Attach a managed filesystem Memory Backing
 
-Status: ready-for-dev
+Status: done
 
 <!-- Context engineered by create-story (headless BMAD run, 2026-07-30). Ground truth verified against `origin/main` @ 0752d30. -->
 
@@ -59,60 +59,60 @@ Verbatim from `_bmad-output/planning-artifacts/epics.md` lines 493–508 (Story 
 
 Dependency-ordered. Each task names its AC/DC. **Read "Exact code seams" and "Testing Notes" in Dev Notes before writing any code.**
 
-- [ ] **Task 1 — Path authority: the managed directory's one true path (AC1, DC-1, DC-8)**
-  - [ ] 1.1 In `crates/ktesio-engine/src/paths.rs`, add `pub const MEMORY_DIR: &str = "memory";` beside `EFFECTIVE_CONFIG_SNAPSHOT_FILE` (`:70`) and `pub fn agent_memory_dir(&self, name: &InstanceName) -> PathBuf` → `<agent_home>/memory`, mirroring `effective_config_snapshot` (`:177`) exactly. Do **not** hard-code `"memory"` anywhere else — note that `registry.rs:971`'s `instance_log_dir` inlines `join("logs")`; that is the inconsistency to NOT copy.
-  - [ ] 1.2 Update the (currently stale) Agent Home layout doc comment at `paths.rs:26-32` — it still lists only `state.db` + `agents/<name>/config.toml`. Record the real layout: `config.toml`, `adapter.json`, `effective-config.json`, rendered native config files, `logs/` (`instance.log`, `agent.log`, `agent-stderr.log`, `output.log[.1|.2]`, `breaches.log`), and the new `memory/`. (Epic-4 retro §hand-off explicitly asked Epic 5 to state the current layout rather than assume the pre-4-2 shape.)
-  - [ ] 1.3 Expose the path on the engine's public API only if a caller needs it (`kt`'s confirmation line does — see Task 5). Follow `Engine::agent_home` (`engine.rs:252-256`) as the shape; add the mirrored method to the `Blocking<'_>` facade (`engine.rs:948+`) in the same commit — a public engine method missing from the facade is an incomplete surface.
+- [x] **Task 1 — Path authority: the managed directory's one true path (AC1, DC-1, DC-8)**
+  - [x] 1.1 In `crates/ktesio-engine/src/paths.rs`, add `pub const MEMORY_DIR: &str = "memory";` beside `EFFECTIVE_CONFIG_SNAPSHOT_FILE` (`:70`) and `pub fn agent_memory_dir(&self, name: &InstanceName) -> PathBuf` → `<agent_home>/memory`, mirroring `effective_config_snapshot` (`:177`) exactly. Do **not** hard-code `"memory"` anywhere else — note that `registry.rs:971`'s `instance_log_dir` inlines `join("logs")`; that is the inconsistency to NOT copy.
+  - [x] 1.2 Update the (currently stale) Agent Home layout doc comment at `paths.rs:26-32` — it still lists only `state.db` + `agents/<name>/config.toml`. Record the real layout: `config.toml`, `adapter.json`, `effective-config.json`, rendered native config files, `logs/` (`instance.log`, `agent.log`, `agent-stderr.log`, `output.log[.1|.2]`, `breaches.log`), and the new `memory/`. (Epic-4 retro §hand-off explicitly asked Epic 5 to state the current layout rather than assume the pre-4-2 shape.)
+  - [x] 1.3 Expose the path on the engine's public API only if a caller needs it (`kt`'s confirmation line does — see Task 5). Follow `Engine::agent_home` (`engine.rs:252-256`) as the shape; add the mirrored method to the `Blocking<'_>` facade (`engine.rs:948+`) in the same commit — a public engine method missing from the facade is an incomplete surface.
 
-- [ ] **Task 2 — The port seam + the descriptor type (AC1, DC-5)**
-  - [ ] 2.1 Create `crates/ktesio-engine/src/ports/memory_backing.rs` — the AD-11 seam whose arrival `ports/mod.rs:14-15` has been waiting for. It holds: `MemoryBackingKind` (a closed enum with the FR-16 vocabulary + `as_str`/`from_wire`, copying `LifecycleState`'s wire-string discipline at `lifecycle.rs:48/64`) and the descriptor type handed to the adapter. **Do NOT invent a trait tree, resolver, or registry** — AD-11's "richer backings are Deferred behind this port" means the port is the extension SEAM, not a polymorphism exercise; the `filesystem` implementation is pure path authority inside the engine. Add a trait only if the `filesystem`/`native` split genuinely needs dispatch, and say so in the Dev Agent Record if you do.
-  - [ ] 2.2 Wire the module into `ports/mod.rs` (`mod memory_backing;` + a `pub use`) and **update the module doc at `ports/mod.rs:14-15`** to drop `MemoryBacking` from the "remaining port … arrives with the story that needs it" list — stories 2-4 (`:170`) and 3-1 (`:132/:171`) both set this precedent when their ports landed.
-  - [ ] 2.3 Scope decision to honor: this story implements **`filesystem` only**. `native` is story 5-2. Ship the kind vocabulary such that 5-2 adds behavior without a breaking enum edit, and have the CLI's `--kind` value parser accept only what 5-1 implements (an unrecognized token → the `AgentUnknownKind`-shaped diagnostic → exit **2**, naming the accepted value). If a reserved-but-unimplemented variant trips `dead_code`, follow the documented `#[allow(dead_code)]` precedent of `ExitCode::Success` (`crates/kt/src/exit_code.rs`) — a one-line justification comment, not a silencing.
+- [x] **Task 2 — The port seam + the descriptor type (AC1, DC-5)**
+  - [x] 2.1 Create `crates/ktesio-engine/src/ports/memory_backing.rs` — the AD-11 seam whose arrival `ports/mod.rs:14-15` has been waiting for. It holds: `MemoryBackingKind` (a closed enum with the FR-16 vocabulary + `as_str`/`from_wire`, copying `LifecycleState`'s wire-string discipline at `lifecycle.rs:48/64`) and the descriptor type handed to the adapter. **Do NOT invent a trait tree, resolver, or registry** — AD-11's "richer backings are Deferred behind this port" means the port is the extension SEAM, not a polymorphism exercise; the `filesystem` implementation is pure path authority inside the engine. Add a trait only if the `filesystem`/`native` split genuinely needs dispatch, and say so in the Dev Agent Record if you do.
+  - [x] 2.2 Wire the module into `ports/mod.rs` (`mod memory_backing;` + a `pub use`) and **update the module doc at `ports/mod.rs:14-15`** to drop `MemoryBacking` from the "remaining port … arrives with the story that needs it" list — stories 2-4 (`:170`) and 3-1 (`:132/:171`) both set this precedent when their ports landed.
+  - [x] 2.3 Scope decision to honor: this story implements **`filesystem` only**. `native` is story 5-2. Ship the kind vocabulary such that 5-2 adds behavior without a breaking enum edit, and have the CLI's `--kind` value parser accept only what 5-1 implements (an unrecognized token → the `AgentUnknownKind`-shaped diagnostic → exit **2**, naming the accepted value). If a reserved-but-unimplemented variant trips `dead_code`, follow the documented `#[allow(dead_code)]` precedent of `ExitCode::Success` (`crates/kt/src/exit_code.rs`) — a one-line justification comment, not a silencing.
 
-- [ ] **Task 3 — Persist the attachment (AC1, AC3, AC4, DC-2)**
-  - [ ] 3.1 `crates/ktesio-engine/src/store/sqlite.rs`: add `const SCHEMA_V5: &str` beside `SCHEMA_V4` (`:124`) creating one table (working name `agent_memory_backing`) with `id INTEGER PRIMARY KEY`, `instance_id INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE`, `kind TEXT NOT NULL`, `attached_at TEXT NOT NULL` (RFC-3339 UTC — conventions row). `agent_runtime` (`:81`) is the exact structural precedent (one row per instance, UNIQUE FK, cascade). Doc-comment it in the house style: name the story and assert additivity.
-  - [ ] 3.2 Bump `SCHEMA_VERSION` 4 → 5 (`:41`, extend its doc comment) and add `if version < 5 { conn.execute_batch(SCHEMA_V5)…}` to `migrate` (`:232`, after `:258`). Keep the step-up-one-at-a-time shape so a reopen is idempotent and a crash-interrupted migration re-runs only what remains. `PRAGMA foreign_keys=ON` is already set per-connection in `configure` (`:164`) — that is what makes the cascade real; assert the cascade in a test rather than assuming it.
-  - [ ] 3.3 Add the read/write/clear methods to the `StateStore` port (`ports/state_store.rs`) and `impl StateStore for SqliteStore`, then thin `pub(crate)` pass-throughs on `Registry` — copy `write_spawn_record` (`registry.rs:666`) / `clear_spawn_record` (`:673`) / `spawn_record` (`:679`) verbatim in shape. Use the existing `SqliteStore::instance_id` (`:186`) resolution and the existing `backend`/`classify_insert` error mappers (`:271`/`:298`) — do not add new SQLite error plumbing.
-  - [ ] 3.4 Migration test: open a state dir, seed it at v4 shape, reopen, assert `PRAGMA user_version == 5` and that pre-existing instances/usage rows survive. Also assert `SchemaTooNew` still triggers for a future version (the guard at `:237-242` must not regress).
+- [x] **Task 3 — Persist the attachment (AC1, AC3, AC4, DC-2)**
+  - [x] 3.1 `crates/ktesio-engine/src/store/sqlite.rs`: add `const SCHEMA_V5: &str` beside `SCHEMA_V4` (`:124`) creating one table (working name `agent_memory_backing`) with `id INTEGER PRIMARY KEY`, `instance_id INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE`, `kind TEXT NOT NULL`, `attached_at TEXT NOT NULL` (RFC-3339 UTC — conventions row). `agent_runtime` (`:81`) is the exact structural precedent (one row per instance, UNIQUE FK, cascade). Doc-comment it in the house style: name the story and assert additivity.
+  - [x] 3.2 Bump `SCHEMA_VERSION` 4 → 5 (`:41`, extend its doc comment) and add `if version < 5 { conn.execute_batch(SCHEMA_V5)…}` to `migrate` (`:232`, after `:258`). Keep the step-up-one-at-a-time shape so a reopen is idempotent and a crash-interrupted migration re-runs only what remains. `PRAGMA foreign_keys=ON` is already set per-connection in `configure` (`:164`) — that is what makes the cascade real; assert the cascade in a test rather than assuming it.
+  - [x] 3.3 Add the read/write/clear methods to the `StateStore` port (`ports/state_store.rs`) and `impl StateStore for SqliteStore`, then thin `pub(crate)` pass-throughs on `Registry` — copy `write_spawn_record` (`registry.rs:666`) / `clear_spawn_record` (`:673`) / `spawn_record` (`:679`) verbatim in shape. Use the existing `SqliteStore::instance_id` (`:186`) resolution and the existing `backend`/`classify_insert` error mappers (`:271`/`:298`) — do not add new SQLite error plumbing.
+  - [x] 3.4 Migration test: open a state dir, seed it at v4 shape, reopen, assert `PRAGMA user_version == 5` and that pre-existing instances/usage rows survive. Also assert `SchemaTooNew` still triggers for a future version (the guard at `:237-242` must not regress).
 
-- [ ] **Task 4 — Engine API: `attach` / `detach` / read, with the running-guard (AC1, AC3, DC-1, DC-3, DC-4, DC-7)**
-  - [ ] 4.1 Add the attach operation to `Registry` (it owns both path authority and the DB — `registry.rs:253`). Ordering is non-negotiable and copies `remove`'s discipline (`registry.rs:528-547`): validate the name → `lookup` (→ `NotFound`) → **state guard** → only then any side effect. Side effects, in order: `ensure_dir(&self.paths.agent_memory_dir(name), name.as_str())` (reuse the existing helper at `registry.rs:1131`, which already maps to `RegistryError::Io { name, path, source }`) → persist the row. If the row write fails after the directory exists, leave the directory (it is inert and idempotent) and return the store error — do **not** invent a rollback that deletes operator data.
-  - [ ] 4.2 Add the detach operation: same validate → lookup → guard order; then clear the row **only**. **Detach does NOT delete the directory** (DC-7 + "Detach semantics" in Dev Notes). Detaching when nothing is attached is a successful no-op; re-attaching the same kind is an idempotent success. Attaching a *different* kind while one is attached is rejected (detach first) → exit **4**.
-  - [ ] 4.3 New error variant for the guard. Reuse nothing that lies: `RegistryError::RunningRequiresForce` (`error.rs:45`) says "or pass `--force`", which is FALSE here. Add a variant whose message names the instance, its current state, and the remediation ("stop it first — a Memory Backing cannot be hot-swapped"), following the `EngineError::NotRunning` (`error.rs:325`) doc pattern that explains *why* a non-transition op gets a dedicated pre-flight check instead of `InvalidTransition`. Note both `Registered` and `Stopped`/`Failed` are permitted states; only `Running` (and, decide explicitly, `Starting`/`Stopping`/`Paused` — recommend rejecting every non-terminal state, i.e. permit only `Registered`/`Stopped`/`Failed`, and say so in the message) is refused.
-  - [ ] 4.4 Add the public `Engine` methods (async) + their `Blocking<'_>` mirrors. `Engine::set_config` (`engine.rs:844-848`, registry-lock only) is the closest shape — attach/detach need the **registry lock only**, not the supervisor lock. Do not take the supervisor lock; taking it would widen the fleet-wide stall for no reason (see "The global-lock question").
-  - [ ] 4.5 Add a public read so the attachment is observable through the public API (AD-2: `crates/ktesio-engine/tests/*` may use nothing else — `tests/registration.rs:1-7`). Keep it minimal: the kind + the managed path, or `None` — **plus the DC-10 delivery fact** (whether the adapter's declared mapping targets the reserved key), since the Q-1 ruling makes "offered vs delivered" part of what an operator must be able to learn. This is also what story 5-2's status/effective-config surface will consume, so shape it for reuse, not for one call site.
+- [x] **Task 4 — Engine API: `attach` / `detach` / read, with the running-guard (AC1, AC3, DC-1, DC-3, DC-4, DC-7)**
+  - [x] 4.1 Add the attach operation to `Registry` (it owns both path authority and the DB — `registry.rs:253`). Ordering is non-negotiable and copies `remove`'s discipline (`registry.rs:528-547`): validate the name → `lookup` (→ `NotFound`) → **state guard** → only then any side effect. Side effects, in order: `ensure_dir(&self.paths.agent_memory_dir(name), name.as_str())` (reuse the existing helper at `registry.rs:1131`, which already maps to `RegistryError::Io { name, path, source }`) → persist the row. If the row write fails after the directory exists, leave the directory (it is inert and idempotent) and return the store error — do **not** invent a rollback that deletes operator data.
+  - [x] 4.2 Add the detach operation: same validate → lookup → guard order; then clear the row **only**. **Detach does NOT delete the directory** (DC-7 + "Detach semantics" in Dev Notes). Detaching when nothing is attached is a successful no-op; re-attaching the same kind is an idempotent success. Attaching a *different* kind while one is attached is rejected (detach first) → exit **4**.
+  - [x] 4.3 New error variant for the guard. Reuse nothing that lies: `RegistryError::RunningRequiresForce` (`error.rs:45`) says "or pass `--force`", which is FALSE here. Add a variant whose message names the instance, its current state, and the remediation ("stop it first — a Memory Backing cannot be hot-swapped"), following the `EngineError::NotRunning` (`error.rs:325`) doc pattern that explains *why* a non-transition op gets a dedicated pre-flight check instead of `InvalidTransition`. Note both `Registered` and `Stopped`/`Failed` are permitted states; only `Running` (and, decide explicitly, `Starting`/`Stopping`/`Paused` — recommend rejecting every non-terminal state, i.e. permit only `Registered`/`Stopped`/`Failed`, and say so in the message) is refused.
+  - [x] 4.4 Add the public `Engine` methods (async) + their `Blocking<'_>` mirrors. `Engine::set_config` (`engine.rs:844-848`, registry-lock only) is the closest shape — attach/detach need the **registry lock only**, not the supervisor lock. Do not take the supervisor lock; taking it would widen the fleet-wide stall for no reason (see "The global-lock question").
+  - [x] 4.5 Add a public read so the attachment is observable through the public API (AD-2: `crates/ktesio-engine/tests/*` may use nothing else — `tests/registration.rs:1-7`). Keep it minimal: the kind + the managed path, or `None` — **plus the DC-10 delivery fact** (whether the adapter's declared mapping targets the reserved key), since the Q-1 ruling makes "offered vs delivered" part of what an operator must be able to learn. This is also what story 5-2's status/effective-config surface will consume, so shape it for reuse, not for one call site.
 
-- [ ] **Task 5 — Hand the descriptor to the adapter at start (AC1, AC2, DC-5, DC-7)**
-  - [ ] 5.1 Add the reserved engine-namespace unified-config key (working name `memory.dir`) to `crates/ktesio-engine/src/domain/config.rs`: a `pub const` doc-commented in the exact style of `METERING_BASE_URL_KEY` (`:126`) — engine-computed, engine-injected, operator-does-NOT-set, known so a mapping can target it, **and explicitly "does not touch the Adapter Contract surface (no `CONTRACT_VERSION` bump)"** — plus an entry in `KNOWN_KEYS` (`:565-581`) with the same style of comment. This is the decided delivery mechanism; see "Descriptor delivery" in Dev Notes for why, and A-1 for what Islam still owns.
-  - [ ] 5.2 In `Supervisor::start_inner`, build the invocation-override `ConfigLayer` from the attached backing and fold it into the **`mapping_effective`** resolution — copy `base_url_override` (`supervisor.rs:2752-2763`; the call site is `:513-519`) exactly, including its nested-dotted-table construction. **Critical: follow the precedent's SPLIT.** The override goes only into the value handed to `resolve_secrets` (`:530`) and `apply_config_mapping` (`:532`); `write_effective_config_snapshot` (`:551`) keeps taking the **plain** `effective`. Read the CORRECTION block under "Descriptor delivery" before writing this — the story originally claimed the opposite and it is wrong. Place the read of the attached backing in the **pre-transition block** (before the persisted `→ starting` transition at `supervisor.rs:579`), preserving the documented invariant at `supervisor.rs:399-408`: every fallible step happens before any state change, so a failure rejects the start with no state change. The adapter's existing `[config]` mapping (story 2-2) then delivers the value into env/flag/file — zero new delivery code.
-  - [ ] 5.2a **DC-10 delivery notice.** In the same pre-transition block, when a `filesystem` backing is attached, check `mapping.target(MEMORY_DIR_KEY)`; on `None` emit one diagnostic notice (stderr, AD-12) naming the instance, the managed path, and that the adapter declares no mapping for the key. The start still succeeds. `mapping` is already in hand at `:491` — do not re-resolve it, and do not add any filesystem work here (AD-17).
-  - [ ] 5.3 Defensive directory presence at start: if a `filesystem` backing is attached, `create_dir_all` the managed dir (idempotent, one directory, no recursion) so a home whose `memory/` was manually deleted still starts. Mirror `ensure_log_dir` (`supervisor.rs:2110`), reuse its error shape, and keep it in the pre-transition block. **Nothing else** — no listing, no copying, no size accounting (DC-7).
-  - [ ] 5.4 Mock parity: add the `memory.dir` → env mapping to **BOTH** mocks in lockstep — `native_config_mapping` in `crates/ktesio-engine/src/adapter/builtin.rs:50` and `MockAdapter` in `crates/ktesio-conformance/src/lib.rs:52`. `conformance_mock_fixture_matches_builtin_shape` (`crates/ktesio-engine/tests/registration.rs:182-232`) asserts the two declare identical config mappings and FAILS if only one is updated. Follow `MOCK_MODEL_ENV_VAR` (`builtin.rs:31` / `conformance/src/lib.rs:38`) for the shared-constant pattern.
-  - [ ] 5.5 Manifest parity (AC2): the test fixture manifest declares `[config."memory.dir"] env = "<VAR>"` — **no `ktesio-adapter-api` change is required for this**, because `ConfigMapping` keys are arbitrary dotted strings today. Verify no manifest-schema edit sneaks in (DC-5).
+- [x] **Task 5 — Hand the descriptor to the adapter at start (AC1, AC2, DC-5, DC-7)**
+  - [x] 5.1 Add the reserved engine-namespace unified-config key (working name `memory.dir`) to `crates/ktesio-engine/src/domain/config.rs`: a `pub const` doc-commented in the exact style of `METERING_BASE_URL_KEY` (`:126`) — engine-computed, engine-injected, operator-does-NOT-set, known so a mapping can target it, **and explicitly "does not touch the Adapter Contract surface (no `CONTRACT_VERSION` bump)"** — plus an entry in `KNOWN_KEYS` (`:565-581`) with the same style of comment. This is the decided delivery mechanism; see "Descriptor delivery" in Dev Notes for why, and A-1 for what Islam still owns.
+  - [x] 5.2 In `Supervisor::start_inner`, build the invocation-override `ConfigLayer` from the attached backing and fold it into the **`mapping_effective`** resolution — copy `base_url_override` (`supervisor.rs:2752-2763`; the call site is `:513-519`) exactly, including its nested-dotted-table construction. **Critical: follow the precedent's SPLIT.** The override goes only into the value handed to `resolve_secrets` (`:530`) and `apply_config_mapping` (`:532`); `write_effective_config_snapshot` (`:551`) keeps taking the **plain** `effective`. Read the CORRECTION block under "Descriptor delivery" before writing this — the story originally claimed the opposite and it is wrong. Place the read of the attached backing in the **pre-transition block** (before the persisted `→ starting` transition at `supervisor.rs:579`), preserving the documented invariant at `supervisor.rs:399-408`: every fallible step happens before any state change, so a failure rejects the start with no state change. The adapter's existing `[config]` mapping (story 2-2) then delivers the value into env/flag/file — zero new delivery code.
+  - [x] 5.2a **DC-10 delivery notice.** In the same pre-transition block, when a `filesystem` backing is attached, check `mapping.target(MEMORY_DIR_KEY)`; on `None` emit one diagnostic notice (stderr, AD-12) naming the instance, the managed path, and that the adapter declares no mapping for the key. The start still succeeds. `mapping` is already in hand at `:491` — do not re-resolve it, and do not add any filesystem work here (AD-17).
+  - [x] 5.3 Defensive directory presence at start: if a `filesystem` backing is attached, `create_dir_all` the managed dir (idempotent, one directory, no recursion) so a home whose `memory/` was manually deleted still starts. Mirror `ensure_log_dir` (`supervisor.rs:2110`), reuse its error shape, and keep it in the pre-transition block. **Nothing else** — no listing, no copying, no size accounting (DC-7).
+  - [x] 5.4 Mock parity: add the `memory.dir` → env mapping to **BOTH** mocks in lockstep — `native_config_mapping` in `crates/ktesio-engine/src/adapter/builtin.rs:50` and `MockAdapter` in `crates/ktesio-conformance/src/lib.rs:52`. `conformance_mock_fixture_matches_builtin_shape` (`crates/ktesio-engine/tests/registration.rs:182-232`) asserts the two declare identical config mappings and FAILS if only one is updated. Follow `MOCK_MODEL_ENV_VAR` (`builtin.rs:31` / `conformance/src/lib.rs:38`) for the shared-constant pattern.
+  - [x] 5.5 Manifest parity (AC2): the test fixture manifest declares `[config."memory.dir"] env = "<VAR>"` — **no `ktesio-adapter-api` change is required for this**, because `ConfigMapping` keys are arbitrary dotted strings today. Verify no manifest-schema edit sneaks in (DC-5).
 
-- [ ] **Task 6 — CLI surface: `kt agent memory attach|detach` (AC1, AC2, AC3, DC-1, DC-4, DC-6)**
-  - [ ] 6.1 Add a nested `Memory { #[command(subcommand)] command: MemoryCommands }` variant to `AgentCommands` (`crates/kt/src/main.rs:107+`), modeled exactly on `Config { … ConfigCommands }` (`:220` / `:229`-`:239`) — the repo's one precedent for a two-level `kt agent` group. `MemoryCommands::Attach { name, kind }` and `Detach { name }`. Wire both dispatch arms (`main.rs:312`).
-  - [ ] 6.2 Command bodies in `crates/kt/src/cli/agent.rs`, next to `config_set` (`:1399`) / `config_get` (`:1444`). Human output only in this story: a confirmation naming the instance, the kind, and the managed path (received from the engine — DC-1). AD-12: result on stdout, notes/diagnostics on stderr. **No `--json` flag in this story** (DC-6, A-3) — adding one would freeze a new document into the v1 surface before 5-2 decides the memory wire shape.
-  - [ ] 6.3 Validate the instance name FIRST via the existing `validate_instance_name` helper (`agent.rs`, added by 4-3's M2 fix) so a malformed name exits **2** uniformly, not **3**. This is a shipped, test-pinned convention — `a_malformed_instance_name_exits_with_the_usage_code_on_every_read_command` exists precisely because it was violated once.
-  - [ ] 6.4 New diagnostics in `crates/kt/src/error.rs` + arms in `map_error` (`agent.rs:1763`) / `map_engine_error` (`:1884`), + `classify()` arms in `crates/kt/src/exit_code.rs`, + its unit-test assertions, + the two mapper tests (`agent.rs:2198`/`:2298`). Update `exit_code.rs`'s module-doc table (it is the human-readable contract) — the numbers do not change, only the diagnostic lists.
+- [x] **Task 6 — CLI surface: `kt agent memory attach|detach` (AC1, AC2, AC3, DC-1, DC-4, DC-6)**
+  - [x] 6.1 Add a nested `Memory { #[command(subcommand)] command: MemoryCommands }` variant to `AgentCommands` (`crates/kt/src/main.rs:107+`), modeled exactly on `Config { … ConfigCommands }` (`:220` / `:229`-`:239`) — the repo's one precedent for a two-level `kt agent` group. `MemoryCommands::Attach { name, kind }` and `Detach { name }`. Wire both dispatch arms (`main.rs:312`).
+  - [x] 6.2 Command bodies in `crates/kt/src/cli/agent.rs`, next to `config_set` (`:1399`) / `config_get` (`:1444`). Human output only in this story: a confirmation naming the instance, the kind, and the managed path (received from the engine — DC-1). AD-12: result on stdout, notes/diagnostics on stderr. **No `--json` flag in this story** (DC-6, A-3) — adding one would freeze a new document into the v1 surface before 5-2 decides the memory wire shape.
+  - [x] 6.3 Validate the instance name FIRST via the existing `validate_instance_name` helper (`agent.rs`, added by 4-3's M2 fix) so a malformed name exits **2** uniformly, not **3**. This is a shipped, test-pinned convention — `a_malformed_instance_name_exits_with_the_usage_code_on_every_read_command` exists precisely because it was violated once.
+  - [x] 6.4 New diagnostics in `crates/kt/src/error.rs` + arms in `map_error` (`agent.rs:1763`) / `map_engine_error` (`:1884`), + `classify()` arms in `crates/kt/src/exit_code.rs`, + its unit-test assertions, + the two mapper tests (`agent.rs:2198`/`:2298`). Update `exit_code.rs`'s module-doc table (it is the human-readable contract) — the numbers do not change, only the diagnostic lists.
   - [ ] 6.5 Optional-but-recommended observability: add a Memory Backing row to the **human** `kt agent show` table only. The human table and the `--json` document are rendered separately, so this costs no frozen key-set edit (DC-6). If you do it, say so explicitly in the Dev Agent Record; if the reviewer prefers strict minimalism, dropping it is acceptable.
 
-- [ ] **Task 7 — Tests (all ACs, DC-3, DC-9) — read Testing Notes first**
-  - [ ] 7.1 `crates/ktesio-engine/tests/` — a new `memory.rs` integration file (the repo has one file per capability: `registration.rs`, `lifecycle.rs`, `pause.rs`, `interaction.rs`, `logs.rs`, `metering.rs`, `budget.rs`, `cost.rs`…). Public API only; reuse the `fn open(base: &TempDir) -> Registry` helper shape (`tests/registration.rs:18`).
-  - [ ] 7.2 **AC1:** attach on a `registered` instance ⇒ the directory exists at the engine-reported path *inside* the Agent Home, and the public read reports the kind.
-  - [ ] 7.3 **AC3:** attach AND detach on a `Running` instance are both rejected, with **no** side effect (assert the directory/row state is unchanged afterwards — a guard that rejects *after* mutating is the bug worth catching). Use `Registry::seed_instance` (`registry.rs:1118`) to seed `Running` with no live process, exactly as `remove_running_without_force_is_rejected` (`:1383`) does. Also cover the other non-terminal states you decided to refuse in 4.3.
-  - [ ] 7.4 **AC4 — the headline test.** Attach → start → write a known byte payload into the managed dir (include a nested subdirectory and a non-UTF-8 byte so "byte-identical" is real, not "text survived") → stop → start → **drop the `Engine` and `Engine::open` the same state dir again** (that is the "engine restart" half; do not simulate it) → assert every byte equal. Poll committed state for the stop/start transitions (the instance log / a public status read) — never sleep (DC-9).
-  - [ ] 7.5 **AC2 — kind parity.** The SAME attach→start sequence against (a) `--kind mock` and (b) a fixture manifest adapter, asserting the descriptor actually reached the child both times. Deterministic observation vehicle: `fake_agent --dump <path>` writes `env=KEY=VALUE` lines (`crates/ktesio-conformance/src/bin/fake_agent.rs:709-725`, flags at `:325-334`) — assert the mapped variable is present with the engine-computed path. Table-drive the two kinds so the test literally *is* "the same command sequence".
-  - [ ] 7.5a **DC-10 (delivery honesty).** Two cases, table-driven against the same attach→start sequence: an adapter whose mapping DOES declare the reserved key (assert the child receives it via `fake_agent --dump`, and the public read reports it delivered) and one whose mapping does NOT (assert the start still SUCCEEDS, the notice is emitted, and the public read reports it undelivered). The second case is the one that would otherwise ship silent — do not skip it because it looks like a no-op. Also assert the reserved key does **NOT** appear in `effective-config.json` (the CORRECTION's property; a regression here would silently break story 3-4's honest-provenance rule).
-  - [ ] 7.6 CLI tests in `crates/kt/tests/agent_cli.rs`: attach/detach happy paths + `code == Some(N)` for every failure mode in DC-4. Parse tests inline in `main.rs` (mirror `test_agent_config_*`), and add `memory` to `test_agent_subcommands_exist`'s positive list.
-  - [ ] 7.7 Coverage: every new branch needs a test — including each new error arm and each `from_wire` rejection. **The 95% gate is functional again as of PR #120** (see "Coverage is real now" in Dev Notes); budget for a real tarpaulin run.
-  - [ ] 7.8 **Scoped mutation check (Q-5 ruling — NOT a full AI-64 pass).** Self-administered, two mutations, minutes not a session; record both in the Dev Agent Record. (a) Break one new exit-code mapper arm (point a new diagnostic at the wrong code) and confirm `agent.rs`'s mapper test FAILS; restore. (b) Delete the `if version < 5` step from `migrate` and confirm the Task 3.4 migration test FAILS; restore. If either mutation passes undetected, the guard is theater — fix the test, then re-apply the mutation to prove the fix catches it (AI-64 clause (b)). Nothing else in this story needs a mutation pass: it freezes no wire shape, no `schema_version`, no exit-code *number*, and no contract surface.
+- [x] **Task 7 — Tests (all ACs, DC-3, DC-9) — read Testing Notes first**
+  - [x] 7.1 `crates/ktesio-engine/tests/` — a new `memory.rs` integration file (the repo has one file per capability: `registration.rs`, `lifecycle.rs`, `pause.rs`, `interaction.rs`, `logs.rs`, `metering.rs`, `budget.rs`, `cost.rs`…). Public API only; reuse the `fn open(base: &TempDir) -> Registry` helper shape (`tests/registration.rs:18`).
+  - [x] 7.2 **AC1:** attach on a `registered` instance ⇒ the directory exists at the engine-reported path *inside* the Agent Home, and the public read reports the kind.
+  - [x] 7.3 **AC3:** attach AND detach on a `Running` instance are both rejected, with **no** side effect (assert the directory/row state is unchanged afterwards — a guard that rejects *after* mutating is the bug worth catching). Use `Registry::seed_instance` (`registry.rs:1118`) to seed `Running` with no live process, exactly as `remove_running_without_force_is_rejected` (`:1383`) does. Also cover the other non-terminal states you decided to refuse in 4.3.
+  - [x] 7.4 **AC4 — the headline test.** Attach → start → write a known byte payload into the managed dir (include a nested subdirectory and a non-UTF-8 byte so "byte-identical" is real, not "text survived") → stop → start → **drop the `Engine` and `Engine::open` the same state dir again** (that is the "engine restart" half; do not simulate it) → assert every byte equal. Poll committed state for the stop/start transitions (the instance log / a public status read) — never sleep (DC-9).
+  - [x] 7.5 **AC2 — kind parity.** The SAME attach→start sequence against (a) `--kind mock` and (b) a fixture manifest adapter, asserting the descriptor actually reached the child both times. Deterministic observation vehicle: `fake_agent --dump <path>` writes `env=KEY=VALUE` lines (`crates/ktesio-conformance/src/bin/fake_agent.rs:709-725`, flags at `:325-334`) — assert the mapped variable is present with the engine-computed path. Table-drive the two kinds so the test literally *is* "the same command sequence".
+  - [x] 7.5a **DC-10 (delivery honesty).** Two cases, table-driven against the same attach→start sequence: an adapter whose mapping DOES declare the reserved key (assert the child receives it via `fake_agent --dump`, and the public read reports it delivered) and one whose mapping does NOT (assert the start still SUCCEEDS, the notice is emitted, and the public read reports it undelivered). The second case is the one that would otherwise ship silent — do not skip it because it looks like a no-op. Also assert the reserved key does **NOT** appear in `effective-config.json` (the CORRECTION's property; a regression here would silently break story 3-4's honest-provenance rule).
+  - [x] 7.6 CLI tests in `crates/kt/tests/agent_cli.rs`: attach/detach happy paths + `code == Some(N)` for every failure mode in DC-4. Parse tests inline in `main.rs` (mirror `test_agent_config_*`), and add `memory` to `test_agent_subcommands_exist`'s positive list.
+  - [x] 7.7 Coverage: every new branch needs a test — including each new error arm and each `from_wire` rejection. **The 95% gate is functional again as of PR #120** (see "Coverage is real now" in Dev Notes); budget for a real tarpaulin run.
+  - [x] 7.8 **Scoped mutation check (Q-5 ruling — NOT a full AI-64 pass).** Self-administered, two mutations, minutes not a session; record both in the Dev Agent Record. (a) Break one new exit-code mapper arm (point a new diagnostic at the wrong code) and confirm `agent.rs`'s mapper test FAILS; restore. (b) Delete the `if version < 5` step from `migrate` and confirm the Task 3.4 migration test FAILS; restore. If either mutation passes undetected, the guard is theater — fix the test, then re-apply the mutation to prove the fix catches it (AI-64 clause (b)). Nothing else in this story needs a mutation pass: it freezes no wire shape, no `schema_version`, no exit-code *number*, and no contract surface.
 
-- [ ] **Task 8 — Docs and gates (AC1, AC3, DC-4, DC-5)**
-  - [ ] 8.1 `docs/commands.md`: a `## kt agent memory attach <name> --kind filesystem` / `detach` section with bash-fence examples, placed near the `config` sections. State plainly what Ktesio guarantees (the managed directory persists under the Agent Home and travels with it) and that attach/detach require the instance stopped. Add **one** sentence for DC-10 — the engine hands the path to the adapter at the reserved config key, and whether the agent uses it depends on the adapter declaring a mapping for that key — so the docs are not silently wrong about delivery. The **full** three-level guarantee-vs-delegation statement (NFR-7) is **story 5-2's** deliverable per the Q-1 ruling — do not pre-empt it, and do not contradict it.
-  - [ ] 8.2 `scripts/check_docs.py`: add `"memory"` to `AGENT_COMMANDS` **and** add a nested set for its subcommands, mirroring `CONFIG_COMMANDS = {"get", "set"}` (`~:37-53`). Without both, the new bash fences either fail the gate or are silently skipped — 4-3 proved the skip case by mutation.
-  - [ ] 8.3 `README.md` command table gains the new verb (AI-68/M3 lesson: Epic 4 shipped three commands and forgot the table twice).
-  - [ ] 8.4 Run every gate under the pinned toolchain (see "Gate commands"). Confirm `Cargo.lock` unchanged (no new dependency) and `CONTRACT_VERSION` still `"0.4.0"` (DC-5).
+- [x] **Task 8 — Docs and gates (AC1, AC3, DC-4, DC-5)**
+  - [x] 8.1 `docs/commands.md`: a `## kt agent memory attach <name> --kind filesystem` / `detach` section with bash-fence examples, placed near the `config` sections. State plainly what Ktesio guarantees (the managed directory persists under the Agent Home and travels with it) and that attach/detach require the instance stopped. Add **one** sentence for DC-10 — the engine hands the path to the adapter at the reserved config key, and whether the agent uses it depends on the adapter declaring a mapping for that key — so the docs are not silently wrong about delivery. The **full** three-level guarantee-vs-delegation statement (NFR-7) is **story 5-2's** deliverable per the Q-1 ruling — do not pre-empt it, and do not contradict it.
+  - [x] 8.2 `scripts/check_docs.py`: add `"memory"` to `AGENT_COMMANDS` **and** add a nested set for its subcommands, mirroring `CONFIG_COMMANDS = {"get", "set"}` (`~:37-53`). Without both, the new bash fences either fail the gate or are silently skipped — 4-3 proved the skip case by mutation.
+  - [x] 8.3 `README.md` command table gains the new verb (AI-68/M3 lesson: Epic 4 shipped three commands and forgot the table twice).
+  - [x] 8.4 Run every gate under the pinned toolchain (see "Gate commands"). Confirm `Cargo.lock` unchanged (no new dependency) and `CONTRACT_VERSION` still `"0.4.0"` (DC-5).
 
 ## Dev Notes
 
@@ -309,8 +309,165 @@ and `scripts/test_automation.py:142-158` asserts both jobs still carry those exa
 
 ### Agent Model Used
 
+ox-alpha (opencode), resuming + completing an interrupted dev run on `feat/epic-5-memory`, 2026-08-23.
+
 ### Debug Log References
+
+Resumed from an interrupted run: Tasks 1–5 and the 6.2–6.4 bodies existed but were UNVERIFIED (workspace did not compile — non-exhaustive `map_error` match on the two new `RegistryError` variants; Task 6.1's clap tree, Task 7's tests, and Task 8's docs were missing entirely). This session audited every existing hunk against the spec (kept all of it; it conformed), then finished: mapper arms + mapper-test pins, the full clap tree + dispatch + parse tests, the migration-test literal-pin fix (AI-66 #5 tautology: it compared `PRAGMA user_version` to `SCHEMA_VERSION` itself), `tests/memory.rs` (6 tests), 7 CLI tests, docs + gates.
+
+Test-currency fixes found by running the suite (the interrupted run never had): (1) config.rs's pinned `KNOWN_KEYS` list needed the additive `"memory.dir"` entry (+ a new known-but-not-operator-set assertion test); (2) registry.rs's terminal-state unit test read `memory_status` on SEEDED rows — the delivery fact needs the adapter snapshot, which a seeded row's home deliberately lacks; the store-level row assert is what that test needs (real-instance delivery reads are covered in `register()`-based tests + integration).
+
+Task 7.8 scoped mutation check (Q-5): BOTH mutations caught. (a) Pointed the `MemoryBackingHotSwap` mapper arm at `AgentIo` (code 1) → `registry_error_mapper_arms_preserve_their_documented_exit_codes` FAILED (`left: General, right: InvalidState`); restored, test green. (b) Deleted the `if version < 5` step from `migrate` → `migration_v4_db_upgrades_to_v5_preserving_rows` FAILED (`no such table: agent_memory_backing`); restored, test green.
+
+Gates (all under `cargo +1.96.1`; bare cargo is mise-shimmed to 1.94.1 here and its rustfmt DISAGREES with 1.96.1's — format/check with one toolchain only): fmt ✓ · clippy `-D warnings` ✓ (fixed 3 `doc_lazy_continuation` doc-list errors) · fresh fake_agent build ✓ · workspace tests all-targets ✓ (~950 tests, 0 fail) · doc tests ✓ · check_docs.py ✓ (22 files) · test_automation.py ✓ (21 tests) · OS-cfg grep: 7 hits, ALL pre-existing in kt self_update/update_check (untouched) · AD-2 tree gate ✓ (`ktesio → ktesio-engine → ktesio-adapter-api`, no conformance) · Cargo.lock UNCHANGED ✓ · CONTRACT_VERSION still "0.4.0" ✓ · **tarpaulin --engine llvm --fail-under 95: 95.43%** (4614/4835; `ports/memory_backing.rs` 100%).
+
+### Review Round (2026-08-23, three-layer BMAD review: blind-hunter + edge-case-hunter + verification-gap)
+
+23 findings triaged: 10 patched, 4 deferred, 9 rejected (no intent_gap / no bad_spec ⇒ no loopback; code re-verified in place). PATCHES applied to the same tree:
+
+1. **E5 symlink containment** — new `Registry::ensure_managed_memory_dir` refuses a pre-existing symlink at `<home>/memory` on attach/re-attach (deliberately NOT the shared `ensure_dir`: state-dir/home roots may legitimately be operator symlinks to another volume); the start-time self-heal gained the mirror refusal before its `create_dir_all`. Unix-gated integration test drives BOTH refusals through the public API and asserts nothing is written through the link.
+2. **E3 strict UTF-8 delivery** — the start path now fails LOUD (typed `EngineError::Log`, pre-transition) if the managed path is not valid UTF-8, instead of lossy-coercing a mangled path into the reserved-key override.
+3. **E4 spoofed reserved key** — `start_inner` strips any operator-supplied `memory.dir` from the resolved layers (mirroring the reserved-identity `name` drop), so without an attached backing no hand-set value can masquerade as engine-delivered memory; also keeps it out of the persisted snapshot.
+4. **V1 self-heal proof** — new integration test: hand-delete `<home>/memory` while stopped ⇒ START recreates it; hand-delete again ⇒ same-kind RE-ATTACH recreates it.
+5. **V2 native-suppression pin** — new integration test: `native` backing + manifest adapter that DOES declare the mapping ⇒ real child starts with NO injected env line and NO created directory (the `.filter(kind == Filesystem)` gate can no longer regress silently).
+6. **B8 honesty rename** — `MemoryBackingStatus::delivered` → `declared` (it reports a DECLARED mapping target, not runtime receipt); field doc states exactly that.
+7. **B5 state-aware remediation** — both HotSwap message copies now say "bring it to a terminal state first … stop from running or paused" instead of unconditional "stop it first" (which dead-ends from starting/stopping).
+8. **B7 stdout contract documented** — commands.md now states the attach output shape (banner line + bare path on the final stdout line; diagnostics on stderr).
+9. **B11 reserved key documented** — commands.md states `memory.dir` is engine-reserved, never operator-set, stripped at start, never in the snapshot.
+10. **B12** — removed the vestigial `#[allow(dead_code)]` on `MemoryBackingKind::Native` (the variant is constructed by shipped paths).
+
+Post-patch gates, all green: fmt ✓ · clippy `-D warnings` ✓ · full workspace tests all-targets ✓ (memory suite 9/9 incl. the 3 new tests; registry unit test added for the corrupt-manifest `memory_status` → typed Io path) · check_docs.py ✓ · test_automation.py 21/21 ✓ · **tarpaulin 95.45% ≥ 95** (+0.03pp vs pre-review).
+
+Deferred (see `deferred-work.md`): attach↔start TOCTOU family (E1/E2/B4 — inherent to AD-17's adopted coarse-lock model, belongs to AI-63(b)), migration stamp atomicity (E6 — the V1→V5 pattern predates this story), store REPLACE-vs-registry-keep semantic split (B3), integration test-helper duplication (B15). Rejected as noise/spec-scoped: CLI status surface (Task 4.5 scopes the read to the engine API; 5-2 owns the surface), attached_at display, hot-swap wording, re-attach output distinction, CHANGELOG (release-flow concern), opaque timestamp decode.
 
 ### Completion Notes List
 
+- **A-8 honored**: NO trait — the port module IS the seam; types only.
+- **A-5/A-6 honored**: terminal-states-only guard (Registered/Stopped/Failed pass; Running/Starting/Stopping/Paused refuse), no force escape; same-kind re-attach idempotent (original timestamp stands); different-kind attach rejected with both kinds named.
+- **CORRECTION honored**: the memory override rides a `mapping_effective`-shaped resolution used ONLY for secret-resolution + mapping application; `write_effective_config_snapshot` keeps the plain `effective`. Asserted by tests: neither `memory.dir` nor the path appears in `effective-config.json`.
+- **DC-10 delivered twice over**: pure decision fn (`memory_delivery_notice`) + one stderr emission in the start pre-transition block; the public read carries `delivered`; CLI e2e asserts the notice text on stderr with exit 0 (mapped leg: dump proves receipt, notice silent).
+- **Task 7.5 deviation, recorded honestly**: "the descriptor actually reached the child BOTH times" is unachievable verbatim — a native `--kind mock` has NO launch command (`NativeHasNoLaunch`), so it cannot have a child. The mock leg uses the SHIPPED story-2-2 Decision-8 inert-mock vehicle instead: resolve the builtin's code-declared mapping via the public API, fold the invocation override exactly as `start_inner` does, apply onto a launch, assert the declared env target carries the engine-computed path. The manifest leg observes a REAL child via `fake_agent --dump`. Both legs run ONE shared table-driven sequence.
+- **Task 6.5 (optional human `show` Memory Backing row): deliberately NOT done**, per the task's own "strict minimalism is acceptable" allowance — observability ships via attach/detach confirmations (path from the engine), the DC-10 start notice, and the public read. Story 5-2 owns the fuller status surface.
+- **AI-63(b) input (recorded per the spec's lock section)**: `Engine::remove --delete`'s `remove_dir_all(home)` under both locks now also walks whatever operators store in `memory/` — constant-factor growth of already-unbounded site 17, accepted debt under AD-17 (Q-3).
+- **Second-order honesty note**: `Registry::memory_status` resolves the delivery fact from adapter facts; for an instance whose home lacks the snapshot (only reachable via test-seeded rows today) it errors like every other snapshot read rather than guessing.
+- Windows note: nothing OS-specific was added; the new engine suite runs cross-OS (manifest legs spawn real processes through the standard harness). The `_unix` convention was not needed.
+
 ### File List
+
+- crates/ktesio-engine/src/paths.rs (MEMORY_DIR const + accessor + layout doc)
+- crates/ktesio-engine/src/ports/memory_backing.rs (NEW)
+- crates/ktesio-engine/src/ports/mod.rs
+- crates/ktesio-engine/src/ports/state_store.rs
+- crates/ktesio-engine/src/store/sqlite.rs (SCHEMA_V5, bump, methods, tests)
+- crates/ktesio-engine/src/domain/config.rs (MEMORY_DIR_KEY + KNOWN_KEYS + tests)
+- crates/ktesio-engine/src/domain/error.rs (two RegistryError variants)
+- crates/ktesio-engine/src/domain/mod.rs
+- crates/ktesio-engine/src/domain/registry.rs (attach/detach/read + guard + tests)
+- crates/ktesio-engine/src/domain/supervisor.rs (pre-transition wiring, invocation_overrides, DC-10 notice + tests)
+- crates/ktesio-engine/src/engine.rs (async + Blocking methods)
+- crates/ktesio-engine/src/lib.rs
+- crates/ktesio-engine/src/adapter/builtin.rs (mock mapping + MOCK_MEMORY_ENV_VAR)
+- crates/ktesio-conformance/src/lib.rs (fixture lockstep)
+- crates/ktesio-engine/tests/memory.rs (NEW)
+- crates/kt/src/main.rs (clap tree + dispatch + parse tests)
+- crates/kt/src/cli/agent.rs (command bodies + map_error arms + mapper pins)
+- crates/kt/src/error.rs (AgentMemoryHotSwap, AgentMemoryKindConflict)
+- crates/kt/src/exit_code.rs (classify arms + module-doc table + tests)
+- crates/kt/tests/agent_cli.rs (7 memory tests + seeding helper)
+- docs/commands.md (memory sections + exit-code-4 causes)
+- scripts/check_docs.py (memory + MEMORY_COMMANDS allowlist)
+- README.md (command table rows)
+- _bmad-output/implementation-artifacts/5-1-attach-a-managed-filesystem-memory-backing.md (this record)
+- _bmad-output/implementation-artifacts/sprint-status.yaml (status note)
+
+## Suggested Review Order
+
+**The port seam (design intent)**
+
+- Closed kind vocabulary + wire discipline — the AD-11 extension point, deliberately not a trait
+  [`memory_backing.rs:43`](../../crates/ktesio-engine/src/ports/memory_backing.rs#L43)
+
+- The public read: kind + path + the DC-10 `declared` fact (honesty about offered vs received)
+  [`memory_backing.rs:100`](../../crates/ktesio-engine/src/ports/memory_backing.rs#L100)
+
+**Path authority**
+
+- The one true managed path: `<Agent Home>/memory`, computed only by the engine
+  [`paths.rs:216`](../../crates/ktesio-engine/src/paths.rs#L216)
+
+**Persistence (additive schema v4→v5)**
+
+- One table, UNIQUE FK, cascade — structural copy of `agent_runtime`; no contract surface
+  [`sqlite.rs:145`](../../crates/ktesio-engine/src/store/sqlite.rs#L145)
+
+- Port method on `StateStore` (thin SQLite impl at :860; REPLACE documented, registry enforces A-6)
+  [`state_store.rs:200`](../../crates/ktesio-engine/src/ports/state_store.rs#L200)
+
+**Registry ops: guard ordering is the security model**
+
+- attach: validate → lookup → terminal-state guard → symlink-hardened dir → row
+  [`registry.rs:612`](../../crates/ktesio-engine/src/domain/registry.rs#L612)
+
+- detach: metadata-only (operator data never deleted); nothing-attached is a success no-op
+  [`registry.rs:677`](../../crates/ktesio-engine/src/domain/registry.rs#L677)
+
+- The public read resolving the adapter's declared mapping into the delivery fact
+  [`registry.rs:699`](../../crates/ktesio-engine/src/domain/registry.rs#L699)
+
+- Review hardening: refuses to follow a planted symlink out of the Agent Home
+  [`registry.rs:1330`](../../crates/ktesio-engine/src/domain/registry.rs#L1330)
+
+**Start-path delivery + honesty**
+
+- Pre-transition block: read backing, filesystem-only gate, strict UTF-8, symlink refusal, self-heal
+  [`supervisor.rs:616`](../../crates/ktesio-engine/src/domain/supervisor.rs#L616)
+
+- Reserved-key strip: operator hand-set `memory.dir` can never masquerade as engine delivery
+  [`supervisor.rs:601`](../../crates/ktesio-engine/src/domain/supervisor.rs#L601)
+
+- Invocation override builder — the descriptor rides the layered-config seam, not the contract
+  [`supervisor.rs:3019`](../../crates/ktesio-engine/src/domain/supervisor.rs#L3019)
+
+- DC-10 notice: attached-but-unmapped says so on stderr; start still succeeds
+  [`supervisor.rs:3050`](../../crates/ktesio-engine/src/domain/supervisor.rs#L3050)
+
+**Engine facade + adapter parity**
+
+- Public async methods + Blocking mirrors (AD-2: tests may use nothing else)
+  [`engine.rs:1174`](../../crates/ktesio-engine/src/engine.rs#L1174)
+
+- Mock declares the reserved key in code, in lockstep with the conformance mock
+  [`builtin.rs:113`](../../crates/ktesio-engine/src/adapter/builtin.rs#L113)
+
+**CLI + error surface**
+
+- `kt agent memory attach|detach`: name-first validation, exit codes per frozen table
+  [`agent.rs:1684`](../../crates/kt/src/cli/agent.rs#L1684)
+
+- Both guard errors map to exit 4 (invalid state) — no new exit-code number minted
+  [`agent.rs:1941`](../../crates/kt/src/cli/agent.rs#L1941)
+
+- Typed error with state-aware remediation text
+  [`error.rs:64`](../../crates/ktesio-engine/src/domain/error.rs#L64)
+
+**Tests**
+
+- Integration suite: AC1–AC4 byte-identical survival, parity table, DC-10 both legs
+  [`memory.rs:135`](../../crates/ktesio-engine/tests/memory.rs#L135)
+
+- Self-heal proof: hand-deleted dir recreated by start AND re-attach
+  [`memory.rs:560`](../../crates/ktesio-engine/tests/memory.rs#L560)
+
+- Native-suppression pin: mapped manifest + native backing ⇒ no injection, no directory
+  [`memory.rs:672`](../../crates/ktesio-engine/tests/memory.rs#L672)
+
+- CLI exit-code matrix incl. kind-conflict via DB-seeded row and stderr-notice e2e
+  [`agent_cli.rs:5409`](../../crates/kt/tests/agent_cli.rs#L5409)
+
+**Docs & gates**
+
+- Command docs: guarantee statement, stdout contract, reserved-key warning
+  [`commands.md:208`](../../docs/commands.md#L208)
+
+- check_docs allowlist for the nested `memory` verbs (the 4-3 mutation lesson)
+  [`check_docs.py:50`](../../scripts/check_docs.py#L50)

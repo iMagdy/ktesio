@@ -850,6 +850,82 @@ impl Engine {
         .await
     }
 
+    /// Attach a Memory Backing of `kind` to an Agent Instance (story 5-1,
+    /// FR-15 / spine AD-11). The engine creates the managed directory inside the
+    /// Agent Home (path authority — the returned path IS the engine's, `kt`
+    /// never constructs it) and persists the attachment; the descriptor is
+    /// handed to the adapter at next start via the reserved unified-config key.
+    ///
+    /// Permitted ONLY while the instance sits in a TERMINAL persisted state
+    /// (`registered`/`stopped`/`failed`) — every non-terminal state is refused
+    /// with no side effect, and there is NO force escape (AD-11 forbids
+    /// hot-swap outright).
+    ///
+    /// REGISTRY LOCK ONLY (AD-17): unlike `start`/`stop`, this never takes the
+    /// supervisor lock — it is one bounded DB write plus, for a `filesystem`
+    /// backing, one bounded directory creation (a non-filesystem kind is pure
+    /// delegation metadata and creates nothing), so it cannot widen the
+    /// fleet-wide stall.
+    pub async fn attach_memory(
+        &self,
+        name: &str,
+        kind: crate::ports::MemoryBackingKind,
+    ) -> Result<PathBuf, RegistryError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .attach_memory(&name, kind)
+        })
+        .await
+    }
+
+    /// Detach an Agent Instance's Memory Backing (story 5-1). METADATA ONLY:
+    /// clears the persisted attachment and leaves the managed directory and its
+    /// contents on disk (operator data is never silently deleted — A-4);
+    /// re-attaching later re-adopts them. Same terminal-state guard as
+    /// [`Engine::attach_memory`] (no hot-swap, no force), same registry-lock-only
+    /// discipline. Detaching when nothing is attached is a successful no-op.
+    pub async fn detach_memory(&self, name: &str) -> Result<(), RegistryError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .detach_memory(&name)
+        })
+        .await
+    }
+
+    /// Read an instance's Memory Backing status through the public API (story
+    /// 5-1, Task 4.5): `None` when nothing is attached; otherwise the kind, the
+    /// engine-computed managed directory, whether the adapter's declared
+    /// config mapping targets the reserved key (the DC-10 delivery fact — the
+    /// path is OFFERED at every start for a `filesystem` backing; receiving it
+    /// is the adapter's declared choice; a non-filesystem backing delivers
+    /// nothing and reads `declared: false`), and the typed guarantee level
+    /// (story 5-2).
+    pub async fn memory_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .memory_status(&name)
+        })
+        .await
+    }
+
     /// Read the recorded transition events for an instance from its log (AC1
     /// "each transition emits an event"; AC3 escalation recorded). Test/embedding
     /// observation helper — this is the AD-14 seed, NOT the 7-2 subscription bus.
@@ -1095,6 +1171,31 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.reveal_secrets(name, overrides))
+    }
+
+    /// Blocking [`Engine::attach_memory`] (story 5-1). Returns the engine-computed
+    /// managed directory path (path authority — display it, never reconstruct it).
+    pub fn attach_memory(
+        &self,
+        name: &str,
+        kind: crate::ports::MemoryBackingKind,
+    ) -> Result<PathBuf, RegistryError> {
+        self.engine
+            .rt
+            .block_on(self.engine.attach_memory(name, kind))
+    }
+
+    /// Blocking [`Engine::detach_memory`] (story 5-1).
+    pub fn detach_memory(&self, name: &str) -> Result<(), RegistryError> {
+        self.engine.rt.block_on(self.engine.detach_memory(name))
+    }
+
+    /// Blocking [`Engine::memory_status`] (story 5-1).
+    pub fn memory_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
+        self.engine.rt.block_on(self.engine.memory_status(name))
     }
 }
 

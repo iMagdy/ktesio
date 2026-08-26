@@ -79,6 +79,9 @@ pub use domain::{
     LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, InstanceStatus};
+// Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary
+// `kt` parses `--kind` against and the status shape the public read returns.
+pub use ports::{GuaranteeLevel, MemoryBackingKind, MemoryBackingStatus};
 
 // Re-export the adapter-contract types `kt` needs to render the effective
 // per-OS Capability Declaration (AD-2: `kt` names these types, not the schema).

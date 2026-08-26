@@ -47,9 +47,12 @@ AGENT_COMMANDS = {
     "list",
     "show",
     "config",
+    "memory",
 }
 # `kt agent config` nests one level deeper (`ConfigCommands`).
 CONFIG_COMMANDS = {"get", "set"}
+# `kt agent memory` nests one level deeper (`MemoryCommands`, story 5-1).
+MEMORY_COMMANDS = {"attach", "detach"}
 
 
 def main() -> int:
@@ -203,6 +206,16 @@ def validate_agent_subcommands(
             errors.append(
                 f"{rel_path}: shell fence #{fence_index}, line {line_number}: "
                 f"unknown `kt agent config` command `{config_subcommand}`"
+            )
+    if subcommand == "memory":
+        memory_found = first_non_flag(rest[index + 1 :])
+        if memory_found is None:
+            return
+        _, memory_subcommand = memory_found
+        if memory_subcommand not in MEMORY_COMMANDS:
+            errors.append(
+                f"{rel_path}: shell fence #{fence_index}, line {line_number}: "
+                f"unknown `kt agent memory` command `{memory_subcommand}`"
             )
 
 

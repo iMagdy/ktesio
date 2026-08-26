@@ -47,6 +47,48 @@ pub enum RegistryError {
         name: String,
     },
 
+    /// `memory attach`/`detach` targeted an instance in a NON-terminal Lifecycle
+    /// State (story 5-1, AC3 / spine AD-11 "attach/detach permitted only while
+    /// the Agent Instance is not `running"`; architect ruling A-5 narrows the
+    /// permission to the TERMINAL states only — `registered`/`stopped`/`failed`).
+    /// Like [`EngineError::NotRunning`]'s doctrine, attach/detach are NOT
+    /// lifecycle verbs — no transition is being attempted — so this is a
+    /// dedicated pre-flight check against the PERSISTED state (pure
+    /// state-machine validation, deterministically testable with no live
+    /// process) rather than an entry in the transition table. There is
+    /// deliberately NO `--force` escape (unlike [`RegistryError::RunningRequiresForce`],
+    /// whose "or pass --force" message would be FALSE here): AD-11 forbids
+    /// hot-swapping a backing under a live or transitioning agent outright.
+    /// Names the instance + its actual state + the remediation.
+    #[error(
+        "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped — \
+         attach/detach need a terminal state (registered, stopped, or failed). Bring it to \
+         a terminal state first: kt agent stop {name} from running or paused"
+    )]
+    MemoryBackingHotSwap {
+        /// The instance whose backing was being changed.
+        name: String,
+        /// The instance's current Lifecycle State (wire form).
+        state: String,
+    },
+
+    /// `memory attach` requested a DIFFERENT kind than the one already attached
+    /// (story 5-1, A-6). Exactly ONE Memory Backing exists per instance and
+    /// kinds never hot-swap; the operator detaches first. Re-attaching the SAME
+    /// kind is an idempotent success and never reaches this error. Names both
+    /// kinds + the remediation.
+    #[error(
+        "Agent Instance '{name}' already has a '{attached}' Memory Backing attached; detach it before attaching '{requested}': kt agent memory detach {name}"
+    )]
+    MemoryBackingKindConflict {
+        /// The instance whose backing conflicts.
+        name: String,
+        /// The currently attached kind (wire form).
+        attached: String,
+        /// The requested kind (wire form).
+        requested: String,
+    },
+
     /// A filesystem operation on the Agent Home failed.
     ///
     /// Carries the offending path so the diagnostic can name it (NFR-1). Used

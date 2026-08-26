@@ -21,12 +21,12 @@ kt agent register my-agent --manifest ./my-agent
 Arguments and options:
 
 - `<name>` — Fleet-unique instance name matching `^[a-z0-9][a-z0-9_-]*$`.
-- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`). Mutually exclusive with `--manifest`.
+- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`, `hermes`). Mutually exclusive with `--manifest`.
 - `--manifest <path>` — a manifest adapter loaded from a directory (or an `adapter.toml` file). Mutually exclusive with `--kind`.
 
 Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
 
-The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process.
+The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
 
 ## `kt agent list [--json]`
 
@@ -205,6 +205,58 @@ kt agent remove my-agent --force
 
 `--delete` and `--retain` are mutually exclusive; when neither is given, the safe default is to retain.
 
+## `kt agent memory attach <name> --kind <kind>`
+
+Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
+
+- **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Ktesio guarantees only that the Agent Home itself persists. Attaching it creates no directory.
+
+```bash
+kt agent memory attach demo --kind filesystem
+kt agent memory attach demo --kind native
+```
+
+Arguments:
+
+- `<name>` — the Agent Instance to attach the backing to.
+- `--kind <kind>` — the backing kind: `filesystem` or `native`. The full vocabulary grows without a breaking change.
+
+The confirmation names the kind and prints one boundary sentence stating exactly what is guaranteed versus delegated, then the managed directory path alone on the final stdout line (scripts can read the last line); diagnostics go to stderr. For `native`, that path is the computed location only — nothing was created there.
+
+For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
+
+`memory.dir` is an engine-reserved delivery key, never operator configuration — do not set it yourself. Any hand-set value is stripped where it matters: the engine removes it from the operator layers when resolving what applies at start, so it can be delivered only by the engine itself (when a `filesystem` backing is attached) and never lands in the persisted start snapshot as applied configuration.
+
+Attach and detach require the instance to be in a terminal state (`registered`, `stopped`, or `failed`) — a Memory Backing cannot be hot-swapped under a live agent, and there is no `--force` escape. Re-attaching the same kind is an idempotent success; attaching a different kind over an existing one is rejected until you detach.
+
+### Portability: moving an Agent Home to another machine
+
+Both backing kinds travel with the Agent Home — the attachment lives in the state database inside the state dir, and `filesystem` contents are plain files under `<home>/memory`. To move an instance to another machine:
+
+1. **Stop first.** Attach/detach aside, copy from a quiescent state: bring the instance to a terminal state (`registered`, `stopped`, or `failed`).
+2. **Copy the whole state dir**, preserving the relative layout (`state.db`, `secrets.toml` if present, and everything under `agents/`). Do not reorganize or rename anything inside it.
+3. **Open at the same relative location on the target machine** (or set `KTESIO_STATE_DIR` to the copied root).
+
+The `filesystem` memory tree arrives byte-identical and the instance runs with memory intact; the delegation recorded for a `native` backing travels too. One caveat: a state database written by a NEWER Ktesio version refuses to open on an older one with a clear schema-version error — upgrade before copying forward.
+
+## `kt agent memory detach <name>`
+
+Detach an Agent Instance's Memory Backing.
+
+```bash
+kt agent memory detach demo
+```
+
+Detach is metadata-only: the attachment is removed, but the managed directory **and its contents remain on disk** — your data is never silently deleted, and re-attaching later re-adopts the existing contents. The same terminal-state requirement applies as `attach`.
+
+## Memory guarantees at a glance
+
+| Kind | Ktesio guarantees | Delegated to the agent |
+| --- | --- | --- |
+| `filesystem` | The managed directory exists, its contents survive restarts byte-identically, and it travels with the Agent Home | What the agent does with the delivered path |
+| `native` | Only that the Agent Home persists | All memory semantics (storage, retrieval, lifecycle) |
+
 ## `kt agent config set <name> <key> <value>`
 
 Set one config key on the Agent Instance layer. Validated at write time.
@@ -264,7 +316,7 @@ Every `kt` command returns one of these numeric exit codes, so failures can be b
 | `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter declaring no capabilities or no metering source, a failed self-update |
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
-| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, or a stop that could not be confirmed |
+| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
 | `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
 

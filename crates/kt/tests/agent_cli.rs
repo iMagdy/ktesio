@@ -5207,3 +5207,389 @@ fn help_and_version_still_exit_zero() {
         );
     }
 }
+
+// ---- Story 5-1: `kt agent memory attach | detach` ----
+//
+// DC-1 note: this file NEVER joins the managed directory's name itself — the
+// path arrives printed on stdout FROM the engine, and tests assert against that
+// engine-reported path (the same discipline the shipping code follows).
+
+/// Seed a Memory Backing row of an arbitrary `kind` directly into the state DB
+/// (the `force_state_running` technique, extended to the v5 table). Used to
+/// reach the kind-conflict guard, which the `--kind filesystem`-only CLI cannot
+/// otherwise produce.
+fn force_attach_kind(state_dir: &Path, name: &str, kind: &str) {
+    let conn = rusqlite::Connection::open(state_db(state_dir)).expect("open state db");
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM agent_instances WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .expect("instance row exists");
+    let affected = conn
+        .execute(
+            "INSERT INTO agent_memory_backing (instance_id, kind, attached_at) \
+             VALUES (?1, ?2, '2026-08-23T00:00:00Z') \
+             ON CONFLICT(instance_id) DO UPDATE SET kind = excluded.kind",
+            rusqlite::params![id, kind],
+        )
+        .expect("seed backing row");
+    assert_eq!(affected, 1, "expected to seed exactly one backing row");
+}
+
+#[test]
+fn memory_attach_prints_the_engine_managed_path_and_creates_it() {
+    // AC1 at the CLI + DC-1: the managed path is RECEIVED from the engine
+    // (printed on stdout), and the directory genuinely exists at that path.
+    // This test never constructs the path itself.
+    let (ctx, state) = registered_mock("demo");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        run.code,
+        Some(0),
+        "attach should exit 0; stderr={}",
+        run.stderr
+    );
+    assert!(run.stdout.contains("Attached"), "stdout={}", run.stdout);
+    assert!(
+        run.stdout.contains("filesystem"),
+        "names the kind; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("demo"),
+        "names the instance; stdout={}",
+        run.stdout
+    );
+
+    // The LAST stdout line is the engine-computed path — it must exist on disk.
+    let reported = run
+        .stdout
+        .lines()
+        .last()
+        .expect("attach prints the managed path")
+        .trim()
+        .to_string();
+    assert!(
+        Path::new(&reported).is_dir(),
+        "the engine-reported managed directory must exist: {reported}"
+    );
+    // And it lives inside the instance's Agent Home (which register printed).
+    assert!(
+        reported.contains(
+            &state_dir
+                .join("agents")
+                .join("demo")
+                .to_string_lossy()
+                .to_string()
+        ),
+        "the managed directory is inside the Agent Home: {reported}"
+    );
+
+    // Re-attaching the SAME kind is an idempotent success (A-6).
+    let again = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        again.code,
+        Some(0),
+        "idempotent re-attach; stderr={}",
+        again.stderr
+    );
+
+    // Detaching reports metadata-only semantics on stdout.
+    let detach = run_kt_agent(
+        &["agent", "memory", "detach", "demo"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(detach.code, Some(0), "detach; stderr={}", detach.stderr);
+    assert!(
+        detach.stdout.contains("Detached") && detach.stdout.contains("remain"),
+        "detach names what happened AND that data stays; stdout={}",
+        detach.stdout
+    );
+    assert!(
+        Path::new(&reported).is_dir(),
+        "detach leaves the managed directory on disk"
+    );
+}
+
+#[test]
+fn an_unknown_memory_kind_exits_with_the_usage_code() {
+    // DC-4: an unsupported `--kind` token is a USAGE error (2), naming BOTH
+    // accepted values (story 5-2 widened the accepted set to filesystem+native;
+    // the diagnostic tracks the set).
+    let (ctx, state) = registered_mock("demo");
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "teleporting"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(2), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("filesystem") && run.stderr.contains("native"),
+        "names both accepted values; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn memory_attach_native_is_metadata_only_and_states_the_delegation_boundary() {
+    // Story 5-2, AC1 at the CLI + DC-6: attaching `native` succeeds, prints the
+    // NFR-7 boundary sentence (delegation, Agent Home persistence only), and
+    // prints a path that is NOT created on disk (the computed location only).
+    // The LAST stdout line stays the engine-reported path (DC-1 discipline).
+    let (ctx, state) = registered_mock("nat");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "nat", "--kind", "native"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("Attached") && run.stdout.contains("native"),
+        "names the kind; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("only Agent Home persistence"),
+        "states the delegation boundary; stdout={}",
+        run.stdout
+    );
+
+    // The reported location is the COMPUTED memory dir inside the Agent Home,
+    // and it was NOT created.
+    let reported = run
+        .stdout
+        .lines()
+        .last()
+        .expect("attach prints the computed location")
+        .trim()
+        .to_string();
+    assert!(
+        reported.contains(
+            &state_dir
+                .join("agents")
+                .join("nat")
+                .to_string_lossy()
+                .to_string()
+        ),
+        "the reported location is inside the Agent Home: {reported}"
+    );
+    assert!(
+        !Path::new(&reported).exists(),
+        "a native backing must not create anything at the reported location"
+    );
+
+    // Idempotent re-attach of the same kind succeeds (A-6) and still creates
+    // nothing.
+    let again = run_kt_agent(
+        &["agent", "memory", "attach", "nat", "--kind", "native"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(again.code, Some(0), "stderr={}", again.stderr);
+    assert!(!Path::new(&reported).exists());
+
+    // The kind-conflict guard works in BOTH directions now that the CLI can
+    // request either kind natively (A-6): native over an attached filesystem → 4.
+}
+
+#[test]
+fn memory_attach_filesystem_states_the_managed_directory_guarantee() {
+    // Story 5-2, DC-6: the filesystem attach confirmation ALSO states its NFR-7
+    // boundary — the managed-directory guarantee — so both kinds' outputs name
+    // what is guaranteed versus delegated.
+    let (ctx, state) = registered_mock("fs");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "fs", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("managed directory") && run.stdout.contains("byte-identically"),
+        "states the managed-directory guarantee; stdout={}",
+        run.stdout
+    );
+}
+
+#[test]
+fn a_malformed_name_on_memory_commands_exits_with_the_usage_code() {
+    // DC-4 + the shipped 4-3 M2 convention: validate the name FIRST so a
+    // malformed name exits 2 uniformly (never 3 via a lookup miss).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    for args in [
+        vec![
+            "agent",
+            "memory",
+            "attach",
+            "Bad Name",
+            "--kind",
+            "filesystem",
+        ],
+        vec!["agent", "memory", "detach", "Bad Name"],
+    ] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{args:?} must exit 2 (usage); stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn memory_commands_on_an_unregistered_instance_exit_with_the_not_found_code() {
+    // DC-4: unregistered instance → 3.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    for args in [
+        vec!["agent", "memory", "attach", "ghost", "--kind", "filesystem"],
+        vec!["agent", "memory", "detach", "ghost"],
+    ] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(
+            run.code,
+            Some(3),
+            "{args:?} must exit 3 (not found); stderr={}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn memory_attach_and_detach_on_a_running_instance_exit_with_the_invalid_state_code() {
+    // AC3 at the CLI (DC-4): no hot-swap → 4, with NO force escape. Running is
+    // seeded directly into the DB (no live process needed — the guard is pure
+    // persisted-state validation, DC-3).
+    let (ctx, state) = registered_mock("live");
+    let state_dir = state.project_dir.as_path();
+    force_state_running(state_dir, "live");
+
+    let attach = run_kt_agent(
+        &["agent", "memory", "attach", "live", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(attach.code, Some(4), "stderr={}", attach.stderr);
+    assert!(
+        attach.stderr.contains("hot-swapped") || attach.stderr.contains("terminal"),
+        "names the remediation; stderr={}",
+        attach.stderr
+    );
+
+    let detach = run_kt_agent(
+        &["agent", "memory", "detach", "live"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(detach.code, Some(4), "stderr={}", detach.stderr);
+}
+
+#[test]
+fn attaching_a_different_kind_than_the_attached_one_exits_with_the_invalid_state_code() {
+    // A-6 / DC-4: kinds never conflict-overwrite — detach first → 4.
+    let (ctx, state) = registered_mock("demo");
+    let state_dir = state.project_dir.as_path();
+    force_attach_kind(state_dir, "demo", "native");
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(4), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("'native'") && run.stderr.contains("detach"),
+        "names both kinds + the remediation; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn attaching_native_over_an_attached_filesystem_exits_with_the_invalid_state_code() {
+    // Story 5-2: the CLI can now request `native` directly, so exercise the
+    // conflict guard in the OTHER direction too (filesystem attached, native
+    // requested → 4, detach remediation, no hot-swap).
+    let (ctx, state) = registered_mock("demo");
+    let state_dir = state.project_dir.as_path();
+    force_attach_kind(state_dir, "demo", "filesystem");
+
+    let run = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "native"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(4), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("'filesystem'") && run.stderr.contains("detach"),
+        "names both kinds + the remediation; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_start_with_an_attached_but_unmapped_memory_backing_says_so_and_still_succeeds() {
+    // DC-10 end to end through the real binary: a manifest adapter declaring NO
+    // mapping for the reserved key gets ONE stderr notice naming the key — and
+    // the start STILL succeeds (exit 0). Delivery is offered, not imposed; the
+    // engine is never silent about it.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let attach = run_kt_agent(
+        &["agent", "memory", "attach", "svc", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(attach.code, Some(0), "stderr={}", attach.stderr);
+
+    let start = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        start.code,
+        Some(0),
+        "unmapped delivery must not fail; stderr={}",
+        start.stderr
+    );
+    assert!(
+        start.stderr.contains("memory.dir"),
+        "the notice names the reserved key; stderr={}",
+        start.stderr
+    );
+    assert!(
+        !start.stdout.contains("memory.dir"),
+        "the notice is a diagnostic (stderr), never stdout",
+    );
+}
