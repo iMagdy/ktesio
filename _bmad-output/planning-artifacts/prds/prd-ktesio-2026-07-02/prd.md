@@ -2,7 +2,7 @@
 title: "PRD: Ktesio — Unified Personal-Agent Runtime Engine"
 status: review
 created: 2026-07-02
-updated: 2026-07-02
+updated: 2026-08-28
 ---
 
 # PRD: Ktesio — Unified Personal-Agent Runtime Engine
@@ -323,24 +323,24 @@ Skills can be listed, upgraded (re-lock to newer commit), and removed per Agent 
 **Consequences (testable):**
 - An integrity check detects a hand-modified installed Skill and reports it with remediation, per Agent Instance.
 
-#### FR-37: Legacy command deprecation surface
-The general-purpose skills commands (project-level `skills.json` workflow) remain functional but emit deprecation notices pointing to the agent-scoped replacement and the migration doc.
+#### FR-37: Legacy command removal
+The general-purpose skills commands (project-level `skills.json` workflow) are removed outright at v0.6.0 — no transitional notice-emitting surface and no shim layer. The replacement is `kt agent …`; the removal and a migration pointer are published at the release boundary (FR-38). `[FIXED — amended in epics.md and ratified by Islam 2026-07-14 (Epic 9, story 9-3 Part B); AD-16 Correction in ARCHITECTURE-SPINE.md; shipped in 39f0a57 / PR #114. Supersedes the notice-window policy this FR previously specified.]`
 **Consequences (testable):**
-- Every legacy skills command emits exactly one deprecation notice per invocation to stderr (not stdout), including the removal-target version. `[ASSUMPTION: notice mechanics.]`
+- From v0.6.0 no retired legacy skills command name resolves at the top level of `kt`: the names are absent, not deprecated — asserted in the CLI surface test rather than by counting notices.
 
 ### 4.10 Migration & Deprecation (Legacy Skills Manager)
 
-**Description:** Ktesio v0.5.0 has real users on crates.io/Homebrew for whom `kt` is a skills package manager. The pivot must not strand them silently. Destination is confirmed (agent-scoped sub-feature); mechanics below are proposals. `[ASSUMPTION: window mechanics — §13 Q7.]`
+**Description:** Ktesio v0.5.0 has real users on crates.io/Homebrew for whom `kt` is a skills package manager. The pivot must not strand them silently. Destination is confirmed (agent-scoped sub-feature) and the rollout mechanics are now settled as a clean release-boundary break rather than a notice window. `[FIXED — amended in epics.md and ratified by Islam 2026-07-14 (Epic 9, story 9-3 Part B); AD-16 Correction in ARCHITECTURE-SPINE.md; shipped in 39f0a57 / PR #114. The legacy general-purpose surface is removed outright at v0.6.0, announced at that same release, with no deprecation-notice window and no shim layer — superseding the announce → notice → remove proposal FR-37/FR-38 previously carried. Scope note: this settles §4.10 only; the forward-looking deprecation policy for the three §7 public contracts remains open (§13 Q7 / AI-68) and is untouched by this amendment.]`
 
-#### FR-38: Deprecation lifecycle
-The legacy general-purpose surface follows a published deprecation path: announce (release notes + README), notice period with functional commands (FR-37), then removal in a stated later version.
+#### FR-38: Removal announcement at the release boundary
+The legacy general-purpose surface is announced and removed in the same release: the v0.6.0 changelog and release notes name the retired commands, the removal version, and the `kt agent …` replacement, and carry a migration pointer. There is no notice period and no interim release in which the legacy commands still run. `[FIXED — ratified by Islam 2026-07-14 (Epic 9, story 9-3 Part B); AD-16 Correction in ARCHITECTURE-SPINE.md; shipped in 39f0a57 / PR #114.]`
 **Consequences (testable):**
-- Docs and release notes for the pivot release state the deprecation, the timeline, and the replacement, and `kt --version`-adjacent help output links the migration doc. `[ASSUMPTION: one minor-version cycle ≥ 90 days notice.]`
+- The v0.6.0 changelog and release-notes entries state the retired command names, the 0.6.0 removal version, the replacement surface, and a migration pointer; historical pre-0.6.0 entries stay byte-unchanged.
 
 #### FR-39: Continuity of identity & channels
-The `kt` binary name, crates.io package, Homebrew tap, and install scripts carry over through the pivot; a legacy user upgrading sees the deprecation story, not a broken tool.
+The `kt` binary name, crates.io package, Homebrew tap, and install scripts carry over through the pivot; a legacy user upgrading gets a working, repositioned tool whose retired commands are documented at the release boundary — not a silent breakage. `[FIXED — ratified by Islam 2026-07-14 (Epic 9, story 9-3 Part B); AD-16 Correction in ARCHITECTURE-SPINE.md; shipped in 39f0a57 / PR #114. Continuity of identity and channels stands as written; only the notice-window half of this FR is struck.]`
 **Consequences (testable):**
-- Upgrading from v0.5.0 via each published channel yields a working `kt` where legacy commands still run (with notices) for the stated window.
+- Upgrading from v0.5.0 via each published channel yields a working `kt` whose surface is the agent runner plus binary self-maintenance; the retired legacy command names are absent, and their removal is stated in the v0.6.0 release notes the upgrade points at.
 
 ## 5. Cross-Cutting NFRs
 
@@ -390,7 +390,7 @@ Carried from the brief (confirmed direction, list awaiting Islam's re-confirmati
 - Memory Backings: `filesystem` + `native` only (FR-16).
 - Token Budgets + Rate-derived Cost Caps with configurable Breach Action (FR-18–FR-23).
 - Engine library + `kt` on the public Embedding Interface (FR-31–FR-34).
-- Agent-scoped Skills provisioning + legacy deprecation notices (FR-35–FR-39).
+- Agent-scoped Skills provisioning + the legacy surface's clean removal at v0.6.0 (FR-35–FR-39).
 - All §5 NFRs including 3-OS parity and the ≥95% coverage gate.
 
 ### 9.2 Out of Scope for MVP
@@ -457,8 +457,8 @@ Every inline `[ASSUMPTION]`, indexed:
 12. §4.5 — FR-19 metering mandatory (Q8); FR-21 enforcement-latency placeholder.
 13. §4.6 — FR-25 retention default (10MB); FR-26 JSON schema compatibility testing.
 14. §4.7 — FR-27 conformance kit in v1; FR-28 integration-test isolation strategy deferred.
-15. §4.9 — FR-35 native-skills mapping is the Adapter's job; FR-37 notice mechanics.
-16. §4.10 — FR-38 window (≥90 days / one minor cycle); skills.sh search dropped (Q7).
+15. §4.9 — FR-35 native-skills mapping is the Adapter's job; ~~FR-37 notice mechanics~~ RESOLVED 2026-07-14: moot — the legacy surface was removed outright at v0.6.0, so there are no notice mechanics to specify.
+16. §4.10 — ~~FR-38 window (≥90 days / one minor cycle)~~ RESOLVED 2026-07-14: no notice window — announce and removal both land at v0.6.0; skills.sh search dropped (Q7).
 17. §5 — NFR-4 all performance numbers placeholders; NFR-8 dependency policy.
 18. §6 — zero remote telemetry in v1.
 19. §7 — deprecation policy mechanics.
