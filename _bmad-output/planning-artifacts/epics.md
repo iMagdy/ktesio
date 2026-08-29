@@ -597,6 +597,8 @@ So that the contract is proven non-Hermes-shaped before it freezes. (FR-29, Isla
 
 ### Story 6.6: Freeze and publish the Adapter Contract v1
 
+*(Acceptance criteria extended 2026-08-28 — propagating a decision already ratified by Islam on 2026-08-24 (Story 5-2, Q-1/Q-2), not a new ruling. Story 5-2 deferred the `--json` memory wire surface out of Epic 5 and into this story — "the wire-format freeze moves to Epic 6 where Hermes' real consumers force the shape" — and Story 5-1's DC-6 "ONE intentional announced key-set edit" obligation transferred with it. Until now that obligation lived only in the compiled `epic-6-context.md`, not in the criteria that bind the work: a developer working from this file alone would have frozen contract v1 with the memory wire surface still missing, and the freeze is irreversible under the semver policy this same story publishes.)*
+
 As an adapter author,
 I want a semver'd, documented Adapter Contract whose version the engine negotiates,
 So that adapters built today keep working tomorrow. (FR-30, PRD §7)
@@ -608,6 +610,12 @@ So that adapters built today keep working tomorrow. (FR-30, PRD §7)
 **Then** loading an adapter with an incompatible contract version fails with both versions named and the compatibility rule quoted
 **And** contract docs (trait + manifest schema + capability declaration + versioning policy) publish with the crate (NFR-7)
 **And** the semver-check CI job guards the crate from unannounced breakage
+
+**Given** the `--json` memory wire surface Story 5-2 deferred into this epic (ratified by Islam 2026-08-24, Q-1/Q-2), carrying Story 5-1's "ONE intentional announced key-set edit" obligation with it
+**When** contract v1 freezes
+**Then** the same change lands memory on the wire — every memory read reachable via `--json`, none left human-output-only — carrying both Memory Backing kinds and the guarantee level in the typed form reserved for exactly this freeze (`GuaranteeLevel`'s snake_case wire strings, adopted unchanged)
+**And** it lands as exactly ONE announced key-set edit: Story 4-3's frozen key-set and `schema_version` assertions are re-pinned to the new shape in that same change, and the edit is announced in the release's CHANGELOG/RELEASE_NOTES and docs (PRD §7, NFR-7) — never as silent drift
+**And** contract v1 is not tagged with this surface still deferred, since after the freeze the same story's semver policy makes adding it a breaking wire change
 
 ## Epic 7: Embed the Engine (Hosts)
 
