@@ -17,6 +17,7 @@ use crate::domain::{
     UsageEvent, UsageTotals,
 };
 
+use super::memory_backing::MemoryBacking;
 use super::{ProcessFingerprint, StoreError};
 
 /// A write-ahead spawn record (spine AD-5) — the durable supervision state for
@@ -188,4 +189,23 @@ pub trait StateStore {
         name: &InstanceName,
         policy: RestartPolicy,
     ) -> Result<(), StoreError>;
+
+    // ---- Memory Backing attachments (story 5-1, spine AD-11/AD-6) ----
+
+    /// Persist the attached [`MemoryBacking`] for an instance, in ONE transaction
+    /// (AD-6). Exactly ONE backing per instance — the row is UNIQUE on the
+    /// instance FK, so a re-attach REPLACES the row (kind + timestamp). Typed
+    /// columns, never a JSON blob (DC-2). Fails with [`StoreError::NotFound`] if
+    /// the instance row is gone.
+    fn upsert_memory_backing(&self, backing: &MemoryBacking) -> Result<(), StoreError>;
+
+    /// Clear the Memory Backing attachment for an instance (a detach).
+    /// IDEMPOTENT: clearing when nothing is attached (or the instance is gone)
+    /// is success — the desired end state already holds. METADATA ONLY: this
+    /// never touches any directory on disk (A-4 — operator data stays).
+    fn clear_memory_backing(&self, name: &InstanceName) -> Result<(), StoreError>;
+
+    /// Read the attached [`MemoryBacking`] for an instance, or `None` if nothing
+    /// is attached.
+    fn get_memory_backing(&self, name: &InstanceName) -> Result<Option<MemoryBacking>, StoreError>;
 }

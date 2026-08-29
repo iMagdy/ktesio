@@ -28,7 +28,7 @@
 //! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, + any unmapped error |
 //! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName` |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
-//! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed` |
+//! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict` |
 //! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentInteractionUnavailable` |
 //! | `6` | Timed out | `AgentInteractionTimedOut` |
 //!
@@ -55,8 +55,8 @@
 use crate::error::{
     AgentCapabilityUnsupported, AgentDuplicateName, AgentInteractionTimedOut,
     AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentManifestNotFound,
-    AgentNotFound, AgentNotRunning, AgentRunningRequiresForce, AgentStopUnconfirmed,
-    AgentUnknownConfigKey, AgentUnknownKind,
+    AgentMemoryHotSwap, AgentMemoryKindConflict, AgentNotFound, AgentNotRunning,
+    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentUnknownConfigKey, AgentUnknownKind,
 };
 
 /// The documented, stable `kt` process exit codes (story 4-3). A FROZEN v1
@@ -122,6 +122,10 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         || err.is::<AgentRunningRequiresForce>()
         || err.is::<AgentInvalidTransition>()
         || err.is::<AgentStopUnconfirmed>()
+        // Story 5-1: a Memory Backing cannot be hot-swapped (attach/detach need
+        // a terminal state; no force escape) and kinds never conflict-overwrite.
+        || err.is::<AgentMemoryHotSwap>()
+        || err.is::<AgentMemoryKindConflict>()
     {
         ExitCode::InvalidState
     // 5 — unsupported capability: the Capability Declaration forbids it.
@@ -269,6 +273,14 @@ mod tests {
             }),
             boxed(AgentStopUnconfirmed {
                 message: "stop".into(),
+            }),
+            // Story 5-1: the two memory-guard diagnostics join code 4 — no new
+            // exit-code number was minted (DC-4).
+            boxed(crate::error::AgentMemoryHotSwap {
+                message: "hot-swap".into(),
+            }),
+            boxed(crate::error::AgentMemoryKindConflict {
+                message: "kind-conflict".into(),
             }),
         ] {
             assert_eq!(

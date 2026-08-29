@@ -23,12 +23,31 @@
 //!
 //! ## Layout (`[ASSUMPTION]`: exact names not spine-fixed)
 //!
+//! Recorded CURRENT (Q-4 ruling: this module OWNS the Agent Home layout doc —
+//! every story that adds an entry records it here in the same commit):
+//!
 //! ```text
 //! <state_base>/
 //!   state.db                 # the one SQLite state store (AD-6)
+//!   secrets.toml             # the engine-SHARED 0600 secret store (AD-10; optional)
 //!   agents/
 //!     <instance_name>/       # one Agent Home per instance
 //!       config.toml          # instance-level config (AD-9)
+//!       adapter.json         # persisted adapter snapshot (story 1-3)
+//!       effective-config.json  # resolved config + per-value provenance, written
+//!                            #   at START, overwritten every start (story 2-3)
+//!       <rendered files>     # native config FILE targets of a manifest `[config]`
+//!                            #   mapping (story 2-2; paths are adapter-declared,
+//!                            #   validated relative to the home)
+//!       logs/                # per-instance logs (AD-12): instance.log (JSON-Lines
+//!                            #   transitions), agent.log (raw stdout capture),
+//!                            #   agent-stderr.log (raw stderr capture),
+//!                            #   output.log[.1|.2] (attributed, rotated, story 4-2),
+//!                            #   breaches.log (JSON-Lines budget breaches, story 3-2)
+//!       memory/              # the managed Memory Backing directory (story 5-1,
+//!                            #   spine AD-11 — engine-managed, survives restarts
+//!                            #   byte-identically; contents are OPERATOR data the
+//!                            #   engine never touches)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -68,6 +87,16 @@ pub const INSTANCE_CONFIG_FILE: &str = "config.toml";
 /// provenance tags cleanly, and kept DISTINCT from the editable `config.toml`
 /// (this file is engine-owned, read-only-to-humans, never hand-edited).
 pub const EFFECTIVE_CONFIG_SNAPSHOT_FILE: &str = "effective-config.json";
+
+/// Directory name of the managed Memory Backing inside an Agent Home (story 5-1,
+/// spine AD-11 "`filesystem` — engine-managed directory inside the Agent Home;
+/// survives restarts byte-identically"). The ONE true name for the directory: the
+/// path is computed only through [`EnginePaths::agent_memory_dir`] (path
+/// authority, conventions row) and `kt`/adapters/Hosts never join this segment
+/// themselves. The engine CREATES the directory (attach + a defensive start-time
+/// self-heal, each one idempotent `create_dir_all`) but NEVER touches its
+/// CONTENTS — they are operator data that must survive byte-identically (DC-7).
+pub const MEMORY_DIR: &str = "memory";
 
 /// Computes engine-owned paths from a resolved state-dir base.
 ///
@@ -177,6 +206,16 @@ impl EnginePaths {
     pub fn effective_config_snapshot(&self, name: &InstanceName) -> PathBuf {
         self.agent_home(name).join(EFFECTIVE_CONFIG_SNAPSHOT_FILE)
     }
+
+    /// Absolute path to an Agent Home's managed Memory Backing directory (story
+    /// 5-1, spine AD-11). The engine is the SOLE path authority: `kt` receives the
+    /// path from the public API and never constructs it; adapters receive it via
+    /// the reserved unified-config key injected at start. Mirrors
+    /// [`effective_config_snapshot`](Self::effective_config_snapshot), rooted at
+    /// the same Agent Home.
+    pub fn agent_memory_dir(&self, name: &InstanceName) -> PathBuf {
+        self.agent_home(name).join(MEMORY_DIR)
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +256,9 @@ mod tests {
             paths.effective_config_snapshot(&name("alpha")),
             a.join("effective-config.json")
         );
+        // Story 5-1: the managed Memory Backing directory lives inside the home
+        // as memory/ (path authority — one const, one accessor).
+        assert_eq!(paths.agent_memory_dir(&name("alpha")), a.join("memory"));
     }
 
     #[test]

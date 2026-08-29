@@ -5,7 +5,7 @@ description: Run AI agents like services — supervise their lifecycle, meter re
 
 # Ktesio Documentation
 
-![Ktesio banner: run AI agents like services — supervise, meter, and budget them](assets/ktesio-banner.jpg)
+![Ktesio banner: run AI agents like services — supervise, meter, and budget them](assets/ktesio-banner.png)
 
 Welcome to the Ktesio docs. Ktesio is a Rust CLI and engine that **runs AI agents like services**: register any agent, supervise its lifecycle, meter its real token usage, and enforce token and dollar budgets. These pages explain how to install it, run agents, configure them, and contribute.
 

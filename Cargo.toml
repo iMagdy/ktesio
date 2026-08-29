@@ -27,6 +27,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 # Internal crates
 ktesio-engine = { path = "crates/ktesio-engine", version = "0.1.0" }
 ktesio-adapter-api = { path = "crates/ktesio-adapter-api", version = "0.1.0" }
+ktesio-adapters-hermes = { path = "crates/ktesio-adapters-hermes", version = "0.1.0" }
 
 # External dependencies (single source of truth for versions)
 clap = { version = "4", features = ["derive"] }

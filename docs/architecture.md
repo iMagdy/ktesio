@@ -14,11 +14,11 @@ crates/
 ├── kt/                     # package "ktesio" — the shipping kt CLI (all current behavior)
 ├── ktesio-engine/          # engine library (registration + adapter resolution live)
 ├── ktesio-adapter-api/     # Adapter Contract: trait, per-OS capability + metering types, manifest schema
-├── ktesio-adapters-hermes/ # native adapter home (reserved skeleton)
+├── ktesio-adapters-hermes/ # native adapter home (Hermes gateway builtin, launchable)
 └── ktesio-conformance/     # adapter conformance fixtures (mock adapter + scripted fake agent)
 ```
 
-`kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types); CI enforces that dependency boundary. `ktesio-adapter-api` depends on nothing internal — it owns the Adapter Contract types and the `adapter.toml` manifest schema (with validation), versioned under a contract-version constant. The engine consumes that crate's parsed form and defines no schema of its own. The `ktesio-conformance` mock adapter is a dev/test fixture: the engine and `kt` reference it as a dev-dependency only, so it never appears in the shipping dependency graph (a normal edge would trip the boundary gate). The `hermes` adapter crate stays a reserved skeleton until epic 6.
+`kt` may depend only on `ktesio-engine`'s public API (plus `ktesio-adapter-api` types and the `ktesio-adapters-hermes` builtin); CI enforces that dependency boundary. `ktesio-adapter-api` depends on nothing internal — it owns the Adapter Contract types and the `adapter.toml` manifest schema (with validation), versioned under a contract-version constant. The engine consumes that crate's parsed form and defines no schema of its own. The `ktesio-conformance` mock adapter is a dev/test fixture: the engine and `kt` reference it as a dev-dependency only, so it never appears in the shipping dependency graph (a normal edge would trip the boundary gate). The `ktesio-adapters-hermes` native builtin declares the real Hermes gateway launch (`hermes gateway run --external-supervisor`) and maps `memory.dir` onto the agent's `HERMES_HOME`; story 6-2 made it launchable end to end.
 
 ### Engine modules
 

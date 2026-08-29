@@ -221,6 +221,32 @@ enum AgentCommands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Attach or detach an Agent Instance's Memory Backing (FR-15)
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Attach a Memory Backing to an Agent Instance (requires a terminal state —
+    /// no hot-swap). `filesystem` creates the managed directory inside the Agent
+    /// Home; `native` records the delegation (Ktesio guarantees only Agent Home
+    /// persistence) and creates nothing.
+    Attach {
+        /// Name of the Agent Instance
+        name: String,
+        /// The Memory Backing kind to attach (accepted: filesystem, native)
+        #[arg(long)]
+        kind: String,
+    },
+    /// Detach an Agent Instance's Memory Backing (metadata only: the managed
+    /// directory and its contents remain on disk; requires a terminal state)
+    Detach {
+        /// Name of the Agent Instance
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -319,6 +345,10 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                     json,
                     reveal,
                 } => cli::agent::config_get(&name, key.as_deref(), json, reveal),
+            },
+            AgentCommands::Memory { command } => match command {
+                MemoryCommands::Attach { name, kind } => cli::agent::memory_attach(&name, &kind),
+                MemoryCommands::Detach { name } => cli::agent::memory_detach(&name),
             },
         },
         None => {
@@ -425,6 +455,7 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "list"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
+        assert!(agent.get_subcommands().any(|c| c.get_name() == "memory"));
     }
 
     #[test]
@@ -449,6 +480,40 @@ mod tests {
         assert!(Cli::try_parse_from(["kt", "agent", "config", "get"]).is_err());
         // config requires a subcommand.
         assert!(Cli::try_parse_from(["kt", "agent", "config"]).is_err());
+    }
+
+    #[test]
+    fn test_agent_memory_parse() {
+        // Story 5-1: `memory attach <name> --kind <kind>` and `memory detach
+        // <name>` parse (a nested subcommand, mirroring `config`).
+        assert!(Cli::try_parse_from([
+            "kt",
+            "agent",
+            "memory",
+            "attach",
+            "demo",
+            "--kind",
+            "filesystem"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["kt", "agent", "memory", "detach", "demo"]).is_ok());
+        // attach requires --kind.
+        assert!(Cli::try_parse_from(["kt", "agent", "memory", "attach", "demo"]).is_err());
+        // attach requires a name.
+        assert!(
+            Cli::try_parse_from(["kt", "agent", "memory", "attach", "--kind", "filesystem"])
+                .is_err()
+        );
+        // detach requires a name.
+        assert!(Cli::try_parse_from(["kt", "agent", "memory", "detach"]).is_err());
+        // memory requires a subcommand.
+        assert!(Cli::try_parse_from(["kt", "agent", "memory"]).is_err());
+        // The kind value is NOT validated by clap (an unknown token is a runtime
+        // usage diagnostic, exit 2 — pinned in the agent_cli integration tests).
+        assert!(Cli::try_parse_from([
+            "kt", "agent", "memory", "attach", "demo", "--kind", "bogus"
+        ])
+        .is_ok());
     }
 
     #[test]
