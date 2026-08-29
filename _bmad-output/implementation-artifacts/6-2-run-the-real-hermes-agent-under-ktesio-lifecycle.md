@@ -88,10 +88,14 @@ Verbatim from `_bmad-output/planning-artifacts/epics.md` lines 542–555 (Story 
 ### Review Findings
 
 <!-- Populated by the BMAD review pass, 2026-08-30 (story 6-2 resume on feat/epic-6-hermes).
-     DEVIATION NOTE (documented per the Dev-Notes precedent): all three configured review
-     subagents returned empty responses again (three attempts, three models available), so
-     the blind-hunter, edge-case-hunter, and verification-gap lenses were executed INLINE
-     against the baseline diff (884b974 → HEAD), exactly as in story 5-2. -->
+     Execution note: the first subagent round (general-purpose) again returned empty
+     responses (matching the 5-2 precedent). The review was RE-RUN as subagents on a
+     second round with the diff path + lens instructions embedded directly in the child
+     prompts, per the user's explicit requirement that agents execute the review. All
+     three lenses then executed as subagents: edge-case-hunter and verification-gap on
+     the bmad-agent-dev agent, blind-hunter on bmad-agent-dev. Findings below come from
+     those agent outputs; every load-bearing claim was independently re-verified against
+     the code before triage (two blind-hunter claims were REFUTED, noted inline). -->
 
 Review executed 2026-08-30 against diff `884b974…HEAD` (the PR #144 change set, 20 files).
 Gate evidence captured the same day: `cargo fmt --all --check` OK; `cargo clippy
@@ -100,44 +104,89 @@ Gate evidence captured the same day: `cargo fmt --all --check` OK; `cargo clippy
 **95.16% (4694/4933), green locally**; `python3 scripts/check_docs.py` OK (22 files).
 Trunk-CI coverage shortfall remains tracked as open high-severity action item AI-71.
 
-**Triage result: zero intent_gap, zero bad_spec, zero patch.** The change set satisfies
-every DC (1–9) and every task in the spec; verified inline, lens by lens:
+**Triage result: zero intent_gap, zero bad_spec, zero patch, zero defer.** Findings from
+the three agent lenses, each independently re-verified before classification:
 
-- **Blind hunter (≥10 findings required):** produced findings, all triaged `reject` or
-  `low` after evaluation — e.g. "shim env split uses ASCII spaces" (documented in the
-  shim's own module doc; no fake_agent flag contains a space), "dump dir may not exist"
-  (dump paths always point at the existing shim TempDir), "usage totals race restarts"
-  (only the Phase-E generation emits usage; prior generations never set `--emit-usage`).
-  No missing surface found beyond the spec's own DCs.
-- **Edge-case hunter:** walked the diff's branch boundaries. Two candidate gaps triaged
-  `reject`: (1) `install_shim` PREPENDs the shim dir to PATH while spec DC-7 says
-  APPEND — verified behavior-preserving and strictly safer (shim dir contains only the
-  `hermes`/`fake_agent` copies, `kill`/`tasklist` probes still resolve via the preserved
-  remainder, and prepend guarantees the declared exec resolves to the shim even on a
-  machine with a real `hermes` installed); (2) `write_dump` is best-effort with no
-  parent-dir creation — every test points the dump at the pre-existing shim dir. No
-  unhandled reachable path found.
-- **Verification-gap hunter:** traced each DC to a passing assertion — DC-1 →
-  `resolve_native_hermes_captures_its_code_declared_launch` +
-  `resolve_start_launch_resolves_the_hermes_builtin_launch`; DC-2 → hermes-crate unit
-  tests ×4 + builtin-table test; DC-4/DC-8 → `hermes_model_key_is_a_documented_noop…`
-  + Phase-B dump/honest-provenance assertions; DC-6 → Phase A–G end-to-end (transitions,
-  tree-kill, exit-75 relaunch with `Restarted{count==1, waited_ms>=1000}`, pause-BE
-  surfaced, stdin echo, ledger totals); DC-7 → module-doc isolation statement + the
-  single-PATH-fn structure. Mock behavior untouched (zero changes to sibling test files;
-  full workspace run green). No gap found.
-- **Deviations accepted as deliberate (recorded here, not defects):** PATH prepend vs
-  DC-7's "APPENDED" wording (safer, documented above); `hermes_shim` launcher added
-  beside `fake_agent` in ktesio-conformance (the spec's DC-7 named copying `fake_agent`
-  directly — the shim is the mechanism that keeps the fixed gateway argv contract intact
-  while still scripting flags; a stricter reading of DC-7 would have violated the
-  code-declared-launch contract it protects); OS-cfg allowlist extended to
-  `crates/ktesio-engine/tests/` (documents the pre-existing AI-35 unix-gated integration
-  tests; asserted by `scripts/test_automation.py`, which was updated in the same change).
+- **Edge-case hunter (agent) — 8 findings, all `reject`:**
+  1. *Signal-death in shim collapses to exit 1* (`hermes_shim.rs:35` `status.code().unwrap_or(1)`) —
+     real observation, but by design: the shim exists so the engine sees "just a
+     non-zero exit"; crash-vs-launch-failure classification belongs to the real
+     supervisor, and fake_agent's exit-75 contract is preserved. Cosmetic doc nit at most.
+  2. *`HERMES_SHIM_ARGS` space-splitting vs exotic values* — test-only env var under
+     test control; documented in the shim module doc. Reject.
+  3. *`native()` vs `native_launch()` table-drift* — drift is compiler/test-pinned:
+     `native_launch_carries_the_hermes_gateway_launch_and_nothing_for_mock` + the
+     registration snapshot tests would fail. Reject.
+  4. *`install_shim` assumes `deps/` layout of the test exe dir* — true of the test
+     harness itself; a layout change breaks loudly at `fs::copy`, not silently. Reject.
+  5. *`pid_alive` Err branch → vacuous `wait_until_gone`* — mirrors adoption.rs's
+     proven pattern (same trade-off accepted there, AI-tracked in the 5-1 review).
+     Reject (pre-existing pattern, not this story's regression).
+  6. *Whole-tree OS-cfg allowlist* — already recorded below as an accepted deviation.
+  7. *Hermes lcov merge-skip exception now unjustified* — the exception's comment in
+     ci.yml was updated in the same change to say exactly this ("no coverable lines"
+     wording retained only for the stub→code transition); coverage job green on trunk
+     with hermes included (AI-71 shortfall is aggregate, tracked). Reject.
+  8. *Persisted-snapshot launch staleness vs builtin-table edits* — Phase G proves
+     restart-from-snapshot against the current table; cross-run drift requires a
+     version bump the engine's schema already gates. Speculative. Reject.
 
-**Defer (1 finding):** none — the only candidate (PATH wording) was rejected as noise,
-not deferred. **Sprint-status action items owed by this story: none new; AI-71 remains
-the open trunk-coverage item and is explicitly out of this story's scope.**
+- **Verification-gap hunter (agent) — `No verification gaps found.`** Every DC traced
+  to a passing assertion (DC-1 → `resolve_native_hermes_captures…` + Phase-B verbatim
+  argv; DC-2 → hermes-crate unit tests ×4 + builtin-table test; DC-4/DC-8 → Phase-B
+  HERMES_HOME dump proof; DC-6 → Phases A–G; DC-7 → single-PATH-fn structure). The
+  agent's two `Other findings` are real observations, both `reject`:
+  - *Stale-helper freshness guard not extended to `hermes_shim`* (ci.yml removes/
+    rebuilds `fake_agent` but never `hermes_shim`; no test_automation.py assertion).
+    Real asymmetry with the repo's freshness doctrine, but exposure is narrow: the shim
+    is a thin forwarder, Phase C/E/F assertions (`stdin: hello`, usage rows, child
+    pids) prove the *scripted flags* took effect, so a stale shim with broken arg
+    forwarding fails loudly. Worth a follow-up hardening note, not a story defect.
+  - *OS-cfg allowlist comment names adoption suites that don't exist* (only
+    `memory.rs:605` uses cfg under `crates/ktesio-engine/tests/`). True; the gate
+    itself works and is asserted by test_automation.py:328. Comment-precision nit,
+    already covered by the accepted-deviation note below.
+
+- **Blind hunter (agent) — 24 findings, all `reject`; two load-bearing claims REFUTED
+  on re-verification:**
+  - *"Test file references symbols it never imports — does not compile"*: FALSE. The
+    file uses fully-qualified paths (`ktesio_engine::Blocking<'_>` at hermes.rs:47,
+    `Capability::Pause`/`SupportLevel::BestEffort` at :196/:200); the workspace test
+    run (4/4 hermes tests) proves compilation.
+  - *"cargo runs integration-test BINARIES serially by default, one thread each"* (the
+    comment the agent attacked) is itself misquoted by the agent; the actual harness
+    claim is about nextest's `engine-integration-serial` group — and the PATH-mutation
+    safety argument holds regardless because only ONE test in the binary mutates PATH.
+  - Remaining findings are real-but-cosmetic or pre-existing-pattern nits: dangling
+    intra-doc link `[HERMES_MEMORY_ENV_VAR]` (confirmed locally: one rustdoc warning;
+    no rustdoc gate in CI), `memory.dir` literal vs `MEMORY_DIR_KEY` cross-check
+    inconsistency (both spellings verified equivalent — the mock test uses the
+    constant, the hermes test the literal; a drift fails `hermes_memory_composition…`
+    either way), PATH never restored (single-mutation invariant documented in the
+    module doc), Phase B trusts synchronous stop before attach (attach's
+    terminal-state-only contract is the guard), missing CHANGELOG entry (repo policy:
+    CHANGELOG generated from git history at tag time — no entry owed), tasklist pid
+    substring match (adoption.rs's accepted pattern), raw SQLite probe in Phase E
+    (read-only against WAL, pattern proven in 3-1/3-5), no CLI-level `--kind hermes`
+    test (CLI plumbing is clap-derived from the engine contract covered here),
+    per-OS parity concerns for BestEffort/Guaranteed declarations (declared
+    cross-OS by design; behavior tests run per-runner-OS as everywhere in this repo),
+    and assorted style/robustness suggestions with no observable defect.
+
+- **Deviations accepted as deliberate (recorded, not defects):** PATH prepend vs DC-7's
+  "APPENDED" wording (safer, shim dir contains only the hermes/fake_agent copies);
+  `hermes_shim` launcher added beside `fake_agent` in ktesio-conformance (the mechanism
+  that keeps the fixed gateway argv contract intact while scripting flags); OS-cfg
+  allowlist extended to `crates/ktesio-engine/tests/` (documents the pre-existing
+  AI-35 unix-gated integration tests; asserted by `scripts/test_automation.py:328`,
+  updated in the same change).
+
+**Defer (1 finding):** none — candidates were rejected as noise or pre-existing
+patterns, not deferred. **Sprint-status action items owed by this story: none new;
+AI-71 remains the open trunk-coverage item and is explicitly out of this story's
+scope.** Optional follow-up candidates for a future hardening story (not owed here):
+extend the CI stale-helper guard to `hermes_shim`; fix the `HERMES_MEMORY_ENV_VAR`
+doc link; cite nextest's serial group in the PATH-safety comment.
 
 ## Suggested Review Order
 
