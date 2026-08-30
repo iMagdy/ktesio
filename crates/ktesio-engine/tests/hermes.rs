@@ -406,12 +406,16 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
 
     // SAFETY: this is the ONLY PATH mutation in this binary; it runs once, at
     // this single test's start, before any child is spawned by the engine
-    // threads below (edition 2024 requires the unsafe block for set_var; the
-    // harness runs each #[test] fn on its own thread and no other test in this
-    // file reads or writes PATH concurrently — cargo also runs integration-test
-    // BINARIES serially by default, one thread each, unless --test-threads
-    // shares a binary, which is exactly why ALL spawn-dependent phases live
-    // inside THIS one function).
+    // threads below (edition 2024 requires the unsafe block for set_var).
+    // Race analysis: a test binary's set_var can only affect THIS process —
+    // other test binaries are separate processes and are untouched. Under
+    // nextest (CI) every #[test] is its own process AND this package's test
+    // binaries run one at a time via the `engine-integration-serial` group
+    // (.config/nextest.toml, max-threads = 1); under plain `cargo test`
+    // (local) test binaries already run sequentially. Within THIS binary the
+    // load-bearing fact holds under either harness: no other test in this
+    // file reads or writes PATH — which is exactly why ALL spawn-dependent
+    // phases live inside THIS one function (the mutation is process-global).
     let joined = {
         let mut paths: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -689,6 +693,19 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         |s| s == LifecycleState::Running,
         Duration::from_secs(30),
         "the relaunched gateway to reach running",
+    );
+    // Exactly ONE supervisor hand-off (review-of-6-2 hardening): assert the
+    // SETTLED event log, not merely the first match — a second Restarted here
+    // would mean a crash-loop (crash-times = 1 forbids a second shim crash),
+    // which the first-match find() above would silently pass.
+    let events = facade.transition_events("gw").unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.cause, TransitionCause::Restarted { .. }))
+            .count(),
+        1,
+        "exactly one Restarted event after the single crash (no crash-loop)"
     );
     // Teardown.
     let _ = facade.stop("gw", Some(Duration::from_secs(5)));

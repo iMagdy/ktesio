@@ -150,7 +150,14 @@ jobs:
         shell: bash
         run: |
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
+          rm -f target/debug/hermes_shim target/debug/hermes_shim.exe
           cargo +stable build -p ktesio-conformance --bin fake_agent
+          # hermes_shim gets the SAME freshness guard (review-of-6-2, vg-o1):
+          # the hermes e2e test resolves it at target/debug/hermes_shim via the
+          # same exists()-only locator (install_shim, ktesio-engine/tests/
+          # hermes.rs), so a cached stale copy would silently shadow the
+          # committed launcher's current arg surface (--crash-* family).
+          cargo +stable build -p ktesio-conformance --bin hermes_shim
           cargo +stable nextest run --workspace --all-targets --no-run
       - name: Run tests (nextest)
         # Single unified run for all three OSes (#106). The x86-ubuntu `adoption`
@@ -591,7 +598,12 @@ jobs:
           # which is the documented posture (docs/testing.md: `fake_agent` runs
           # only as a spawned subprocess and is excluded from coverage).
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
+          rm -f target/debug/hermes_shim target/debug/hermes_shim.exe
           cargo +stable build -p ktesio-conformance --bin fake_agent
+          # hermes_shim: same freshness + lock-contention rationale as
+          # fake_agent above (review-of-6-2, vg-o1) — its locator also accepts
+          # a merely-EXISTING target/debug/hermes_shim.
+          cargo +stable build -p ktesio-conformance --bin hermes_shim
           # NO RETRY WRAPPER. The former 3-attempt whole-job retry (PR #117, built
           # on a since-disproven "runner contention" theory) could never converge:
           # the failure above is DETERMINISTIC, so every attempt re-hit it. It

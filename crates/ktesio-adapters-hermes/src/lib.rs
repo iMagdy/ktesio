@@ -17,7 +17,7 @@
 //! - **MeteringSource::SelfReported** (CP-d): usage comes from the agent's own
 //!   `/usage` + insights surface; BudgetEvaluator stays additive (no $ cap).
 //! - **Config mapping**: ONLY the reserved unified key `memory.dir` → env
-//!   [`HERMES_MEMORY_ENV_VAR`] ([`HERMES_HOME`], CP-e+f) — the same filesystem-
+//!   [`HERMES_HOME`] (CP-e+f) — the same filesystem-
 //!   backing invocation override the builtin mock maps to `KTESIO_MEMORY_DIR`.
 //!   The `model` key is deliberately UNMAPPED (Decision 6): Hermes switches
 //!   models via its own `hermes model` CLI, so an operator-set `model` value is
