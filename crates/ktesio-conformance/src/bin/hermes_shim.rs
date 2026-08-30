@@ -18,7 +18,15 @@
 //! AND which environment the engine injected (`env=HERMES_HOME=…`). A missing
 //! `HERMES_SHIM_ARGS` means "forward and behave like plain fake_agent".
 //!
-//! Pure std; NO OS-cfg (the OS-cfg CI gate allowlists only `backends/`).
+//! // Pure std; NO OS-cfg (the OS-cfg CI gate allowlists only `backends/`).
+
+// This whole binary runs only as a SPAWNED SUBPROCESS of the story 6-2
+// integration test (`crates/ktesio-engine/tests/hermes.rs`), which copies it to
+// a temp dir and launches it via the engine's PATH resolution, so a coverage
+// harness (tarpaulin) instrumenting the test process can never record its
+// lines — the same rationale as `fake_agent`. Exclude it from coverage; its
+// BEHAVIOR is proven by the spawning test, not by line coverage.
+#[cfg(not(tarpaulin_include))]
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if let Ok(script) = std::env::var("HERMES_SHIM_ARGS") {

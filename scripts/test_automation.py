@@ -141,6 +141,10 @@ class ReleaseDocsTests(unittest.TestCase):
         # both the `rm` and the explicit rebuild so neither is dropped.
         self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
         self.assertIn("cargo +stable build -p ktesio-conformance --bin fake_agent", ci)
+        # hermes_shim (story 6-2) joins fake_agent in the stale-helper guard for
+        # the identical reason — assert its rm + rebuild pair in BOTH jobs too.
+        self.assertIn("rm -f target/debug/hermes_shim target/debug/hermes_shim.exe", ci)
+        self.assertIn("cargo +stable build -p ktesio-conformance --bin hermes_shim", ci)
         # The COVERAGE job needs the very same guard, for the same reason, and a
         # workspace-wide assertIn cannot tell the two jobs apart — so scope this
         # pair to the coverage step's own script. The stale-helper defect has now
@@ -156,6 +160,15 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self.assertIn(
             "cargo +stable build -p ktesio-conformance --bin fake_agent",
+            coverage_step,
+        )
+        # hermes_shim's pair is asserted in the coverage job's own script too.
+        self.assertIn(
+            "rm -f target/debug/hermes_shim target/debug/hermes_shim.exe",
+            coverage_step,
+        )
+        self.assertIn(
+            "cargo +stable build -p ktesio-conformance --bin hermes_shim",
             coverage_step,
         )
         self.assertIn(
