@@ -337,8 +337,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/ktesio-engine/src/backends/", ci)
         # OS-cfg allowlist covers honestly-unix-gated engine integration tests
-        # (AI-35 disclosure convention) alongside the backends home.
-        self.assertIn("^crates/ktesio-engine/tests/", ci)
+        # (AI-35 disclosure convention) alongside the backends home. Assert the
+        # FULL allowlist LINE shape (review blind-12): a bare substring would
+        # also match a stale comment quoting the pattern, so a narrowed
+        # allowlist (e.g. a dropped legacy-file entry) must fail here.
+        self.assertIn(
+            r"allowlist='^crates/ktesio-engine/src/backends/"
+            r"|^crates/kt/src/update_check\.rs:"
+            r"|^crates/kt/src/cli/self_update\.rs:"
+            r"|^crates/ktesio-engine/tests/'",
+            ci,
+        )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
         # It scans for the BROADENED set of dollar-string-building forms (`${`, `$ {`,
         # `}$`, a `"$`-prefixed string, and a bare `'$'` char) and allowlists the

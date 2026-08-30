@@ -160,6 +160,61 @@ fn duplicate_registration_exits_nonzero_with_diagnostic() {
 }
 
 #[test]
+fn register_hermes_kind_plumbs_through_the_cli_and_surfaces_in_list() {
+    // Review blind-10: engine-API tests prove the hermes builtin resolves, but
+    // the CLI arg-plumbing (`--kind hermes` → AdapterRef::Native → engine) is
+    // its own surface. This registers the REAL hermes kind at the CLI level —
+    // register-only, NO spawn (hermes is never started here) — and asserts the
+    // kind survives the round trip through register's stdout confirmation and
+    // `list --json`'s machine-readable kind field.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &["agent", "register", "gw", "--kind", "hermes"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        run.success,
+        "register --kind hermes should exit 0; stderr={}",
+        run.stderr
+    );
+    assert!(run.stdout.contains("Registered"), "stdout={}", run.stdout);
+    assert!(
+        run.stdout.contains("gw"),
+        "the instance name should be echoed; stdout={}",
+        run.stdout
+    );
+
+    // The engine's builtin table resolved the kind (hermes declares
+    // self-reported metering + a non-empty declaration; an unknown kind would
+    // have been rejected before any state was written).
+    let home = state_dir.join("agents").join("gw");
+    assert!(home.join("adapter.json").is_file(), "snapshot persisted");
+
+    // The kind surfaces verbatim in `list --json`.
+    let listed = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    assert!(
+        listed.success,
+        "list --json should exit 0; stderr={}",
+        listed.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&listed.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", listed.stdout));
+    let instances = doc["instances"].as_array().expect("instances array");
+    assert_eq!(instances.len(), 1, "{doc}");
+    assert_eq!(instances[0]["name"], serde_json::json!("gw"), "{doc}");
+    assert_eq!(instances[0]["kind"], serde_json::json!("hermes"), "{doc}");
+    assert_eq!(
+        instances[0]["metering_source"],
+        serde_json::json!("self-reported"),
+        "{doc}"
+    );
+}
+
+#[test]
 fn invalid_name_exits_nonzero() {
     let ctx = TestContext::new();
     let state = TestContext::new();

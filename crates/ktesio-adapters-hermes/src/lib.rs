@@ -56,6 +56,13 @@ pub const HERMES_EXEC: &str = "hermes";
 /// Positional args of the foreground gateway launch (see [`HERMES_EXEC`]).
 pub const HERMES_ARGS: [&str; 3] = ["gateway", "run", "--external-supervisor"];
 
+/// The adapter's kind string (review blind-7): the single source of truth for
+/// the name every resolution path matches against — the engine's builtin table
+/// matches this constant in its `match` arms (a `&str` const IS a valid match
+/// pattern), and [`AgentAdapter::kind`] returns it, so the kind name can never
+/// drift between the table and the declaration.
+pub const HERMES_KIND: &str = HERMES_EXEC;
+
 use ktesio_adapter_api::{
     AgentAdapter, Capability, CapabilityDeclaration, ConfigMapping, ConfigTarget, MeteringSource,
     OsId, SupportLevel,
@@ -106,7 +113,7 @@ impl Default for HermesAdapter {
 
 impl AgentAdapter for HermesAdapter {
     fn kind(&self) -> &str {
-        "hermes"
+        HERMES_KIND
     }
 
     fn capabilities(&self) -> &CapabilityDeclaration {
@@ -135,7 +142,7 @@ mod tests {
     #[test]
     fn hermes_kind_resolves() {
         let adapter = HermesAdapter::new();
-        assert_eq!(adapter.kind(), "hermes");
+        assert_eq!(adapter.kind(), HERMES_KIND);
         assert_eq!(adapter.metering_source(), MeteringSource::SelfReported);
         assert!(!adapter.capabilities().is_empty());
     }

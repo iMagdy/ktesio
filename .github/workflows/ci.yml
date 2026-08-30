@@ -271,6 +271,11 @@ jobs:
           if [ -n "$violations" ]; then
             echo "$violations"
             echo "::error::kt may depend only on ktesio-engine (plus ktesio-adapter-api types and the ktesio-adapters-hermes builtin); forbidden internal crate edge found."
+            # WHY the adapters-hermes edge is allowed (review blind-22): it is
+            # the builtin native-adapter table the engine's `native()` matcher
+            # consults to resolve `--kind hermes` — code, not a plugin, so the
+            # shipping binary carries it. Any OTHER internal crate must stay
+            # out of kt's graph (mock/dev fixtures ride dev-dependencies only).
             exit 1
           fi
           echo "Boundary gate green: internal edges are exactly the allowlisted ktesio-engine / ktesio-adapter-api / ktesio-adapters-hermes."
@@ -286,10 +291,11 @@ jobs:
           # two pre-existing v0.5.0 legacy CLI files (self-update platform
           # detection) grandfathered until epic 8 relocates/deprecates them
           # (AC-4 amendment, ratified 2026-07-02), plus engine integration
-          # TESTS: symlink containment (memory.rs, story 5-1) and adoption
-          # process-spawning suites are honestly unix-gated there under the
-          # AI-35 disclosure convention ("the test does not exist on Windows"
-          # rather than passing vacuously); no production code may use cfg.
+          # TESTS: the symlink-containment test (memory.rs:605, story 5-1) is
+          # the one honestly unix-gated suite there under the AI-35 disclosure
+          # convention ("the test does not exist on Windows" rather than
+          # passing vacuously) — adoption/interaction suites deliberately use
+          # NO cfg (data-driven OS ids); no production code may use cfg.
           allowlist='^crates/ktesio-engine/src/backends/|^crates/kt/src/update_check\.rs:|^crates/kt/src/cli/self_update\.rs:|^crates/ktesio-engine/tests/'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?

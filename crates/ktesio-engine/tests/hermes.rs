@@ -22,10 +22,12 @@
 //! edition 2024), so EVERY spawn-dependent phase lives inside ONE `#[test]`
 //! function running sequentially over one instance in ONE engine, and the
 //! mutation happens ONCE at that test's start (before any other thread this
-//! test spawns). Out-of-band probes borrowed from adoption.rs (`kill -0`,
-//! `tasklist`) resolve through the preserved remainder of PATH. Tests that
-//! need NO process spawn (declaration surface, config composition) stay
-//! independent `#[test]` fns and never touch the environment.
+//! test spawns) and is RESTORED at that test's teardown (review blind-3), so
+//! any test added to this binary later starts from a pristine environment.
+//! Out-of-band probes borrowed from adoption.rs (`kill -0`, `tasklist`)
+//! resolve through the preserved remainder of PATH. Tests that need NO
+//! process spawn (declaration surface, config composition) stay independent
+//! `#[test]` fns and never touch the environment.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,6 +45,12 @@ fn open(base: &TempDir) -> Engine {
 }
 
 /// Poll `instance_status` until `pred(state)` holds, bounded (crash.rs pattern).
+///
+/// Review blind-15: a NOT-FOUND instance is NOT mapped onto a synthetic state —
+/// an instance that has not appeared yet keeps polling, and only the deadline
+/// panic surfaces the last OBSERVED state (or `unregistered`, if the instance
+/// was never seen). A `pred` on `Registered` therefore can no longer pass
+/// vacuously against a missing registry entry.
 fn wait_until_state(
     facade: &ktesio_engine::Blocking<'_>,
     name: &str,
@@ -51,17 +59,21 @@ fn wait_until_state(
     what: &str,
 ) -> LifecycleState {
     let deadline = Instant::now() + within;
+    let mut last_seen: Option<LifecycleState> = None;
     loop {
-        let state = facade
-            .instance_status(name)
-            .map(|s| s.instance.state)
-            .unwrap_or(LifecycleState::Registered);
-        if pred(state) {
-            return state;
+        if let Ok(state) = facade.instance_status(name).map(|s| s.instance.state) {
+            if pred(state) {
+                return state;
+            }
+            last_seen = Some(state);
         }
+        // Not found yet (or the store is mid-write): keep polling.
+        let shown = last_seen
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unregistered (no registry entry ever observed)".to_string());
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {what} (last state: {state})"
+            "timed out waiting for {what} (last state: {shown})"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -219,8 +231,9 @@ fn hermes_registers_with_its_declared_per_os_shape_and_self_reported_metering() 
     assert_eq!(entry.metering_source, "self-reported");
 
     // The code-declared launch is public contract surface (DC-1).
-    let launch = ktesio_engine::adapter::native_launch("hermes").expect("declared");
-    assert_eq!(launch.exec, "hermes");
+    let launch = ktesio_engine::adapter::native_launch(ktesio_adapters_hermes::HERMES_KIND)
+        .expect("declared");
+    assert_eq!(launch.exec, ktesio_adapters_hermes::HERMES_KIND);
     assert_eq!(launch.args, vec!["gateway", "run", "--external-supervisor"]);
 }
 
@@ -250,13 +263,16 @@ fn hermes_memory_composition_maps_the_managed_dir_onto_hermes_home_exactly_as_st
     let effective = facade.effective_config("svc", overrides).unwrap();
     let mapping = ktesio_engine::adapter::resolve_config_mapping("hermes", None).unwrap();
     let env_var = mapping
-        .target("memory.dir")
+        .target(ktesio_engine::domain::MEMORY_DIR_KEY)
         .and_then(|t| t.env_var())
         .expect("hermes declares an env target for memory.dir")
         .to_string();
 
+    // Blind-21: compose the launch from the adapter crate's public consts —
+    // this is the test that pins the kind/exec literals, so a constant change
+    // cannot sail through engine tests.
     let mut launch = ktesio_engine::adapter::StartLaunch {
-        exec: "hermes".to_string(),
+        exec: ktesio_adapters_hermes::HERMES_KIND.to_string(),
         args: vec![
             "gateway".to_string(),
             "run".to_string(),
@@ -317,8 +333,11 @@ fn hermes_model_key_is_a_documented_noop_and_unbacked_gets_no_hermes_home() {
         mapping.target("model").is_none(),
         "`model` must be unmapped"
     );
+    // Blind-21: compose the launch from the adapter crate's public consts —
+    // this is the test that pins the kind/exec literals, so a constant change
+    // cannot sail through engine tests.
     let mut launch = ktesio_engine::adapter::StartLaunch {
-        exec: "hermes".to_string(),
+        exec: ktesio_adapters_hermes::HERMES_KIND.to_string(),
         args: vec![
             "gateway".to_string(),
             "run".to_string(),
@@ -404,18 +423,21 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         }
     }
 
-    // SAFETY: this is the ONLY PATH mutation in this binary; it runs once, at
-    // this single test's start, before any child is spawned by the engine
-    // threads below (edition 2024 requires the unsafe block for set_var).
-    // Race analysis: a test binary's set_var can only affect THIS process —
-    // other test binaries are separate processes and are untouched. Under
-    // nextest (CI) every #[test] is its own process AND this package's test
-    // binaries run one at a time via the `engine-integration-serial` group
-    // (.config/nextest.toml, max-threads = 1); under plain `cargo test`
-    // (local) test binaries already run sequentially. Within THIS binary the
-    // load-bearing fact holds under either harness: no other test in this
-    // file reads or writes PATH — which is exactly why ALL spawn-dependent
-    // phases live inside THIS one function (the mutation is process-global).
+    // SAFETY: PATH is mutated here and RESTORED at the end of this test (see
+    // teardown below); it runs once, at this single test's start, before any
+    // child is spawned by the engine threads below (edition 2024 requires the
+    // unsafe block for set_var). Race analysis: a test binary's set_var can
+    // only affect THIS process — other test binaries are separate processes
+    // and are untouched. Under nextest (CI) every #[test] is its own process
+    // AND this package's test binaries run one at a time via the
+    // `engine-integration-serial` group (.config/nextest.toml, max-threads =
+    // 1); under plain `cargo test` (local) test binaries already run
+    // sequentially. Within THIS binary the load-bearing fact holds under
+    // either harness: no other test in this file reads or writes PATH — which
+    // is exactly why ALL spawn-dependent phases live inside THIS one function
+    // (the mutation is process-global). Restoring at teardown keeps the
+    // process-global state clean for any test added here later (review blind-3).
+    let original_path = std::env::var_os("PATH").map(|v| v.to_os_string());
     let joined = {
         let mut paths: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -644,7 +666,9 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
     // ================================================================
     // PHASE G — FR-6 exit 75 (the CP-b external-supervisor hand-off) is JUST a
     // crash: the reaper detects it and the on-failure policy relaunches with
-    // the SAME persisted launch → Restarted{count==1, waited_ms>=1000}.
+    // the SAME persisted launch → Restarted{count==1, waited_ms>0} (blind-24:
+    // production waits the real 1s base backoff, but the test pins semantics,
+    // not scheduler timing).
     // ================================================================
     let crash_count = shim_dir.path().join("crash-count");
     script(&format!(
@@ -660,7 +684,7 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         "the crash-phase gateway to reach running first",
     );
     // The exit-75 crash crosses the readiness window → detected → restarted
-    // after the production 1s base backoff (single crash keeps count stable).
+    // after the supervisor's backoff (single crash keeps count stable).
     let deadline = Instant::now() + Duration::from_secs(30);
     let restart_evt = loop {
         let events = facade.transition_events("gw").unwrap();
@@ -676,13 +700,19 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    // Recorded DATA on the event, not wall-clock measurements.
+    // Recorded DATA on the event, not wall-clock measurements. The semantic
+    // contract under review (blind-24): the supervisor DID wait before
+    // relaunching (its backoff is unit-tested separately with injected
+    // backoff), so the integration test asserts a positive wait without
+    // coupling this test to the production base-backoff constant — an adaptive
+    // future backoff must not break this test while the crash-loop proof
+    // (count == 1, exactly one Restarted event below) stays intact.
     match &restart_evt.cause {
         TransitionCause::Restarted { count, waited_ms } => {
             assert_eq!(*count, 1, "exactly one supervisor hand-off relaunch");
             assert!(
-                *waited_ms >= 1000,
-                "production backoff honored: waited_ms={waited_ms}"
+                *waited_ms > 0,
+                "the supervisor backed off before relaunching: waited_ms={waited_ms}"
             );
         }
         other => panic!("expected Restarted, got {other:?}"),
@@ -709,4 +739,16 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
     );
     // Teardown.
     let _ = facade.stop("gw", Some(Duration::from_secs(5)));
+    // Review blind-3: restore the process-global PATH mutation so any test
+    // added to this binary later starts from the pristine environment. The
+    // variable may be absent on exotic runners; deleting it reproduces that.
+    if let Some(original) = original_path {
+        unsafe {
+            std::env::set_var("PATH", original);
+        }
+    } else {
+        unsafe {
+            std::env::remove_var("PATH");
+        }
+    }
 }

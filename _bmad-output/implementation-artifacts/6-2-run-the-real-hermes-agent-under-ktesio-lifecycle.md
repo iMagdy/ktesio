@@ -97,7 +97,7 @@ Verbatim from `_bmad-output/planning-artifacts/epics.md` lines 542–555 (Story 
      those agent outputs; every load-bearing claim was independently re-verified against
      the code before triage (two blind-hunter claims were REFUTED, noted inline). -->
 
-Review executed 2026-08-30 against diff `884b974…HEAD` (the PR #144 change set, 20 files).
+Review executed 2026-08-30 against diff `884b974…HEAD` (the PR #149 change set, 20 files).
 Gate evidence captured the same day: `cargo fmt --all --check` OK; `cargo clippy
 --workspace --all-targets -- -D warnings` OK; `cargo test --workspace --all-targets` OK
 (all suites green, hermes.rs 4/4); `cargo tarpaulin --workspace --fail-under 95` →
@@ -185,15 +185,21 @@ the three agent lenses, each independently re-verified before classification:
 patterns, not deferred. **Sprint-status action items owed by this story: none new;
 AI-71 remains the open trunk-coverage item and is explicitly out of this story's
 scope.** Optional follow-up candidates for a future hardening story (not owed here):
-extend the CI stale-helper guard to `hermes_shim`; fix the `HERMES_MEMORY_ENV_VAR`
-doc link; cite nextest's serial group in the PATH-safety comment.
+~~extend the CI stale-helper guard to `hermes_shim`; fix the `HERMES_MEMORY_ENV_VAR`
+doc link; cite nextest's serial group in the PATH-safety comment~~ (RESOLVED 2026-08-30
+in commit `dca3fef` on `feat/epic-6-hermes`: all three implemented — hermes_shim guard
+in both CI jobs, `[`HERMES_HOME`]` doc link fix, nextest serial-group SAFETY comment —
+plus a Phase G exactly-one-Restarted assertion; the finding that spawned-subprocess
+helper binaries carry `#[cfg(not(tarpaulin_include))]` was applied to hermes_shim in
+the follow-up commit, and `scripts/test_automation.py` asserts both helpers' rm/build
+guard pairs).
 
 ## Suggested Review Order
 
 **The one engine behavior change — launchable native builtins (DC-1, DC-3)**
 
 - The builtin table gains the `hermes` arm and its code-declared launch — the design intent in one stop.
-  [`builtin.rs:74`](../../../crates/ktesio-engine/src/adapter/builtin.rs#L74)
+  [`builtin.rs:76`](../../../crates/ktesio-engine/src/adapter/builtin.rs#L76)
 
 - `resolve_native` captures the launch into the registration snapshot — start needs no special case.
   [`mod.rs:622`](../../../crates/ktesio-engine/src/adapter/mod.rs#L622)
@@ -218,10 +224,12 @@ doc link; cite nextest's serial group in the PATH-safety comment.
   [`hermes.rs:1`](../../../crates/ktesio-engine/tests/hermes.rs#L1)
 
 - Phase B: one dump artifact proves the verbatim gateway argv AND the HERMES_HOME injection.
-  [`hermes.rs:405`](../../../crates/ktesio-engine/tests/hermes.rs#L405)
+  [`hermes.rs:468`](../../../crates/ktesio-engine/tests/hermes.rs#L468)
 
-- Phase G: exit-75 hand-off is just a crash — `Restarted{count==1, waited_ms>=1000}`.
-  [`hermes.rs:642`](../../../crates/ktesio-engine/tests/hermes.rs#L642)
+- Phase G: exit-75 hand-off is just a crash — `Restarted{count==1, waited_ms>0}` (round-1 blind-24 relaxed the
+  `>=1000` floor: the supervisor waits `plan.delay` before the restart, but scheduler jitter must not fail CI;
+  the exact 1s-base/cap-60s backoff stays pinned by `restart.rs` unit tests).
+  [`hermes.rs:680`](../../../crates/ktesio-engine/tests/hermes.rs#L680)
 
 - The shim launcher that forwards contract argv then scripted flags into fake_agent.
   [`hermes_shim.rs:1`](../../../crates/ktesio-conformance/src/bin/hermes_shim.rs#L1)
@@ -233,3 +241,38 @@ doc link; cite nextest's serial group in the PATH-safety comment.
 
 - Docs currency: architecture + commands now name hermes as the launchable native.
   [`architecture.md:17`](../../../docs/architecture.md#L17)
+
+## Round-1 triage resolution (PR #149, 2026-08-30)
+
+The 13 round-1 findings accepted for resolution (blind-2, blind-3, blind-7, blind-10,
+blind-12, blind-13, blind-15, blind-18, blind-19, blind-22, blind-23, blind-24, vg-o2)
+were fixed in one batch on `feat/epic-6-hermes`:
+
+- **blind-7** — `HERMES_KIND` const in ktesio-adapters-hermes; builtin match arms and
+  `kind()` use it. Engine-side `resolve_native` test already pinned `resolve()` with the
+  literal (`adapter_cli` + `resolve_native_hermes_captures_its_code_declared_launch`),
+  so an accidental constant change cannot sail through.
+- **blind-2** — unit/integration tests use `crate::domain::MEMORY_DIR_KEY` /
+  `ktesio_engine::domain::MEMORY_DIR_KEY` instead of `"memory.dir"` literals at the
+  key-delivery assert sites.
+- **blind-10** — new CLI test `register_hermes_kind_plumbs_through_the_cli_and_surfaces_in_list`
+  (exit 0, Registered, adapter.json snapshot, `list --json` kind).
+- **blind-12** — test_automation.py asserts the full OS-cfg allowlist line from ci.yml.
+- **blind-15** — `wait_until_state` no longer maps not-found onto a synthetic state;
+  deadline panic shows the last OBSERVED state or `unregistered`.
+- **blind-18** — `resolve_start_launch_hermes_native_launch_env_stays_empty` drift guard
+  (production resolve path env must be empty); the registration-snapshot path was already
+  asserted by `resolve_native_hermes_captures_its_code_declared_launch` (`launch.env` empty).
+- **blind-19** — `resolve_start_launch_manifest_kind_takes_precedence_over_the_builtin_table`
+  pins manifest-over-builtin precedence.
+- **blind-3** — hermes.rs PATH shim now saves `PATH` and restores it at teardown.
+- **blind-24** — Phase G asserts `waited_ms > 0` (semantics, not scheduler timing);
+  exact backoff values stay pinned in restart.rs unit tests.
+- **blind-13** — docs/commands.md documents the unbacked-hermes shared-default-home
+  fallback and points to `kt agent memory attach` as the remedy.
+- **blind-22** — ci.yml boundary error message explains WHY the adapters-hermes edge is
+  allowed (builtin table, code not plugin; other internal crates stay out).
+- **blind-23** — docs/architecture.md states the shipping consequence: the hermes
+  adapter compiles into every kt binary.
+- **vg-o2** — ci.yml OS-cfg allowlist comment names the real user: only `memory.rs:605`
+  `#[cfg(unix)]` under engine tests/ (no adoption-suite cfg exists).
