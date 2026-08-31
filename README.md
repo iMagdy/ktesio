@@ -70,7 +70,7 @@ Register an agent, give it a budget, inspect it, and run it under supervision.
 An agent is registered through an `adapter.toml` that declares how to launch it, its per-OS capabilities, and its metering source. Create a directory `my-agent/` with an `adapter.toml`:
 
 ```toml
-contract_version = "0.3.0"
+contract_version = "0.4.0"
 
 [adapter]
 kind = "my-agent"

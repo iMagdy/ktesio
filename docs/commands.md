@@ -292,6 +292,7 @@ Set these with `kt agent config set <name> <key> <value>`.
 
 | Key | Value | Meaning |
 |-----|-------|---------|
+| `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` maps it nowhere) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
 | `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`) |
@@ -301,6 +302,8 @@ Set these with `kt agent config set <name> <key> <value>`.
 | `budget.dollars.cumulative` | dollar string | Cumulative dollar Cost Cap (needs a Rate to enforce) |
 | `metering.upstream_base_url` | URL | Real upstream endpoint for an `engine-observed` instance |
 | `agent.<key>` | any | Pass-through namespace delivered verbatim to the agent (bypasses known-key validation) |
+
+Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped where it matters, so these can only ever be delivered by the engine itself.
 
 Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Ktesio displays it.
 

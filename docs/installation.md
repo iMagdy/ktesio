@@ -5,13 +5,11 @@ description: Install Ktesio on macOS, Linux, or Windows with the hosted installe
 
 # Installation
 
-Ktesio is a Rust CLI. It works on macOS, Linux, and Windows as long as `git` is available on `PATH`.
+Ktesio is a Rust CLI. It works on macOS, Linux, and Windows with no runtime dependencies beyond the operating system.
 
 ## Prerequisites
 
-- Git
-
-Rust is only required when installing through Cargo or from source.
+- None for the installed binary. Rust is only required when installing through Cargo or from source.
 
 ## Install with the Installer
 
@@ -117,7 +115,7 @@ Set `KTESIO_NO_UPDATE_CHECK=1` to skip automatic update checks.
 ## Platform Notes
 
 - macOS may require Xcode Command Line Tools when building from source.
-- Windows users should install Git for Windows and make sure `git.exe` is on `PATH`.
+- Windows users building from source need the MSVC build tools (see [Rust's Windows setup](https://rustup.rs/)).
 - Linux users may need standard build tools for Rust crates.
 
 ## Next Steps
