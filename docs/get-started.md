@@ -30,7 +30,7 @@ kt --version
 kt agent --help
 ```
 
-## Describe Your Agent With a Manifest Adapter
+## Describe your agent with a manifest adapter
 
 Ktesio registers an agent through an **adapter** — either a native builtin (`--kind`) or a **manifest adapter** you supply as an `adapter.toml` (`--manifest`). A manifest declares how to launch the agent, its per-OS capabilities, and its metering source.
 
@@ -84,7 +84,7 @@ kt agent register demo --kind mock
 
 `mock` is a registration/config fixture — it declares capabilities and a metering source but has **no launch command**, so it cannot be started. Use a manifest adapter to run a real process.
 
-## Set a Budget and a Cost Cap
+## Set a budget and a cost cap
 
 Budgets and rates are ordinary unified-config values, validated at write time and changeable at any time:
 
@@ -99,19 +99,20 @@ kt agent config set my-agent cost.rate.output 15.00
 kt agent config set my-agent budget.dollars.cumulative 10.00
 ```
 
-The Breach Action (`pause`, `stop`, or `warn`) fires the instant a ceiling is reached, on real usage from the Usage Ledger. A dollar cap set without a Rate is inert until a Rate exists.
+The Breach Action (`pause`, `stop`, or `warn`) fires the instant a ceiling is reached, on real usage from the Usage Ledger — `warn` records the breach event only and performs no lifecycle transition. A dollar cap set without a Rate is inert until a Rate exists.
 
-## Inspect the Fleet
+## Inspect the fleet
 
 ```bash
 kt agent list                  # name, kind, state, restarts, budget, usage
 kt agent show my-agent         # capabilities, runtime status, usage, budget, cost, metering source
+kt agent usage my-agent        # Usage Ledger totals for one instance (or Fleet-wide without a name)
 kt agent config get my-agent   # the effective config with the source layer of each value
 ```
 
 Add `--json` to `list` or `show` for a versioned, machine-readable document. Token totals equal the Usage Ledger exactly; dollar figures appear only when a Rate is configured and are always labeled estimates.
 
-## Drive the Lifecycle
+## Drive the lifecycle
 
 ```bash
 kt agent start my-agent
@@ -124,7 +125,7 @@ kt agent stop my-agent --timeout 10
 
 > **Supervision boundary:** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. Durable supervision across separate CLI invocations is future work (a supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
-## Manage Secrets
+## Manage secrets
 
 Reference secrets indirectly with a `secret:NAME` value — the reference is stored, and the real value is resolved from the environment (then the engine secrets file) at start and delivered to the agent, while staying masked in `kt agent config get`, snapshots, logs, and events:
 
@@ -134,14 +135,14 @@ kt agent config get my-agent               # shows secret:**** for that key
 kt agent config get my-agent --reveal      # the sole explicit un-mask
 ```
 
-## Remove an Agent
+## Remove an agent
 
 ```bash
 kt agent remove my-agent            # keeps the Agent Home by default
 kt agent remove my-agent --delete   # also deletes the Agent Home
 ```
 
-## Next Steps
+## Next steps
 
 - Read the [command reference](commands.md).
 - Learn the [adapter manifest format](manifest.md).

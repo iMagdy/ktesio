@@ -144,6 +144,15 @@ If your platform does not have a prebuilt release archive, install with Cargo:
 cargo install ktesio --force
 ```
 
+## Usage Totals Stay Zero
+
+`kt agent usage <name>` (or the usage columns in `list`/`show`) reporting all zeros means no usage was recorded — check the Metering Source:
+
+- **Self-reported** — the agent must emit `KTESIO_USAGE {json}` sentinel lines on its stdout (e.g. `KTESIO_USAGE {"sequence": 0, "input_tokens": 128, "output_tokens": 512}`). Check they are actually reaching stdout: run `kt agent logs <name>` and look for the lines. A malformed JSON payload is silently dropped as a diagnostic, and stdout that is redirected or wrapped by the agent's own tooling may never reach the captured stream.
+- **Engine-observed** — the engine meters only traffic pointed at its loopback proxy. Verify the config mapping that points the agent's OpenAI-compatible `base_url` at the engine-injected `metering.base_url` is declared in the manifest, and that `metering.upstream_base_url` names the real provider endpoint (see [Unified Config Keys](commands.md#unified-config-keys)).
+
+An instance that has never started also reports zeros — that is expected.
+
 ## Release Workflow Did Not Update Docs
 
 The tag workflow publishes the GitHub Release first, then opens a pull request for `CHANGELOG.md` and `docs/RELEASE_NOTES.md`.

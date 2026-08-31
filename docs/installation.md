@@ -11,7 +11,7 @@ Ktesio is a Rust CLI. It works on macOS, Linux, and Windows with no runtime depe
 
 - None for the installed binary. Rust is only required when installing through Cargo or from source.
 
-## Install with the Installer
+## Install with the installer
 
 On macOS or Linux:
 
@@ -46,11 +46,11 @@ KTESIO_INSTALL_DRY_RUN=1 curl -fsSL https://cli.ktesio.dev/install.sh | sh
 `KTESIO_INSTALL_METHOD` accepts `auto`, `brew`, `cargo`, or `binary` on macOS
 and Linux. Windows accepts `auto`, `cargo`, or `binary`.
 
-The installer does not install Homebrew, Rust, Cargo, Git, or shell profile
-entries. If it installs a binary into a directory that is not on `PATH`, it
-prints the directory to add.
+The installer does not install Homebrew, Rust, or Cargo, and it writes no shell
+profile entries. Git is not a runtime dependency. If it installs a binary into
+a directory that is not on `PATH`, it prints the directory to add.
 
-## Install from Source
+## Install from source
 
 ```bash
 git clone https://github.com/iMagdy/ktesio.git
@@ -73,7 +73,7 @@ cargo install ktesio
 
 The crates.io package is named `ktesio`; it installs the `kt` binary.
 
-## Install from a Release
+## Install from a release
 
 Download the archive for your platform from [GitHub Releases](https://github.com/iMagdy/ktesio/releases), then unpack it and place the `kt` binary on your `PATH`.
 
@@ -108,17 +108,37 @@ kt self-update
 `kt self-update` preserves the current install channel automatically. Homebrew
 installs upgrade with Homebrew, Cargo installs upgrade with Cargo, and manual
 release installs download the latest GitHub Release archive, verify its
-`.sha256` checksum, and replace the current binary.
+`.sha256` checksum, and replace the current binary. A running agent keeps
+executing the binary it was started with; restart it to pick up the new version.
 
 Set `KTESIO_NO_UPDATE_CHECK=1` to skip automatic update checks.
 
-## Platform Notes
+## Uninstall
+
+How to remove Ktesio depends on the install channel:
+
+```bash
+brew uninstall imagdy/tap/ktesio   # Homebrew installs
+cargo uninstall ktesio             # Cargo installs
+```
+
+For a manual release install, delete the `kt` binary from the directory it was
+installed into.
+
+Uninstalling removes the binary only. Ktesio's own state is untouched: the state
+directory (override `KTESIO_STATE_DIR`, otherwise the platform data dir) holds
+`state.db`, instance Agent Homes, and any filesystem Memory Backing contents,
+and `<state dir>/secrets.toml` holds any stored secrets. Delete the state
+directory yourself if you want a fully clean removal — otherwise it is reused
+if you reinstall.
+
+## Platform notes
 
 - macOS may require Xcode Command Line Tools when building from source.
 - Windows users building from source need the MSVC build tools (see [Rust's Windows setup](https://rustup.rs/)).
 - Linux users may need standard build tools for Rust crates.
 
-## Next Steps
+## Next steps
 
 - [Getting started](get-started.md)
 - [Command reference](commands.md)
