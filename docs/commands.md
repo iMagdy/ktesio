@@ -210,7 +210,7 @@ kt agent remove my-agent --force
 Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
 
 - **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
-- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Ktesio guarantees only that the Agent Home itself persists. Attaching it creates no directory.
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Ktesio guarantees only that the Agent Home itself persists. Attaching it creates no directory. On adapters that own their memory entirely (e.g. `hermes`), the engine does not inject a `HERMES_HOME`-style environment override at start either — the agent's own mechanism locates its home; Ktesio surfaces the computed path for reference only.
 
 ```bash
 kt agent memory attach demo --kind filesystem
@@ -306,6 +306,10 @@ Set these with `kt agent config set <name> <key> <value>`.
 Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
 
 Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Ktesio displays it.
+
+### Budget breaches and the pause action
+
+When a token ceiling or dollar Cost Cap is crossed, the recorded breach names its scope (`per_run`/`cumulative`), the limit, and the observed value. With the default `breach_action: pause`, the enforcement pause on a **best-effort**-pause adapter carries the budget cause (`BudgetExceeded`, naming the token or dollar scope that crossed first) — the same honest cause surfaces whether the pause was operator-initiated or enforcement-initiated. When both a token ceiling and a dollar cap are set and both breach in the same enforcement pass, the token breach wins the pause (the dollar breach is still recorded); enforcement evaluates token ceilings before dollar caps. A `pause` breach on an already-paused instance does not abort the run — the breach is recorded and a diagnostic notes the pause could not be honored.
 
 ## Global Behavior
 
