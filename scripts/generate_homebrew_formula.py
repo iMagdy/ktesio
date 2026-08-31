@@ -81,8 +81,6 @@ def render_formula(tag: str, checksums: dict[str, str]) -> str:
   version "{version}"
   license "{LICENSE}"
 
-  depends_on "git"
-
   on_macos do
     on_arm do
       url "{release_url(tag, arm_macos)}"

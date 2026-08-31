@@ -70,7 +70,7 @@ Register an agent, give it a budget, inspect it, and run it under supervision.
 An agent is registered through an `adapter.toml` that declares how to launch it, its per-OS capabilities, and its metering source. Create a directory `my-agent/` with an `adapter.toml`:
 
 ```toml
-contract_version = "0.3.0"
+contract_version = "0.4.0"
 
 [adapter]
 kind = "my-agent"
@@ -150,22 +150,16 @@ The agent runner lives under `kt agent`. Every command supports `--help`.
 
 | Command | Purpose |
 |---------|---------|
-| `kt agent register <name> --kind <kind>` | Register an instance from a native builtin adapter |
-| `kt agent register <name> --manifest <path>` | Register an instance from an `adapter.toml` manifest adapter |
-| `kt agent list [--json]` | List every Agent Instance in the Fleet |
-| `kt agent show <name> [--json]` | Show one instance's capabilities, runtime status, usage, and budget |
-| `kt agent usage [<name>] [--json]` | Read Usage Ledger totals for one instance, or Fleet-wide |
-| `kt agent start <name>` | Start a registered instance |
-| `kt agent stop <name> [--timeout <secs>]` | Stop a running instance (graceful, then forced after the window) |
-| `kt agent pause <name>` | Pause a running instance (honest per-OS semantics) |
-| `kt agent resume <name>` | Resume a paused instance |
-| `kt agent send <name> <text>` | Send a line of input to a running instance's stdin |
-| `kt agent logs <name> [--follow] [--json]` | Read an instance's retained output (`--json` emits NDJSON, one line per record) |
-| `kt agent remove <name> [--delete\|--retain] [--force]` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
-| `kt agent config set <name> <key> <value>` | Set one config key on the instance layer (validated at write time) |
-| `kt agent config get <name> [<key>] [--json] [--reveal]` | Read the effective config with per-value source (`--reveal` un-masks secrets) |
-| `kt agent memory attach <name> --kind <kind>` | Attach a Memory Backing (`filesystem`: engine-managed directory, or `native`: delegation — terminal state required) |
-| `kt agent memory detach <name>` | Detach the backing; the managed directory and its contents remain on disk |
+| `kt agent register` | Register an instance from a native builtin (`--kind`) or an `adapter.toml` manifest adapter (`--manifest`) |
+| `kt agent list` | List every Agent Instance in the Fleet |
+| `kt agent show` | Show one instance's capabilities, runtime status, usage, and budget |
+| `kt agent usage` | Read Usage Ledger totals for one instance, or Fleet-wide |
+| `kt agent start` / `stop` / `pause` / `resume` | Drive the lifecycle |
+| `kt agent send` | Send a line of input to a running instance's stdin |
+| `kt agent logs` | Read an instance's retained output (`--follow` to stream, `--json` emits NDJSON) |
+| `kt agent remove` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
+| `kt agent config set` / `get` | Write and read the layered config (validated; `--reveal` un-masks secrets) |
+| `kt agent memory attach` / `detach` | Attach or detach a Memory Backing (`filesystem` or `native`) |
 
 See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys, and the [exit-code table](docs/commands.md#exit-codes) for the documented numeric codes every command returns.
 

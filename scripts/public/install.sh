@@ -173,12 +173,6 @@ dir_is_on_path() {
   esac
 }
 
-warn_if_git_missing() {
-  if ! command_exists git; then
-    warn "git is not on PATH. Ktesio installs successfully, but most kt commands need git at runtime."
-  fi
-}
-
 download_to_stdout() {
   url=$1
   if command_exists curl; then
@@ -405,8 +399,6 @@ main() {
       fail "KTESIO_INSTALL_METHOD must be one of: auto, brew, cargo, binary."
       ;;
   esac
-
-  warn_if_git_missing
 
   existing_kt=$(find_existing_kt)
   if [ -n "$existing_kt" ] && ! is_ktesio_binary "$existing_kt"; then

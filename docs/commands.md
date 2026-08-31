@@ -26,7 +26,9 @@ Arguments and options:
 
 Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
 
-The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir. **Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home** — a fleet of multiple unbacked hermes instances therefore all resolve the SAME unmanaged default home (documented fallback, not an error); attach Memory Backing (`kt agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
+The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
+
+**Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home.** A fleet of multiple unbacked hermes instances therefore all resolve the **same** unmanaged default home (documented fallback, not an error); attach Memory Backing (`kt agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
 
 ## `kt agent list [--json]`
 
@@ -37,7 +39,7 @@ kt agent list
 kt agent list --json
 ```
 
-The human table shows name, kind, state, restart count, the token budget (ceilings + remaining + Breach Action, or `—` when un-budgeted), the real usage token totals, and the Agent Home, followed by a Fleet-wide totals footer. `--json` emits a versioned document (`schema_version`, `instances`, `totals`); token totals equal the Usage Ledger exactly, and dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates).
+The human table shows name, kind, state, restart count, the token budget (ceilings + remaining + Breach Action, or `—` when un-budgeted), the real usage token totals, and the Agent Home, followed by a Fleet-wide totals footer. `--json` emits a versioned document (`schema_version`, `instances`, `totals`); dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates). Token totals always equal the Usage Ledger exactly — see `kt agent usage` below.
 
 ## `kt agent show <name> [--json]`
 
@@ -48,9 +50,7 @@ kt agent show demo
 kt agent show demo --json
 ```
 
-The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.
-
-## `kt agent usage [<name>] [--json]`
+The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.## `kt agent usage [<name>] [--json]`
 
 Read Usage Ledger totals for one instance, or for the whole Fleet.
 
@@ -66,7 +66,7 @@ kt agent usage --json
 
 The named form reports tokens by both scopes (cumulative and current-run), the derived dollar cost per scope, and the active Metering Source. The Fleet-wide form reports summed tokens plus the summed derived dollar cost across the instances that have a Rate — flagged as a lower bound, naming how many instances are unpriced, when some metered instance has no Rate.
 
-Token totals equal the Usage Ledger exactly, and are the same numbers `list`/`show` report — this command is a focused surface over the same data, never a second, independently-summed figure. Dollar figures appear only when a Rate is configured and are always labeled estimates; with no Rate the dollar view is honestly inert (`—`), never a fabricated `$0.00`.
+Token totals equal the Usage Ledger exactly, and are the same numbers `list`/`show` report — this command is a focused surface over the same data, never a second, independently-summed figure. Dollar figures appear only when a Rate is configured and are always labeled estimates; with no Rate the dollar view is honestly inert (`—`), never a fabricated `$0.00`. An instance that has never started reports all-zero totals — zeros mean "no usage recorded", not "usage was lost".
 
 Both `--json` forms carry the same Fleet `schema_version` as `list`/`show`, since they serialize the same fleet domain types:
 
@@ -131,7 +131,7 @@ kt agent stop my-agent
 kt agent stop my-agent --timeout 10
 ```
 
-- `--timeout <secs>` — the graceful-shutdown window before a forced kill (default 30). No child process survives.
+- `--timeout <secs>` — the graceful-shutdown window before a forced kill (default 30). No child process survives. `--timeout 0` skips the graceful window entirely: SIGTERM is sent and a forced kill escalates immediately.
 
 ## `kt agent pause <name>` / `kt agent resume <name>`
 
@@ -179,7 +179,7 @@ Log capture is **unconditional and capability-independent** — unlike `send`, i
 
 The captured output is bounded: each generation caps at 10MB, with the current generation plus its 2 most recent rotated predecessors retained (10MB × 3 total, fixed and non-configurable). `kt agent logs` never errors due to rotation — a read that spans a rotation boundary returns whatever is currently retained, not a claim of the instance's entire lifetime history.
 
-`--follow` (`-f`) prints the retained lines first, then keeps polling for new output and printing it as it arrives — exiting cleanly with a note once the instance stops or pauses (never hanging). This works identically whether or not the current `kt` process is the one that originally started the instance: reading only needs the instance's log file, not a live process handle, so `kt agent logs --follow` also works against an instance recovered by crash adoption in a different `kt agent start` session.
+`--follow` (`-f`) prints the retained lines first, then keeps polling for new output and printing it as it arrives — exiting cleanly with a note once the instance stops, pauses, crashes to `failed`, or otherwise leaves `running` (never hanging). This works identically whether or not the current `kt` process is the one that originally started the instance: reading only needs the instance's log file, not a live process handle, so `kt agent logs --follow` also works against an instance recovered by crash adoption in a different `kt agent start` session.
 
 `--json` emits **newline-delimited JSON (NDJSON)**: one complete, self-contained log-line object per stdout line, each carrying its own `schema_version`. This is deliberately not a single wrapping document — `--follow` is an unbounded stream that a wrapper could never close — so the shape is identical for the one-shot and `--follow` forms, and a reader can process each line as it arrives:
 
@@ -200,7 +200,7 @@ kt agent remove my-agent --force
 ```
 
 - `--retain` — keep the Agent Home directory on disk (the default).
-- `--delete` — delete the Agent Home directory as well.
+- `--delete` — delete the Agent Home directory as well. This includes the `filesystem` Memory Backing contents under `<home>/memory`: `--delete` removes **everything** in the Agent Home, not just registration metadata. (Detaching, by contrast, never deletes contents.)
 - `--force` — remove even if the instance is running. Required for a running instance.
 
 `--delete` and `--retain` are mutually exclusive; when neither is given, the safe default is to retain.
@@ -226,7 +226,7 @@ The confirmation names the kind and prints one boundary sentence stating exactly
 
 For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 
-`memory.dir` is an engine-reserved delivery key, never operator configuration — do not set it yourself. Any hand-set value is stripped where it matters: the engine removes it from the operator layers when resolving what applies at start, so it can be delivered only by the engine itself (when a `filesystem` backing is attached) and never lands in the persisted start snapshot as applied configuration.
+`memory.dir` is an engine-reserved delivery key, never operator configuration — do not set it yourself. Any hand-set value is stripped from the operator layers at resolve time: the engine removes it when resolving what applies at start, so it can be delivered only by the engine itself (when a `filesystem` backing is attached) and never lands in the persisted start snapshot as applied configuration.
 
 Attach and detach require the instance to be in a terminal state (`registered`, `stopped`, or `failed`) — a Memory Backing cannot be hot-swapped under a live agent, and there is no `--force` escape. Re-attaching the same kind is an idempotent success; attaching a different kind over an existing one is rejected until you detach.
 
@@ -267,7 +267,7 @@ kt agent config set demo budget.tokens.cumulative 500000
 kt agent config set demo agent.api_key secret:OPENAI_KEY
 ```
 
-A known unified key or an `agent.*` pass-through key is accepted and persisted; an unknown key **outside** `agent.*` is rejected before anything is written, with the nearest valid key suggested. The value is stored verbatim — a `secret:NAME` reference is stored as-is and resolved + masked at start/read (never resolved or echoed by this write).
+A known unified key or an `agent.*` pass-through key is accepted and persisted; an unknown key **outside** `agent.*` is rejected before anything is written, with the nearest valid key suggested. The value is stored verbatim — a `secret:NAME` reference is stored as-is and resolved + masked at start/read (never resolved or echoed by this write). Setting config on a **running** instance is allowed and never touches the live process: the change takes effect on the next start (budget/cost keys are an exception — they are re-read on each usage ingestion and apply immediately).
 
 ## `kt agent config get <name> [<key>] [--json] [--reveal]`
 
@@ -292,15 +292,18 @@ Set these with `kt agent config set <name> <key> <value>`.
 
 | Key | Value | Meaning |
 |-----|-------|---------|
+| `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` does not map it) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
-| `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`) |
+| `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
 | `budget.dollars.per_run` | dollar string | Per-run dollar Cost Cap (needs a Rate to enforce) |
 | `budget.dollars.cumulative` | dollar string | Cumulative dollar Cost Cap (needs a Rate to enforce) |
 | `metering.upstream_base_url` | URL | Real upstream endpoint for an `engine-observed` instance |
 | `agent.<key>` | any | Pass-through namespace delivered verbatim to the agent (bypasses known-key validation) |
+
+Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
 
 Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Ktesio displays it.
 
@@ -335,11 +338,18 @@ elif [ $code -ne 0 ]; then
 fi
 ```
 
-Here `3` means "not registered yet", `4` means "registered but not in a usable state", and any other non-zero code is a genuine failure worth surfacing.
-
 Every command that writes machine-readable output to stdout keeps that output pure, so `kt agent logs my-agent --json | head -5` is safe: a consumer that stops reading ends the command cleanly with `0` rather than an I/O failure.
 
 These codes are a **v1 compatibility surface**, governed by the same deprecation policy as the `--json` schemas: a breaking change is announced in the release notes, carries at least a one-minor notice window, and is removed only at a major version. Compatibility tests assert each documented condition returns its documented code, so an unannounced change fails CI.
+
+### Environment variables
+
+Two environment variables control `kt`'s own behavior (they are never injected into the agent's environment):
+
+| Variable | Meaning |
+|----------|---------|
+| `KTESIO_STATE_DIR` | Overrides the state directory location. Precedence: explicit CLI path (where supported) → `KTESIO_STATE_DIR` → the platform data dir. A relative path is refused with a diagnostic. |
+| `KTESIO_NO_UPDATE_CHECK` | Set to `1` to disable the GitHub Release update check. The check is also skipped automatically when `CI=true`. |
 
 ### Update checks
 
@@ -347,7 +357,7 @@ When a `kt` subcommand runs, Ktesio checks whether a newer GitHub Release is ava
 
 ### `kt self-update`
 
-Update the `kt` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary).
+Update the `kt` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary). Running instances already hold their own process image: they keep executing the binary they were started with until their next start, so a self-update does not interrupt them — restart agents to pick up the new version.
 
 ```bash
 kt self-update

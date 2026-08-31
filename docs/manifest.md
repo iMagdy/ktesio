@@ -59,6 +59,8 @@ A manifest is valid only if it declares all of the following. Validation reports
 
 The Adapter Contract version the manifest targets, as a semver string (current: `"0.4.0"`). A non-semver value is rejected.
 
+Any valid semver string is accepted today — there is no minimum and no negotiation; `"current"` is informational only. The engine does not refuse an older contract version.
+
 ### `[adapter]`
 
 Adapter identity.
@@ -108,6 +110,20 @@ A viable Metering Source. `source` is one of:
 [metering]
 source = "self-reported"
 ```
+
+A `self-reported` agent forwards its own usage accounting by emitting `KTESIO_USAGE {json}` sentinel lines on stdout. The JSON payload carries three agent-supplied fields (snake_case):
+
+```json
+{"sequence": 0, "input_tokens": 128, "output_tokens": 512}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `sequence` | non-negative integer | A per-Run monotonic ordinal stamped by the agent. It is the replay-dedup key: a re-delivered batch with the same `sequence` is recognized and not double-counted. |
+| `input_tokens` | non-negative integer | Input token count for the event. |
+| `output_tokens` | non-negative integer | Output token count for the event. |
+
+The engine stamps the Run id, the instance, the Metering Source, and the timestamp. A malformed usage line is a diagnostic (ignored), never fatal.
 
 ## Optional Sections
 
