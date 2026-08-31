@@ -2007,6 +2007,159 @@ fn human_show_surfaces_the_budget_row_and_real_usage_rows() {
     assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
+// ---- Story 6-3: the UJ-1 governance journey through documented kt commands ----
+
+#[test]
+fn uj1_governance_journey_through_documented_cli_commands() {
+    // Story 6-3 (UJ-1's "govern and interact for real" contract) at the CLI:
+    // every command below is a DOCUMENTED surface (`docs/commands.md`), run
+    // against the REAL hermes kind — register-only, NO spawn (hermes is never
+    // started here; the spawn-side governance proof is the engine e2e's
+    // phases H–L). What this pins at the CLI:
+    //   1. `register --kind hermes` → the kind + its `self-reported` metering
+    //      source round-trip;
+    //   2. `config set` accepts the UJ-1 budget keys (token ceiling + breach
+    //      action, Rate + dollar Cost Cap) — validated at write time;
+    //   3. `show --json` carries the budget (token ceiling, cap in integer
+    //      micros, labeled), the zero usage object, and the honest
+    //      `metering_source: self-reported`;
+    //   4. `usage <name> --json` carries the labeled dollar fields (a Rate
+    //      exists ⇒ dollars appear, `$0` labeled `estimated` at zero usage);
+    //   5. the human `usage` surface names the Metering source and, on the
+    //      no-Rate twin, renders the honest inert-cost cell — dollars only
+    //      with a Rate (AC-B).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+
+    // (1) Register the hermes instance.
+    let reg = run_kt_agent(
+        &["agent", "register", "gw", "--kind", "hermes"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register --kind hermes: stderr={}", reg.stderr);
+
+    // (2) Configure the UJ-1 guardrails with documented keys (tokens + dollars).
+    for (key, value) in [
+        ("budget.tokens.cumulative", "90"),
+        ("budget.breach_action", "pause"),
+        ("cost.rate.input", "1.00"),
+        ("cost.rate.output", "1.00"),
+        ("budget.dollars.cumulative", "0.00009"),
+    ] {
+        let set = run_kt_agent(
+            &["agent", "config", "set", "gw", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+        assert!(
+            set.success,
+            "config set {key}={value}: stderr={}",
+            set.stderr
+        );
+    }
+
+    // (3) `show --json`: the governed shape — budget populated, usage real
+    // (zero tokens), metering_source honest.
+    let show = run_kt_agent(
+        &["agent", "show", "gw", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(show.success, "show --json: stderr={}", show.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&show.stdout)
+        .unwrap_or_else(|e| panic!("show --json not JSON: {e}\n{}", show.stdout));
+    assert_eq!(doc["schema_version"], serde_json::json!(2), "{doc}");
+    let entry = &doc["instance"];
+    assert_eq!(entry["kind"], serde_json::json!("hermes"), "{entry}");
+    assert_eq!(
+        entry["metering_source"],
+        serde_json::json!("self-reported"),
+        "{entry}"
+    );
+    let budget = &entry["budget"];
+    assert_eq!(
+        budget["cumulative_limit"],
+        serde_json::json!(90),
+        "{budget}"
+    );
+    assert_eq!(
+        budget["cumulative_remaining"],
+        serde_json::json!(90),
+        "never metered ⇒ remaining equals the ceiling"
+    );
+    assert_eq!(budget["breach_action"], serde_json::json!("pause"));
+    // The dollar Cost Cap surfaces as integer micros ($0.00009 = 90 micros).
+    assert_eq!(
+        budget["cumulative_cost_cap"],
+        serde_json::json!(90),
+        "the cap must be integer micros: {budget}"
+    );
+    // Zero usage, but a Rate exists ⇒ a labeled $0 (never absent).
+    let usage = &entry["usage"];
+    assert_eq!(usage["cumulative_input_tokens"], serde_json::json!(0));
+    assert_eq!(usage["cumulative_dollars"], serde_json::json!(0), "{usage}");
+    assert_eq!(usage["estimate_label"], serde_json::json!("estimated"));
+
+    // (4) `usage <name> --json`: the focused surface over the SAME data.
+    let uj = run_kt_agent(
+        &["agent", "usage", "gw", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(uj.success, "usage --json: stderr={}", uj.stderr);
+    let udoc: serde_json::Value = serde_json::from_str(&uj.stdout)
+        .unwrap_or_else(|e| panic!("usage --json not JSON: {e}\n{}", uj.stdout));
+    assert_eq!(udoc["schema_version"], serde_json::json!(2), "{udoc}");
+    assert_eq!(udoc["instance"], serde_json::json!("gw"), "{udoc}");
+    assert_eq!(
+        udoc["usage"]["cumulative_dollars"],
+        serde_json::json!(0),
+        "{udoc}"
+    );
+    assert_eq!(
+        udoc["usage"]["estimate_label"],
+        serde_json::json!("estimated")
+    );
+    // The metering note rides on stderr (stdout stays a pure document).
+    assert!(uj.stderr.contains("Usage Ledger"), "stderr={}", uj.stderr);
+
+    // (5) The no-Rate twin: dollars only with a Rate. A second hermes
+    // instance with NO cost.rate.* renders the honest inert cost cell —
+    // `—` (no fabricated $0.00) — while the metering source stays honest.
+    let reg2 = run_kt_agent(
+        &["agent", "register", "free", "--kind", "hermes"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg2.success, "register free: stderr={}", reg2.stderr);
+    let ufree = run_kt_agent(&["agent", "usage", "free"], &ctx.project_dir, state_dir);
+    assert!(ufree.success, "usage free: stderr={}", ufree.stderr);
+    assert!(
+        ufree.stdout.contains("Metering source"),
+        "stdout={}",
+        ufree.stdout
+    );
+    assert!(
+        ufree.stdout.contains("self-reported"),
+        "stdout={}",
+        ufree.stdout
+    );
+    assert!(
+        ufree
+            .stdout
+            .contains("no Rate configured — dollar features inert"),
+        "the no-Rate cost cell must be the honest inert marker: stdout={}",
+        ufree.stdout
+    );
+    assert!(
+        !ufree.stdout.contains('$'),
+        "no dollar figure anywhere without a Rate: stdout={}",
+        ufree.stdout
+    );
+}
+
 // ---- Story 3-3: dollar cost + Cost Cap rendering (AC-B/AC10 — AD-8) ----
 
 #[test]

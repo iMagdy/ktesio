@@ -31,7 +31,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ktesio_engine::{AdapterRef, BreachScope, Engine, LifecycleState, OsId};
+use ktesio_engine::{AdapterRef, BreachDimension, BreachScope, Engine, LifecycleState, OsId};
 use tempfile::TempDir;
 
 /// The token sentinels the `fake_agent --emit-usage` emitter stamps on every
@@ -657,6 +657,93 @@ fn an_unbudgeted_instance_never_breaches() {
     );
 
     let _ = facade.stop("free", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn with_both_budgets_armed_the_token_breach_wins_the_pause() {
+    // Story 6-3 review decision: the docs (architecture.md / commands.md) state
+    // that when a token ceiling AND a dollar Cost Cap are both configured and BOTH
+    // cross on the same event with `breach_action: pause`, the supervisor's single
+    // enforcement site evaluates the TOKEN ceilings FIRST — so the token breach
+    // wins the pause (the `running → paused` cause carries `BudgetExceeded{Tokens}`)
+    // while the dollar breach is still recorded (its own dimension latch). The
+    // one-armed-dimension twins (the test above for tokens, cost.rs's for dollars)
+    // cannot pin the ORDER; this one arms both and asserts which cause landed.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "bothpause",
+        &["--emit-usage", "5", "--linger-ms", "600000"],
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "bothpause",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    // A $1/1M Rate (1 micro/token) + BOTH ceilings sized to cross on event 3
+    // (90 tokens ≥ 90; 90 micros ≥ 90 micros) with the default pause action.
+    facade
+        .set_config("bothpause", "cost.rate.input", "1.00")
+        .unwrap();
+    facade
+        .set_config("bothpause", "cost.rate.output", "1.00")
+        .unwrap();
+    facade
+        .set_config("bothpause", "budget.tokens.cumulative", "90")
+        .unwrap();
+    facade
+        .set_config("bothpause", "budget.dollars.cumulative", "0.00009")
+        .unwrap();
+
+    facade.start("bothpause").unwrap();
+    wait_for_state(
+        state.path(),
+        "bothpause",
+        LifecycleState::Paused,
+        Duration::from_secs(30),
+    );
+
+    // BOTH dimensions recorded exactly once (independent latches, cost.rs:503
+    // already proved this under `warn`; here it underpins the ORDER assertion).
+    let breaches = facade.budget_breach_events("bothpause").unwrap();
+    let tokens = breaches
+        .iter()
+        .filter(|b| b.dimension == BreachDimension::Tokens)
+        .count();
+    let dollars = breaches
+        .iter()
+        .filter(|b| b.dimension == BreachDimension::Dollars)
+        .count();
+    assert_eq!(tokens, 1, "one token breach: {breaches:?}");
+    assert_eq!(dollars, 1, "one dollar breach: {breaches:?}");
+
+    // THE ORDER PROOF: the pause the instance actually took carries the TOKEN
+    // cause — enforce_budget evaluated tokens first, its apply_breach landed the
+    // pause, and the dollar breach found the instance already paused (its pause
+    // attempt declines with the already-paused diagnostic, recording only).
+    let events = facade.transition_events("bothpause").unwrap();
+    let paused = events
+        .iter()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .expect("a running → paused transition was recorded");
+    assert!(
+        matches!(
+            paused.cause,
+            ktesio_engine::TransitionCause::BudgetExceeded {
+                dimension: BreachDimension::Tokens,
+                ..
+            }
+        ),
+        "with both ceilings crossed, the TOKEN breach must win the pause, got {:?}",
+        paused.cause
+    );
+
+    let _ = facade.stop("bothpause", Some(Duration::from_secs(5)));
 }
 
 #[test]

@@ -1,6 +1,9 @@
 //! Integration tests for story 6-2: run the REAL (native-adapter) Hermes agent
 //! under the Ktesio lifecycle — every Epic 1 lifecycle AC exercised against
-//! `--kind hermes` through the PUBLIC [`Engine`] API.
+//! `--kind hermes` through the PUBLIC [`Engine`] API — extended by story 6-3
+//! with the UJ-1 GOVERNANCE journey (phases H–L): replay-idempotent ledger
+//! metering, token-budget + dollar cost-cap breach→pause, native memory
+//! attach, and interaction on the governed instance.
 //!
 //! ## Isolation strategy (the AC's documented-sandbox clause)
 //!
@@ -35,8 +38,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ktesio_engine::{
-    ConfigLayer, Engine, LifecycleState, MemoryBackingKind, OsId, RestartPolicy, SourceLayer,
-    TransitionCause,
+    BreachDimension, BreachScope, ConfigLayer, Engine, LifecycleState, MemoryBackingKind, OsId,
+    RestartPolicy, SourceLayer, TransitionCause,
 };
 use tempfile::TempDir;
 
@@ -582,6 +585,7 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
     // PHASE E — FR-22 self-reported usage lands in the ledger; fleet totals
     // equal the ledger exactly; metering_source visible in Fleet detail.
     // ================================================================
+    let fleet_rows_before = usage_row_count(state.path(), "gw");
     facade.stop("gw", Some(Duration::from_secs(5))).unwrap();
     script("--emit-usage 2 --linger-ms 600000");
     facade.start("gw").unwrap();
@@ -592,7 +596,19 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         Duration::from_secs(10),
         "the metering-phase gateway to reach running",
     );
-    wait_for_usage_rows(state.path(), "gw", 2, Duration::from_secs(10));
+    // EXACTLY 2 rows — an absolute floor-poll (>=) would hide a genuine
+    // over-count (e.g. an earlier Run's lines re-ingested) from this phase.
+    let metering_rows = wait_for_usage_rows(
+        state.path(),
+        "gw",
+        fleet_rows_before + 2,
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        metering_rows,
+        fleet_rows_before + 2,
+        "the ledger must gain exactly 2 rows for the 2 emitted events (got {metering_rows}, baseline {fleet_rows_before})"
+    );
     let fleet = facade.fleet().unwrap();
     let entry = fleet.iter().find(|e| e.name.as_str() == "gw").unwrap();
     assert_eq!(entry.metering_source, "self-reported");
@@ -737,6 +753,253 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         1,
         "exactly one Restarted event after the single crash (no crash-loop)"
     );
+    // ================================================================
+    // PHASE H — Story 6.3 / UJ-1: replay-idempotent self-reported usage on
+    // the REAL adapter kind. `--replay-usage` re-emits sequence 0 once; the
+    // (run_id, sequence) replay key must dedup it (metering.rs:170 twin) so
+    // exactly 3 rows land and fleet totals equal 3 events exactly.
+    // ================================================================
+    let replay_rows_before = usage_row_count(state.path(), "gw");
+    facade.stop("gw", Some(Duration::from_secs(5))).unwrap();
+    script("--emit-usage 3 --replay-usage --linger-ms 600000");
+    facade.start("gw").unwrap();
+    wait_until_state(
+        &facade,
+        "gw",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(10),
+        "the replay-phase gateway to reach running",
+    );
+    // Exactly 3 NEW rows this Run — a 4th would mean the replay double-counted;
+    // fewer would mean a batch was dropped. Poll to the expected count, then a
+    // generous settle (metering.rs:190 shape) so a late duplicate would commit
+    // here before the exact assertion.
+    let expected = replay_rows_before + 3;
+    wait_for_usage_rows(state.path(), "gw", expected, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_millis(800));
+    let replay_rows = usage_row_count(state.path(), "gw");
+    assert_eq!(
+        replay_rows, expected,
+        "replayed batch must not double-count the ledger (expected exactly {expected} rows, got {replay_rows})"
+    );
+    let fleet = facade.fleet().unwrap();
+    let entry = fleet.iter().find(|e| e.name.as_str() == "gw").unwrap();
+    assert_eq!(
+        entry.usage.current_run_input_tokens,
+        3 * USAGE_INPUT,
+        "this Run's per-run totals cover exactly the 3 fresh events (no replay bleed)"
+    );
+    assert_eq!(entry.usage.current_run_output_tokens, 3 * USAGE_OUTPUT);
+    assert_eq!(
+        entry.metering_source, "self-reported",
+        "the honesty label rides the whole journey"
+    );
+
+    // ================================================================
+    // PHASE I — Story 6.3: TOKEN BUDGET breach → pause on a BEST-EFFORT-pause
+    // adapter. The guaranteed-pause twin lives in budget.rs:149; this is the
+    // FIRST committed-state proof on a BestEffort×3 adapter (hermes): the
+    // budget cause-override must win over the best-effort qualifier, so the
+    // `running → paused` cause is BudgetExceeded — NOT pause-best-effort.
+    // 5 events × 30 tokens vs a cumulative ceiling of 90 breaches on event 3.
+    // ================================================================
+    facade.stop("gw", Some(Duration::from_secs(5))).unwrap();
+    facade
+        .set_config("gw", "budget.tokens.cumulative", "90")
+        .unwrap();
+    script("--emit-usage 5 --linger-ms 600000");
+    facade.start("gw").unwrap();
+    wait_until_state(
+        &facade,
+        "gw",
+        |s| s == LifecycleState::Paused,
+        Duration::from_secs(30),
+        "the breach-phase gateway to commit paused",
+    );
+    let breaches = facade.budget_breach_events("gw").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "exactly one breach for a single crossing"
+    );
+    let b = &breaches[0];
+    assert_eq!(b.scope, BreachScope::Cumulative);
+    assert_eq!(b.limit, 90);
+    assert!(b.observed >= 90);
+    assert_eq!(b.action.as_str(), "pause");
+    assert_eq!(
+        b.metering_source, "self-reported",
+        "the breach event cites the honest metering source"
+    );
+    let events = facade.transition_events("gw").unwrap();
+    // The LAST paused transition — Phase D's operator pause already produced a
+    // PauseBestEffort one earlier in this long-lived test.
+    let paused_evt = events
+        .iter()
+        .rfind(|e| e.new_state == LifecycleState::Paused)
+        .expect("a running → paused transition was recorded");
+    assert!(
+        matches!(
+            paused_evt.cause,
+            TransitionCause::BudgetExceeded {
+                dimension: BreachDimension::Tokens,
+                ..
+            }
+        ),
+        "breach-pause on a BestEffort adapter must carry BudgetExceeded (cause-override wins), got {:?}",
+        paused_evt.cause
+    );
+
+    // ================================================================
+    // PHASE J — Story 6.3: DOLLAR COST-CAP breach → pause on the same
+    // BestEffort adapter (cost.rs:171 twin). Rate $1.00/1M both directions
+    // ⇒ 30 micros/event; a cumulative cap of 90 micros ($0.00009) breaches
+    // on event 3. Resume first: the instance sits paused from Phase I, and
+    // `resume` is the documented return-to-running command.
+    // ================================================================
+    facade.resume("gw").unwrap();
+    // Lift the token ceiling out of reach for THIS phase: with both budgets set,
+    // enforce_budget evaluates TOKENS first (supervisor.rs enforce_budget), so the
+    // token breach would win the pause and the dollar breach would find the
+    // instance already paused. The dollar twin needs a run where ONLY the cap
+    // fires. (No `config unset` exists; a documented key set high is the honest
+    // disarm.)
+    facade
+        .set_config("gw", "budget.tokens.cumulative", "900000")
+        .unwrap();
+    facade.set_config("gw", "cost.rate.input", "1.00").unwrap();
+    facade.set_config("gw", "cost.rate.output", "1.00").unwrap();
+    facade
+        .set_config("gw", "budget.dollars.cumulative", "0.00009")
+        .unwrap();
+    facade.stop("gw", Some(Duration::from_secs(5))).unwrap();
+    script("--emit-usage 5 --linger-ms 600000");
+    facade.start("gw").unwrap();
+    wait_until_state(
+        &facade,
+        "gw",
+        |s| s == LifecycleState::Paused,
+        Duration::from_secs(30),
+        "the dollar-breach gateway to commit paused",
+    );
+    let breaches = facade.budget_breach_events("gw").unwrap();
+    let dollar: Vec<_> = breaches
+        .iter()
+        .filter(|b| b.dimension == BreachDimension::Dollars)
+        .collect();
+    assert_eq!(
+        dollar.len(),
+        1,
+        "exactly one dollar breach for the single crossing; got {}: {breaches:?}",
+        dollar.len()
+    );
+    let b = dollar[0];
+    assert_eq!(b.dollar_limit.map(|m| m.get()), Some(90));
+    assert!(b.dollar_observed.map(|m| m.get()).unwrap_or(0) >= 90);
+    assert_eq!(
+        b.estimate_label.map(|l| l.as_str()),
+        Some("estimated"),
+        "the dollar breach carries the honest estimate label"
+    );
+    let events = facade.transition_events("gw").unwrap();
+    let paused_evt = events
+        .iter()
+        .rfind(|e| e.new_state == LifecycleState::Paused)
+        .expect("a paused transition exists");
+    assert!(
+        matches!(
+            paused_evt.cause,
+            TransitionCause::BudgetExceeded {
+                dimension: BreachDimension::Dollars,
+                ..
+            }
+        ),
+        "the LAST pause must be the dollar breach, got {:?}",
+        paused_evt.cause
+    );
+
+    // ================================================================
+    // PHASE K — Story 6.3: NATIVE memory attach on hermes (the 5-2
+    // delegation marker on the REAL adapter kind — memory.rs:672 twin).
+    // Terminal-state only: stop, detach the Phase-B filesystem backing
+    // (a DIFFERENT kind over an existing one is rejected — detach first),
+    // attach native, re-script a fresh --dump, start, and prove the ABSENCE
+    // of HERMES_HOME plus the delegation row.
+    // ================================================================
+    facade.stop("gw", Some(Duration::from_secs(5))).unwrap();
+    facade.detach_memory("gw").unwrap();
+    let native_dir = facade
+        .attach_memory("gw", MemoryBackingKind::Native)
+        .unwrap();
+    // The returned path is the engine's computed managed dir; for a FRESH
+    // instance native materializes nothing. (gw's dir exists from Phase B —
+    // operator-shaped data the engine never deletes — so the honest
+    // native-no-dir proof here is the memory STATUS + the dump below.)
+    let status = facade.memory_status("gw").unwrap().expect("attached");
+    assert_eq!(status.kind, MemoryBackingKind::Native);
+    assert_eq!(status.dir, native_dir, "the row carries the computed path");
+    assert!(
+        !status.declared,
+        "a non-filesystem backing never declares delivery"
+    );
+    let native_dump = shim_dir.path().join("phase-k.dump");
+    script(&format!(
+        "--linger-ms 600000 --echo-stdin --dump {}",
+        native_dump.display()
+    ));
+    facade.start("gw").unwrap();
+    wait_until_state(
+        &facade,
+        "gw",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(10),
+        "the native-backed gateway to reach running",
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::read_to_string(&native_dump) {
+            Ok(text) if text.contains("arg=") => break,
+            _ => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the native-backed gateway never wrote its dump at {}",
+                    native_dump.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let native_dump_text = std::fs::read_to_string(&native_dump).unwrap();
+    assert!(
+        !native_dump_text.contains("env=HERMES_HOME="),
+        "a native backing must NOT inject HERMES_HOME on hermes:\n{native_dump_text}"
+    );
+    // No NEW directory materializes for native: the only dir on disk is the
+    // Phase-B leftover, whose creation predates this attach. (For a fresh
+    // instance — memory.rs:672 twin — nothing exists at all.)
+
+    // ================================================================
+    // PHASE L — Story 6.3: interaction STILL works on the governed instance
+    // (paused/resumed/breached/budgeted): the standard send_input round-trip
+    // after the full governance journey. The instance is RUNNING here (Phase K
+    // started it fresh; the dollar breach was disarmed), so no resume first.
+    // ================================================================
+    facade.send_input("gw", "governed").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let echoed = std::fs::read_to_string(&agent_log)
+            .map(|c| c.lines().any(|l| l == "stdin: governed"))
+            .unwrap_or(false);
+        if echoed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the governed gateway never echoed the post-governance send"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     // Teardown.
     let _ = facade.stop("gw", Some(Duration::from_secs(5)));
     // Review blind-3: restore the process-global PATH mutation so any test
