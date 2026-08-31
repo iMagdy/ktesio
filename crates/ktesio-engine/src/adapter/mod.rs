@@ -1014,9 +1014,54 @@ source = "self-reported"
         // Story 6-2: resolve_start_launch consults the builtin table BEFORE
         // erroring, so a native hermes instance starts from the same fallback
         // seam a legacy snapshot would use.
-        let launch = resolve_start_launch("hermes", None).expect("hermes carries a launch");
-        assert_eq!(launch.exec, "hermes");
+        let launch = resolve_start_launch(ktesio_adapters_hermes::HERMES_KIND, None)
+            .expect("hermes carries a launch");
+        assert_eq!(launch.exec, ktesio_adapters_hermes::HERMES_KIND);
         assert_eq!(launch.args, vec!["gateway", "run", "--external-supervisor"]);
+    }
+
+    #[test]
+    fn resolve_start_launch_hermes_native_launch_env_stays_empty() {
+        // Review blind-18 drift guard: the PRODUCTION resolve path for a native
+        // hermes instance (what the supervisor actually consults when the
+        // snapshot is missing) must yield an env-EMPTY launch. The gateway
+        // receives its config through `apply_config_mapping` (HERMES_HOME via
+        // memory.dir), never through a code-declared launch env — a builtin
+        // table edit that sneaks an env var into the launch fails HERE.
+        let launch = resolve_start_launch(ktesio_adapters_hermes::HERMES_KIND, None)
+            .expect("hermes carries a launch");
+        assert!(
+            launch.env.is_empty(),
+            "the code-declared hermes launch must stay env-empty, got {launch:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_start_launch_manifest_kind_takes_precedence_over_the_builtin_table() {
+        // Review blind-19: the kind arg is only the builtin-table key for the
+        // MANIFEST-LESS path. When a manifest is supplied, its OWN
+        // [lifecycle.start] wins — a manifest whose [adapter].kind is "hermes"
+        // but whose start template spawns something else resolves from the
+        // TEMPLATE, not the hermes builtin launch (kind is metadata, not a
+        // table override).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "0.1.0"
+[adapter]
+kind = "hermes"
+[lifecycle.start]
+exec = "not-the-gateway"
+args = ["--own-thing"]
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let launch = resolve_start_launch(ktesio_adapters_hermes::HERMES_KIND, Some(&path))
+            .expect("a manifest hermes-kind adapter resolves from its manifest");
+        assert_eq!(launch.exec, "not-the-gateway");
+        assert_eq!(launch.args, vec!["--own-thing"]);
     }
 
     #[test]
