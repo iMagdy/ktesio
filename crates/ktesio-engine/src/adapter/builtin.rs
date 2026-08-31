@@ -58,7 +58,9 @@ pub const HERMES_ARGS: [&str; 3] = ktesio_adapters_hermes::HERMES_ARGS;
 pub fn native(kind: &str) -> Option<Box<dyn AgentAdapter>> {
     match kind {
         "mock" => Some(Box::new(BuiltinMock::new())),
-        "hermes" => Some(Box::new(ktesio_adapters_hermes::HermesAdapter::new())),
+        ktesio_adapters_hermes::HERMES_KIND => {
+            Some(Box::new(ktesio_adapters_hermes::HermesAdapter::new()))
+        }
         _ => None,
     }
 }
@@ -73,7 +75,7 @@ pub fn native(kind: &str) -> Option<Box<dyn AgentAdapter>> {
 /// most native kinds remain inert.
 pub fn native_launch(kind: &str) -> Option<StartLaunch> {
     match kind {
-        "hermes" => Some(StartLaunch {
+        ktesio_adapters_hermes::HERMES_KIND => Some(StartLaunch {
             exec: HERMES_EXEC.to_string(),
             args: HERMES_ARGS.iter().map(|s| s.to_string()).collect(),
             env: std::collections::BTreeMap::new(),
@@ -181,8 +183,8 @@ mod tests {
     fn hermes_kind_resolves_with_declared_shape() {
         // Story 6-2: the launchable native builtin resolves through the same
         // table as `mock`, carrying its CP-a/d declared shape.
-        let adapter = native("hermes").expect("hermes must resolve");
-        assert_eq!(adapter.kind(), "hermes");
+        let adapter = native(ktesio_adapters_hermes::HERMES_KIND).expect("hermes must resolve");
+        assert_eq!(adapter.kind(), ktesio_adapters_hermes::HERMES_KIND);
         assert_eq!(adapter.metering_source(), MeteringSource::SelfReported);
         let decl = adapter.capabilities();
         for os in [OsId::Linux, OsId::Macos, OsId::Windows] {
@@ -196,12 +198,17 @@ mod tests {
             );
         }
         // Only the reserved memory.dir leaf maps — to HERMES_HOME (CP-e+f);
-        // `model` is a documented no-op (Decision 6).
+        // `model` is a documented no-op (Decision 6). The KEY is named via the
+        // engine's own constant (same discipline as the mock test below), so a
+        // rename of the reserved key fails here too, not just in production.
         let mapping = adapter.config_mapping();
         assert_eq!(mapping.len(), 1);
         assert_eq!(
-            mapping.target("memory.dir").unwrap().env_var(),
-            Some("HERMES_HOME")
+            mapping
+                .target(crate::domain::MEMORY_DIR_KEY)
+                .unwrap()
+                .env_var(),
+            Some(ktesio_adapters_hermes::HERMES_HOME)
         );
         assert!(mapping.target("model").is_none());
     }
@@ -210,9 +217,10 @@ mod tests {
     fn native_launch_carries_the_hermes_gateway_launch_and_nothing_for_mock() {
         // Story 6-2 (DC-1): hermes declares its foreground gateway launch in
         // code; mock stays inert.
-        let launch = native_launch("hermes").expect("hermes must carry a launch");
+        let launch =
+            native_launch(ktesio_adapters_hermes::HERMES_KIND).expect("hermes must carry a launch");
         assert_eq!(launch.exec, HERMES_EXEC);
-        assert_eq!(launch.exec, "hermes");
+        assert_eq!(launch.exec, ktesio_adapters_hermes::HERMES_KIND);
         assert_eq!(launch.args, vec!["gateway", "run", "--external-supervisor"]);
         assert!(launch.env.is_empty());
         assert!(native_launch("mock").is_none());

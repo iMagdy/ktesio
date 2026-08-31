@@ -141,6 +141,10 @@ class ReleaseDocsTests(unittest.TestCase):
         # both the `rm` and the explicit rebuild so neither is dropped.
         self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
         self.assertIn("cargo +stable build -p ktesio-conformance --bin fake_agent", ci)
+        # hermes_shim (story 6-2) joins fake_agent in the stale-helper guard for
+        # the identical reason — assert its rm + rebuild pair in BOTH jobs too.
+        self.assertIn("rm -f target/debug/hermes_shim target/debug/hermes_shim.exe", ci)
+        self.assertIn("cargo +stable build -p ktesio-conformance --bin hermes_shim", ci)
         # The COVERAGE job needs the very same guard, for the same reason, and a
         # workspace-wide assertIn cannot tell the two jobs apart — so scope this
         # pair to the coverage step's own script. The stale-helper defect has now
@@ -156,6 +160,15 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self.assertIn(
             "cargo +stable build -p ktesio-conformance --bin fake_agent",
+            coverage_step,
+        )
+        # hermes_shim's pair is asserted in the coverage job's own script too.
+        self.assertIn(
+            "rm -f target/debug/hermes_shim target/debug/hermes_shim.exe",
+            coverage_step,
+        )
+        self.assertIn(
+            "cargo +stable build -p ktesio-conformance --bin hermes_shim",
             coverage_step,
         )
         self.assertIn(
@@ -324,8 +337,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/ktesio-engine/src/backends/", ci)
         # OS-cfg allowlist covers honestly-unix-gated engine integration tests
-        # (AI-35 disclosure convention) alongside the backends home.
-        self.assertIn("^crates/ktesio-engine/tests/", ci)
+        # (AI-35 disclosure convention) alongside the backends home. Assert the
+        # FULL allowlist LINE shape (review blind-12): a bare substring would
+        # also match a stale comment quoting the pattern, so a narrowed
+        # allowlist (e.g. a dropped legacy-file entry) must fail here.
+        self.assertIn(
+            r"allowlist='^crates/ktesio-engine/src/backends/"
+            r"|^crates/kt/src/update_check\.rs:"
+            r"|^crates/kt/src/cli/self_update\.rs:"
+            r"|^crates/ktesio-engine/tests/'",
+            ci,
+        )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
         # It scans for the BROADENED set of dollar-string-building forms (`${`, `$ {`,
         # `}$`, a `"$`-prefixed string, and a bare `'$'` char) and allowlists the

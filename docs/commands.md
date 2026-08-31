@@ -26,7 +26,7 @@ Arguments and options:
 
 Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
 
-The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
+The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir. **Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home** — a fleet of multiple unbacked hermes instances therefore all resolve the SAME unmanaged default home (documented fallback, not an error); attach Memory Backing (`kt agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
 
 ## `kt agent list [--json]`
 

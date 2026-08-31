@@ -17,7 +17,7 @@
 //! - **MeteringSource::SelfReported** (CP-d): usage comes from the agent's own
 //!   `/usage` + insights surface; BudgetEvaluator stays additive (no $ cap).
 //! - **Config mapping**: ONLY the reserved unified key `memory.dir` → env
-//!   [`HERMES_MEMORY_ENV_VAR`] ([`HERMES_HOME`], CP-e+f) — the same filesystem-
+//!   [`HERMES_HOME`] (CP-e+f) — the same filesystem-
 //!   backing invocation override the builtin mock maps to `KTESIO_MEMORY_DIR`.
 //!   The `model` key is deliberately UNMAPPED (Decision 6): Hermes switches
 //!   models via its own `hermes model` CLI, so an operator-set `model` value is
@@ -55,6 +55,13 @@ pub const HERMES_EXEC: &str = "hermes";
 
 /// Positional args of the foreground gateway launch (see [`HERMES_EXEC`]).
 pub const HERMES_ARGS: [&str; 3] = ["gateway", "run", "--external-supervisor"];
+
+/// The adapter's kind string (review blind-7): the single source of truth for
+/// the name every resolution path matches against — the engine's builtin table
+/// matches this constant in its `match` arms (a `&str` const IS a valid match
+/// pattern), and [`AgentAdapter::kind`] returns it, so the kind name can never
+/// drift between the table and the declaration.
+pub const HERMES_KIND: &str = HERMES_EXEC;
 
 use ktesio_adapter_api::{
     AgentAdapter, Capability, CapabilityDeclaration, ConfigMapping, ConfigTarget, MeteringSource,
@@ -106,7 +113,7 @@ impl Default for HermesAdapter {
 
 impl AgentAdapter for HermesAdapter {
     fn kind(&self) -> &str {
-        "hermes"
+        HERMES_KIND
     }
 
     fn capabilities(&self) -> &CapabilityDeclaration {
@@ -135,7 +142,7 @@ mod tests {
     #[test]
     fn hermes_kind_resolves() {
         let adapter = HermesAdapter::new();
-        assert_eq!(adapter.kind(), "hermes");
+        assert_eq!(adapter.kind(), HERMES_KIND);
         assert_eq!(adapter.metering_source(), MeteringSource::SelfReported);
         assert!(!adapter.capabilities().is_empty());
     }
