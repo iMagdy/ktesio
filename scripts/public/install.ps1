@@ -245,10 +245,6 @@ if ($Method -notin @("auto", "cargo", "binary")) {
     Fail "KTESIO_INSTALL_METHOD must be one of: auto, cargo, binary."
 }
 
-if (-not (Test-Command "git")) {
-    Write-WarningMessage "git is not on PATH. Ktesio installs successfully, but most kt commands need git at runtime."
-}
-
 $existingKt = Find-ExistingKt
 if ($existingKt -and -not (Test-KtesioBinary $existingKt)) {
     Fail "Refusing to overwrite non-Ktesio kt command at $existingKt."

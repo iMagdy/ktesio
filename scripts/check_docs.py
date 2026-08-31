@@ -21,6 +21,14 @@ STALE_PATTERNS = [
     "../specs/002-project-docs/quickstart.md",
     "specs/005-github-ci-pipeline",
     "docs/RELEASES_NOTES.md",
+    # Git is not a runtime dependency — these warnings were removed from the
+    # installers and the Homebrew formula (review 2026-02).
+    "most kt commands need git at runtime",
+    'depends_on "git"',
+    # Older contract revisions must not resurface outside CHANGELOG/release notes
+    # (narrow patterns so version-history files keep passing).
+    "contract_version = \"0.3.0\"",
+    'contract_version "0.3.0"',
 ]
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")

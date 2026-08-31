@@ -86,7 +86,6 @@ class ReleaseDocsTests(unittest.TestCase):
 
         self.assertIn('class Ktesio < Formula', formula)
         self.assertIn('version "1.2.3"', formula)
-        self.assertIn('depends_on "git"', formula)
         self.assertIn("on_macos do", formula)
         self.assertIn("on_arm do", formula)
         self.assertIn("on_intel do", formula)
