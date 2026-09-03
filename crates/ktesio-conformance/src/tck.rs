@@ -3597,10 +3597,26 @@ env = "MODEL"
         .expect("write terminal probe manifest");
         // Point the launch exec at a path that does not exist on ANY OS: the
         // start lands `failed` (a terminal state that can never become
-        // Running).
+        // Running). Rewrite the `exec = ...` LINE rather than string-matching
+        // the binary path — the manifest stores the path TOML-escaped
+        // (`{:?}`), so on Windows the raw text has doubled backslashes and a
+        // plain-path replace would silently no-op.
         let manifest = std::fs::read_to_string(scratch.path().join("adapter.toml")).unwrap();
-        let real_bin = crate::fake_agent_bin().to_string_lossy().into_owned();
-        let broken = manifest.replacen(&real_bin, "./tck-missing-agent", 1);
+        let broken = manifest
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("exec = ") {
+                    "exec = \"./tck-missing-agent\""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            broken.contains("./tck-missing-agent") && broken != manifest,
+            "the exec rewrite must take effect (escaped-path no-op guard)"
+        );
         std::fs::write(scratch.path().join("adapter.toml"), broken).unwrap();
         facade
             .register_with_adapter(
