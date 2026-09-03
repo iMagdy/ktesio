@@ -54,3 +54,16 @@ Findings surfaced incidentally during quick-dev reviews that are out of scope fo
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-3-govern-and-interact-with-hermes-end-to-end-uj-1-for-real.md`
   summary: architecture.md:68 breach-record sentence's "(…; tokens only)" parenthetical is stale since story 3-3 — `BudgetBreachEvent` also carries `dimension` plus `dollar_limit`/`dollar_observed`/`estimate_label` on dollar breaches (event.rs:507-525).
   evidence: The rewritten Budget-enforcement paragraph kept the pre-existing parenthetical; the dollar fields shipped in story 3-3 and the sentence was out of this story's minimal-edit scope.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
+  summary: TCK polling helpers hard-code engine storage internals (usage_events/agent_instances SQLite schema, agents/<name>/logs/agent.log path, adapter.json snapshot layout) instead of public engine seams.
+  evidence: Story 6-4 adversarial review (blind-hunter); coupling is intra-workspace and CI-tested today, but breaks silently if engine storage/layout changes. Switch to public engine APIs (e.g. read_agent_log) when available.
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
+  summary: TCK usage/observed row-count helpers conflate DB open/query errors with zero rows, producing misleading "have 0" timeout reasons instead of the actual error.
+  evidence: Story 6-4 adversarial review (blind-hunter + edge-case-hunter); diagnostic polish only — the section still fails on timeout. Propagate Result through the helpers when touched next.
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
+  summary: All post-registration pre-section failures (tempdir, Engine::open, snapshot read) are mislabeled "registration failed" across all 8 report sections.
+  evidence: Story 6-4 adversarial review (blind-hunter + edge-case-hunter EC1); needs a stage-differentiated error type plus new covered arms — deferred to avoid thinning the 95% coverage margin in this story.
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
+  summary: TCK harness is non-configurable — private 30s section timeout, fixed temp state root, no per-section selection — limiting third-party CI environments.
+  evidence: Story 6-4 adversarial review (blind-hunter); API-surface design beyond story 6-4's captured intent; candidate for a future ergonomics story alongside the 6-6 contract freeze.

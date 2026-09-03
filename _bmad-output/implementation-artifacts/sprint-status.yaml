@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 2026-08-31
+last_updated: 2026-09-03
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -89,7 +89,7 @@ development_status:
   6-1-verify-hermes-agent-surfaces-from-primary-sources: done  # ✅ Verified from primary sources 2026-08-25 — note at _bmad-output/planning-artifacts/hermes-agent-verification-2026-08-25.md (docs fetched directly + repo clone @ 41447a6d, v0.20.5). All five AC surfaces covered. Corrections vs brief §C: gateway stop/restart/status DO exist (§C wrong); pause EXISTS as ESTOP sentinel (new-work-only, never kills in-flight; NO signal pause anywhere). Six contract change proposals recorded (CP-6.1-a…f): best-effort pause declaration; foreground run under Ktesio ProcessBackend via --external-supervisor exit-code-75 handoff; Windows taskkill /T /F tree-kill parity for TCK; no $-cap → BudgetEvaluator additive, idempotent batch reconciliation; HERMES_HOME as canonical isolation key; config delivery seam decision (CLI override vs generated config.yaml) deferred to 6.2. §H caveat CLOSED.
   6-2-run-the-real-hermes-agent-under-ktesio-lifecycle: done  # 🎉 MERGED to main 2026-08-31 as 19f5fca (PR #149 squash: implementation 58d5a70 + review close-out). Round-1 triage resolved 13 findings (blind-2/3/7/10/12/13/15/18/19/22/23/24, vg-o2) in 8bbb63e; one-shot blind-hunter: 7 patched / 11 rejected / 5 deferred. Coverage 95.25% CI-green (16/16 checks). Prior: 2026-08-30 BMAD review pass COMPLETE (bmad-build resume on feat/epic-6-hermes): implementation proven = PR #144 (58d5a70); all gates green same-day (fmt, clippy, workspace tests, docs; tarpaulin 95.16% locally); 3 review lenses executed INLINE (documented deviation — subagents empty again, 5-2 precedent); findings triaged zero intent_gap/bad_spec/patch; story file Review Findings populated + Suggested Review Order added. Per step-05, status lands here (`review`) — Islam's merge of the next PR is the review-passed signal (per the #145 rule, merge ≠ review passed).
   6-3-govern-and-interact-with-hermes-end-to-end-uj-1-for-real: done  # 2026-08-31: story 6-3 complete (bmad-build + code review resolved; branch feat/epic-6-hermes-6-3)
-  6-4-prove-any-adapter-with-the-conformance-test-kit: backlog
+  6-4-prove-any-adapter-with-the-conformance-test-kit: review
   6-5-validate-the-contract-against-opencode-on-paper: backlog
   6-6-freeze-and-publish-the-adapter-contract-v1: backlog
   epic-6-retrospective: optional
