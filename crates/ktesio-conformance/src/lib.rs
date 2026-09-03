@@ -1,10 +1,15 @@
 //! # ktesio-conformance
 //!
-//! The adapter conformance fixtures: a **mock native adapter** and an **inert
-//! scripted fake agent**, used by this story and all later lifecycle/governance
-//! tests (architecture spine AD-2, AD-3; PRD FR-28). The full conformance
-//! test-kit (TCK) itself lands with story 6.4 — this crate ships only the
-//! reusable fixtures now.
+//! The adapter conformance kit (story 6-4, PRD FR-27; architecture spine
+//! AD-2, AD-3):
+//!
+//! * [`tck`] — the Conformance Test Kit itself: register any adapter with a
+//!   fresh engine, run the eight proof sections, and get back a
+//!   machine-readable [`ConformanceReport`]. The public entry point for
+//!   third-party adapter crates' dev-tests.
+//! * A **mock native adapter** ([`MockAdapter`]) and an **inert scripted fake
+//!   agent** ([`ScriptedFakeAgent`]), the reusable fixtures the engine's
+//!   lifecycle/governance tests (and the TCK's own probes) build on.
 //!
 //! ## Dependency boundary (CRITICAL — why this is a DEV fixture downstream)
 //!
@@ -17,15 +22,29 @@
 //! fixture later stories (1-4 start/stop, epic 3 metering, 6.4 TCK) import to
 //! drive lifecycle and governance tests.
 //!
-//! ## Inert this story
+//! The OUTBOUND edges tell the other half of the story (story 6-4): the TCK's
+//! public harness needs a live engine, so this crate takes `ktesio-engine` as
+//! its own normal dependency. Nothing that ships traverses that edge in the
+//! other direction, so the boundary gate stays green; a third-party adapter
+//! crate that dev-depends on this kit pulls the engine into ITS dev graph,
+//! which is exactly the point — the harness drives the real supervision path.
 //!
-//! Nothing here spawns a process. The [`ScriptedFakeAgent`] describes a canned
-//! lifecycle-op script that story 1-4 will actually run; this story only
-//! constructs and inspects it.
+//! ## Fixtures vs. harness
+//!
+//! The [`ScriptedFakeAgent`] fixture itself stays inert (it describes a canned
+//! lifecycle-op script and spawns nothing); the SPAWNING lives in the [`tck`]
+//! harness's probe manifests, which exec the `fake_agent` binary fixture.
 
 use ktesio_adapter_api::{
     AdapterError, AgentAdapter, Capability, CapabilityDeclaration, ConfigMapping, ConfigTarget,
     MeteringSource, OsId, SupportLevel,
+};
+
+pub mod tck;
+
+pub use tck::{
+    run_conformance, run_mock_conformance, section_ids, ConformanceReport, SectionReport,
+    SectionResult, TckAdapter,
 };
 
 /// The kind string the mock adapter registers under.
@@ -257,20 +276,28 @@ pub fn fake_agent_bin() -> std::path::PathBuf {
     if candidate.exists() {
         return candidate;
     }
-    // Not built by this harness — build it on demand (e.g. tarpaulin).
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = std::process::Command::new(cargo)
-        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
-        .env_remove("RUSTC_WRAPPER") // a shimmed PATH must not break the build
-        .status();
-    match status {
-        Ok(s) if s.success() && candidate.exists() => candidate,
-        other => panic!(
-            "fake_agent binary not found at {} and an on-demand build did not produce it \
-             (build status: {other:?}). Build `ktesio-conformance` first.",
-            candidate.display()
-        ),
+    // Not built by this harness — build it on demand. EXCLUDED from coverage
+    // (the fake_agent bin's own `#[cfg(not(tarpaulin_include))]` precedent):
+    // a coverage harness can never honestly execute this arm — the coverage
+    // CI job builds the helper explicitly BEFORE the suite, so under
+    // tarpaulin the arm is dead by contract, and instrumenting it would only
+    // tax the gate with unexecutable lines.
+    #[cfg(not(tarpaulin_include))]
+    {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = std::process::Command::new(cargo)
+            .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
+            .env_remove("RUSTC_WRAPPER") // a shimmed PATH must not break the build
+            .status();
+        if !matches!(status, Ok(s) if s.success() && candidate.exists()) {
+            panic!(
+                "fake_agent binary not found at {} and an on-demand build did not produce it \
+                 (build status: {status:?}). Build `ktesio-conformance` first.",
+                candidate.display()
+            );
+        }
     }
+    candidate
 }
 
 #[cfg(test)]

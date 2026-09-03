@@ -163,6 +163,29 @@ The agent runner lives under `kt agent`. Every command supports `--help`.
 
 See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys, and the [exit-code table](docs/commands.md#exit-codes) for the documented numeric codes every command returns.
 
+## Prove your adapter conforms
+
+If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a native adapter crate), the **Conformance Test Kit** proves it honors the Adapter Contract — the same controls, metering honesty, and capability declarations every built-in adapter is held to. Add one dev-dependency and one `#[test]`:
+
+```toml
+[dev-dependencies]
+# The kit is not published to a registry yet — depend on it by git or path
+# until then:
+ktesio-conformance = { path = "../ktesio-conformance" }
+```
+
+```rust
+#[test]
+fn my_adapter_conforms() {
+    let report = ktesio_conformance::run_mock_conformance(std::path::Path::new("adapter-dir"));
+    assert!(report.is_conformant(), "failures = {:?}", report.failures());
+}
+```
+
+The harness registers your adapter with a fresh engine and returns a machine-readable report (versioned with `schema_version`): one entry per contract section — capability projection, lifecycle (including crash), pause, config mapping, both metering sources, memory delivery, and interaction — each `pass`, `fail` (with the first failure reason), or `not_applicable` (justified from your adapter's own declaration: a self-reported metering source, for example, is never asked for engine-observed proof, and a `pause: unsupported` declaration skips the pause demonstration honestly).
+
+Plainly, four sections exercise **your adapter itself** — capability projection, lifecycle, pause, and (for manifest adapters) config delivery through your declared rules — while the metering, memory, and interaction sections prove the same engine seams through small probe fixtures the harness brings along, so a failing probe never damages your adapter's run. Native builtins register by kind via `run_conformance(&TckAdapter::Native(...))`; `run_mock_conformance` is the manifest-adapter shorthand. The section semantics are documented in [Testing](docs/testing.md#the-conformance-test-kit).
+
 ## Documentation
 
 - [Getting started](docs/get-started.md)

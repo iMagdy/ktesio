@@ -786,6 +786,11 @@ name = "ktesio-conformance"
 version = "0.1.0"
 dependencies = [
  "ktesio-adapter-api",
+ "ktesio-engine",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
