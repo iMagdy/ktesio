@@ -438,15 +438,24 @@ jobs:
                 # resolved, degrade to the presence check (never-red).
                 if [ "$version" = "unknown" ]; then
                   if ! command -v cargo-semver-checks >/dev/null 2>&1; then
-                    cargo +stable install cargo-semver-checks --locked
+                    # --force: a cache restore can have left a binary the
+                    # probe cannot run; install must replace, not abort.
+                    cargo +stable install cargo-semver-checks --locked --force
                     echo "installed=true" >> "$GITHUB_OUTPUT"
                   fi
                 else
-                  # `|| true` rescues set -o pipefail when the binary is absent
-                  # (a failed probe must read "no cached version", never abort the job).
-                  cached="$(cargo +stable cargo-semver-checks --version 2>/dev/null | tail -n 1 | awk '{print $NF}' || true)"
+                  # Probe the binary DIRECTLY, never as `cargo cargo-semver-checks`:
+                  # that asks cargo for an external subcommand named
+                  # cargo-semver-checks, i.e. a binary called
+                  # cargo-cargo-semver-checks, which does not exist — the
+                  # probe read empty, the mismatch guard reinstalled over the
+                  # just-restored cache, and cargo install aborted (red gate
+                  # on every cache-hit run). `|| true` rescues set -o
+                  # pipefail when the binary is absent (a failed probe must
+                  # read "no cached version", never abort the job).
+                  cached="$(cargo-semver-checks --version 2>/dev/null | tail -n 1 | awk '{print $NF}' || true)"
                   if [ "$cached" != "$version" ]; then
-                    cargo +stable install cargo-semver-checks --locked --version "$version"
+                    cargo +stable install cargo-semver-checks --locked --force --version "$version"
                     echo "installed=true" >> "$GITHUB_OUTPUT"
                   fi
                 fi
