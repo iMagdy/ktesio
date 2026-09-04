@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 09-04-2026 04:12
+last_updated: 09-04-2026 04:27
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -1121,7 +1121,7 @@ action_items:
     epic: 4
     owner: "Islam (policy ratification); release-notes authoring per whoever owns
       the release cut"
-    status: open
+    status: done
     severity: medium
     action: "Announce Epic 4's shipped surface, and resolve PRD SS7's still-open deprecation
       policy BEFORE Epic 6 freezes the Adapter Contract. Epic 4 shipped three new

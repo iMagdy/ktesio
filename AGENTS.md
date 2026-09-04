@@ -3,7 +3,12 @@
 Ktesio is being repositioned from a skills package manager into a unified
 runner for personal agents (runtime controls, config, memory wiring, token
 limits, and cost caps). Planning for that pivot runs through the BMAD Method;
-its artifacts live under `_bmad-output/` and `_bmad/`, which are gitignored.
+its artifacts (`_bmad-output/` — plans, specs, sprint status, retrospectives)
+and its toolchain (`_bmad/`) are **tracked in git** and are part of the repo's
+open workflow record (the 2026-08-27 reversal in `.gitignore` documents why:
+the artifacts are the project's sprint record, and clones need the tooling).
+Treat them as real, versioned project files — keep them current in the same
+changes that make them stale.
 
 When working here:
 
