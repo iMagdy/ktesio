@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/iMagdy/ktesio/actions/workflows/ci.yml/badge.svg)](https://github.com/iMagdy/ktesio/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/ktesio.svg)](https://crates.io/crates/ktesio)
-[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-orange.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Ktesio%20NC--Attribution%201.0.0-blue.svg)](LICENSE)
 
 Ktesio is a Rust CLI and engine that **runs AI agents like services** — supervise their lifecycle, meter real token usage, and enforce dollar budgets. Register any agent, start and stop it under supervision, watch what it actually consumes, and set token and cost ceilings that stop runaway spend the moment they are crossed.
 
@@ -205,10 +205,13 @@ Ktesio is early and moving fast. The lifecycle, layered configuration, secrets, 
 
 ## License
 
-Ktesio is **source-available**, licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+Ktesio is **source-available**, licensed under the [Ktesio Noncommercial-Attribution License 1.0.0](LICENSE).
 
 - **Noncommercial use is free.** You may use, copy, modify, and share Ktesio for any noncommercial purpose under the terms of the license.
+- **Visible credit is required.** Whenever you distribute Ktesio, distribute a modified version of it, use it in your own product or distribution, or operate it to provide functionality to third parties, you must prominently credit the Ktesio project and its author ("Islam Magdy", the copyright holder) in at least one place a reasonable user would readily see — your product's documentation, an "About" or credits screen, or a public README all qualify. Private, internal use that reaches no third party owes no credit. See the Attribution section of the LICENSE file.
 - **Commercial use requires a separate license.** Any commercial use needs the prior written permission of the copyright holder, Islam Magdy. To request a commercial license, open an issue or contact the maintainer through the project's official channels.
+
+Based on the PolyForm Noncommercial License 1.0.0 (polyformproject.org), modified: an Attribution condition has been added. This is a custom license, not a PolyForm license.
 
 This is source-available software, not an OSI-approved open source license.
 

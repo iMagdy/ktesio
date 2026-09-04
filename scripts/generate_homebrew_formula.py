@@ -10,8 +10,20 @@ from pathlib import Path
 
 REPO = "iMagdy/ktesio"
 FORMULA_CLASS = "Ktesio"
-DESCRIPTION = "Agentic skills package manager"
-LICENSE = "PolyForm-Noncommercial-1.0.0"
+DESCRIPTION = (
+    "Run AI agents like services: supervise their lifecycle, meter real "
+    "token usage, and enforce dollar budgets."
+)
+# Ktesio ships a custom license (no SPDX id exists), so Homebrew gets the
+# `:any` symbol — to Homebrew this means the license is unspecified, not
+# "any version". It must render unquoted: `license :any`.
+LICENSE = ":any"
+# Emitted above the `license` clause in the formula so the tap states the
+# real terms even though `:any` cannot name them.
+LICENSE_COMMENT = (
+    "# Ktesio Noncommercial-Attribution License 1.0.0 — source-available; "
+    "commercial use requires the author's written approval."
+)
 HOMEBREW_TARGETS = [
     ("x86_64-apple-darwin", "tar.gz"),
     ("aarch64-apple-darwin", "tar.gz"),
@@ -61,6 +73,17 @@ def parse_checksums(text: str) -> dict[str, str]:
     return checksums
 
 
+def license_clause() -> str:
+    """Render the formula's `license` value.
+
+    Homebrew license symbols (`:any`, `:public_domain`, …) are Ruby symbols
+    and must be unquoted; SPDX ids are strings and need double quotes.
+    """
+    if LICENSE.startswith(":"):
+        return LICENSE
+    return f'"{LICENSE}"'
+
+
 def render_formula(tag: str, checksums: dict[str, str]) -> str:
     version = version_from_tag(tag)
     missing = [
@@ -79,7 +102,8 @@ def render_formula(tag: str, checksums: dict[str, str]) -> str:
   desc "{DESCRIPTION}"
   homepage "https://github.com/{REPO}"
   version "{version}"
-  license "{LICENSE}"
+  {LICENSE_COMMENT}
+  license {license_clause()}
 
   on_macos do
     on_arm do

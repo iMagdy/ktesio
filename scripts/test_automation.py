@@ -95,6 +95,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("x86_64-unknown-linux-gnu", formula)
         self.assertNotIn("x86_64-pc-windows-msvc", formula)
         self.assertIn('bin.install "kt"', formula)
+        # The custom license has no SPDX id: Homebrew gets the unquoted `:any`
+        # symbol ("license unspecified"), never a quoted string, and the
+        # formula comments the real terms above the clause.
+        self.assertIn("license :any", formula)
+        self.assertNotIn('license "', formula)
+        self.assertIn(
+            "# Ktesio Noncommercial-Attribution License 1.0.0", formula
+        )
+        self.assertIn(
+            "commercial use requires the author's written approval", formula
+        )
 
     def test_homebrew_checksum_parser_accepts_sha256sum_lines(self) -> None:
         checksums = homebrew_formula.parse_checksums(

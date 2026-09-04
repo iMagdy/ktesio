@@ -24,12 +24,13 @@ source of truth.
 - [x] Auto-merge and update-branch support are enabled.
 - [x] Merge commits and rebase merges are disabled.
 - [x] Squash merge is the only allowed merge method.
-- [ ] Repository license is source-available (PolyForm Noncommercial 1.0.0); GitHub shows it as a non-standard license.
+- [ ] Repository license is source-available (Ktesio Noncommercial-Attribution License 1.0.0, a custom license); GitHub shows it as "Other" / a non-standard license.
 
 Evidence:
 
 - `gh api repos/iMagdy/ktesio`
 - `gh api repos/iMagdy/ktesio/license`
+- Observed: `license.spdx_id` is `null` and GitHub displays the custom license as "Other"; the fetched `LICENSE` is titled "Ktesio Noncommercial-Attribution License 1.0.0" (PolyForm Noncommercial 1.0.0 terms plus the Attribution condition).
 
 ## Branch And Tag Rulesets
 
@@ -108,7 +109,7 @@ Evidence:
 ## Community Health Files
 
 - [x] `README.md` exists.
-- [x] `LICENSE` exists and contains the PolyForm Noncommercial 1.0.0 text with a commercial-use notice.
+- [x] `LICENSE` exists and contains the Ktesio Noncommercial-Attribution License 1.0.0 text (PolyForm Noncommercial 1.0.0 terms plus the Attribution condition) with a commercial-use notice.
 - [x] `SECURITY.md` exists.
 - [x] `CONTRIBUTING.md` exists.
 - [x] `CODE_OF_CONDUCT.md` exists.
