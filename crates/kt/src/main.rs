@@ -7,9 +7,11 @@ mod update_check;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
+// The license is a custom one (LICENSE, `license-file` in the manifests), so
+// Cargo exposes no `CARGO_PKG_LICENSE` value for it (that env is empty under
+// `license-file`); the title is stated literally instead.
 const HELP_FOOTER: &str = concat!(
-    "License: ",
-    env!("CARGO_PKG_LICENSE"),
+    "License: Ktesio Noncommercial-Attribution License 1.0.0",
     "\nRepository: ",
     env!("CARGO_PKG_REPOSITORY")
 );
@@ -719,8 +721,31 @@ mod tests {
     #[test]
     fn test_cli_help_includes_license_and_repository() {
         let help = Cli::command().render_help().to_string();
-        assert!(help.contains("License: PolyForm-Noncommercial-1.0.0"));
+        assert!(help.contains("License: Ktesio Noncommercial-Attribution License 1.0.0"));
         assert!(help.contains("Repository: https://github.com/iMagdy/ktesio"));
+    }
+
+    #[test]
+    fn test_help_footer_license_title_matches_shipped_license() {
+        // Drift guard: HELP_FOOTER prints the license title as a literal
+        // (Cargo exposes no CARGO_PKG_LICENSE under `license-file`). If the
+        // shipped LICENSE is ever retitled, this fails CI instead of
+        // `kt --help` silently advertising a license the repo no longer
+        // ships. The title must appear in the binding text below the
+        // separator, not just the non-binding preface.
+        let license = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../LICENSE"));
+        let title = HELP_FOOTER
+            .strip_prefix("License: ")
+            .and_then(|rest| rest.split('\n').next())
+            .expect("HELP_FOOTER must start with the license title");
+        let binding = license
+            .split_once("\n----")
+            .map(|(_, rest)| rest)
+            .unwrap_or(license);
+        assert!(
+            binding.contains(title),
+            "LICENSE's binding terms must contain the printed license title {title:?}"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ edition = "2021"
 # 1.96.1 (builds cleanly there; 1.94.1 fails with E0658). Members inherit via
 # `rust-version.workspace = true`.
 rust-version = "1.96.1"
-license = "PolyForm-Noncommercial-1.0.0"
+license-file = "LICENSE"
 homepage = "https://github.com/iMagdy/ktesio"
 repository = "https://github.com/iMagdy/ktesio"
 

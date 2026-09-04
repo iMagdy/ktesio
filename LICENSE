@@ -1,7 +1,8 @@
 Ktesio is Copyright (c) 2026 Islam Magdy.
 
-Ktesio is source-available software, licensed under the PolyForm
-Noncommercial License 1.0.0. The full text of that license follows below.
+Ktesio is source-available software, licensed under the Ktesio
+Noncommercial-Attribution License 1.0.0. The full text of that license
+follows below.
 
 In plain terms:
 
@@ -13,16 +14,26 @@ In plain terms:
     request a commercial license, contact the copyright holder through
     https://github.com/iMagdy/ktesio.
 
+  * You must visibly credit the Ktesio project and its author whenever you
+    distribute Ktesio, use it in your own product or distribution, or operate
+    it to provide functionality to others (see "Attribution" below).
+
   * Contributions are accepted only under the Contributor License Agreement
     in CLA.md, under which contributors assign their copyright in the
     contribution to the copyright holder. See CONTRIBUTING.md.
 
 This plain-language summary is for convenience only. The binding terms are
-the PolyForm Noncommercial License 1.0.0 text below and the CLA.
+the Ktesio Noncommercial-Attribution License 1.0.0 text below and the CLA.
+
+Based on the PolyForm Noncommercial License 1.0.0 (polyformproject.org), modified: an Attribution condition has been added. This is a custom license, not a PolyForm license.
 
 --------------------------------------------------------------------------------
 
-# PolyForm Noncommercial License 1.0.0
+# Ktesio Noncommercial-Attribution License 1.0.0
+
+These terms are the text of the PolyForm Noncommercial License 1.0.0
+(polyformproject.org), retitled and amended as set out in this document.
+Where this document and the PolyForm text differ, this document governs.
 
 <https://polyformproject.org/licenses/noncommercial/1.0.0>
 
@@ -54,12 +65,27 @@ License](#changes-and-new-works-license).
 ## Notices
 
 You must ensure that anyone who gets a copy of any part of
-the software from you also gets a copy of these terms or the
-URL for them above, as well as copies of any plain-text lines
-beginning with `Required Notice:` that the licensor provided
-with the software.  For example:
+the software from you also gets a copy of these terms, as
+well as copies of any plain-text lines beginning with
+`Required Notice:` that the licensor provided with the
+software.  For example:
 
 > Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+
+## Attribution
+
+Whenever you distribute the software, distribute a modified version of
+it, use it in your own product or distribution, or operate it to
+provide functionality to third parties, you must prominently credit
+the Ktesio project and its author. The credit must name both the
+project ("Ktesio") and the author ("Islam Magdy", the copyright
+holder), and must appear in at least one place a reasonable user or
+recipient would readily see — such as your product's documentation, an
+"About" or credits screen, or a public README or about page. Private,
+internal use that reaches no third party owes no credit under this
+section. This section supplements, and does not replace, the Notices
+obligation above. You may not state or imply that the author endorses
+you or your use.
 
 ## Changes and New Works License
 

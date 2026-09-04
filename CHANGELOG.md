@@ -14,6 +14,13 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 >
 > *Placement note (mechanics): this banner sits ABOVE the first `## ` heading on purpose — `scripts/generate_release_docs.py::upsert_release_section` inserts every generated release section directly above the first `## ` heading, so a `## Unreleased` heading would be pushed below the fold at the very next tag. The script never touches the header region, so the banner stays visible through the next release cut. At that cut, the release author moves this notice's content into the release section and deletes the banner.*
 
+> **License change — announced ahead of the next release (Ktesio Noncommercial-Attribution License 1.0.0).**
+> `LICENSE` is retitled and amended in place: the PolyForm Noncommercial 1.0.0 terms are kept, and one new condition is added — **Attribution**. Whenever you distribute the software, distribute a modified version of it, use it in your own product or distribution, or operate it to provide functionality to third parties, you must prominently credit the Ktesio project and its author ("Islam Magdy", the copyright holder) in at least one place a reasonable user or recipient would readily see (your product's documentation, an "About" or credits screen, or a public README all qualify); you may not state or imply that the author endorses you or your use. The commercial mechanism is unchanged: all commercial use remains unlicensed without the copyright holder's separate written license.
+>
+> - **Existing noncommercial users: your usage rights are unchanged — with one new requirement.** Noncommercial use, modification, and sharing stay free under the same terms; but any product or distribution using Ktesio now carries the visible-credit requirement above. Private, internal use that reaches no third party owes no credit.
+> - **Commercial users: contact for a license.** Request one through https://github.com/iMagdy/ktesio.
+> - Packaging metadata moves with the retitle in the same change: Cargo uses `license-file = "LICENSE"` (a custom license has no SPDX id), the Homebrew formula declares `license :any`, and the README badge and License section name the new license. Ktesio remains **source-available** — not open source.
+
 ## v0.6.0
 
 Ktesio is repositioned as an agent runner: `kt` runs AI agents like services — supervising their lifecycle, metering real token usage, and enforcing dollar budgets.

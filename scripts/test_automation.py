@@ -95,6 +95,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("x86_64-unknown-linux-gnu", formula)
         self.assertNotIn("x86_64-pc-windows-msvc", formula)
         self.assertIn('bin.install "kt"', formula)
+        # The custom license has no SPDX id: Homebrew gets the unquoted `:any`
+        # symbol ("license unspecified"), never a quoted string, and the
+        # formula comments the real terms above the clause.
+        self.assertIn("license :any", formula)
+        self.assertNotIn('license "', formula)
+        self.assertIn(
+            "# Ktesio Noncommercial-Attribution License 1.0.0", formula
+        )
+        self.assertIn(
+            "commercial use requires the author's written approval", formula
+        )
 
     def test_homebrew_checksum_parser_accepts_sha256sum_lines(self) -> None:
         checksums = homebrew_formula.parse_checksums(
@@ -363,7 +374,7 @@ class ReleaseDocsTests(unittest.TestCase):
             ci,
         )
         # Semver gate: lazy install inside the armed branch, transient skip.
-        self.assertIn("cargo +stable install cargo-semver-checks --locked", ci)
+        self.assertIn("cargo +stable install cargo-semver-checks --locked --force", ci)
         self.assertIn("cargo +stable semver-checks check-release", ci)
         self.assertIn("000|429|5[0-9][0-9]", ci)
         # Semver gate caches the source-installed binary so it is not rebuilt
@@ -387,7 +398,12 @@ class ReleaseDocsTests(unittest.TestCase):
         # version-VERIFIED (not merely present) before the pinned install is
         # skipped — restore-keys can restore an older binary.
         self.assertIn('[[ "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || version=unknown', ci)
-        self.assertIn("cargo +stable cargo-semver-checks --version", ci)
+        self.assertIn("cached=\"$(cargo-semver-checks --version 2>/dev/null | tail -n 1 | awk '{print $NF}' || true)\"", ci)
+        # The probe must invoke the binary DIRECTLY: `cargo cargo-semver-checks`
+        # asks cargo for an external subcommand and always fails, which made
+        # every cache-hit semver run reinstall over the restored binary and
+        # abort (main was red across 102a7fc..b661c13).
+        self.assertNotIn("cargo +stable cargo-semver-checks --version", ci)
         self.assertIn('if [ "$cached" != "$version" ]; then', ci)
         # The old constant key must not resurface.
         self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
