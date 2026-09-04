@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 2026-09-04
+last_updated: 09-04-2026 04:12
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -92,7 +92,7 @@ development_status:
   6-4-prove-any-adapter-with-the-conformance-test-kit: done  # 🎉 MERGED to main 2026-09-03 as 8591bac (PR #154 squash: d7c6869 implementation + 70b0c25 Windows-test fix). TCK (FR-27): 8-section public harness + report contract (schema_version 1). 3 adversarial review lenses → 16 patches applied (detection logic pinned via pure defect functions), 4 deferred. Coverage restored 95.36% (gate was red on main at 94.94%). All 16 CI checks green.
   6-5-validate-the-contract-against-opencode-on-paper: done  # 🎉 MERGED to main 2026-09-04 as 067c4a2 (PR #156 squash: 5d60f3f). Paper artifacts: characterization + conformance mapping pinned to anomalyco/opencode v1.18.27 @ 4b7e19e. 6 newly-opencode-covered axes of 23; CP-6.5-a…f proposals + freeze risks R1-R11 handed to 6-6 (none silently absorbed). 3 review lenses → 13 patches applied. No production code changes.
   6-6-freeze-and-publish-the-adapter-contract-v1: done  # 🎉 MERGED to main 2026-09-04 as 4119db3 (PR #157 squash: dc29e86). Adapter Contract v1 FROZEN: CONTRACT_VERSION 1.0.0 + same-major negotiation (both versions + rule named on rejection; 0.x not grandfathered; AI-6 closed); the ONE announced key-set edit (memory attach/detach --json, wire strings verbatim); CP-6.5-a..f + R1-R11 all verdicted; deprecation policy ratified (AI-68 closed); AI-3 cache fix landed. AI-64 independent mutation pass: 15 mutations, 14 killed, 1 hole closed with re-applied-mutation proof. 3 lenses + AI-64 → 18 patches. Battery: 1050 tests, 95.19%, 23 docs files. EPIC 6 COMPLETE.
-  epic-6-retrospective: optional
+  epic-6-retrospective: done
   epic-7: backlog
   7-1-drive-every-capability-through-the-library-alone: backlog
   7-2-subscribe-to-engine-events-with-stable-schemas: backlog
@@ -126,401 +126,839 @@ action_items:
     owner:
     status: done
     severity: medium
-    action: "ci.yml semver job: add ~/.cargo/bin to its cache paths — the armed gate now source-installs cargo-semver-checks (~10 min) on every fresh runner. One-line fix; fold into the next story touching ci.yml."
-    note: "Done in story 1-2 fix pass (2026-07-03): added a dedicated cache step keyed 'cargo-semver-checks-bin' persisting ~/.cargo/bin in the semver job; test_automation asserts its presence."
+    action: "ci.yml semver job: add ~/.cargo/bin to its cache paths — the armed gate
+      now source-installs cargo-semver-checks (~10 min) on every fresh runner. One-line
+      fix; fold into the next story touching ci.yml."
+    note: "Done in story 1-2 fix pass (2026-07-03): added a dedicated cache step keyed
+      'cargo-semver-checks-bin' persisting ~/.cargo/bin in the semver job; test_automation
+      asserts its presence."
   - id: AI-2
     epic: 1
     owner:
     status: open
     severity: low
-    action: "scripts/test_automation.py: tighten '-p ktesio' assertIn pins (prefix-substring of sibling crate names) and assert placement of the lazy semver install. Fold into next automation-touching story."
+    action: "scripts/test_automation.py: tighten '-p ktesio' assertIn pins (prefix-substring
+      of sibling crate names) and assert placement of the lazy semver install. Fold
+      into next automation-touching story."
   # From story 1-2 scoped re-review (2026-07-03, verdict APPROVED — non-gating LOW follow-ups)
   - id: AI-3
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ci.yml semver job: AI-1's cache key is constant with no restore-keys/content hash — if first populated while the gate is dormant (crates unpublished pre-7-4), the cache freezes empty and cargo-semver-checks reinstalls every armed run, defeating the ~10-min saving. Never breaks CI (fallback installs). Key on a version or presence hash. Fold into a CI-touching story."
+    action: "ci.yml semver job: AI-1's cache key is constant with no restore-keys/content
+      hash — if first populated while the gate is dormant (crates unpublished pre-7-4),
+      the cache freezes empty and cargo-semver-checks reinstalls every armed run,
+      defeating the ~10-min saving. Never breaks CI (fallback installs). Key on a
+      version or presence hash. Fold into a CI-touching story."
   - id: AI-4
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-engine registry.rs open(): F8 fix names the env-var placeholder '<default via KTESIO_STATE_DIR>' in RegistryError::Io.path rather than the offending relative value (value survives in source). Diagnostic polish only. Fold into a paths/config-touching story."
+    action: "ktesio-engine registry.rs open(): F8 fix names the env-var placeholder
+      '<default via KTESIO_STATE_DIR>' in RegistryError::Io.path rather than the offending
+      relative value (value survives in source). Diagnostic polish only. Fold into
+      a paths/config-touching story."
   # From story 1-3 scoped re-review (2026-07-04, verdict APPROVED — non-gating LOW follow-ups)
   - id: AI-5
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-adapter-api manifest.rs from_toml_str: the [metering] error-attribution heuristic keys on the shared kebab vocabulary, so a capability-level typo (e.g. `linux = \"self-reported\"` under [capabilities]) is misattributed to [metering]. Always rejects (no partial state); only the message misleads. Key on the toml error field-path/span instead. Fold into a manifest/adapter-touching story."
+    action: "ktesio-adapter-api manifest.rs from_toml_str: the [metering] error-attribution
+      heuristic keys on the shared kebab vocabulary, so a capability-level typo (e.g.
+      `linux = \"self-reported\"` under [capabilities]) is misattributed to [metering].
+      Always rejects (no partial state); only the message misleads. Key on the toml
+      error field-path/span instead. Fold into a manifest/adapter-touching story."
   - id: AI-6
     epic: 1
     owner: "story 6-6 (contract freeze / version negotiation)"
     status: open
     severity: low
-    action: "ktesio-adapter-api manifest.rs validate(): contract_version uses semver::Version::parse (strict X.Y.Z) — rejects '1'/'1.0'/'v0.1.0', accepts prerelease/build metadata; the field doc doesn't state the requirement. Decide strict-triple (document + test buckets) vs VersionReq/lenient. Natural owner: story 6-6 (contract freeze / version negotiation)."
+    action: "ktesio-adapter-api manifest.rs validate(): contract_version uses semver::Version::parse
+      (strict X.Y.Z) — rejects '1'/'1.0'/'v0.1.0', accepts prerelease/build metadata;
+      the field doc doesn't state the requirement. Decide strict-triple (document
+      + test buckets) vs VersionReq/lenient. Natural owner: story 6-6 (contract freeze
+      / version negotiation)."
   # From story 1-5 code review (2026-07-04, verdict APPROVED WITH NITS — 4 nit-fixes applied in-story; these 3 deferred as they are cross-lifetime / not load-bearing in 1-5)
   - id: AI-7
     epic: 1
     owner: "story 1-6"
     status: open
     severity: low
-    action: "ktesio-engine supervisor.rs resume(): resume fail-fasts when the effective pause level reads Unsupported, which could strand a `paused` instance with no path back to `running`. Unreachable in 1-5 (the adapter snapshot is never rewritten after register, and stop-from-paused works cleanly), but becomes reachable once snapshots can be re-synced. Owner: story 1-6. Fix: resume from `paused` should always be permitted (SIGCONT if Guaranteed, else transition + qualifier), never fail-fast."
+    action: "ktesio-engine supervisor.rs resume(): resume fail-fasts when the effective
+      pause level reads Unsupported, which could strand a `paused` instance with no
+      path back to `running`. Unreachable in 1-5 (the adapter snapshot is never rewritten
+      after register, and stop-from-paused works cleanly), but becomes reachable once
+      snapshots can be re-synced. Owner: story 1-6. Fix: resume from `paused` should
+      always be permitted (SIGCONT if Guaranteed, else transition + qualifier), never
+      fail-fast."
   - id: AI-8
     epic: 1
     owner: "story 1-6"
     status: open
     severity: low
-    action: "ktesio-engine supervisor.rs signal_backend()/pause(): a guaranteed pause when this engine holds no in-memory handle returns Ok and records the plain `command(pause)` cause — indistinguishable in the log/--json from a real SIGSTOP suspension. Purely cross-lifetime (engine restarted; row says running/paused but no handle in this process) = story 1-6 orphan-adoption territory. Owner: story 1-6. Fix: emit a qualifier cause (reuse pause-best-effort with a 'no in-custody process' detail, or add pause-unverified) when the signal was a no-op. Dev documented this as Decision #4."
+    action: "ktesio-engine supervisor.rs signal_backend()/pause(): a guaranteed pause
+      when this engine holds no in-memory handle returns Ok and records the plain
+      `command(pause)` cause — indistinguishable in the log/--json from a real SIGSTOP
+      suspension. Purely cross-lifetime (engine restarted; row says running/paused
+      but no handle in this process) = story 1-6 orphan-adoption territory. Owner:
+      story 1-6. Fix: emit a qualifier cause (reuse pause-best-effort with a 'no in-custody
+      process' detail, or add pause-unverified) when the signal was a no-op. Dev documented
+      this as Decision #4."
   - id: AI-9
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-engine supervisor.rs pause() (guaranteed path): signals SIGSTOP THEN persists state=paused — opposite to stop()'s persist-first order. A set_state failure in the narrow window after a successful SIGSTOP leaves the process frozen while the row still says `running`. Not load-bearing (I/O failure in a tiny window; the error surfaces). Flipping the order only moves the inconsistency window, so it was intentionally left as-is; revisit only if 1-6/1-7 crash-consistency work makes one ordering clearly preferable."
+    action: "ktesio-engine supervisor.rs pause() (guaranteed path): signals SIGSTOP
+      THEN persists state=paused — opposite to stop()'s persist-first order. A set_state
+      failure in the narrow window after a successful SIGSTOP leaves the process frozen
+      while the row still says `running`. Not load-bearing (I/O failure in a tiny
+      window; the error surfaces). Flipping the order only moves the inconsistency
+      window, so it was intentionally left as-is; revisit only if 1-6/1-7 crash-consistency
+      work makes one ordering clearly preferable."
   # From story 1-6 code review (2026-07-04, verdict APPROVED WITH NITS — 6 in-scope fixes applied in-story; these 5 deferred as out-of-1-6-scope follow-ups, reviewer-agreed)
   - id: AI-10
     epic: 1
     owner:
     status: done  # DONE in 721c6d9 (2026-07-06): start_time stored on UnixProcess, re-verified each adopted poll — mismatch→Exited (recycled-PID crash caught), read-failure→Alive+retry (review hardening, no false-fail of a live agent), PID-gone→Exited. Windows already immune. Review Approved-with-nits; 687 tests, 95.17%.
     severity: high
-    action: "ktesio-engine backends/unix: an ADOPTED UnixProcess (child: None) checks liveness via kill(pid,0) and verifies the start-time fingerprint ONLY at adoption time, never on subsequent reaper polls. If an adopted agent crashes and the OS recycles its PID within a reaper interval (~250ms), poll_once reads the recycled PID as Alive → the crash is never detected, the row stays a phantom `running`, no restart fires. Windows is safe (self.adopted is a real HANDLE, immune to PID reuse) — a Unix/Windows asymmetry. Fix: store start_time on UnixProcess and re-verify process_start_time(pid) in the adopted branch of reap_if_exited (or adopt via pidfd). Needs a follow-up story (touches the hot poll path). Reduced-surface by AI-8/F-Low-2 (terminal records settle to pid-0 seed, skipped by adopt)."
+    action: "ktesio-engine backends/unix: an ADOPTED UnixProcess (child: None) checks
+      liveness via kill(pid,0) and verifies the start-time fingerprint ONLY at adoption
+      time, never on subsequent reaper polls. If an adopted agent crashes and the
+      OS recycles its PID within a reaper interval (~250ms), poll_once reads the recycled
+      PID as Alive → the crash is never detected, the row stays a phantom `running`,
+      no restart fires. Windows is safe (self.adopted is a real HANDLE, immune to
+      PID reuse) — a Unix/Windows asymmetry. Fix: store start_time on UnixProcess
+      and re-verify process_start_time(pid) in the adopted branch of reap_if_exited
+      (or adopt via pidfd). Needs a follow-up story (touches the hot poll path). Reduced-surface
+      by AI-8/F-Low-2 (terminal records settle to pid-0 seed, skipped by adopt)."
   - id: AI-11
     epic: 1
     owner:
     status: done  # DONE in 721c6d9 (2026-07-06): Engine::remove stops/tears down a live/adopted instance (kills group, drops handle, clears write-ahead record) before deleting the row — plain + --force; teardown-failure aborts the remove (no orphan); Paused-live handled; lock order registry→supervisor consistent (no deadlock). Review verified.
     severity: medium
-    action: "ktesio-engine Engine::remove / registry.remove: `kt agent remove` (incl. --force) deletes the instance row (FK-cascading the agent_runtime write-ahead record) but never stops or drops the Supervisor.running handle of a live/adopted instance — the process survives until Engine::drop, and because its write-ahead record is now gone, a subsequent engine crash leaves a TRUE unsupervised orphan no future engine can adopt (NFR-1 counterexample). Pre-existing gap (remove never stopped processes; deferred from 1-2/1-4). Fix: remove should stop the live process / drop the handle before deleting the row. Needs a follow-up story + a product decision on remove-of-a-running-instance semantics."
+    action: "ktesio-engine Engine::remove / registry.remove: `kt agent remove` (incl.
+      --force) deletes the instance row (FK-cascading the agent_runtime write-ahead
+      record) but never stops or drops the Supervisor.running handle of a live/adopted
+      instance — the process survives until Engine::drop, and because its write-ahead
+      record is now gone, a subsequent engine crash leaves a TRUE unsupervised orphan
+      no future engine can adopt (NFR-1 counterexample). Pre-existing gap (remove
+      never stopped processes; deferred from 1-2/1-4). Fix: remove should stop the
+      live process / drop the handle before deleting the row. Needs a follow-up story
+      + a product decision on remove-of-a-running-instance semantics."
   - id: AI-12
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-engine supervisor.rs poll_once: a persistent backend.poll error is swallowed as `Err(_) => None` (treat as alive), so a permanently un-pollable handle is never crash-detected and stays `running` forever with no diagnostic. Fix: count consecutive poll errors and surface/reconcile past a threshold."
+    action: "ktesio-engine supervisor.rs poll_once: a persistent backend.poll error
+      is swallowed as `Err(_) => None` (treat as alive), so a permanently un-pollable
+      handle is never crash-detected and stays `running` forever with no diagnostic.
+      Fix: count consecutive poll errors and surface/reconcile past a threshold."
   - id: AI-13
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-engine supervisor.rs (~609-612): an ADOPTED process that exits non-zero reports Exited{code:None} (a non-child's exit code is unrecoverable), so the recorded crash cause reads 'terminated by signal' even for a clean non-zero exit. Cosmetic/operator-facing. Fix: distinguish 'no code (signal, spawned)' from 'no code (adopted, unknown)'."
+    action: "ktesio-engine supervisor.rs (~609-612): an ADOPTED process that exits
+      non-zero reports Exited{code:None} (a non-child's exit code is unrecoverable),
+      so the recorded crash cause reads 'terminated by signal' even for a clean non-zero
+      exit. Cosmetic/operator-facing. Fix: distinguish 'no code (signal, spawned)'
+      from 'no code (adopted, unknown)'."
   - id: AI-14
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-engine backends/{unix,windows}: a fingerprint-read failure at spawn writes start_time=0 as a sentinel; if such a process is later still alive, adopt compares live(non-zero) != 0 → Ok(None) → the live survivor is wrongly reconciled to `failed`. Only reachable if the start-time read fails on a process we hold alive ('cannot happen in normal operation'). Fix: make start_time an Option / fail-closed, or fail the spawn if the fingerprint can't be read."
+    action: "ktesio-engine backends/{unix,windows}: a fingerprint-read failure at
+      spawn writes start_time=0 as a sentinel; if such a process is later still alive,
+      adopt compares live(non-zero) != 0 → Ok(None) → the live survivor is wrongly
+      reconciled to `failed`. Only reachable if the start-time read fails on a process
+      we hold alive ('cannot happen in normal operation'). Fix: make start_time an
+      Option / fail-closed, or fail the spawn if the fingerprint can't be read."
   # From story 1-7 code review (2026-07-04, verdict APPROVED — no fixes needed; 2 non-blocking perf/polish nits, both out-of-scope for 1-7)
   - id: AI-15
     epic: 1
     owner:
     status: open
     severity: low
-    action: "kt cli/agent.rs `show --json`: builds the single entry via facade.fleet().find(name) — an O(N) full-fleet scan for one instance, and it inherits fleet()'s SILENT status-read-back degradation (defaults to count 0 / no cause) whereas the human `show` path surfaces a read-back failure as a stderr warning. Harmless at Epic-1 fleet sizes. Future: build `show --json`'s entry directly and distinguish 'not found' from 'found-but-status-degraded'. [story 1-7 review nit]"
+    action: "kt cli/agent.rs `show --json`: builds the single entry via facade.fleet().find(name)
+      — an O(N) full-fleet scan for one instance, and it inherits fleet()'s SILENT
+      status-read-back degradation (defaults to count 0 / no cause) whereas the human
+      `show` path surfaces a read-back failure as a stderr warning. Harmless at Epic-1
+      fleet sizes. Future: build `show --json`'s entry directly and distinguish 'not
+      found' from 'found-but-status-degraded'. [story 1-7 review nit]"
   - id: AI-16
     epic: 1
     owner:
     status: open
     severity: low
-    action: "ktesio-engine engine.rs fleet_entry_for re-reads the spawn record per instance while Engine::fleet already holds the registry lock (an N+1 read shape). Fine at current scale; batch via a single list_spawn_records() join if the fleet grows large. [story 1-7 review nit]"
+    action: "ktesio-engine engine.rs fleet_entry_for re-reads the spawn record per
+      instance while Engine::fleet already holds the registry lock (an N+1 read shape).
+      Fine at current scale; batch via a single list_spawn_records() join if the fleet
+      grows large. [story 1-7 review nit]"
   # From Epic 1 retrospective (2026-07-06, Party Mode; artifact epic-1-retro-2026-07-06.md; verdict SUCCESS). Recommended follow-ups:
   - id: AI-17
     epic: 1
     owner: "next CI/build-touching dev story"
     status: done  # DONE in 0d0a093 (2026-07-06): root rust-toolchain.toml @ 1.96.1 + CI made explicit (+stable latest jobs, +1.96.1 MSRV job, +stable release); test_automation.py locks the strings. CAVEAT: mise's RUSTUP_TOOLCHAIN overrides the file on this machine → bare cargo still needs +1.96.1 here (see memory ktesio-gate-toolchain). Verified 687 tests / 95.17% on bare cargo=1.96.1 with mise cleared.
     severity: medium
-    action: "Add a root `rust-toolchain.toml` pinning 1.96.1 so bare `cargo` uses the right toolchain automatically — kills the recurring per-story friction (local default stable 1.94.1 < MSRV 1.96.1; libsqlite3-sys needs cfg_select!). NEEDS ISLAM APPROVAL: committing this changes the default toolchain for everyone on the repo. Owner: next CI/build-touching dev story."
+    action: "Add a root `rust-toolchain.toml` pinning 1.96.1 so bare `cargo` uses
+      the right toolchain automatically — kills the recurring per-story friction (local
+      default stable 1.94.1 < MSRV 1.96.1; libsqlite3-sys needs cfg_select!). NEEDS
+      ISLAM APPROVAL: committing this changes the default toolchain for everyone on
+      the repo. Owner: next CI/build-touching dev story."
   - id: AI-18
     epic: 1
     owner: "tech-writer / project-context"
     status: open
     severity: low
-    action: "Document the 'honest state / surfaced-not-silent' pattern as a project principle + code-review checklist item, with the three Epic-1 exemplars (1-5 best-effort pause qualifier; 1-6 honest orphan adoption; 1-7 compile-time-null MeteringSeed). Owner: tech-writer / project-context."
+    action: "Document the 'honest state / surfaced-not-silent' pattern as a project
+      principle + code-review checklist item, with the three Epic-1 exemplars (1-5
+      best-effort pause qualifier; 1-6 honest orphan adoption; 1-7 compile-time-null
+      MeteringSeed). Owner: tech-writer / project-context."
   - id: AI-19
     epic: 1
     owner: "review process"
     status: open
     severity: low
-    action: "Adopt a review rule: a 'deferred-as-unreachable' no-op must be PROVEN unreachable across EVERY shipped surface (CLI + library + cross-lifetime) at the same evidence bar as a test. Lesson: 1-5 Decision #4 (guaranteed-pause with no in-memory handle = silent no-op) was reachable via ordinary CLI usage and only surfaced in 1-6. Owner: review process."
+    action: "Adopt a review rule: a 'deferred-as-unreachable' no-op must be PROVEN
+      unreachable across EVERY shipped surface (CLI + library + cross-lifetime) at
+      the same evidence bar as a test. Lesson: 1-5 Decision #4 (guaranteed-pause with
+      no in-memory handle = silent no-op) was reachable via ordinary CLI usage and
+      only surfaced in 1-6. Owner: review process."
   - id: AI-20
     epic: 1
     owner:
     status: open
     severity: medium
-    action: "PRODUCT DECISION (needs Islam + architect): daemon/detach for durable cross-CLI-command supervision. `kt agent start` does NOT persist an agent across separate CLI commands today — the single-lifetime supervisor SIGKILLs the process group on handle Drop; adoption rescues only the engine-CRASH case, not a clean CLI exit. Options: (a) engine-as-daemon/service; (b) `kt agent start --detach`; (c) document single-lifetime as intended v1. Likely sequences into Epic 7 (embedding / engine-as-service). Surfaced honestly today via a stderr notice on `start`. SPIKE DONE (2026-07-06, technical-durable-agent-supervision-daemon-vs-detach-research-2026-07-06.md): RECOMMENDS (c) document single-lifetime as v1 NOW + (a) engine-as-daemon as the durable path in Epic 7/v1.x (proposed new Story 7.6 'Durable supervision via a local engine service', client-auto-start 'invisible daemon' pattern); DO NOT build (b) --detach — detach severs stdin/stdout so it can't deliver Epic 4 send-input and stops Epic 3 metering while detached; adoption re-acquires supervision, not a control channel. Windows KILL_ON_JOB_CLOSE (backends/windows/mod.rs:178) is the NFR-2 fracture point (b) would have to invert; (a) leaves it unchanged. Awaiting Islam's ratification + 5 open Qs (daemon start-model, per-user vs per-fleet, transport timing, interim --detach?, NFR-4 idle budget) — deferred to Epic 7 planning; does NOT block Epic 2."
+    action: "PRODUCT DECISION (needs Islam + architect): daemon/detach for durable
+      cross-CLI-command supervision. `kt agent start` does NOT persist an agent across
+      separate CLI commands today — the single-lifetime supervisor SIGKILLs the process
+      group on handle Drop; adoption rescues only the engine-CRASH case, not a clean
+      CLI exit. Options: (a) engine-as-daemon/service; (b) `kt agent start --detach`;
+      (c) document single-lifetime as intended v1. Likely sequences into Epic 7 (embedding
+      / engine-as-service). Surfaced honestly today via a stderr notice on `start`.
+      SPIKE DONE (2026-07-06, technical-durable-agent-supervision-daemon-vs-detach-research-2026-07-06.md):
+      RECOMMENDS (c) document single-lifetime as v1 NOW + (a) engine-as-daemon as
+      the durable path in Epic 7/v1.x (proposed new Story 7.6 'Durable supervision
+      via a local engine service', client-auto-start 'invisible daemon' pattern);
+      DO NOT build (b) --detach — detach severs stdin/stdout so it can't deliver Epic
+      4 send-input and stops Epic 3 metering while detached; adoption re-acquires
+      supervision, not a control channel. Windows KILL_ON_JOB_CLOSE (backends/windows/mod.rs:178)
+      is the NFR-2 fracture point (b) would have to invert; (a) leaves it unchanged.
+      Awaiting Islam's ratification + 5 open Qs (daemon start-model, per-user vs per-fleet,
+      transport timing, interim --detach?, NFR-4 idle budget) — deferred to Epic 7
+      planning; does NOT block Epic 2."
   - id: AI-21
     epic: 1
     owner: "orchestrator playbook"
     status: open
     severity: low
-    action: "Codify the away-mode / interruption recovery drill used this epic: on a subagent cut-off (session limit) or API stall, VERIFY true state from disk via local gates (free of model budget) → resume the agent with context intact → use incremental small-write authoring for large files. Owner: orchestrator playbook."
+    action: "Codify the away-mode / interruption recovery drill used this epic: on
+      a subagent cut-off (session limit) or API stall, VERIFY true state from disk
+      via local gates (free of model budget) → resume the agent with context intact
+      → use incremental small-write authoring for large files. Owner: orchestrator
+      playbook."
   # AI-17 deferred sub-items (2026-07-06):
   - id: AI-22
     epic: 1
     owner: "tech-writer"
     status: open
     severity: low
-    action: "AI-17 deferred: contributor docs (CONTRIBUTING.md, AGENTS.md, PR template, etc.) still say bare `cargo` and don't note the local-MSRV-pin vs CI-stable split or the mise/RUSTUP_TOOLCHAIN caveat. Point them at docs/testing.md's Toolchain note. Owner: tech-writer."
+    action: "AI-17 deferred: contributor docs (CONTRIBUTING.md, AGENTS.md, PR template,
+      etc.) still say bare `cargo` and don't note the local-MSRV-pin vs CI-stable
+      split or the mise/RUSTUP_TOOLCHAIN caveat. Point them at docs/testing.md's Toolchain
+      note. Owner: tech-writer."
   - id: AI-23
     epic: 1
     owner: "a CI-touching story"
     status: done  # RESOLVED in PR #100 (5506c4f); status field never flipped until the 2026-08-27 staleness sweep. .github/workflows/ci.yml:473-485 ("Cache cargo-tarpaulin binary", ~/.cargo/bin) and :490-495 (guarded `command -v cargo-tarpaulin || cargo +stable install`) BOTH self-cite "AI-23" in their own comments, and scripts/test_automation.py:235-238 pins them against regression. The asymmetry this item named is gone: all three cargo-tool installs (semver, nextest, tarpaulin) now cache AND guard. ADVERSARIALLY VERIFIED 2026-08-27 — an independent refuter tried to break the claim and it held.
     severity: low
-    action: "Pre-existing CI asymmetry (noted during AI-17): the `coverage` job rebuilds cargo-tarpaulin every run with no cache, unlike the `semver` job (cached in AI-1). Add a ~/.cargo/bin cache to the coverage job. Related to AI-1/AI-3. Owner: a CI-touching story."
+    action: "Pre-existing CI asymmetry (noted during AI-17): the `coverage` job rebuilds
+      cargo-tarpaulin every run with no cache, unlike the `semver` job (cached in
+      AI-1). Add a ~/.cargo/bin cache to the coverage job. Related to AI-1/AI-3. Owner:
+      a CI-touching story."
   # From story 2-1 code review (2026-07-06, first pass CHANGES-REQUIRED → fixed → second pass APPROVED). Deferred/nit follow-ups:
   - id: AI-24
     epic: 2
     owner: "a config/IO-touching story"
     status: open
     severity: low
-    action: "ktesio-engine registry.rs set_config (~635): the accepted-write path uses a non-atomic std::fs::write (no temp-file + rename), so a crash mid-write could truncate config.toml. Matches repo-wide convention (no atomic-write helper exists yet) — NOT a 2-1 regression. Add a shared atomic-write helper (temp + rename) and adopt it for config + other durable file writes. Owner: a config/IO-touching story."
+    action: "ktesio-engine registry.rs set_config (~635): the accepted-write path
+      uses a non-atomic std::fs::write (no temp-file + rename), so a crash mid-write
+      could truncate config.toml. Matches repo-wide convention (no atomic-write helper
+      exists yet) — NOT a 2-1 regression. Add a shared atomic-write helper (temp +
+      rename) and adopt it for config + other durable file writes. Owner: a config/IO-touching
+      story."
   - id: AI-25
     epic: 2
     owner:
     status: open
     severity: low
-    action: "kt cli/agent.rs `config get <name> <intermediate.table.path>`: reports 'no effective value' for a table-prefix path even though child leaves exist — correct (a table is not a scalar) but a confusing diagnostic. Improve the message or list the children. [story 2-1 review nit]"
+    action: "kt cli/agent.rs `config get <name> <intermediate.table.path>`: reports
+      'no effective value' for a table-prefix path even though child leaves exist
+      — correct (a table is not a scalar) but a confusing diagnostic. Improve the
+      message or list the children. [story 2-1 review nit]"
   - id: AI-26
     epic: 2
     owner:
     status: open
     severity: low
-    action: "kt main.rs `config set`: a value beginning with '-' is rejected by clap (parsed as a flag) and fails loudly. If verbatim-parity for arbitrary values matters (esp. agent.* pass-through), add #[arg(allow_hyphen_values=true)] on the value arg. [story 2-1 review nit]"
+    action: "kt main.rs `config set`: a value beginning with '-' is rejected by clap
+      (parsed as a flag) and fails loudly. If verbatim-parity for arbitrary values
+      matters (esp. agent.* pass-through), add #[arg(allow_hyphen_values=true)] on
+      the value arg. [story 2-1 review nit]"
   # From story 2-2 code review (2026-07-07, verdict APPROVED WITH NITS — 5 fixed in-story; these 2 deferred):
   - id: AI-27
     epic: 2
     owner:
     status: open
     severity: low
-    action: "ktesio-engine adapter/mod.rs config-mapping application: a config/pass-through Env target (agent.<TAIL> or a known-key Env target) silently SHADOWS a same-named base-launch env var ([lifecycle.start].env) via last-write-wins insert, and an agent.FOO tail vs a known target FOO collide by sort order — no diagnostic. Not a security boundary (single-tenant; operator controls the manifest). Fix: document the precedence (config overrides base-launch, last-write-wins) + add collision tests; consider a warn diagnostic on shadow/collision. [story 2-2 review]"
+    action: "ktesio-engine adapter/mod.rs config-mapping application: a config/pass-through
+      Env target (agent.<TAIL> or a known-key Env target) silently SHADOWS a same-named
+      base-launch env var ([lifecycle.start].env) via last-write-wins insert, and
+      an agent.FOO tail vs a known target FOO collide by sort order — no diagnostic.
+      Not a security boundary (single-tenant; operator controls the manifest). Fix:
+      document the precedence (config overrides base-launch, last-write-wins) + add
+      collision tests; consider a warn diagnostic on shadow/collision. [story 2-2
+      review]"
   - id: AI-28
     epic: 2
     owner:
     status: open
     severity: low
-    action: "ktesio-engine config-file render (File target) + set_config both use non-atomic std::fs::write; a crash mid-write truncates the native config, and multi-file apply is not atomic across files (a later-file failure leaves an earlier file — harmless stale artifact; start-STATE atomicity IS correct). Same family as AI-24. Fix: a shared temp+rename atomic-write helper adopted for config writes + file-target renders. [story 2-2 review]"
+    action: "ktesio-engine config-file render (File target) + set_config both use
+      non-atomic std::fs::write; a crash mid-write truncates the native config, and
+      multi-file apply is not atomic across files (a later-file failure leaves an
+      earlier file — harmless stale artifact; start-STATE atomicity IS correct). Same
+      family as AI-24. Fix: a shared temp+rename atomic-write helper adopted for config
+      writes + file-target renders. [story 2-2 review]"
   # From the Epic 1 PR #100 Windows CI (2026-07-07):
   - id: AI-29
     epic: 1
     owner:
     status: open
     severity: medium
-    action: "Epic 1's SURVIVAL-path NFR-1 proofs are Unix-tested ONLY: engine_kill_adopts_live_child (1-6), whole_fleet_survives_a_reboot (1-7), ai7_paused, + the 2 pause CLI tests are runtime-gated off Windows because the surviving-subprocess harness relies on Unix re-parenting (Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills children WITH the engine). The 'gone→reconcile-to-failed' adoption paths ARE Windows-tested (11/13 adoption tests pass on Windows). Follow-up: add Windows-POSITIVE adoption/reboot tests asserting the correct Windows semantics (engine death → children killed via kill-on-close → reconcile-to-failed), so NFR-1 is affirmatively validated on Windows, not merely gated. Relates to AD-5 + the daemon/detach AI-20 finding."
+    action: "Epic 1's SURVIVAL-path NFR-1 proofs are Unix-tested ONLY: engine_kill_adopts_live_child
+      (1-6), whole_fleet_survives_a_reboot (1-7), ai7_paused, + the 2 pause CLI tests
+      are runtime-gated off Windows because the surviving-subprocess harness relies
+      on Unix re-parenting (Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills children
+      WITH the engine). The 'gone→reconcile-to-failed' adoption paths ARE Windows-tested
+      (11/13 adoption tests pass on Windows). Follow-up: add Windows-POSITIVE adoption/reboot
+      tests asserting the correct Windows semantics (engine death → children killed
+      via kill-on-close → reconcile-to-failed), so NFR-1 is affirmatively validated
+      on Windows, not merely gated. Relates to AD-5 + the daemon/detach AI-20 finding."
   # From story 2-3 code review (2026-07-07, verdict APPROVED WITH NITS — cosmetic, deferred):
   - id: AI-30
     epic: 2
     owner:
     status: open
     severity: low
-    action: "story 2-3 review nits (cosmetic): (a) kt cli/agent.rs config_json docstring (~716) names value_display/source_label accessors it doesn't call (uses display()/source.as_str()) — reword; (b) EffectiveConfig::source_label (config.rs:242) is effectively dead (only its unit test calls it) — remove or wire in; (c) the human config table can misalign on a hand-edited multi-line value (--json/snapshot unaffected); (d) empty-config `config get --json` has no dedicated test (correct by construction). Fold into a config-touching story. ALSO: add scripts/__pycache__/ to .gitignore (recurs as an untracked artifact when test_automation.py runs without PYTHONDONTWRITEBYTECODE)."
+    action: "story 2-3 review nits (cosmetic): (a) kt cli/agent.rs config_json docstring
+      (~716) names value_display/source_label accessors it doesn't call (uses display()/source.as_str())
+      — reword; (b) EffectiveConfig::source_label (config.rs:242) is effectively dead
+      (only its unit test calls it) — remove or wire in; (c) the human config table
+      can misalign on a hand-edited multi-line value (--json/snapshot unaffected);
+      (d) empty-config `config get --json` has no dedicated test (correct by construction).
+      Fold into a config-touching story. ALSO: add scripts/__pycache__/ to .gitignore
+      (recurs as an untracked artifact when test_automation.py runs without PYTHONDONTWRITEBYTECODE)."
   # Epic 1 PR #100 coverage fast-follow (2026-07-08, Islam-authorized merge-over-red):
   - id: AI-31
     epic: 1
     owner:
     status: done  # RESOLVED 2026-07-14 via AI-53 (PR #108 -> main 8d975e7); status field simply never flipped until the 2026-08-13 reconciliation. AI-53 is `done` and its own note says verbatim "Supersedes AI-31/AI-36." The per-crate tarpaulin split (#101 option (b)) fit the free 7 GB runner, so the larger-RAM runner this item asked for was never needed. NOTE the OOM diagnosis in the text below was itself later shown to be only half the story: the SECOND, distinct coverage failure (2026-07-27) was a stale cached fake_agent, not memory — see AI-67, which records that four prior diagnoses were wrong and their remedies reverted. Empirical confirmation 2026-08-13: coverage passed on six consecutive PRs (#122/#129/#48/#131/#132/#133). Do not re-open on the OOM theory.
     severity: high
-    action: "coverage CI job OOMs on the 7 GB hosted runner (annotation: 'runner lost communication ... starves it for CPU/Memory') ~49 min in, during the tail of the cold instrumented compile or the llvm-profdata merge — NOT parallel test execution (RUST_TEST_THREADS=1 + 8 GB swap did not move the failure point). Four fixes landed in #100 got it to COMPILE+run within budget (tarpaulin binary cache; --engine llvm; dedicated -cargo-coverage- cache key so the instrumented target persists; serial tests + swap), but the runner still dies before flushing logs. Epic 1 (#100) was squash-merged OVER the red check (Islam-approved 2026-07-08) since coverage is proven 95.19% locally. Fix options: larger-RAM runner (cleanest); reduce instrumented memory (CARGO_PROFILE_DEV_DEBUG=0/1, codegen-units, CARGO_BUILD_JOBS); split tarpaulin per-crate; free disk. MUST land before the Epic 2 PR so its CI is green. Tracked: GitHub issue #101."
+    action: "coverage CI job OOMs on the 7 GB hosted runner (annotation: 'runner lost
+      communication ... starves it for CPU/Memory') ~49 min in, during the tail of
+      the cold instrumented compile or the llvm-profdata merge — NOT parallel test
+      execution (RUST_TEST_THREADS=1 + 8 GB swap did not move the failure point).
+      Four fixes landed in #100 got it to COMPILE+run within budget (tarpaulin binary
+      cache; --engine llvm; dedicated -cargo-coverage- cache key so the instrumented
+      target persists; serial tests + swap), but the runner still dies before flushing
+      logs. Epic 1 (#100) was squash-merged OVER the red check (Islam-approved 2026-07-08)
+      since coverage is proven 95.19% locally. Fix options: larger-RAM runner (cleanest);
+      reduce instrumented memory (CARGO_PROFILE_DEV_DEBUG=0/1, codegen-units, CARGO_BUILD_JOBS);
+      split tarpaulin per-crate; free disk. MUST land before the Epic 2 PR so its
+      CI is green. Tracked: GitHub issue #101."
   # Observed during Epic 1 push cycles (2026-07-08):
   - id: AI-32
     epic:
     owner:
     status: open  # PARTIALLY RESOLVED 2026-08-12 (docs/npm surface only). The "1 LOW" below was STALE by an order of magnitude: the push warning on 2026-08-12 reported 15 alerts on main (8 high, 6 moderate, 1 low), not 1. The Dependabot backlog cleanup that day closed the npm half — PR #128 (js-yaml 4.3.1) and #129 (nanoid 3.3.18) landed the two security bumps; PR #131 then took js-yaml OUT of the tree entirely (it was a fumadocs-core/fumadocs-mdx dependency and neither 16.14 nor 15.2 needs it) and this change raises postcss's declared floor to ^8.5.26, closing GHSA-r28c-9q8g-f849 / GHSA-fxqj-rqcc-2cmp (path traversal via attacker-controlled sourceMappingURL). `npm audit` in docs/ now reports 0 vulnerabilities. NOTE the postcss trap for whoever picks up the rest: the range was ALREADY `^8.5.15`, which semver-permits the fixed 8.5.26 — but the lockfile held 8.5.15 and `npm install` preserves any resolution that still satisfies the range, so the advisory survived every regeneration silently. Raising the DECLARED floor (devDependency + the `overrides` entry, which must move together) is what actually moves it. CARGO SIDE NOW AUDITED AND CLEAN (2026-08-12): `cargo audit` v0.22.2 against 1216 advisories over 213 crate dependencies reports 0 vulnerabilities and 0 warnings — no unmaintained, unsound, or yanked crates either. github-actions: all pinned actions were moved to current majors by PR #48 (actions/checkout 6.0.3 -> 7.0.0, actions/cache 5.0.5 -> 6.1.0). STILL OPEN, but the shape of it has changed: with the Rust tree clean and `npm audit` in docs/ at 0, the remaining GitHub alerts are most likely STALE ENTRIES rather than live exposure — Dependabot does not reliably auto-close an alert when the fix arrives via a lockfile regeneration instead of its own PR, and PRs #122/#128/#129/#131/#132 moved every version those alerts would have been raised against. That is an INFERENCE, not a measurement: this session had no Dependabot alerts API, so the 15 figure is the push warning's, read before the npm fixes landed, and no post-fix recount was possible. Expect the remaining work to be DISMISSING alerts rather than fixing code, but verify at https://github.com/iMagdy/ktesio/security/dependabot before closing — do not close this on the inference alone.
     severity: high  # was `low`, on the stale 1-LOW reading; 8 of the 15 observed alerts are HIGH
-    action: "GitHub reports Dependabot vulnerabilities on main (surfaced on every push to iMagdy/ktesio). Pre-existing, not introduced by Epic 1/2. Review https://github.com/iMagdy/ktesio/security/dependabot and bump/patch the affected dependencies; the npm/docs half is done (see status note), the cargo + github-actions ecosystems still need a pass — fold into a Cargo.lock-touching story or a dedicated deps PR."
+    action: "GitHub reports Dependabot vulnerabilities on main (surfaced on every
+      push to iMagdy/ktesio). Pre-existing, not introduced by Epic 1/2. Review https://github.com/iMagdy/ktesio/security/dependabot
+      and bump/patch the affected dependencies; the npm/docs half is done (see status
+      note), the cargo + github-actions ecosystems still need a pass — fold into a
+      Cargo.lock-touching story or a dedicated deps PR."
   # From story 2-4 review (2026-07-08 — primary APPROVED; adversarial leak audit: all observable surfaces airtight):
   - id: AI-33
     epic: 2
     owner:
     status: open
     severity: low
-    action: "2-4 adversarial audit MEDIUM (doc part fixed IN 2-4; behavior-change deferred): a secret:NAME mapped to a `flag` ConfigTarget is delivered as cleartext into the child's argv (adapter/mod.rs Flag arm), world-readable cross-user via ps / /proc/<pid>/cmdline — a stricter exposure than the filesystem-isolated Agent Home (the env + rendered-native-file boundaries are already documented+accepted). 2-4 documents the flag/argv boundary (docs/architecture.md) so it is no longer silent. ENHANCEMENT follow-up: when a secret resolves into a Flag target, emit an operator warning via the kt stderr-note channel (AD-12; story 1-5 pause-note precedent), or refuse + steer to env/file — deferred here if it needs cross-boundary (engine→kt) signal infrastructure. Fold into a config/adapter-delivery story."
+    action: "2-4 adversarial audit MEDIUM (doc part fixed IN 2-4; behavior-change
+      deferred): a secret:NAME mapped to a `flag` ConfigTarget is delivered as cleartext
+      into the child's argv (adapter/mod.rs Flag arm), world-readable cross-user via
+      ps / /proc/<pid>/cmdline — a stricter exposure than the filesystem-isolated
+      Agent Home (the env + rendered-native-file boundaries are already documented+accepted).
+      2-4 documents the flag/argv boundary (docs/architecture.md) so it is no longer
+      silent. ENHANCEMENT follow-up: when a secret resolves into a Flag target, emit
+      an operator warning via the kt stderr-note channel (AD-12; story 1-5 pause-note
+      precedent), or refuse + steer to env/file — deferred here if it needs cross-boundary
+      (engine→kt) signal infrastructure. Fold into a config/adapter-delivery story."
   - id: AI-34
     epic: 2
     owner:
     status: open
     severity: low
-    action: "Pre-existing (NOT introduced by 2-4): RUSTDOCFLAGS=\"-D warnings\" cargo doc --document-private-items fails on kt/src/main.rs:324 — the ^[a-z0-9][a-z0-9_-]*$ pattern in the `name` field doc comment is parsed as a broken intra-doc link. NOT the CI doc gate (CI runs scripts/check_docs.py, which passes), so non-gating. Wrap the pattern in backticks/code span. Fold into a kt-CLI-touching story."
+    action: "Pre-existing (NOT introduced by 2-4): RUSTDOCFLAGS=\"-D warnings\" cargo
+      doc --document-private-items fails on kt/src/main.rs:324 — the ^[a-z0-9][a-z0-9_-]*$
+      pattern in the `name` field doc comment is parsed as a broken intra-doc link.
+      NOT the CI doc gate (CI runs scripts/check_docs.py, which passes), so non-gating.
+      Wrap the pattern in backticks/code span. Fold into a kt-CLI-touching story."
   # Surfaced by the Epic 2 PR #102 3-OS CI (first time Epic 2 ran on macOS+Windows, 2026-07-08):
   - id: AI-35
     epic: 2
     owner:
     status: open
     severity: medium
-    action: "Epic 2's `_live` dump-observing tests are GATED Linux-only (runtime OsId gate): the CLI `secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it` (agent_cli.rs) + the supervisor `_live` tests (manifest_start_delivers_agent_pass_through_verbatim_live, manifest_start_maps_model_to_the_declared_flag_target_live, secret_leaf_delivers_cleartext_to_the_adapter_but_masks_snapshot_and_events). They spawn the real fake_agent and poll for its --dump file; that spawn+observe is fragile on macOS/Windows CI ('dump file never appeared' — spawn latency on loaded runners; fake_agent `.exe` name on Windows; and for the CLI test, agent survival past the one-shot `kt` exit — killed on Windows kill-on-close, and never-writes on macOS CI). The DELIVERY logic they prove (config→native env/flag, secret→cleartext + masking) is OS-agnostic and IS covered on Linux (+ tarpaulin) and by Epic 1's OS-specific spawn/backend tests on all 3 OSes. FOLLOW-UP to restore 3-OS coverage: (a) fake_agent_bin() `.exe` handling on Windows if missing; (b) a readiness signal or larger/adaptive dump timeout for macOS; (c) route the CLI test through the surviving-engine harness (with env injection for the resolver) so it runs on Unix. Then drop the Linux-only gates. Fold into a test-hardening or Epic 6 conformance story."
+    action: "Epic 2's `_live` dump-observing tests are GATED Linux-only (runtime OsId
+      gate): the CLI `secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it`
+      (agent_cli.rs) + the supervisor `_live` tests (manifest_start_delivers_agent_pass_through_verbatim_live,
+      manifest_start_maps_model_to_the_declared_flag_target_live, secret_leaf_delivers_cleartext_to_the_adapter_but_masks_snapshot_and_events).
+      They spawn the real fake_agent and poll for its --dump file; that spawn+observe
+      is fragile on macOS/Windows CI ('dump file never appeared' — spawn latency on
+      loaded runners; fake_agent `.exe` name on Windows; and for the CLI test, agent
+      survival past the one-shot `kt` exit — killed on Windows kill-on-close, and
+      never-writes on macOS CI). The DELIVERY logic they prove (config→native env/flag,
+      secret→cleartext + masking) is OS-agnostic and IS covered on Linux (+ tarpaulin)
+      and by Epic 1's OS-specific spawn/backend tests on all 3 OSes. FOLLOW-UP to
+      restore 3-OS coverage: (a) fake_agent_bin() `.exe` handling on Windows if missing;
+      (b) a readiness signal or larger/adaptive dump timeout for macOS; (c) route
+      the CLI test through the surviving-engine harness (with env injection for the
+      resolver) so it runs on Unix. Then drop the Linux-only gates. Fold into a test-hardening
+      or Epic 6 conformance story."
   # From the Epic 2 retrospective (2026-07-08, Party Mode; epic-2-retro-2026-07-08.md; verdict SUCCESS-with-asterisk):
   - id: AI-36
     epic: 2
     owner:
     status: done  # RESOLVED 2026-07-14 via AI-53 (PR #108 -> main 8d975e7); status field never flipped until the 2026-08-13 reconciliation. AI-53 explicitly supersedes this item. Its premise — "the coverage gate no longer gates (BOTH epics admin-merged OVER red coverage)" — is no longer true: coverage has gated honestly since Epic 9 (the first epic in project history needing no admin-merge-over-red) and passed on six consecutive PRs on 2026-08-13 (#122/#129/#48/#131/#132/#133). The larger-RAM runner cost call this item escalated to Islam is MOOT — option (b), the per-crate split, fit the free runner.
     severity: high
-    action: "Resolve the coverage-runner OOM (#101) — the coverage gate no longer gates (BOTH epics admin-merged OVER red coverage). Options: a larger-RAM GitHub runner (Islam cost call) OR a per-crate tarpaulin split so each fits the 7 GB free runner. Diagnose the NEXT attempt LOCALLY under a memory-capped container (reproduce the OOM off-CI to end the ~50-min blind cycles). Land before/early in Epic 3; if it cannot, CONSCIOUSLY mark the coverage job continue-on-error with a local-coverage-proof DoD rather than leave a silently-red required check. Absorbs AI-31."
+    action: "Resolve the coverage-runner OOM (#101) — the coverage gate no longer
+      gates (BOTH epics admin-merged OVER red coverage). Options: a larger-RAM GitHub
+      runner (Islam cost call) OR a per-crate tarpaulin split so each fits the 7 GB
+      free runner. Diagnose the NEXT attempt LOCALLY under a memory-capped container
+      (reproduce the OOM off-CI to end the ~50-min blind cycles). Land before/early
+      in Epic 3; if it cannot, CONSCIOUSLY mark the coverage job continue-on-error
+      with a local-coverage-proof DoD rather than leave a silently-red required check.
+      Absorbs AI-31."
   - id: AI-37
     epic: 2
     owner:
     status: open
     severity: medium
-    action: "Run the 3-OS CI matrix EARLIER than the epic PR (per-story, or nightly/manual on feat/* branches). Epic 2's local-only (macOS) verification hid BOTH the coverage OOM and 4 cross-OS _live failures until the epic PR, forcing test-gating under merge pressure instead of robustness."
+    action: "Run the 3-OS CI matrix EARLIER than the epic PR (per-story, or nightly/manual
+      on feat/* branches). Epic 2's local-only (macOS) verification hid BOTH the coverage
+      OOM and 4 cross-OS _live failures until the epic PR, forcing test-gating under
+      merge pressure instead of robustness."
   - id: AI-38
     epic: 2
     owner:
     status: open
     severity: medium
-    action: "Make the _live tests cross-OS robust (executes AI-35): fake_agent .exe handling on Windows, a readiness handshake instead of a wall-clock dump-file poll, and/or route through the surviving-engine harness; then DROP the Linux-only gates. Land as an Epic-3 ENABLER before Epic 3's first agent-spawning story."
+    action: "Make the _live tests cross-OS robust (executes AI-35): fake_agent .exe
+      handling on Windows, a readiness handshake instead of a wall-clock dump-file
+      poll, and/or route through the surviving-engine harness; then DROP the Linux-only
+      gates. Land as an Epic-3 ENABLER before Epic 3's first agent-spawning story."
   - id: AI-39
     epic: 2
     owner:
     status: open
     severity: medium
-    action: "Promote the AI-33 argv/secret boundary from DOCUMENTED to ENFORCED-at-runtime: warn (or refuse + steer to env/file) when a secret: value resolves into a Flag ConfigTarget, via the AD-12 stderr-note channel. Supersedes the deferral in AI-33."
+    action: "Promote the AI-33 argv/secret boundary from DOCUMENTED to ENFORCED-at-runtime:
+      warn (or refuse + steer to env/file) when a secret: value resolves into a Flag
+      ConfigTarget, via the AD-12 stderr-note channel. Supersedes the deferral in
+      AI-33."
   - id: AI-40
     epic: 2
     owner:
     status: open
     severity: low
-    action: "Bundle sliding doc debt into ONE tech-writer story: the three open Epic-1 doc items (AI-18/19/21) + two Epic-2 recipes (the git rebase --onto <squash> epic-boundary rebase procedure; the 'reproduce the CI coverage OOM under a local memory cap' diagnostic)."
+    action: "Bundle sliding doc debt into ONE tech-writer story: the three open Epic-1
+      doc items (AI-18/19/21) + two Epic-2 recipes (the git rebase --onto <squash>
+      epic-boundary rebase procedure; the 'reproduce the CI coverage OOM under a local
+      memory cap' diagnostic)."
   # From the story 3-1 adversarial ledger-integrity audit (2026-07-08 — deferred vectors; C1/C2/H1/M2 + doc nits fixed in-story):
   - id: AI-41
     epic: 3
     owner:
     status: open
     severity: medium
-    action: "3-1 ledger M3: a transient store error on the usage INSERT (SQLITE_BUSY under WAL contention, disk full) silently drops the event — Supervisor::drain_usage_for advances the cursor BEFORE the ingest loop (supervisor.rs ~:1176) so a failed insert is never retried → permanent UNDER-count for that Run. Fix: on a non-dedup store Err, do NOT advance the cursor past the failed event; leave it for the next drain (the UNIQUE dedup key makes retry safe for the already-committed ones). Needs careful per-event cursor bookkeeping; deferred from the 3-1 fix pass as non-trivial."
+    action: "3-1 ledger M3: a transient store error on the usage INSERT (SQLITE_BUSY
+      under WAL contention, disk full) silently drops the event — Supervisor::drain_usage_for
+      advances the cursor BEFORE the ingest loop (supervisor.rs ~:1176) so a failed
+      insert is never retried → permanent UNDER-count for that Run. Fix: on a non-dedup
+      store Err, do NOT advance the cursor past the failed event; leave it for the
+      next drain (the UNIQUE dedup key makes retry safe for the already-committed
+      ones). Needs careful per-event cursor bookkeeping; deferred from the 3-1 fix
+      pass as non-trivial."
   - id: AI-42
     epic: 3
     owner:
     status: open
     severity: medium
-    action: "3-1 self-reported usage CHANNEL robustness vs a buggy/non-cooperative agent (audit H2/L1/L2): the KTESIO_USAGE stdout-sentinel over the SHARED AD-12 agent.log assumes a cooperative agent. Gaps: (H2) concurrent stdout/stderr writes can split/corrupt a usage line → silent drop (under-count); (L1) duplicate JSON keys → serde keeps the last; (L2) an agent reusing a `sequence` within a Run → the distinct event is silently classified DuplicateReplay and dropped (under-count). Harden the channel: a dedicated usage FD or length-framed channel + stricter validation, so the ledger is robust to a misbehaving self-reporter. Ties to the Adapter Contract metering surface (Epic 6). v1's cooperative-agent assumption should be documented in the contract."
+    action: "3-1 self-reported usage CHANNEL robustness vs a buggy/non-cooperative
+      agent (audit H2/L1/L2): the KTESIO_USAGE stdout-sentinel over the SHARED AD-12
+      agent.log assumes a cooperative agent. Gaps: (H2) concurrent stdout/stderr writes
+      can split/corrupt a usage line → silent drop (under-count); (L1) duplicate JSON
+      keys → serde keeps the last; (L2) an agent reusing a `sequence` within a Run
+      → the distinct event is silently classified DuplicateReplay and dropped (under-count).
+      Harden the channel: a dedicated usage FD or length-framed channel + stricter
+      validation, so the ledger is robust to a misbehaving self-reporter. Ties to
+      the Adapter Contract metering surface (Epic 6). v1's cooperative-agent assumption
+      should be documented in the contract."
   - id: AI-43
     epic: 3
     owner:
     status: open
     severity: low
-    action: "3-1 AC-C literal wording (primary review Low-3): the active Metering Source is surfaced in `kt agent show` (human + --json) and `list --json`, but deliberately NOT in the compact human `list` table (80-col overflow). The headline AC-C ('Fleet listing detail') is met; the derived criterion literally says list+show human+json. Either add a Metering column to `list` (widen) or accept + document the split. Cosmetic."
+    action: "3-1 AC-C literal wording (primary review Low-3): the active Metering
+      Source is surfaced in `kt agent show` (human + --json) and `list --json`, but
+      deliberately NOT in the compact human `list` table (80-col overflow). The headline
+      AC-C ('Fleet listing detail') is met; the derived criterion literally says list+show
+      human+json. Either add a Metering column to `list` (widen) or accept + document
+      the split. Cosmetic."
   # From the story 3-2 adversarial enforcement-integrity audit (2026-07-08 — deferred; idempotency/log-write/test/doc fixed in-story):
   - id: AI-44
     epic: 3
     owner:
     status: open
     severity: low
-    action: "3-2 budget enforcement crash-gap: enforcement runs only on a fresh Inserted usage event, and adopt_orphans (engine.rs) re-holds handles WITHOUT re-evaluating budgets. If the engine crashes in the narrow window between recording a breach and firing the lifecycle action, a restarted+adopted OVER-budget agent runs un-enforced until its next usage event (then self-heals within ~250ms). Fix: re-evaluate budgets on adoption (or on the first reaper pass for an adopted instance) so an over-budget adopted agent is enforced even if it emits no further usage. Narrow window + self-healing → low."
+    action: "3-2 budget enforcement crash-gap: enforcement runs only on a fresh Inserted
+      usage event, and adopt_orphans (engine.rs) re-holds handles WITHOUT re-evaluating
+      budgets. If the engine crashes in the narrow window between recording a breach
+      and firing the lifecycle action, a restarted+adopted OVER-budget agent runs
+      un-enforced until its next usage event (then self-heals within ~250ms). Fix:
+      re-evaluate budgets on adoption (or on the first reaper pass for an adopted
+      instance) so an over-budget adopted agent is enforced even if it emits no further
+      usage. Narrow window + self-healing → low."
   # From the story 3-3 primary review + adversarial audit (2026-07-08 — deferred; list-cell/gate/doc/migration fixed in-story):
   - id: AI-45
     epic: 3
     owner:
     status: open
     severity: low
-    action: "3-3 FR-23 consistency: the Fleet `list` Usage column's inline DERIVED-COST dollar (usage_cell) has the same truncatable-label shape as the Budget cell 3-3 fixed — on a narrow terminal the `(estimated)` label can be chopped. Currently label-covered by the always-present stderr metering note (so not a bare-unlabeled-dollar-with-no-label-anywhere), but for consistency apply the Budget-cell treatment (header-level estimate qualifier + render_dollars_bare). Cosmetic/consistency."
+    action: "3-3 FR-23 consistency: the Fleet `list` Usage column's inline DERIVED-COST
+      dollar (usage_cell) has the same truncatable-label shape as the Budget cell
+      3-3 fixed — on a narrow terminal the `(estimated)` label can be chopped. Currently
+      label-covered by the always-present stderr metering note (so not a bare-unlabeled-dollar-with-no-label-anywhere),
+      but for consistency apply the Budget-cell treatment (header-level estimate qualifier
+      + render_dollars_bare). Cosmetic/consistency."
   # From the story 3-4 primary review + adversarial security audit (2026-07-09 — deferred; body-cap/relay/framing/leak-sweep fixed in-story):
   - id: AI-46
     epic: 3
     owner:
     status: open
     severity: medium
-    action: "3-4 engine-observed ADOPTION stranding: after an engine crash+restart, an adopted engine-observed instance still holds the OLD base_url pointing at the now-DEAD loopback listener port → the agent's MODEL CALLS break (connection-refused) silently until a stop→start (the engine cannot re-inject a base_url into an already-running process). v1 documented limit (fails LOUD, recoverable). Fix: re-launch adopted observed instances, OR a STABLE per-instance listener port across restarts, OR the Epic-7 daemon owning the listener persistently. Ties to AD-5 adoption + AI-20 daemon spike (Epic 7)."
+    action: "3-4 engine-observed ADOPTION stranding: after an engine crash+restart,
+      an adopted engine-observed instance still holds the OLD base_url pointing at
+      the now-DEAD loopback listener port → the agent's MODEL CALLS break (connection-refused)
+      silently until a stop→start (the engine cannot re-inject a base_url into an
+      already-running process). v1 documented limit (fails LOUD, recoverable). Fix:
+      re-launch adopted observed instances, OR a STABLE per-instance listener port
+      across restarts, OR the Epic-7 daemon owning the listener persistently. Ties
+      to AD-5 adoption + AI-20 daemon spike (Epic 7)."
   - id: AI-47
     epic: 3
     owner:
     status: open
     severity: medium
-    action: "3-4 engine-observed PRODUCTION-usability gaps (v1 deferrals, all honest today): (a) HTTPS upstream — v1 forwards HTTP only; an https:// upstream is a clean start error, but real LLM APIs are HTTPS, so the observed channel is not yet usable against a real provider (needs a TLS client — weigh rustls vs the bundled-deps philosophy); (b) STREAMING-response usage parse — a stream:true (SSE) response has no non-streaming `usage` object, so parse returns None → 0 observed tokens → a streaming agent is effectively UNMETERED by the observed channel (parse stream_options.include_usage / the final SSE usage frame); (c) non-OpenAI provider usage schemas. Make the observed channel production-usable; ties to Epic 6 adapter conformance."
+    action: "3-4 engine-observed PRODUCTION-usability gaps (v1 deferrals, all honest
+      today): (a) HTTPS upstream — v1 forwards HTTP only; an https:// upstream is
+      a clean start error, but real LLM APIs are HTTPS, so the observed channel is
+      not yet usable against a real provider (needs a TLS client — weigh rustls vs
+      the bundled-deps philosophy); (b) STREAMING-response usage parse — a stream:true
+      (SSE) response has no non-streaming `usage` object, so parse returns None →
+      0 observed tokens → a streaming agent is effectively UNMETERED by the observed
+      channel (parse stream_options.include_usage / the final SSE usage frame); (c)
+      non-OpenAI provider usage schemas. Make the observed channel production-usable;
+      ties to Epic 6 adapter conformance."
   - id: AI-48
     epic: 3
     owner:
     status: open
     severity: low
-    action: "3-4 latent tracing exposure: hyper-util (client-legacy) links `tracing`; SAFE today (no tracing-subscriber in the tree → events are no-ops; hyper's own tracing feature is OFF; hyper-util events carry the upstream host:port + timing, NEVER the Authorization header/body/key). Latent: IF a future story installs a global DEBUG/TRACE subscriber, hyper-util connection-pool events would surface the upstream endpoint + timing (still not the key). Mitigation: document 'no engine-wide DEBUG tracing subscriber without auditing hyper-util events', or drop the tracing feature if it becomes directly selectable."
+    action: "3-4 latent tracing exposure: hyper-util (client-legacy) links `tracing`;
+      SAFE today (no tracing-subscriber in the tree → events are no-ops; hyper's own
+      tracing feature is OFF; hyper-util events carry the upstream host:port + timing,
+      NEVER the Authorization header/body/key). Latent: IF a future story installs
+      a global DEBUG/TRACE subscriber, hyper-util connection-pool events would surface
+      the upstream endpoint + timing (still not the key). Mitigation: document 'no
+      engine-wide DEBUG tracing subscriber without auditing hyper-util events', or
+      drop the tracing feature if it becomes directly selectable."
   # Observed across the 3-2 gate + 3-4 fix passes (2026-07-09):
   - id: AI-49
     epic: 3
     owner:
     status: done  # RESOLVED; status field never flipped until the 2026-08-27 staleness sweep. Both named flaky tests were rewritten deterministically: crates/ktesio-engine/tests/crash.rs:149 carries a "DETERMINISM (AI-49)" comment (fa57ab3; mechanism confirmed in fake_agent.rs:410-427) and cost.rs:562-580 is pause-free. The alternative remedy also shipped — the engine-integration-serial group in .config/nextest.toml (PR #108, 8d975e7). AI-50 (done) states "Absorbs AI-49". ADVERSARIALLY VERIFIED 2026-08-27, claim upheld. NOTE the distinct AI-70 (logs.rs heartbeat race) is a DIFFERENT root cause — a missing happens-before edge, not parallel-load contention — and its own closure is unaffected by this one.
     severity: low
-    action: "Parallelism-flaky integration tests: the crash.rs restart-count test (on_failure_crash_is_restarted_by_the_reaper) and at least one cost.rs metering test intermittently FAIL under a full parallel `cargo test --workspace` load but pass in isolation / on re-run (seen during the 3-2-gate + 3-4-fix passes). Risk: intermittent RED on the Epic 3 PR CI. Stabilize — make the timing/restart-count assertions robust to a loaded runner, or mark the few timing-sensitive spawn/restart integration tests `serial`. Worth clearing BEFORE the Epic 3 PR to avoid flaky CI."
+    action: "Parallelism-flaky integration tests: the crash.rs restart-count test
+      (on_failure_crash_is_restarted_by_the_reaper) and at least one cost.rs metering
+      test intermittently FAIL under a full parallel `cargo test --workspace` load
+      but pass in isolation / on re-run (seen during the 3-2-gate + 3-4-fix passes).
+      Risk: intermittent RED on the Epic 3 PR CI. Stabilize — make the timing/restart-count
+      assertions robust to a loaded runner, or mark the few timing-sensitive spawn/restart
+      integration tests `serial`. Worth clearing BEFORE the Epic 3 PR to avoid flaky
+      CI."
   # From the Epic 3 retrospective (2026-07-13, Party Mode; epic-3-retro-2026-07-13.md; verdict SUCCESS-on-product with an escalating CI/process asterisk):
   - id: AI-50
     epic: 3
     owner: "Islam (runner call) + a CI/test-harness story"
     status: done  # RESOLVED 2026-07-14 (PR #108 → main 8d975e7). CI harness stabilized: cargo-nextest (Windows timing flake GONE + per-test kill-timeouts) + pid_alive zombie fix + build/run split + engine-integration-serial test-group. The Epic-3-tail ubuntu hang root-caused to the `adoption` integration binary: a single test deadlocks uninterruptibly (D-state) on the x86 ubuntu runner ONLY (passes macOS/Windows/arm64/local-Linux); NOT concurrency (serialization didn't fix it); un-capturable in CI (GHA blocks on the unkillable process tree; timeout-cancel discards logs) + unreproducible locally (arm64 host). Islam-approved mitigation: the 6 process-spawning adoption tests are runtime-skipped on Linux-in-CI (still run everywhere else). The remaining root-cause + un-skip is tracked in GitHub issue #109 (per-test bisect + x86 repro). ubuntu now ~6min. AI-38 harness overhaul (readiness handshake, .exe) still open as a separate improvement.
     severity: high
-    action: "Stabilize the engine integration-test harness on the Windows/ubuntu CI runners (GitHub issue #106). Epic 3 (#103) was admin-merged OVER flaky Windows/ubuntu test legs. Root cause of the macOS/Windows failures FOUND + FIXED: a STALE cached fake_agent helper — fake_agent_bin() (crates/ktesio-conformance/src/lib.rs) rebuilds only-if-MISSING, and the per-OS target/ CI cache restored a pre-metering build predating the --emit-usage/--dump args → fixed by 'rm -f target/debug/fake_agent*' before cargo test in ci.yml (bdc1fd0). A second flake (cost.rs no_retroactive_repricing read-consistency race) fixed pause-free/deterministic (1dbe790/1a31dda). Reverted red herrings: RUST_TEST_THREADS=1 serial (masked the race + overran the ubuntu 25-min timeout → ubuntu cancelled) and was NOT the cause; oversubscription + a start-time manifest re-read were also wrong theories (KTESIO_ARGDIAG proved argc=6 reached Command::spawn — engine exonerated). The snapshot-launch-at-registration change was KEPT as a robustness win (adversarially reviewed, no secret leak, AD-10 preserved) though also not the root cause. OPEN TAIL: an ubuntu-runner timeout unreproducible in a Debian container. Execute Epic-2 AI-38's harness overhaul (readiness handshake, .exe handling, surviving-engine harness) + a rebuild-on-staleness guard for prebuilt helpers. HEADLINE LESSON: suspect a stale cached test-helper binary before theorizing about the engine. Absorbs AI-49; supersedes the reverted serial experiment; executes AI-38. Land before Epic 4. Owner: Islam (runner call) + a CI/test-harness story."
+    action: "Stabilize the engine integration-test harness on the Windows/ubuntu CI
+      runners (GitHub issue #106). Epic 3 (#103) was admin-merged OVER flaky Windows/ubuntu
+      test legs. Root cause of the macOS/Windows failures FOUND + FIXED: a STALE cached
+      fake_agent helper — fake_agent_bin() (crates/ktesio-conformance/src/lib.rs)
+      rebuilds only-if-MISSING, and the per-OS target/ CI cache restored a pre-metering
+      build predating the --emit-usage/--dump args → fixed by 'rm -f target/debug/fake_agent*'
+      before cargo test in ci.yml (bdc1fd0). A second flake (cost.rs no_retroactive_repricing
+      read-consistency race) fixed pause-free/deterministic (1dbe790/1a31dda). Reverted
+      red herrings: RUST_TEST_THREADS=1 serial (masked the race + overran the ubuntu
+      25-min timeout → ubuntu cancelled) and was NOT the cause; oversubscription +
+      a start-time manifest re-read were also wrong theories (KTESIO_ARGDIAG proved
+      argc=6 reached Command::spawn — engine exonerated). The snapshot-launch-at-registration
+      change was KEPT as a robustness win (adversarially reviewed, no secret leak,
+      AD-10 preserved) though also not the root cause. OPEN TAIL: an ubuntu-runner
+      timeout unreproducible in a Debian container. Execute Epic-2 AI-38's harness
+      overhaul (readiness handshake, .exe handling, surviving-engine harness) + a
+      rebuild-on-staleness guard for prebuilt helpers. HEADLINE LESSON: suspect a
+      stale cached test-helper binary before theorizing about the engine. Absorbs
+      AI-49; supersedes the reverted serial experiment; executes AI-38. Land before
+      Epic 4. Owner: Islam (runner call) + a CI/test-harness story."
   - id: AI-51
     epic: 3
     owner: "Islam / PM (epic planning)"
     status: done  # RESOLVED 2026-07-14 — this action item's fulfillment IS Epic 9 (retire the legacy skill-manager CLI). All 3 stories done, squash-merged to main as 39f0a57 (PR #114), no admin-merge-over-red needed. See epic-9-retro-2026-07-14.md.
     severity: medium
-    action: "Retire the legacy skill-manager CLI as a scoped epic (Islam-APPROVED). The repositioning to an agent runner shipped (README/docs/GitHub description+topics), but the kt binary STILL ships the legacy skill-manager CLI — the old product's entire surface inside the new product's binary. Scope a real epic with deprecation UX (install-channel continuity, a loud-and-kind sunset). Decide sequencing: fold into the already-planned Epic 8 ('deprecate the legacy surface loudly and kindly') or stand up an earlier dedicated epic if the mismatched kt surface is a near-term credibility issue for the repositioned project. Sequence before Epic 4 kickoff so the roadmap reflects it. Owner: Islam / PM (epic planning)."
+    action: "Retire the legacy skill-manager CLI as a scoped epic (Islam-APPROVED).
+      The repositioning to an agent runner shipped (README/docs/GitHub description+topics),
+      but the kt binary STILL ships the legacy skill-manager CLI — the old product's
+      entire surface inside the new product's binary. Scope a real epic with deprecation
+      UX (install-channel continuity, a loud-and-kind sunset). Decide sequencing:
+      fold into the already-planned Epic 8 ('deprecate the legacy surface loudly and
+      kindly') or stand up an earlier dedicated epic if the mismatched kt surface
+      is a near-term credibility issue for the repositioned project. Sequence before
+      Epic 4 kickoff so the roadmap reflects it. Owner: Islam / PM (epic planning)."
   - id: AI-52
     epic: 3
     owner: "Islam / tech-writer / design"
     status: done  # RESOLVED; pure status-field drift, caught by the 2026-08-27 staleness sweep. The banner was regenerated by 0c7453d (PR #116) and replaced again by 884b974 (PR #143), which also deleted the now-fulfilled brief docs/assets/banner-brief-2026-07-14.md; the committed docs/assets/ktesio-banner.png was opened and renders the agent-runner positioning. epic-4-retro-2026-07-21.md:269 had ALREADY recorded it done — the retro knew and the field did not, which is this item class exactly. ADVERSARIALLY VERIFIED 2026-08-27.
     severity: low
-    action: "Regenerate the project banner image to match the repositioned (skill-manager → agent-runner) README/docs. The banner still advertises the old skill-manager positioning; a repositioned README under an old-positioning banner reads as half-finished. Standalone follow-up — needs no epic. Owner: Islam / tech-writer / design."
+    action: "Regenerate the project banner image to match the repositioned (skill-manager
+      → agent-runner) README/docs. The banner still advertises the old skill-manager
+      positioning; a repositioned README under an old-positioning banner reads as
+      half-finished. Standalone follow-up — needs no epic. Owner: Islam / tech-writer
+      / design."
   - id: AI-53
     epic: 3
     owner: "Islam (cost/runner call) + a CI story"
     status: done  # RESOLVED 2026-07-14 (PR #108 → main 8d975e7). The coverage job ran GREEN for the first time in three epics — the per-crate tarpaulin split (#101 option (b)) fit the free 7 GB runner, so NO larger-RAM runner was needed after all. Coverage passed on its first real run once the ubuntu test leg was unblocked (AI-50). #101 resolved. Supersedes AI-31/AI-36.
     severity: high
-    action: "Resolve the coverage-runner OOM (GitHub issue #101) — now a THIRD consecutive epic (#100/#102/#103) admin-merged OVER the red coverage check (Epic 3 also over the #106 harness legs). Escalation of AI-31/AI-36 (continuity, not a duplicate). Root cause unchanged: the INSTRUMENTED build's peak RAM+disk exceeds the free 7 GB runner (five prior fixes insufficient). Fix, in preference order: (a) a larger-RAM coverage runner (Islam cost call); or (b) a per-crate tarpaulin split so no single job holds the whole instrumented workspace (also speeds every run); diagnose any next attempt LOCALLY under a memory-capped container, not in ~50-min blind CI cycles. If unresolved before Epic 4, consciously mark the coverage job continue-on-error with a local-coverage-proof DoD so a red coverage check stops eroding the signal of every red check. Make it (with AI-50) a NAMED PREREQUISITE in the Epic 4 kickoff DoD — the forcing gate AI-36 lacked. Owner: Islam (cost/runner call) + a CI story."
+    action: "Resolve the coverage-runner OOM (GitHub issue #101) — now a THIRD consecutive
+      epic (#100/#102/#103) admin-merged OVER the red coverage check (Epic 3 also
+      over the #106 harness legs). Escalation of AI-31/AI-36 (continuity, not a duplicate).
+      Root cause unchanged: the INSTRUMENTED build's peak RAM+disk exceeds the free
+      7 GB runner (five prior fixes insufficient). Fix, in preference order: (a) a
+      larger-RAM coverage runner (Islam cost call); or (b) a per-crate tarpaulin split
+      so no single job holds the whole instrumented workspace (also speeds every run);
+      diagnose any next attempt LOCALLY under a memory-capped container, not in ~50-min
+      blind CI cycles. If unresolved before Epic 4, consciously mark the coverage
+      job continue-on-error with a local-coverage-proof DoD so a red coverage check
+      stops eroding the signal of every red check. Make it (with AI-50) a NAMED PREREQUISITE
+      in the Epic 4 kickoff DoD — the forcing gate AI-36 lacked. Owner: Islam (cost/runner
+      call) + a CI story."
   # From the Epic 9 retrospective (2026-07-14, Party Mode; epic-9-retro-2026-07-14.md; verdict SUCCESS — first epic with no CI asterisk in the project's four-retro history):
   - id: AI-54
     epic: 9
     owner: "Islam / dev-workflow docs"
     status: open
     severity: medium
-    action: "Codify 'full cross-OS + coverage CI on every commit of a feature branch' as a written, standing practice (e.g. CONTRIBUTING.md / docs/testing.md), not an emergent side effect of #106 having made CI fast and Epic 9 having been small. Epic 9 ran the complete 11-job matrix (boundary, semver, fmt, test x3 OS, build, docs, msrv, clippy, coverage) on all three of its commits and caught nothing hiding until the PR — the first real proof this works as a default, not just a possibility. Continues Epic 2's AI-37 (open two epics running; finally demonstrated in Epic 9, not yet written down as policy). Owner: Islam / dev-workflow docs."
+    action: "Codify 'full cross-OS + coverage CI on every commit of a feature branch'
+      as a written, standing practice (e.g. CONTRIBUTING.md / docs/testing.md), not
+      an emergent side effect of #106 having made CI fast and Epic 9 having been small.
+      Epic 9 ran the complete 11-job matrix (boundary, semver, fmt, test x3 OS, build,
+      docs, msrv, clippy, coverage) on all three of its commits and caught nothing
+      hiding until the PR — the first real proof this works as a default, not just
+      a possibility. Continues Epic 2's AI-37 (open two epics running; finally demonstrated
+      in Epic 9, not yet written down as policy). Owner: Islam / dev-workflow docs."
   - id: AI-55
     epic: 9
     owner: "Islam / whoever owns the review-mandate defaults"
     status: open
     severity: medium
-    action: "Extend the two-pass (primary + adversarial) review default — currently scoped to money/ledger/enforcement/network stories per Epic 3 retro §6.3 — to cover public release-surface changes: version bumps, CHANGELOG.md/RELEASE_NOTES.md entries, and crates.io package metadata (description/keywords). Story 9-2 touched all three and got one proportionate review pass that happened to cover what mattered (nothing broke), but the asymmetry — hard to quietly correct after cargo publish — argues for making this a standing trigger rather than waiting for a release-artifact mistake to justify it after the fact. Owner: Islam / whoever owns the review-mandate defaults."
+    action: "Extend the two-pass (primary + adversarial) review default — currently
+      scoped to money/ledger/enforcement/network stories per Epic 3 retro §6.3 — to
+      cover public release-surface changes: version bumps, CHANGELOG.md/RELEASE_NOTES.md
+      entries, and crates.io package metadata (description/keywords). Story 9-2 touched
+      all three and got one proportionate review pass that happened to cover what
+      mattered (nothing broke), but the asymmetry — hard to quietly correct after
+      cargo publish — argues for making this a standing trigger rather than waiting
+      for a release-artifact mistake to justify it after the fact. Owner: Islam /
+      whoever owns the review-mandate defaults."
   - id: AI-56
     epic: 9
     owner: "whoever opens Epic 8 next (PM/orchestrator)"
     status: open
     severity: low
-    action: "Sync sprint-status.yaml's Story 8-1 entry (key '8-1-relocate-the-install-lock-machinery-into-the-engine' and its inline description) to the ratified 2026-07-14 rewrite already applied to epics.md and GitHub issue #95 ('build fresh in engine::skills', not 'relocate'). The authoritative docs are already correct; only this tracker's own key/comment lags, which risks whoever opens Epic 8 next starting from the voided premise. Owner: whoever opens Epic 8 next (PM/orchestrator)."
+    action: "Sync sprint-status.yaml's Story 8-1 entry (key '8-1-relocate-the-install-lock-machinery-into-the-engine'
+      and its inline description) to the ratified 2026-07-14 rewrite already applied
+      to epics.md and GitHub issue #95 ('build fresh in engine::skills', not 'relocate').
+      The authoritative docs are already correct; only this tracker's own key/comment
+      lags, which risks whoever opens Epic 8 next starting from the voided premise.
+      Owner: whoever opens Epic 8 next (PM/orchestrator)."
   - id: AI-57
     epic: 9
     owner: "Islam / orchestrator playbook"
     status: open
     severity: low
-    action: "Document the resumable-subagent recovery flow as a standing playbook pattern: on a usage-limit cutoff, re-derive state from durable artifacts (task tracker, PR/CI status) and resume the specific named subagent with an explicit 'here's exactly where you stopped' briefing, rather than restarting from scratch. Proven cleanly at least twice now (Epic 3's story 3-2 transient rate-limit; Epic 9's story 9-2 review cutoff, this time surviving a same-day ~10-hour top-level session interruption too) with zero rework both times. Worth writing down so it's institutional knowledge rather than a rediscovered reflex — echoes Epic 3 retro's §4.5 ask for the same treatment of the injected-noise recovery drill. Owner: Islam / orchestrator playbook."
+    action: "Document the resumable-subagent recovery flow as a standing playbook
+      pattern: on a usage-limit cutoff, re-derive state from durable artifacts (task
+      tracker, PR/CI status) and resume the specific named subagent with an explicit
+      'here's exactly where you stopped' briefing, rather than restarting from scratch.
+      Proven cleanly at least twice now (Epic 3's story 3-2 transient rate-limit;
+      Epic 9's story 9-2 review cutoff, this time surviving a same-day ~10-hour top-level
+      session interruption too) with zero rework both times. Worth writing down so
+      it's institutional knowledge rather than a rediscovered reflex — echoes Epic
+      3 retro's §4.5 ask for the same treatment of the injected-noise recovery drill.
+      Owner: Islam / orchestrator playbook."
   - id: AI-58
     epic: 9
     owner: "Islam / Winston (architect playbook)"
     status: open
     severity: low
-    action: "Name and document the draft-then-ratify pattern for architecture-decision corrections: architect drafts a complete proposal touching zero real planning artifacts -> human picks from a small set of bounded, concrete options (via AskUserQuestion or equivalent) -> agent applies the ratified choice verbatim. Worked cleanly for the AD-16/Epic-8 re-scope (Story 9-3 Part B). Worth a short write-up in the architect-agent's playbook so it's the default shape for the next AD correction rather than being reinvented or, worse, partially applied before ratification. Owner: Islam / Winston (architect playbook)."
+    action: "Name and document the draft-then-ratify pattern for architecture-decision
+      corrections: architect drafts a complete proposal touching zero real planning
+      artifacts -> human picks from a small set of bounded, concrete options (via
+      AskUserQuestion or equivalent) -> agent applies the ratified choice verbatim.
+      Worked cleanly for the AD-16/Epic-8 re-scope (Story 9-3 Part B). Worth a short
+      write-up in the architect-agent's playbook so it's the default shape for the
+      next AD correction rather than being reinvented or, worse, partially applied
+      before ratification. Owner: Islam / Winston (architect playbook)."
   # From story 4-1's adversarial review + fix + independent re-verification (2026-07-15):
   - id: AI-59
     epic: 4
-    owner: "whoever picks up Epic 7, or a dedicated resilience story if it proves insufficient in practice before then"
+    owner: "whoever picks up Epic 7, or a dedicated resilience story if it proves
+      insufficient in practice before then"
     status: open
     severity: medium
-    action: "4-1's send_input fix (commit 4b4ac96) bounds a stuck agent's blocking stdin write to a 5s timeout instead of leaving it unbounded (the CRITICAL bug an adversarial audit found and this fix closes, independently re-verified empirically: bounded not permanent, recoverable via stop+start, no compounding on retry). But the bound is achieved by holding the engine's single global Mutex<Supervisor> through the whole 5s recv_timeout wait, so a stuck write still stalls EVERY instance's operations (incl. the crash reaper) for up to ~5s, not just the stuck instance -- independently measured (an unrelated instance's send took 4.31s, resolving in lockstep with the stuck instance's ~5.01s timeout, not near-instantly). This was a deliberate, disclosed, EXPLICITLY-SPECIFIED tradeoff in the fix design (mirrors stop()'s existing accepted bounded-lock-hold pattern) chosen over building a full per-instance-lock/decoupled-write architecture under fix-pass time pressure -- not a surprise shortfall, and a major severity downgrade from the original (unbounded+permanent+unrecoverable) bug. Full fix: decouple a single instance's stdin write from the fleet-wide lock (e.g. a per-instance write lock/channel, or an actor-style dedicated writer task per supervised process) so an unrelated instance's ops are genuinely unaffected, not just bounded-in-lockstep. Natural to revisit alongside Epic 7's daemon/persistent-engine-session work, where write isolation matters even more. Owner: whoever picks up Epic 7, or a dedicated resilience story if it proves insufficient in practice before then."
+    action: "4-1's send_input fix (commit 4b4ac96) bounds a stuck agent's blocking
+      stdin write to a 5s timeout instead of leaving it unbounded (the CRITICAL bug
+      an adversarial audit found and this fix closes, independently re-verified empirically:
+      bounded not permanent, recoverable via stop+start, no compounding on retry).
+      But the bound is achieved by holding the engine's single global Mutex<Supervisor>
+      through the whole 5s recv_timeout wait, so a stuck write still stalls EVERY
+      instance's operations (incl. the crash reaper) for up to ~5s, not just the stuck
+      instance -- independently measured (an unrelated instance's send took 4.31s,
+      resolving in lockstep with the stuck instance's ~5.01s timeout, not near-instantly).
+      This was a deliberate, disclosed, EXPLICITLY-SPECIFIED tradeoff in the fix design
+      (mirrors stop()'s existing accepted bounded-lock-hold pattern) chosen over building
+      a full per-instance-lock/decoupled-write architecture under fix-pass time pressure
+      -- not a surprise shortfall, and a major severity downgrade from the original
+      (unbounded+permanent+unrecoverable) bug. Full fix: decouple a single instance's
+      stdin write from the fleet-wide lock (e.g. a per-instance write lock/channel,
+      or an actor-style dedicated writer task per supervised process) so an unrelated
+      instance's ops are genuinely unaffected, not just bounded-in-lockstep. Natural
+      to revisit alongside Epic 7's daemon/persistent-engine-session work, where write
+      isolation matters even more. Owner: whoever picks up Epic 7, or a dedicated
+      resilience story if it proves insufficient in practice before then."
   # From PR #117 CI validation (2026-07-19): epic-4-interaction's first-ever run through the coverage job (feat/epic-4-interaction never having exercised it before merge time, unlike Epic 9's AI-54 finding of running full CI per-commit)
   - id: AI-60
     epic: 4
     owner:
     status: done  # DONE 2026-07-19 (4c3a231 + c861c34 + 5cce78f): whole-job retry wrapper added (2→3 attempts); PR #117/#119 merged over red coverage by Islam's explicit call. *** CAUSAL EXPLANATION RETRACTED 2026-07-21 (see AI-67): this item's "runner contention / bursty flakiness" diagnosis was WRONG. Real cause is DETERMINISTIC tarpaulin LLVM-instrumentation latency (~100x slower real-child-IO round-trips: the interaction binary takes 87.6s instrumented vs the whole suite <1min plain), so ~6 real-IO tests miss HARD-CODED wall-clock deadlines nearly every attempt. Verified: resources flat/healthy every attempt (Mem 15Gi/14Gi-avail, Swap 0B, zero OOM), three fresh-runner jobs on two branches fail the IDENTICAL 6-test pool -> reproduces on every fresh runner, so the retry wrapper CANNOT converge (never was contention). The retry is to be REMOVED and replaced by AI-67's deadline-scaling fix. Wrapper-added + merged-over-red stand as historical fact; the "why" is corrected. ***
     severity: medium
-    action: "The ubuntu coverage job (tarpaulin, free-tier runner) exhibited a THIRD distinct resource-fragility symptom this epic (after #101's OOM and #109's ubuntu-adoption-hang): real-time waits on a child-process round trip (spawn + stdin write + stdout capture) transiently stalled COMPLETELY (not just slow) -- across every rerun of the identical PR #117 commit tried so far (5+), a DIFFERENT, unrelated test failed each time, always one needing real child I/O (both integration tests in tests/*.rs and plain unit tests under backends::unix::tests), never a fast-fail path; a local repro under the identical tarpaulin/instrumentation config passed instantly every time it was tried. Diagnosed as runner contention, not a product bug (Islam concurred, chose the retry-wrapper option over 3 alternatives). A same-JOB retry runs on the SAME runner instance (unlike a `gh run rerun`, which gets a fresh one) -- so it only helps if the contention is bursty/intermittent within one runner's lifetime, not constant for its whole life; the observed pattern (different tests failing each attempt, most but not all real-IO tests passing even in a failing attempt) is consistent with bursty, supporting more attempts as a reasonable mitigation. Mitigated, not root-caused, with a whole-JOB retry (never a per-test retry -- this repo already has a concrete lesson, the 4-2 H1 fix, of a per-test retry silently absorbing a real, reproducible data-loss race): the coverage step's per-crate loop + lcov merge + >=95% gate now runs in a subshell function, retried up to 2 times (3 total attempts). A genuine coverage regression or a genuine test bug still reproduces on EVERY attempt and fails the job. If 3 attempts still doesn't get green, or this keeps recurring often enough to erode confidence in the gate or burn excessive CI minutes, escalate to Islam for a runner-tier decision (mirrors AI-36's original larger-runner option) rather than continuing to bump the attempt count."
+    action: "The ubuntu coverage job (tarpaulin, free-tier runner) exhibited a THIRD
+      distinct resource-fragility symptom this epic (after #101's OOM and #109's ubuntu-adoption-hang):
+      real-time waits on a child-process round trip (spawn + stdin write + stdout
+      capture) transiently stalled COMPLETELY (not just slow) -- across every rerun
+      of the identical PR #117 commit tried so far (5+), a DIFFERENT, unrelated test
+      failed each time, always one needing real child I/O (both integration tests
+      in tests/*.rs and plain unit tests under backends::unix::tests), never a fast-fail
+      path; a local repro under the identical tarpaulin/instrumentation config passed
+      instantly every time it was tried. Diagnosed as runner contention, not a product
+      bug (Islam concurred, chose the retry-wrapper option over 3 alternatives). A
+      same-JOB retry runs on the SAME runner instance (unlike a `gh run rerun`, which
+      gets a fresh one) -- so it only helps if the contention is bursty/intermittent
+      within one runner's lifetime, not constant for its whole life; the observed
+      pattern (different tests failing each attempt, most but not all real-IO tests
+      passing even in a failing attempt) is consistent with bursty, supporting more
+      attempts as a reasonable mitigation. Mitigated, not root-caused, with a whole-JOB
+      retry (never a per-test retry -- this repo already has a concrete lesson, the
+      4-2 H1 fix, of a per-test retry silently absorbing a real, reproducible data-loss
+      race): the coverage step's per-crate loop + lcov merge + >=95% gate now runs
+      in a subshell function, retried up to 2 times (3 total attempts). A genuine
+      coverage regression or a genuine test bug still reproduces on EVERY attempt
+      and fails the job. If 3 attempts still doesn't get green, or this keeps recurring
+      often enough to erode confidence in the gate or burn excessive CI minutes, escalate
+      to Islam for a runner-tier decision (mirrors AI-36's original larger-runner
+      option) rather than continuing to bump the attempt count."
   # From PR #117 CI validation (2026-07-19): a SEPARATE finding from AI-60, on the plain (non-coverage) windows-latest test job
   - id: AI-61
     epic: 4
     owner:
     status: done  # DONE 2026-07-19 (b42cd23): widened both tests' wait_for_state deadline 30s -> 50s. Root-caused precisely (not a guess), verified NOT a 4484019 regression, NOT related to AI-60's contention theory.
     severity: medium
-    action: "Epic 3's budget.rs::breach_action_stop_drives_the_instance_to_stopped and cost.rs::breach_action_stop_drives_the_instance_to_stopped_on_a_dollar_cap raced their own 30s wait_for_state deadline against the internal 30s DEFAULT_STOP_WINDOW a budget-breach stop is ALWAYS forced through (enforce_stop -> stop_with_cause has no parameter to pass a shorter window, unlike every other stop() call site in the test suite, which all pass an explicit short window). On Unix, SIGTERM's default disposition kills the unhandled fake_agent almost instantly, so the 30s graceful window is never actually consumed in practice; on Windows there is no equivalent graceful-shutdown signal implemented yet (the module docs candidly note a CTRL_BREAK_EVENT mechanism is 'a later refinement'), so the full 30s ALWAYS elapses before escalating to TerminateJobObject + up to KILL_CONFIRM_TIMEOUT (5s) to confirm death -- a 30s test deadline vs. a 30-35s real critical path is a coin flip BY DESIGN, not a contention-dependent flake. Confirmed via two things: (1) empirically -- the exact same symptom reproduced on two separate CI runs (including a fresh-runner rerun), and every OTHER stop()-exercising test in the suite passes an explicit short window (5s/1s/200ms) and is unaffected; (2) by tracing the pre-4484019 diff -- the OLD unbounded post-kill wait had the SAME ~30s+ critical path (dominated by the untouched 30s graceful window, not the 5s confirm bound 4484019 added), so this predates Epic 4 entirely and is NOT a regression from the KILL_CONFIRM_TIMEOUT fix, just a latent Epic-3-origin margin bug that happened to manifest during this epic's CI validation. Fixed by widening both deadlines to 50s (~15s headroom over the 35s worst case, still under nextest's 60s slow-timeout marker). Distinct from AI-60 (that item is genuine multi-test runner contention on the coverage job specifically) -- do not conflate the two if either recurs."
+    action: "Epic 3's budget.rs::breach_action_stop_drives_the_instance_to_stopped
+      and cost.rs::breach_action_stop_drives_the_instance_to_stopped_on_a_dollar_cap
+      raced their own 30s wait_for_state deadline against the internal 30s DEFAULT_STOP_WINDOW
+      a budget-breach stop is ALWAYS forced through (enforce_stop -> stop_with_cause
+      has no parameter to pass a shorter window, unlike every other stop() call site
+      in the test suite, which all pass an explicit short window). On Unix, SIGTERM's
+      default disposition kills the unhandled fake_agent almost instantly, so the
+      30s graceful window is never actually consumed in practice; on Windows there
+      is no equivalent graceful-shutdown signal implemented yet (the module docs candidly
+      note a CTRL_BREAK_EVENT mechanism is 'a later refinement'), so the full 30s
+      ALWAYS elapses before escalating to TerminateJobObject + up to KILL_CONFIRM_TIMEOUT
+      (5s) to confirm death -- a 30s test deadline vs. a 30-35s real critical path
+      is a coin flip BY DESIGN, not a contention-dependent flake. Confirmed via two
+      things: (1) empirically -- the exact same symptom reproduced on two separate
+      CI runs (including a fresh-runner rerun), and every OTHER stop()-exercising
+      test in the suite passes an explicit short window (5s/1s/200ms) and is unaffected;
+      (2) by tracing the pre-4484019 diff -- the OLD unbounded post-kill wait had
+      the SAME ~30s+ critical path (dominated by the untouched 30s graceful window,
+      not the 5s confirm bound 4484019 added), so this predates Epic 4 entirely and
+      is NOT a regression from the KILL_CONFIRM_TIMEOUT fix, just a latent Epic-3-origin
+      margin bug that happened to manifest during this epic's CI validation. Fixed
+      by widening both deadlines to 50s (~15s headroom over the 35s worst case, still
+      under nextest's 60s slow-timeout marker). Distinct from AI-60 (that item is
+      genuine multi-test runner contention on the coverage job specifically) -- do
+      not conflate the two if either recurs."
 
   - id: AI-62
     epic: 4
     owner:
     status: done  # DONE 2026-07-20 (694b845): fixed a real merge-script bug found while explaining AI-60's coverage failure to Islam -- he caught that "68.2% is below 95%" didn't match the actual mechanism.
     severity: low
-    action: "The coverage step's per-crate lcov merge silently skipped ANY crate with no lcov.info, not just the intentionally-empty ktesio-adapters-hermes doc stub it was written for. When ktesio-engine's own tarpaulin run failed (AI-60's real-IO flakiness), it produced no lcov.info too, and the merge silently excluded it from the aggregate -- computing the 95% gate against only the 4 much-smaller crates and landing at an identical 68.2042% on all 3 attempts (a dead giveaway it wasn't a real per-attempt coverage measurement). The gate's own error message ('merged coverage 68.2% is below 95%') read like a genuine workspace-wide coverage shortfall when the real story was 'ktesio-engine is entirely missing from this measurement.' Fixed: only the known doc stub gets the graceful skip now; any other crate missing its lcov.info fails the attempt immediately and loudly ('$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed'), verified on the next CI run to fire correctly on all 3 attempts. Message/diagnostics fix only -- does not change AI-60's underlying flakiness or its accepted mitigation."
+    action: "The coverage step's per-crate lcov merge silently skipped ANY crate with
+      no lcov.info, not just the intentionally-empty ktesio-adapters-hermes doc stub
+      it was written for. When ktesio-engine's own tarpaulin run failed (AI-60's real-IO
+      flakiness), it produced no lcov.info too, and the merge silently excluded it
+      from the aggregate -- computing the 95% gate against only the 4 much-smaller
+      crates and landing at an identical 68.2042% on all 3 attempts (a dead giveaway
+      it wasn't a real per-attempt coverage measurement). The gate's own error message
+      ('merged coverage 68.2% is below 95%') read like a genuine workspace-wide coverage
+      shortfall when the real story was 'ktesio-engine is entirely missing from this
+      measurement.' Fixed: only the known doc stub gets the graceful skip now; any
+      other crate missing its lcov.info fails the attempt immediately and loudly ('$pkg
+      produced no lcov.info -- its tarpaulin run above almost certainly failed'),
+      verified on the next CI run to fire correctly on all 3 attempts. Message/diagnostics
+      fix only -- does not change AI-60's underlying flakiness or its accepted mitigation."
 
   # From the Epic 4 retrospective (2026-07-21, Party Mode; artifact epic-4-retro-2026-07-21.md).
   # Verdict: SUCCESS on product (FR-24/25/26 met + test-guarded, NFR-1 now provably defended),
@@ -530,56 +968,338 @@ action_items:
   # adversarial pass. AI-59 stays open and is SUBSUMED by AI-63 as the narrower instance.
   - id: AI-63
     epic: 4
-    owner: "Islam / Winston (architect); execution naturally Epic 7 or a dedicated resilience story"
+    owner: "Islam / Winston (architect); execution naturally Epic 7 or a dedicated
+      resilience story"
     status: in-progress  # Part (a) SWEEP DONE 2026-07-21 → ai-63-lock-sweep-2026-07-21.md (findings independently spot-verified by the orchestrator against source). Results: the retro's "single Mutex<Supervisor>" was imprecise — EngineInner holds TWO coarse mutexes (Registry + Supervisor) together for the whole op. The count is ~17 genuinely-unbounded FS operation sites under the lock (NOT 2) + fork/exec + a LATENT-unbounded bare child.wait() in the handle Drop (unix:580 — the 4-2 bug's exact shape, never bounded by the 4-2 fix) + the rusqlite class (fsync-at-commit only; SQLite contention is NOT an unbounded block — no busy_timeout, returns SQLITE_BUSY immediately). SEVEREST LIVE finding: drain_usage_for (supervisor.rs:2177) does std::fs::read of the ENTIRE, UNROTATED, monotonically-growing agent.log every 250ms per running instance on the crash-reaper hot path under both locks — degrades the whole fleet silently as uptime grows (exactly the long-running away-mode scenario), inverting the intuition that one-shot operator commands are the risk. Amplifier: poll_once→enforce_stop lets a single stop-action budget breach freeze the fleet lock ~35s automatically. Part (b) — the architectural fix decision (per-call bounds / per-instance write locks / actor-per-process) — is now with Islam+Winston; the severe drain_usage_for+rotation instance may warrant a tactical fix ahead of the broader redesign (Islam deciding). UPDATE 2026-08-23: TACTICAL FIX LANDED — PR #126 squash-merged to main 2026-08-12 as bbed9a7: incremental usage-drain read (new read_usage_tail helper reads only [cursor, len), plan_drain's decision logic byte-identical per adversarial billing-integrity review, UTF-8-at-cursor boundary safe) + post-stop RESCUE Terminal drain after backend.stop confirms death and before handle removal (closes the stat→read window under-count race the adversarial pass found; disjoint by cursor so no double-count; skipped on StopUnconfirmed; net improvement over Epic 3's ship). 924 tests. The broader ~17-site locking-model decision remains OPEN as part (b) with Islam+Winston — status stays in-progress. || 2026-08-26 AD-17 GATE CORRECTION (PR #145). Two records had drifted apart and this entry is routinely quoted for the wrong gate. (i) THIS item recommends doing part (a), THE SWEEP, before Epic 5 — and (a) is DONE. (ii) ARCHITECTURE-SPINE.md AD-17 ("Coarse global locking is a recorded decision, with a bounded-work rule") was written later, is the authoritative record, and scopes (b) explicitly: the replacement model "MUST be decided BEFORE Epic 7's daemon/embedding work begins", because a long-lived daemon removes the short-lived CLI-invocation lifetime that currently masks the cost. AD-17 is referenced nowhere else in this entry, which is why an Epic-5 framing persisted. What actually governed Epic 5 was AD-17's BOUNDED-WORK RULE, and story 5-1 complied with it by construction (bounded single-directory create_dir_all only; contents-copy and detach-time remove_dir_all refused by design; the residual `remove --delete` remove_dir_all at sweep site 17 recorded as an AI-63(b) input it could not fix). SUPERSEDED SCHEDULING NOTE: on 2026-08-13 Islam elected to decide (b) before story 5-1 started; 5-1 has since SHIPPED (PR #138, ff1f669) and 5-2 with it, so that sequencing choice is MOOT — it was always a scheduling preference, never a dependency. THE REAL GATE IS NOW IMMINENT: Epic 6 is in progress (6-1 done, 6-2 in progress) and Epic 7 is next, so per AD-17 part (b) must be decided before Epic 7 opens. Owner remains Islam + Winston (architect).
     severity: high
-    action: "Close the 'unbounded operation under the single global Mutex<Supervisor>' bug class ARCHITECTURALLY, not per-call. Two independent CRITICALs in one epic (4-1's unbounded stdin write; 4-2's unbounded post-SIGKILL wait) share one root: an operation with no upper bound on its duration performed while holding the ONE lock every instance's every operation needs. Different stories, different authors, different triggers (a stuck agent's stdin vs. a process that will not die), same bug. Both were fixed by bounding that SPECIFIC call, which is correct and minimal but does not address the class and composes badly -- each bound adds another whole-engine stall window (AI-59 measured an UNRELATED instance's send at 4.31s, resolving in lockstep with the stuck instance's 5.01s timeout; two 5s bounds exist today, STDIN_WRITE_TIMEOUT and KILL_CONFIRM_TIMEOUT), and nobody has enumerated what ELSE runs unbounded under that lock -- we found both instances only because someone was reading that story's diff. (a) SWEEP: enumerate every operation performed while EngineInner's supervisor lock is held and classify each bounded/unbounded -- mechanical, one sitting, and it sizes the problem (we currently do not know if there are 2 or 12). (b) DECIDE, with (a) in hand: keep bounding per-call, per-instance write locks, or an actor/dedicated-writer task per supervised process with the global lock guarding only bookkeeping. Epic 7's daemon makes this materially worse -- every embedded consumer stalls, not just one short-lived CLI invocation whose forgiving lifetime currently masks it -- so Epic 7 should inherit a DECISION, not rediscover the problem. Recommend doing (a) BEFORE Epic 5 opens, since Epic 5 adds filesystem operations to the engine and filesystem operations are exactly the shape that ends up unbounded under a lock. SUBSUMES AI-59 (closing this should close that). May warrant an explicit AD in ARCHITECTURE-SPINE.md -- the current single-lock model appears to be an implementation fact rather than a recorded decision, which is part of why two stories walked into it independently. Owner: Islam / Winston (architect); execution naturally Epic 7 or a dedicated resilience story."
+    action: "Close the 'unbounded operation under the single global Mutex<Supervisor>'
+      bug class ARCHITECTURALLY, not per-call. Two independent CRITICALs in one epic
+      (4-1's unbounded stdin write; 4-2's unbounded post-SIGKILL wait) share one root:
+      an operation with no upper bound on its duration performed while holding the
+      ONE lock every instance's every operation needs. Different stories, different
+      authors, different triggers (a stuck agent's stdin vs. a process that will not
+      die), same bug. Both were fixed by bounding that SPECIFIC call, which is correct
+      and minimal but does not address the class and composes badly -- each bound
+      adds another whole-engine stall window (AI-59 measured an UNRELATED instance's
+      send at 4.31s, resolving in lockstep with the stuck instance's 5.01s timeout;
+      two 5s bounds exist today, STDIN_WRITE_TIMEOUT and KILL_CONFIRM_TIMEOUT), and
+      nobody has enumerated what ELSE runs unbounded under that lock -- we found both
+      instances only because someone was reading that story's diff. (a) SWEEP: enumerate
+      every operation performed while EngineInner's supervisor lock is held and classify
+      each bounded/unbounded -- mechanical, one sitting, and it sizes the problem
+      (we currently do not know if there are 2 or 12). (b) DECIDE, with (a) in hand:
+      keep bounding per-call, per-instance write locks, or an actor/dedicated-writer
+      task per supervised process with the global lock guarding only bookkeeping.
+      Epic 7's daemon makes this materially worse -- every embedded consumer stalls,
+      not just one short-lived CLI invocation whose forgiving lifetime currently masks
+      it -- so Epic 7 should inherit a DECISION, not rediscover the problem. Recommend
+      doing (a) BEFORE Epic 5 opens, since Epic 5 adds filesystem operations to the
+      engine and filesystem operations are exactly the shape that ends up unbounded
+      under a lock. SUBSUMES AI-59 (closing this should close that). May warrant an
+      explicit AD in ARCHITECTURE-SPINE.md -- the current single-lock model appears
+      to be an implementation fact rather than a recorded decision, which is part
+      of why two stories walked into it independently. Owner: Islam / Winston (architect);
+      execution naturally Epic 7 or a dedicated resilience story."
   - id: AI-64
     epic: 4
     owner: "Islam / whoever owns the review-mandate defaults"
     status: open  # RATIFIED by Islam 2026-07-21 as a STANDING MANDATE (not a one-off task, so it stays open as an always-apply rule): every story that freezes a contract (wire shape, schema_version, exit code, or the Adapter Contract) gets an INDEPENDENT adversarial mutation pass by someone who did NOT write the gate; every closed hole re-verified by re-applying its original mutation; freeze fixtures must populate EVERY optional field. BINDS Story 6-6 (Adapter Contract v1 freeze) directly — enforce there.
     severity: medium
-    action: "Make an INDEPENDENT ADVERSARIAL MUTATION PASS mandatory for any story that ships a frozen contract, and add a maximal-fixture rule. Story 4-3's primary review READ the compatibility gate and was correct about everything it positively asserted (all 22 diagnostics map correctly, main()'s downcast wiring is sound, usage reuses list/show's exact computation so numbers cannot drift, NDJSON compact at all 3 sites) -- it found no CRITICAL/HIGH. The adversarial pass MUTATED the gate and found 4 of 5 mutations undetected, most consequentially that the PRICED (Rate'd) wire shape had NO key-set freeze at all: every fixture was no-Rate, so skip_serializing_if omitted all dollar fields, leaving the metered/cost-controlled half of the contract -- i.e. the entirety of Epic 3's revenue-relevant surfaces -- completely unguarded (adding a field populated only in with_dollars() passed all 69 tests). Critically, the dev agent had ALREADY self-mutated three axes and found nothing: self-mutation confirms the tests you thought to write; adversarial mutation finds the ones you didn't. Reading a gate tells you what it checks; only mutation tells you what it MISSES, and a compatibility gate's entire value is the set of things it catches. Rule: (a) any story freezing a wire shape, schema_version, exit code, or the Adapter Contract gets a mutation pass by someone who did NOT write the gate; (b) every closed hole is re-verified by RE-APPLYING its original mutation (a hole-closing test that doesn't catch the thing that slipped through is theater); (c) freeze fixtures must populate EVERY optional field, since an unpopulated Option is invisible to the freeze. Cost is well-characterized -- 4-3's fix pass was one focused session, +11 tests. Binds Story 6-6 (freeze the Adapter Contract v1) directly. Owner: Islam / whoever owns the review-mandate defaults."
+    action: "Make an INDEPENDENT ADVERSARIAL MUTATION PASS mandatory for any story
+      that ships a frozen contract, and add a maximal-fixture rule. Story 4-3's primary
+      review READ the compatibility gate and was correct about everything it positively
+      asserted (all 22 diagnostics map correctly, main()'s downcast wiring is sound,
+      usage reuses list/show's exact computation so numbers cannot drift, NDJSON compact
+      at all 3 sites) -- it found no CRITICAL/HIGH. The adversarial pass MUTATED the
+      gate and found 4 of 5 mutations undetected, most consequentially that the PRICED
+      (Rate'd) wire shape had NO key-set freeze at all: every fixture was no-Rate,
+      so skip_serializing_if omitted all dollar fields, leaving the metered/cost-controlled
+      half of the contract -- i.e. the entirety of Epic 3's revenue-relevant surfaces
+      -- completely unguarded (adding a field populated only in with_dollars() passed
+      all 69 tests). Critically, the dev agent had ALREADY self-mutated three axes
+      and found nothing: self-mutation confirms the tests you thought to write; adversarial
+      mutation finds the ones you didn't. Reading a gate tells you what it checks;
+      only mutation tells you what it MISSES, and a compatibility gate's entire value
+      is the set of things it catches. Rule: (a) any story freezing a wire shape,
+      schema_version, exit code, or the Adapter Contract gets a mutation pass by someone
+      who did NOT write the gate; (b) every closed hole is re-verified by RE-APPLYING
+      its original mutation (a hole-closing test that doesn't catch the thing that
+      slipped through is theater); (c) freeze fixtures must populate EVERY optional
+      field, since an unpopulated Option is invisible to the freeze. Cost is well-characterized
+      -- 4-3's fix pass was one focused session, +11 tests. Binds Story 6-6 (freeze
+      the Adapter Contract v1) directly. Owner: Islam / whoever owns the review-mandate
+      defaults."
   - id: AI-65
     epic: 4
     owner: "Islam / whoever owns the review-mandate defaults"
     status: open
     severity: medium
-    action: "Scope fix-pass review by whether the fix changes a VALUE or a MECHANISM. Story 4-2's crash-safety fix (21af762) was correct, thoroughly tested, and closed a real CRITICAL -- and CREATED a worse one: removing the stdout/stderr pipe (correctly, to stop an engine crash from SIGPIPE-killing the supervised agent) also removed the pipe's INCIDENTAL write backpressure, a property nothing had ever designed, documented, tested, or mentioned in any story. The result (4484019) was strictly worse than the bug being fixed -- 4-1's residual stall is bounded at ~5s, an OS-uninterruptible-I/O wait under the same global lock is unbounded. It was caught ONLY because the reviewer treated the fix as a NEW DESIGN deserving a fresh adversarial pass rather than as a patch needing confirmation that it works. Rule: a fix that changes a VALUE (timeout, threshold, deadline -- cf. 6463ec8, cba24be, b42cd23, all three fine) may be verified against its own tests; a fix that changes a MECHANISM (pipes -> direct files, channel -> mutex, blocking wait -> polling loop) is a new design and gets its own independent adversarial pass with an EXPLICIT charter: 'what invariant was the removed mechanism providing incidentally, that nothing names?' That is a different question from 'does the fix work,' and only the first one would have found this. Epic 4 contains both the failure case and the success case for this rule, which is why it is worth writing down now. Owner: Islam / whoever owns the review-mandate defaults."
+    action: "Scope fix-pass review by whether the fix changes a VALUE or a MECHANISM.
+      Story 4-2's crash-safety fix (21af762) was correct, thoroughly tested, and closed
+      a real CRITICAL -- and CREATED a worse one: removing the stdout/stderr pipe
+      (correctly, to stop an engine crash from SIGPIPE-killing the supervised agent)
+      also removed the pipe's INCIDENTAL write backpressure, a property nothing had
+      ever designed, documented, tested, or mentioned in any story. The result (4484019)
+      was strictly worse than the bug being fixed -- 4-1's residual stall is bounded
+      at ~5s, an OS-uninterruptible-I/O wait under the same global lock is unbounded.
+      It was caught ONLY because the reviewer treated the fix as a NEW DESIGN deserving
+      a fresh adversarial pass rather than as a patch needing confirmation that it
+      works. Rule: a fix that changes a VALUE (timeout, threshold, deadline -- cf.
+      6463ec8, cba24be, b42cd23, all three fine) may be verified against its own tests;
+      a fix that changes a MECHANISM (pipes -> direct files, channel -> mutex, blocking
+      wait -> polling loop) is a new design and gets its own independent adversarial
+      pass with an EXPLICIT charter: 'what invariant was the removed mechanism providing
+      incidentally, that nothing names?' That is a different question from 'does the
+      fix work,' and only the first one would have found this. Epic 4 contains both
+      the failure case and the success case for this rule, which is why it is worth
+      writing down now. Owner: Islam / whoever owns the review-mandate defaults."
   - id: AI-66
     epic: 4
     owner: "Dev / QA; scope as a dedicated hardening story"
     status: open
     severity: medium
-    action: "Sweep the existing test suite for the FIVE named blind-spot patterns, starting with the one instance still open in main. Story 4-3's adversarial pass surfaced four and 4-2 shipped a fifth of the same family; together they are ONE class, not five incidents -- the suite testing what the CODE DOES rather than what the CONTRACT PROMISES. The patterns, each with a worked fix from this epic: (1) FIXTURE MONOCULTURE -- only the default/unpriced path exercised, so optional fields never materialize on the wire and freezing the wire freezes nothing about them (fix: maximal fixtures populating every optional field at once); (2) SILENT OS SELF-SKIP -- a runtime 'if OsId::current() == Windows { return; }' reports as PASSED, so CI showed green on Windows for assertions that never ran, and two such tests were the SOLE guards for real contract surfaces (fix: the _unix suffix convention, making the limitation visible in the test list, plus the written rule that a _unix test may be an ADDITIONAL proof, never the sole guard); (3) UNPINNED LINK -- both ends of a chain unit-tested, the link between them unasserted, so severing the mapper is invisible (fix: pin every mapper arm directly, driving the real mapper then the real classifier); (4) UNTESTED MODE COMBINATION -- flags covered individually but not their product (--follow --json was never exercised; making follow batches emit human text into an NDJSON stream passed all 33 logs tests); (5) TAUTOLOGICAL ASSERTION -- a field compared to the constant it was stamped from, so bumping the constant could not fail it (fix: pin the literal). START WITH THE KNOWN OPEN INSTANCE: story 4-2 documented, accepted, and shipped an instance of pattern (3) -- BackendError::StopUnconfirmed's wiring into stop_unconfirmed = true inside stop_inner is unreachable by any test, both halves independently well-tested, only the 3-line glue unexercised. That is structurally identical to 4-3's H1 and it is the glue for a CRITICAL fix; nobody connected the two at the time because 4-2's instance was recorded before 4-3's adversarial pass gave the pattern a name. Then sweep Epics 1-3's suites, prioritizing fixture monoculture given that Epic 3's priced surfaces are the ones that were found unguarded. Owner: Dev / QA; scope as a dedicated hardening story."
+    action: "Sweep the existing test suite for the FIVE named blind-spot patterns,
+      starting with the one instance still open in main. Story 4-3's adversarial pass
+      surfaced four and 4-2 shipped a fifth of the same family; together they are
+      ONE class, not five incidents -- the suite testing what the CODE DOES rather
+      than what the CONTRACT PROMISES. The patterns, each with a worked fix from this
+      epic: (1) FIXTURE MONOCULTURE -- only the default/unpriced path exercised, so
+      optional fields never materialize on the wire and freezing the wire freezes
+      nothing about them (fix: maximal fixtures populating every optional field at
+      once); (2) SILENT OS SELF-SKIP -- a runtime 'if OsId::current() == Windows {
+      return; }' reports as PASSED, so CI showed green on Windows for assertions that
+      never ran, and two such tests were the SOLE guards for real contract surfaces
+      (fix: the _unix suffix convention, making the limitation visible in the test
+      list, plus the written rule that a _unix test may be an ADDITIONAL proof, never
+      the sole guard); (3) UNPINNED LINK -- both ends of a chain unit-tested, the
+      link between them unasserted, so severing the mapper is invisible (fix: pin
+      every mapper arm directly, driving the real mapper then the real classifier);
+      (4) UNTESTED MODE COMBINATION -- flags covered individually but not their product
+      (--follow --json was never exercised; making follow batches emit human text
+      into an NDJSON stream passed all 33 logs tests); (5) TAUTOLOGICAL ASSERTION
+      -- a field compared to the constant it was stamped from, so bumping the constant
+      could not fail it (fix: pin the literal). START WITH THE KNOWN OPEN INSTANCE:
+      story 4-2 documented, accepted, and shipped an instance of pattern (3) -- BackendError::StopUnconfirmed's
+      wiring into stop_unconfirmed = true inside stop_inner is unreachable by any
+      test, both halves independently well-tested, only the 3-line glue unexercised.
+      That is structurally identical to 4-3's H1 and it is the glue for a CRITICAL
+      fix; nobody connected the two at the time because 4-2's instance was recorded
+      before 4-3's adversarial pass gave the pattern a name. Then sweep Epics 1-3's
+      suites, prioritizing fixture monoculture given that Epic 3's priced surfaces
+      are the ones that were found unguarded. Owner: Dev / QA; scope as a dedicated
+      hardening story."
   - id: AI-67
     epic: 4
     owner: "Islam (cost/tier decision)"
     status: done  # RESOLVED 2026-07-27 (PR #120: 3629c5d, 39f08d5, b9b30cb, 51d86b7, 947cd68). Coverage job GREEN for the first time: 95.3169% (4376/4591), all 11 gates passing. TRUE ROOT CAUSE (found only on the 5th attempt, by controlled single-variable experiment): a STALE cached fake_agent. The coverage job restores target/ from a cache keyed on hashFiles(Cargo.lock); Cargo.lock had not changed since Epic 9, so the entry was frozen at 2026-07-14 -- predating the --echo-stdin and --heartbeat-stderr-ms flags. fake_agent silently ignores unknown args (_ => {}), so the child never echoed stdin and never wrote stderr; tests waited forever for output that could not arrive. Proof: swapping in the pre-6afac99 helper reproduced the exact CI assertion (out=336 err=0) with NO instrumentation on either axis; with a fresh helper the "tarpaulin-incompatible" tests pass under real LLVM instrumentation in 8.15s (vs the ~487s previously blamed on instrumentation). FIX: rm + rebuild fake_agent in the coverage step -- the identical guard the `test` job has had since the earlier macOS/Windows incident of this SAME bug class. FOUR PRIOR DIAGNOSES WERE ALL WRONG and their remedies were reverted (whole-job retry wrapper=AI-60; cfg!(tarpaulin) 120s deadline inflations; the 4 #[cfg_attr(tarpaulin, ignore)] skips; the "engine lock starvation" theory that motivated stacking AI-63). Net -177 lines of misdirected mitigation removed; 0 tests skipped. GUARDS so it cannot silently recur: test_automation.py now asserts the rebuild INSIDE the coverage step specifically (the pre-existing assertion was satisfied by the `test` job copy alone -- which is exactly why it never caught this), and fake_agent_bin() docs gained an "EXISTENCE IS NOT FRESHNESS" section. Once honest, the gate immediately earned its keep: it exposed crates/kt/src/cli/self_update.rs (user-facing update machinery) at 0/55 coverage, now tested incl. "a failed checksum never reaches the installer" and "a truncated download never yields a partial binary" (947cd68, +19 tests). STILL UNCOVERED, deliberately: ui.rs, install_channel.rs, update_check.rs -- worth a later pass. DEFERRED with evidence: self-verifying fake_agent_bin() freshness (removing the helper reproduced 2 build-lock flakes under nextest, since each test is its own process) -- separate follow-up.  # DIAGNOSIS DONE 2026-07-21 → ai-67-coverage-clustering-2026-07-21.md (findings spot-verified by the orchestrator against the CI logs). ROOT CAUSE (high confidence, call it H-D): cargo tarpaulin's LLVM instrumentation makes real-child-process IO round-trips ~100x slower (interaction-test binary = 87.6s instrumented vs whole suite <1min plain), so a shifting subset of a FIXED ~6-test real-IO pool misses its HARD-CODED wall-clock deadline nearly every attempt. REFUTED: H-A degraded-runner (three fresh-runner jobs on two branches fail the identical pool; resources flat/healthy — Mem 15Gi/14Gi-avail, Swap 0B, zero OOM) and H-B un-reset-retry-state (readings flat across attempts 1→2→3; attempt 3 sometimes did BETTER). The retry wrapper (AI-60) therefore cannot converge and should be REMOVED. FIX (small, test-only, permanent): scale the three offending deadlines under instrumentation — interaction.rs:117 (20s, already bumped once but still short), backends/unix/mod.rs:1550 (5s) and :1799 (10s, both never bumped) — gated on cfg!(tarpaulin) (the build already passes --cfg=tarpaulin, verified) or an env deadline, keeping today's values for plain nextest; tarpaulin --timeout 180 still guards genuine hangs. Also flagged: the heavy OOM apparatus (#101 split, 8GB swap, disk reclaim) was for the SOLVED AI-23 7GB-runner era; the runner now has 15Gi, so the workflow's "7GB/2-core" comments are stale. REMEDY RATIFIED by Islam 2026-07-21: the deadline-scaling CODE FIX (not paid runner, not demotion). Plan: gate the 3 offending deadlines (interaction.rs:117, backends/unix/mod.rs:1550 + :1799) higher under cfg!(tarpaulin) keeping plain-nextest values, and REMOVE the AI-60 whole-job retry wrapper from ci.yml (it can't converge). Test/CI-only, no product code. QUEUED right behind the AI-63 tactical fix (task #101, running on branch fix/ai-63-drain-usage-incremental) to avoid concurrent working-tree edits; will land on its own branch and PR FIRST so the coverage gate is genuinely green before the AI-63 PR and Epic 5. Runner CORE count still unconfirmed but irrelevant to the code fix.
     severity: medium
-    action: "Decide the coverage gate's fate: FIX IT OR DEMOTE IT HONESTLY. Coverage has now been red-at-merge for FOUR of five epics (1, 2, 3, and Epic 4 TWICE -- PR #117 and #119), Epic 9 being the sole exception. Each cause genuinely differed and each was fully diagnosed before Islam authorized the merge, with every OTHER gate confirmed genuinely green first -- this is not carelessness -- but a REQUIRED gate that is reliably overridden has stopped carrying information while still costing CI minutes and attention, and it trains everyone to read 'coverage red' as 'coverage red again.' AI-60's own closure text explicitly asks for a RUNNER-TIER ESCALATION TO ISLAM rather than another attempt-count bump, and that escalation has not happened. Options: (a) a larger-RAM/paid runner (a cost decision only Islam can make -- AI-36's original option resurfacing in a new guise); (b) further diagnosis of why the SAME small test cluster fails TOGETHER within a single attempt, which is not what independent per-attempt bad luck looks like -- a persistently-degraded runner instance for its whole lifetime, and state not being reset between same-job retry attempts, both remain open and undiagnosed; (c) demote coverage to a non-blocking informational job and stop calling it a gate. Also carry forward AI-62's generalization as a standing rule: ANY AGGREGATION STEP THAT CAN SILENTLY DROP AN INPUT MUST FAIL LOUDLY INSTEAD -- the merge script reported a confident, precise, entirely FALSE 'merged coverage 68.2% is below 95%' when the real story was that the largest crate was missing from the measurement, and it was caught only because Islam found the EXPLANATION suspicious, not the number. A gate that fails loudly costs a rerun; a gate that reports a plausible wrong number costs a debugging session down the wrong path. Owner: Islam (cost/tier decision)."
+    action: "Decide the coverage gate's fate: FIX IT OR DEMOTE IT HONESTLY. Coverage
+      has now been red-at-merge for FOUR of five epics (1, 2, 3, and Epic 4 TWICE
+      -- PR #117 and #119), Epic 9 being the sole exception. Each cause genuinely
+      differed and each was fully diagnosed before Islam authorized the merge, with
+      every OTHER gate confirmed genuinely green first -- this is not carelessness
+      -- but a REQUIRED gate that is reliably overridden has stopped carrying information
+      while still costing CI minutes and attention, and it trains everyone to read
+      'coverage red' as 'coverage red again.' AI-60's own closure text explicitly
+      asks for a RUNNER-TIER ESCALATION TO ISLAM rather than another attempt-count
+      bump, and that escalation has not happened. Options: (a) a larger-RAM/paid runner
+      (a cost decision only Islam can make -- AI-36's original option resurfacing
+      in a new guise); (b) further diagnosis of why the SAME small test cluster fails
+      TOGETHER within a single attempt, which is not what independent per-attempt
+      bad luck looks like -- a persistently-degraded runner instance for its whole
+      lifetime, and state not being reset between same-job retry attempts, both remain
+      open and undiagnosed; (c) demote coverage to a non-blocking informational job
+      and stop calling it a gate. Also carry forward AI-62's generalization as a standing
+      rule: ANY AGGREGATION STEP THAT CAN SILENTLY DROP AN INPUT MUST FAIL LOUDLY
+      INSTEAD -- the merge script reported a confident, precise, entirely FALSE 'merged
+      coverage 68.2% is below 95%' when the real story was that the largest crate
+      was missing from the measurement, and it was caught only because Islam found
+      the EXPLANATION suspicious, not the number. A gate that fails loudly costs a
+      rerun; a gate that reports a plausible wrong number costs a debugging session
+      down the wrong path. Owner: Islam (cost/tier decision)."
   - id: AI-68
     epic: 4
-    owner: "Islam (policy ratification); release-notes authoring per whoever owns the release cut"
+    owner: "Islam (policy ratification); release-notes authoring per whoever owns
+      the release cut"
     status: open
     severity: medium
-    action: "Announce Epic 4's shipped surface, and resolve PRD SS7's still-open deprecation policy BEFORE Epic 6 freezes the Adapter Contract. Epic 4 shipped three new commands (kt agent send / logs [--follow] [--json] / usage [<name>] [--json]), a BEHAVIOR CHANGE to an existing artifact (agent.log is now stdout-only, with stderr moved to a new agent-stderr.log -- owner-confirmed, but visible to anyone reading agent logs and adjacent to Epic 3's billing ingestion path, which reads agent.log), CONTRACT_VERSION 0.3.0 -> 0.4.0, and a BRAND-NEW v1 COMPATIBILITY SURFACE (the 0-6 exit-code table plus frozen --json key-sets). NONE of it appears in CHANGELOG.md or docs/RELEASE_NOTES.md -- the newest section in both is still Epic 9's v0.6.0 -- and the workspace version is still 0.6.0. The CHANGELOG's own preamble says entries are generated from git history when a version tag is published, so this MAY simply be deferred to the next release cut rather than being an error; but Epic 9 HAND-AUTHORED its v0.6.0 entry as part of the epic (FR-38 required it), so practice is inconsistent, and PRD SS7 REQUIRES a compatibility surface to be announced in release notes -- so the announcement path for the thing Epic 4 just froze does not currently exist. Compounding this: PRD SS7's own policy text still carries '[ASSUMPTION: policy mechanics pending Islam]', so the project now has shipped, test-enforced, frozen contracts pointing at a deprecation policy that is explicitly unresolved. Nothing is broken today; the exposure is that the FIRST time someone needs to change one of these surfaces, the rules for doing so do not exist. Resolve before Story 6-6 freezes the Adapter Contract v1 -- the same problem at much higher stakes. Also SHARPENS still-open AI-55: Epic 4 touched a release surface (CLI commands, CONTRACT_VERSION, a frozen compatibility surface) and got NO release-surface review pass at all. Owner: Islam (policy ratification); release-notes authoring per whoever owns the release cut."
+    action: "Announce Epic 4's shipped surface, and resolve PRD SS7's still-open deprecation
+      policy BEFORE Epic 6 freezes the Adapter Contract. Epic 4 shipped three new
+      commands (kt agent send / logs [--follow] [--json] / usage [<name>] [--json]),
+      a BEHAVIOR CHANGE to an existing artifact (agent.log is now stdout-only, with
+      stderr moved to a new agent-stderr.log -- owner-confirmed, but visible to anyone
+      reading agent logs and adjacent to Epic 3's billing ingestion path, which reads
+      agent.log), CONTRACT_VERSION 0.3.0 -> 0.4.0, and a BRAND-NEW v1 COMPATIBILITY
+      SURFACE (the 0-6 exit-code table plus frozen --json key-sets). NONE of it appears
+      in CHANGELOG.md or docs/RELEASE_NOTES.md -- the newest section in both is still
+      Epic 9's v0.6.0 -- and the workspace version is still 0.6.0. The CHANGELOG's
+      own preamble says entries are generated from git history when a version tag
+      is published, so this MAY simply be deferred to the next release cut rather
+      than being an error; but Epic 9 HAND-AUTHORED its v0.6.0 entry as part of the
+      epic (FR-38 required it), so practice is inconsistent, and PRD SS7 REQUIRES
+      a compatibility surface to be announced in release notes -- so the announcement
+      path for the thing Epic 4 just froze does not currently exist. Compounding this:
+      PRD SS7's own policy text still carries '[ASSUMPTION: policy mechanics pending
+      Islam]', so the project now has shipped, test-enforced, frozen contracts pointing
+      at a deprecation policy that is explicitly unresolved. Nothing is broken today;
+      the exposure is that the FIRST time someone needs to change one of these surfaces,
+      the rules for doing so do not exist. Resolve before Story 6-6 freezes the Adapter
+      Contract v1 -- the same problem at much higher stakes. Also SHARPENS still-open
+      AI-55: Epic 4 touched a release surface (CLI commands, CONTRACT_VERSION, a frozen
+      compatibility surface) and got NO release-surface review pass at all. Owner:
+      Islam (policy ratification); release-notes authoring per whoever owns the release
+      cut."
   - id: AI-69
     epic: 4
     owner: "Dev / QA; Islam to ratify if the answer is 'the mapper pin is permanent'"
     status: open
     severity: low
-    action: "Decide exit code 6's permanent gate: build a deterministic stuck-agent harness, or ratify the mapper pin as sufficient. Exit code 6 (InteractionTimedOut) has NO end-to-end assertion on ANY OS. A genuine timeout needs a stuck agent whose 64KB stdin pipe buffer is full -- exactly the slow, sleep-shaped, flaky setup this suite forbids on determinism grounds -- so story 4-3 instead pinned the MISSING LINK deterministically (every_engine_error_mapper_arm_preserves_its_documented_exit_code drives the REAL map_engine_error then the REAL classify for every non-1 engine-error class) and composed it with the 0-4 end-to-end proofs of main()'s wiring; AC2's wording was honestly rewritten to say so rather than keep the blanket claim the adversarial pass had just falsified. That is a sound argument. The open question is whether a deterministic harness is achievable at acceptable cost -- e.g. a fake_agent flag that provably never drains stdin plus a deliberately-filled pipe, no sleeps -- or whether the mapper pin is RATIFIED as the permanent gate for this one code. Related residual worth deciding alongside it: the D-state / OS-uninterruptible-I/O scenario behind 4-2's StopUnconfirmed fix has NEVER been reproduced against the fixed code. A ramdisk provably cannot reproduce it (zero write latency by construction -- it returns ENOSPC instantly rather than throttling), and real-disk reproduction was ruled out after two disk-fill incidents costing ~86GB and ~55GB. The fix is sound BY CONSTRUCTION (independently traced to Child::try_wait(), confirmed non-blocking regardless of WHY a process will not die), which is a stronger argument than a single passing observation -- but it is an argument, not an observation. Also note the 7 _unix-suffixed tests that skip Windows: none is the sole guard for anything OS-independent, but the gap is real and now visible. Owner: Dev / QA; Islam to ratify if the answer is 'the mapper pin is permanent'."
+    action: "Decide exit code 6's permanent gate: build a deterministic stuck-agent
+      harness, or ratify the mapper pin as sufficient. Exit code 6 (InteractionTimedOut)
+      has NO end-to-end assertion on ANY OS. A genuine timeout needs a stuck agent
+      whose 64KB stdin pipe buffer is full -- exactly the slow, sleep-shaped, flaky
+      setup this suite forbids on determinism grounds -- so story 4-3 instead pinned
+      the MISSING LINK deterministically (every_engine_error_mapper_arm_preserves_its_documented_exit_code
+      drives the REAL map_engine_error then the REAL classify for every non-1 engine-error
+      class) and composed it with the 0-4 end-to-end proofs of main()'s wiring; AC2's
+      wording was honestly rewritten to say so rather than keep the blanket claim
+      the adversarial pass had just falsified. That is a sound argument. The open
+      question is whether a deterministic harness is achievable at acceptable cost
+      -- e.g. a fake_agent flag that provably never drains stdin plus a deliberately-filled
+      pipe, no sleeps -- or whether the mapper pin is RATIFIED as the permanent gate
+      for this one code. Related residual worth deciding alongside it: the D-state
+      / OS-uninterruptible-I/O scenario behind 4-2's StopUnconfirmed fix has NEVER
+      been reproduced against the fixed code. A ramdisk provably cannot reproduce
+      it (zero write latency by construction -- it returns ENOSPC instantly rather
+      than throttling), and real-disk reproduction was ruled out after two disk-fill
+      incidents costing ~86GB and ~55GB. The fix is sound BY CONSTRUCTION (independently
+      traced to Child::try_wait(), confirmed non-blocking regardless of WHY a process
+      will not die), which is a stronger argument than a single passing observation
+      -- but it is an argument, not an observation. Also note the 7 _unix-suffixed
+      tests that skip Windows: none is the sole guard for anything OS-independent,
+      but the gap is real and now visible. Owner: Dev / QA; Islam to ratify if the
+      answer is 'the mapper pin is permanent'."
   - id: AI-70
     epic: 4
     owner:
     status: done  # FIXED 2026-08-12 in the same change that added this entry. Helper `wait_for_agent_log_line` (logs.rs, mirroring the existing `wait_for_usage_rows` / `wait_for_agent_pid` poll-with-deadline idiom) now waits for `heartbeat 0` instead of reading agent.log straight through; the beat is the LAST of the three line kinds the test asserts, so waiting on it settles the whole file. Verified 30/30 consecutive local runs plus the full 10-test logs.rs suite. Swept the sibling call sites while here: logs.rs:552 and :967 assert heartbeats through the RETAINED-LOG api (already synchronised) and pause.rs:85 only COUNTS beats across a pause boundary (no presence assertion), so line 667 was the only unsynchronised one.
     severity: medium
-    action: "logs.rs `legacy_agent_log_is_byte_identical_to_pre_story_content` was flaky: it asserted a verbatim `heartbeat 0` line in agent.log immediately after `wait_for_usage_rows` returned. Root cause is an ORDERING assumption, not runner load -- `fake_agent` writes the ready line, then every usage line, and only THEN arms its heartbeat clock, so the first beat lands one full --heartbeat-ms interval (40ms in this test) AFTER the last usage line, while the engine's drain pass can commit all three ledger rows inside that window. Caught on PR #48, whose diff is workflow YAML ONLY and therefore could not have caused it; it went RED on macos-latest then GREEN on re-run of the identical commit, which is what ruled out a real regression. GENERALISABLE LESSON, and the reason this is its own item rather than a line under AI-49: synchronising on the LEDGER does not synchronise agent.log -- they are independent streams, and every test that waits on one before asserting the other has this latent shape. DISTINCT FROM AI-49, which is about heavy integration tests contending under a full parallel workspace run (crash.rs restart-count, a cost.rs metering test); this one fails from a missing happens-before edge and would flake at any parallelism level, including a single-threaded run. AI-49 remains open on its own merits."
+    action: "logs.rs `legacy_agent_log_is_byte_identical_to_pre_story_content` was
+      flaky: it asserted a verbatim `heartbeat 0` line in agent.log immediately after
+      `wait_for_usage_rows` returned. Root cause is an ORDERING assumption, not runner
+      load -- `fake_agent` writes the ready line, then every usage line, and only
+      THEN arms its heartbeat clock, so the first beat lands one full --heartbeat-ms
+      interval (40ms in this test) AFTER the last usage line, while the engine's drain
+      pass can commit all three ledger rows inside that window. Caught on PR #48,
+      whose diff is workflow YAML ONLY and therefore could not have caused it; it
+      went RED on macos-latest then GREEN on re-run of the identical commit, which
+      is what ruled out a real regression. GENERALISABLE LESSON, and the reason this
+      is its own item rather than a line under AI-49: synchronising on the LEDGER
+      does not synchronise agent.log -- they are independent streams, and every test
+      that waits on one before asserting the other has this latent shape. DISTINCT
+      FROM AI-49, which is about heavy integration tests contending under a full parallel
+      workspace run (crash.rs restart-count, a cost.rs metering test); this one fails
+      from a missing happens-before edge and would flake at any parallelism level,
+      including a single-threaded run. AI-49 remains open on its own merits."
   # From the trunk coverage breach diagnosed on PR #146 (2026-08-28):
   - id: AI-71
     epic:
     owner:
     status: open
     severity: high
-    action: "Restore the workspace coverage gate to green: trunk's merged workspace coverage is 94.9431% (4675/4924 lines), below the 95% gate that NFR-3 marks non-negotiable and CI-enforced -- 3 lines short. Red since 58d5a70 (2026-08-26), the first trunk run where `coverage` actually EXECUTED; the two runs before it (ff1f669, e0e9f6c) failed on `boundary`, which sits upstream of `coverage` in the job's `needs:` graph and so SKIPPED it, masking the shortfall. Largest untested blocks: crates/ktesio-engine/src/domain/supervisor.rs (848/989) and crates/ktesio-engine/src/engine.rs (402/451). Diagnosed in PR #146 comment 5436345179."
+    action: "Restore the workspace coverage gate to green: trunk's merged workspace
+      coverage is 94.9431% (4675/4924 lines), below the 95% gate that NFR-3 marks
+      non-negotiable and CI-enforced -- 3 lines short. Red since 58d5a70 (2026-08-26),
+      the first trunk run where `coverage` actually EXECUTED; the two runs before
+      it (ff1f669, e0e9f6c) failed on `boundary`, which sits upstream of `coverage`
+      in the job's `needs:` graph and so SKIPPED it, masking the shortfall. Largest
+      untested blocks: crates/ktesio-engine/src/domain/supervisor.rs (848/989) and
+      crates/ktesio-engine/src/engine.rs (402/451). Diagnosed in PR #146 comment 5436345179."
+  - id: "epic-6-retro-item-1-public-api-inventory-pin"
+    epic: 6
+    action: "Pin ktesio-adapter-api public-API inventory (sorted pub-item/signature
+      frozen-list test) so an unannounced v1 surface break fails CI during the semver-gate
+      dormancy window; retire when cargo-semver-checks arms at story 7-4. [epic-6
+      retro A1, high]"
+    owner: "first contract-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-2-renegotiate-on-start-fallback"
+    epic: 6
+    action: "Engine: call negotiate_contract_version on the legacy/launch-less start-fallback
+      path (adapter/mod.rs:290-303 re-reads adapter.toml without renegotiating — a
+      post-registration manifest edit to 2.x bypasses the 6-6 load gate) + bypass
+      test. [epic-6 retro B1, high]"
+    owner: "first engine-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-3-frozen-doc-corrections"
+    epic: 6
+    action: "Correct frozen contract-doc errors: stdin-pipe conditionality (docs/adapter-contract.md
+      claims unconditional piping; supervisor.rs:582 pipes only for Guaranteed|BestEffort),
+      negotiation manifest-only scope (native builtins never negotiate), exit-1 contract-incompatible
+      cause in commands.md, memory declared-field dual definition + hermes native-memory
+      wording. [epic-6 retro B2-B5, med]"
+    owner: "first docs-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-4-tck-hardening-batch"
+    epic: 6
+    action: "TCK hardening: prove subject-declared memory.dir delivery (hermes HERMES_HOME
+      case untested), fix declares_memory_dir re-read-failure collapsing to not_applicable,
+      fix UpstreamStub drop wake-up hang, document interaction-section channel-blindness,
+      distinguish declaration-checked vs honor-system duties, add ConformanceReport.contract_version
+      field, replace seed placeholder reason strings in default Unavailable bodies.
+      [epic-6 retro B6-B11, med]"
+    owner: "first conformance-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-5-test-fixture-consolidation"
+    epic: 6
+    action: "Consolidate the ~16 duplicated manifest-fixture builders (~400-500 lines
+      across 12 engine test files + tck.rs + kt tests) into a shared test-support
+      module; dedupe install_shim (hermes.rs/hermes_tck.rs); single fake_agent_bin
+      seam in agent_cli.rs. The story 5-1 deferral whose forcing function (epic 6)
+      has passed. [epic-6 retro C2, med]"
+    owner: "first test-heavy story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-6-docs-hygiene-batch"
+    epic: 6
+    action: "Docs hygiene: fix commands.md:53 glued heading, architecture.md:68 stale
+      tokens-only parenthetical (open since 6-3 review), add check_docs 0.1.0/0.2.0
+      stale patterns, README TCK dev-dep snippet to git-dependency form, meta.json/README
+      audit-checklist nav reconciliation, supported-agents + Hermes version-pin page
+      + hermes troubleshooting entry, testing.md TCK editorial pass. [epic-6 retro
+      D1-D7, low]"
+    owner: "first docs-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-7-memory-json-partial-state"
+    epic: 6
+    action: "kt: memory attach --json — on a post-attach status read-back error, name
+      the persisted-attachment partial state (currently a generic failure; only the
+      Ok(None) arm is honest). [epic-6 retro B10, low]"
+    owner: "first kt-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-8-tracking-hygiene"
+    epic: 6
+    action: "Reconcile sprint-status epic-6 heading line (still in-progress with stale
+      2026-08-27 comment vs all six stories done); adopt a deferred-work resolution
+      convention and sweep stale entries (6-2 model-no-op entry was fixed by PR #152
+      but still listed open); one architecture.md sentence on the engine-to-adapters-hermes
+      normal edge. [epic-6 retro C1/C6/C7, low]"
+    owner: "orchestrator chore"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+  - id: "epic-6-retro-item-9-carry-forward-bind-or-retire"
+    epic: 6
+    action: "Bind or honestly retire the carry-forward retro items that have landed
+      nothing in two+ epics: AI-63 (global-Mutex unbounded-op architectural closure),
+      AI-65 (value-vs-mechanism fix scoping), AI-66 (blind-spot sweep — never run),
+      AI-69 (exit-code-6 permanent gate). Un-gated recommendations have a zero completion
+      rate across three epics. [epic-6 retro E/follow-through, process]"
+    owner: "Islam prioritization"
+    status: open
+    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
