@@ -359,7 +359,7 @@ fn remove_running_without_force_exits_nonzero_and_with_force_succeeds() {
 
 /// A complete valid `adapter.toml` for a manifest-adapter directory fixture.
 const VALID_MANIFEST: &str = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "demo-manifest"
@@ -571,7 +571,7 @@ fn fake_agent_manifest(dir: &Path, args: &[&str]) -> std::path::PathBuf {
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "fake"
@@ -698,7 +698,7 @@ fn start_missing_exec_lands_failed_with_preserved_diagnostic() {
     std::fs::write(
         m.join("adapter.toml"),
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "bad"
 [lifecycle.start]
@@ -825,7 +825,7 @@ fn fake_agent_manifest_with_pause(
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "fake"
@@ -1007,7 +1007,7 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     let bin = fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "fake"
 [lifecycle.start]
@@ -1120,7 +1120,7 @@ fn fake_agent_manifest_with_interaction(
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "fake"
@@ -1312,7 +1312,7 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     let bin = fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "fake"
 [lifecycle.start]
@@ -1669,7 +1669,7 @@ fn show_surfaces_a_launch_error_failed_cause() {
     let m = ctx.project_dir.join("bad-adapter");
     std::fs::create_dir_all(&m).unwrap();
     let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "bad"
@@ -1727,7 +1727,7 @@ fn start_restarts_a_failed_instance() {
     let bin = ktesio_conformance::fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "svc"
@@ -3332,7 +3332,7 @@ fn fake_agent_manifest_secret_env(dir: &Path, dump_path: &Path) -> std::path::Pa
     let bin = fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "fake"
@@ -4312,6 +4312,38 @@ const BUDGET_VIEW_PRICED_KEYS: &[&str] = &[
     "per_run_remaining",
 ];
 
+// ---------------------------------------------------------------------------
+// The MEMORY documents — story 6-6, THE ONE ANNOUNCED KEY-SET EDIT
+// ---------------------------------------------------------------------------
+//
+// Epic 5 shipped `kt agent memory attach|detach` human-output-only, deferring
+// the wire surface to Epic 6 with Story 5-1's DC-6 "ONE intentional announced
+// key-set edit" obligation attached (epics.md:614-618). Contract v1's freeze
+// lands it here, in the SAME change that tags 1.0.0, announced in the
+// CHANGELOG/RELEASE_NOTES. After this edit the memory documents below are
+// frozen exactly like every set above: any further change is a breaking v1
+// wire change under the published policy (docs/adapter-contract.md).
+//
+// AI-64 maximal-fixture rule: the documents have no `skip_serializing_if`
+// fields, but their VALUES vary by kind/guarantee/delivery — so the fixtures
+// exercise BOTH kinds (`filesystem` + `native`), BOTH guarantee levels, and
+// BOTH delivery facts (`declared` true via the mock's built-in `memory.dir`
+// mapping, false via the native backing's nothing-to-declare rule), so every
+// field materializes on the wire at least once.
+
+/// The FROZEN `memory attach --json` (MemoryAttachDocument) key-set.
+const MEMORY_ATTACH_KEYS: &[&str] = &[
+    "declared",
+    "dir",
+    "guarantee",
+    "instance",
+    "kind",
+    "schema_version",
+];
+
+/// The FROZEN `memory detach --json` (MemoryDetachDocument) key-set.
+const MEMORY_DETACH_KEYS: &[&str] = &["instance", "schema_version"];
+
 /// Sorted JSON object keys of `value`, for the frozen key-set assertions.
 fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
     let mut keys: Vec<String> = value
@@ -4766,6 +4798,236 @@ fn config_get_json_document_key_set_and_schema_version_are_frozen() {
         leaf,
         &["key", "source", "unvalidated", "value"],
         "ConfigLeaf",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6-6 — contract v1 negotiation at the REAL binary + the memory documents'
+// frozen wire shapes (the ONE announced edit)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn register_incompatible_contract_manifest_exits_one_naming_both_versions_and_the_rule() {
+    // FR-30 end-to-end at the REAL `kt` binary (the independent pass found the
+    // kt-side negotiation proof was unit-only): registering a manifest whose
+    // contract major differs from the engine's exits 1, the diagnostic names
+    // BOTH versions and quotes the compatibility rule, stdout stays EMPTY
+    // (diagnostics ride stderr, AD-12), and nothing is registered.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let manifest = VALID_MANIFEST.replace(
+        "contract_version = \"1.0.0\"",
+        "contract_version = \"2.1.0\"",
+    );
+    let m = manifest_dir(&ctx.project_dir, &manifest);
+
+    let run = run_kt_agent(
+        &["agent", "register", "m", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(1), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.is_empty(),
+        "no stdout on a rejected registration: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("2.1.0"),
+        "names the manifest version: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("1.0.0"),
+        "names the engine version: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("compatible iff the major versions match"),
+        "quotes the compatibility rule: {}",
+        run.stderr
+    );
+
+    // The instance genuinely does not exist (the load was refused, not half-done).
+    let show = run_kt_agent(&["agent", "show", "m"], &ctx.project_dir, state_dir);
+    assert_eq!(show.code, Some(3), "stdout={}", show.stdout);
+}
+
+#[test]
+fn memory_attach_json_document_key_set_and_schema_version_are_frozen() {
+    // Story 6-6's deferred wire surface, frozen at the contract v1 freeze.
+    // MAXIMAL fixture: `filesystem` on a `mock` — the mock's builtin mapping
+    // targets the reserved `memory.dir` key, so `declared` is TRUE and every
+    // field materializes with its populated value (AI-64 rule). The kind +
+    // guarantee ride the typed snake_case strings adopted verbatim
+    // (`filesystem` / `managed_dir_byte_durable`); the schema_version is the
+    // memory family's OWN constant (1).
+    let (ctx, state) = registered_mock("demo");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &[
+            "agent",
+            "memory",
+            "attach",
+            "demo",
+            "--kind",
+            "filesystem",
+            "--json",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    // AD-14 purity: --json stdout is the document and NOTHING else.
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(&doc, MEMORY_ATTACH_KEYS, "MemoryAttachDocument");
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    assert_eq!(doc["instance"], serde_json::json!("demo"), "{doc}");
+    assert_eq!(doc["kind"], serde_json::json!("filesystem"), "{doc}");
+    assert_eq!(
+        doc["guarantee"],
+        serde_json::json!("managed_dir_byte_durable"),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["declared"],
+        serde_json::json!(true),
+        "the mock maps memory.dir, so the delivery fact is true: {doc}"
+    );
+    // DC-1: the dir is RECEIVED from the engine — it must genuinely exist.
+    let dir = doc["dir"].as_str().expect("dir is a string").to_string();
+    assert!(
+        Path::new(&dir).is_dir(),
+        "the managed directory exists at the reported path: {dir}"
+    );
+    assert!(
+        dir.contains(
+            &state_dir
+                .join("agents")
+                .join("demo")
+                .to_string_lossy()
+                .to_string()
+        ),
+        "the managed directory is inside the Agent Home: {dir}"
+    );
+    // No `$` anywhere on any --json wire (AD-8/AD-14).
+    assert!(
+        !run.stdout.contains('$'),
+        "no `$` on the wire: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn memory_attach_json_native_shape_is_frozen() {
+    // The native twin (AI-64 maximal fixtures): kind `native`, guarantee
+    // `home_persistence_only`, and `declared` FALSE — a native backing
+    // delivers nothing, so there is no delivery to declare (never read as a
+    // decline). The reported dir is the COMPUTED location only (nothing
+    // created).
+    let (ctx, state) = registered_mock("nat");
+    let state_dir = state.project_dir.as_path();
+
+    let run = run_kt_agent(
+        &[
+            "agent", "memory", "attach", "nat", "--kind", "native", "--json",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(&doc, MEMORY_ATTACH_KEYS, "MemoryAttachDocument (native)");
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    assert_eq!(doc["kind"], serde_json::json!("native"), "{doc}");
+    assert_eq!(
+        doc["guarantee"],
+        serde_json::json!("home_persistence_only"),
+        "{doc}"
+    );
+    assert_eq!(doc["declared"], serde_json::json!(false), "{doc}");
+    let dir = doc["dir"].as_str().expect("dir is a string");
+    assert!(
+        !Path::new(dir).exists(),
+        "a native backing must not create anything at the reported location: {dir}"
+    );
+}
+
+#[test]
+fn memory_detach_json_document_key_set_and_schema_version_are_frozen() {
+    // The detach document is intentionally minimal: the versioned confirmation
+    // that nothing is attached anymore. No path — kt never constructs the
+    // managed-directory name itself (DC-1), and after a detach the engine
+    // reports no attachment to quote.
+    let (ctx, state) = registered_mock("demo");
+    let state_dir = state.project_dir.as_path();
+    let attach = run_kt_agent(
+        &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(attach.code, Some(0), "stderr={}", attach.stderr);
+
+    let run = run_kt_agent(
+        &["agent", "memory", "detach", "demo", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", run.stdout));
+    assert_frozen_keys(&doc, MEMORY_DETACH_KEYS, "MemoryDetachDocument");
+    assert_eq!(doc["schema_version"], serde_json::json!(1), "{doc}");
+    assert_eq!(doc["instance"], serde_json::json!("demo"), "{doc}");
+}
+
+#[test]
+fn memory_json_errors_stay_diagnostics_and_do_not_emit_documents() {
+    // The failure case is NOT a document: an unknown instance still exits 3
+    // with a stderr diagnostic, and stdout stays empty (AD-12/AD-14 — result
+    // documents only on success).
+    let (ctx, state) = registered_mock("demo");
+    for args in [
+        vec![
+            "agent",
+            "memory",
+            "attach",
+            "ghost",
+            "--kind",
+            "filesystem",
+            "--json",
+        ],
+        vec!["agent", "memory", "detach", "ghost", "--json"],
+    ] {
+        let run = run_kt_agent(&args, &ctx.project_dir, state.project_dir.as_path());
+        assert_eq!(run.code, Some(3), "args={args:?}; stderr={}", run.stderr);
+        assert!(
+            run.stdout.is_empty(),
+            "no document on failure; args={args:?} stdout={}",
+            run.stdout
+        );
+    }
+    // A malformed name exits 2 (usage), also document-free.
+    let run = run_kt_agent(
+        &[
+            "agent", "memory", "attach", "Bad Name", "--kind", "native", "--json",
+        ],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert_eq!(run.code, Some(2), "stderr={}", run.stderr);
+    assert!(
+        run.stdout.is_empty(),
+        "no document on failure: {}",
+        run.stdout
     );
 }
 
@@ -5377,7 +5639,7 @@ fn an_internal_failure_exits_with_the_general_code() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("adapter.toml"),
-        "contract_version = \"0.1.0\"\n[adapter]\nkind = \"x\"\n",
+        "contract_version = \"1.0.0\"\n[adapter]\nkind = \"x\"\n",
     )
     .unwrap();
     let run = run_kt_agent(

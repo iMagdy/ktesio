@@ -367,8 +367,30 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo +stable semver-checks check-release", ci)
         self.assertIn("000|429|5[0-9][0-9]", ci)
         # Semver gate caches the source-installed binary so it is not rebuilt
-        # (~10 min) on every fresh runner (AI-1).
-        self.assertIn("${{ runner.os }}-cargo-semver-checks-bin", ci)
+        # (~10 min) on every fresh runner (AI-1). AI-3 (story 6-6): the cache
+        # key names the RESOLVED cargo-semver-checks version (content, never a
+        # constant), the install pins that resolved version, and the save is
+        # conditional on an install actually having run — the old constant key
+        # let a dormant run freeze an entry WITHOUT the binary, which the armed
+        # gate then restored on every run and reinstalled over.
+        self.assertIn(
+            "${{ runner.os }}-cargo-semver-checks-bin-${{ steps.semver_version.outputs.version }}",
+            ci,
+        )
+        self.assertIn("id: semver_version", ci)
+        self.assertIn("echo \"installed=true\" >> \"$GITHUB_OUTPUT\"", ci)
+        self.assertIn("if: steps.semver_check.outputs.installed == 'true'", ci)
+        self.assertIn("uses: actions/cache/restore@", ci)
+        self.assertIn("uses: actions/cache/save@", ci)
+        # AI-3 hardening (review of 6-6): a resolved version is VALIDATED
+        # before it can reach an install pin, and a restored binary is
+        # version-VERIFIED (not merely present) before the pinned install is
+        # skipped — restore-keys can restore an older binary.
+        self.assertIn('[[ "$version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] || version=unknown', ci)
+        self.assertIn("cargo +stable cargo-semver-checks --version", ci)
+        self.assertIn('if [ "$cached" != "$version" ]; then', ci)
+        # The old constant key must not resurface.
+        self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
 
     def test_ci_enforces_msrv_floor(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(

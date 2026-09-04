@@ -4,6 +4,16 @@ All notable changes to Ktesio are generated from git history when a version tag 
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Compatibility notice — announced ahead of the next release (Adapter Contract v1 freeze).**
+> Per the deprecation policy ratified by Islam on 2026-09-04 (*within a major, deprecations announced ≥1 minor ahead via CHANGELOG/RELEASE_NOTES + doc notices; removals only at next major; enforced by semver-checks CI*):
+>
+> - **The Adapter Contract is frozen at v1 (`1.0.0`)** (previously the `0.4.0` seed). The engine now **negotiates** at registration (FR-30): a manifest loads only when its `contract_version` **major** matches the engine's; a mismatch fails with both versions named and the rule quoted — *compatible iff the major versions match*. **Pre-v1 `0.x` manifests are not grandfathered** (the contract was never published under 0.x): set your manifest's `contract_version` to `"1.0.0"`. The parse is strict `X.Y.Z` (no `v` prefix, no `1`/`1.0` partials); prerelease/build suffixes parse and negotiate by major. See the new [Adapter Contract](docs/adapter-contract.md#versioning) page.
+> - **New `--json` wire surface on the memory commands** — the ONE announced key-set edit (transferred from Story 5-1's DC-6 obligation, deferred by Story 5-2, and frozen with contract v1): `kt agent memory attach <name> --kind <kind> --json` emits a versioned document (`schema_version` `1`, `instance`, `kind`, `guarantee`, `dir`, `declared`) carrying the backing kind and guarantee level in their typed snake_case strings (`filesystem`/`native`, `managed_dir_byte_durable`/`home_persistence_only`); `kt agent memory detach <name> --json` emits the minimal versioned confirmation (`schema_version`, `instance`). Human output is unchanged. The Story 4-3 frozen key-set assertions were re-pinned to include these documents in the same change; every other frozen key-set is untouched.
+> - **`[interaction].channel` gains the `"http"` value** (CP-6.5-a, additive vocabulary): an HTTP-native agent may name its real interaction transport. The engine does not branch on the channel in v1. Additive — nothing that parsed before stops parsing.
+> - The CI `semver` job's toolchain cache is now keyed on the resolved `cargo-semver-checks` version, verified against the restored binary, and saved only after a real install (AI-3). The job itself stays **dormant** — it emits a notice instead of checking — until the crates publish to crates.io (story 7-4); it provides no protection today, and the docs say so plainly.
+>
+> *Placement note (mechanics): this banner sits ABOVE the first `## ` heading on purpose — `scripts/generate_release_docs.py::upsert_release_section` inserts every generated release section directly above the first `## ` heading, so a `## Unreleased` heading would be pushed below the fold at the very next tag. The script never touches the header region, so the banner stays visible through the next release cut. At that cut, the release author moves this notice's content into the release section and deletes the banner.*
+
 ## v0.6.0
 
 Ktesio is repositioned as an agent runner: `kt` runs AI agents like services — supervising their lifecycle, metering real token usage, and enforcing dollar budgets.

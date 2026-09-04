@@ -16,7 +16,7 @@ The manifest is parsed and validated **before** any state is written. Unknown ke
 ## Complete Example
 
 ```toml
-contract_version = "0.4.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "my-agent"
@@ -57,9 +57,15 @@ A manifest is valid only if it declares all of the following. Validation reports
 
 ### `contract_version`
 
-The Adapter Contract version the manifest targets, as a semver string (current: `"0.4.0"`). A non-semver value is rejected.
+The Adapter Contract version the manifest targets, as a semver string (current: `"1.0.0"`). A non-semver value is rejected. The parse is **strict `X.Y.Z`**: no `v` prefix and no partial versions (`1`, `1.0`); a prerelease or build-metadata suffix (`1.0.0-rc.1+build.5`) parses, and negotiation compares majors only.
 
-Any valid semver string is accepted today — there is no minimum and no negotiation; `"current"` is informational only. The engine does not refuse an older contract version.
+The engine **negotiates** at registration (contract v1, FR-30): a manifest is rejected when its `contract_version` **major** differs from the engine's — *compatible iff the major versions match*. Read the rule precisely: major-match is **necessary but not sufficient**. It guarantees only that the engine never rejects a manifest solely for version distance within the major — a NEWER same-major manifest that uses a section this engine's schema does not know yet still fails the unknown-key check (`deny_unknown_fields`), because the schema stays additive only within a major. A mismatch fails the load naming **both** versions and quoting the rule, e.g.:
+
+```text
+incompatible adapter contract: manifest declares 2.1.0, engine speaks 1.0.0 — compatible iff the major versions match (contract v1 policy, docs/adapter-contract.md#versioning)
+```
+
+Pre-v1 `0.x` versions are **not** grandfathered: the contract was never published under 0.x, so those seed values carry no back-compat obligation. The full versioning and deprecation policy lives in the [Adapter Contract](adapter-contract.md#versioning).
 
 ### `[adapter]`
 
@@ -83,6 +89,8 @@ Each op template has:
 | `env` | table of strings | no | Environment overrides (default empty) |
 
 The resolved start launch (`exec`/`args`/`env`) is snapshotted **at registration**: editing the manifest afterward has no effect on an already-registered instance until it is removed and re-registered.
+
+**An omitted `[lifecycle.stop]` is normative** (contract v1): it means the engine's process termination (signal, then escalation) IS the stop — the child process exits, and that exit is what the Conformance Test Kit asserts. Adapters whose agents own a graceful-stop verb declare a stop template; agents without one (session-shaped agents, servers) legitimately omit it. There is no graceful-stop acknowledgment concept in v1: an agent that exits on its own (e.g. an in-chat restart hand-off) is simply an unrequested exit handled by the crash/restart policy.
 
 ### `[capabilities]`
 
@@ -125,6 +133,8 @@ A `self-reported` agent forwards its own usage accounting by emitting `KTESIO_US
 
 The engine stamps the Run id, the instance, the Metering Source, and the timestamp. A malformed usage line is a diagnostic (ignored), never fatal.
 
+**The `self-reported` channel is adapter-implemented** (contract v1): the sentinel stream may be produced natively by the agent OR synthesized by an adapter shim over the agent's own usage surfaces (API tails, session reads). A shim derives `sequence` from the agent's per-Run message ordinals, so the replay-dedup invariant holds identically. When an agent's provider omits usage, the adapter must surface it as **unknown** — never coerce it to zero (a `0` token event asserts the provider reported zero; an omitted event means the usage is unknown). The normative v1 path for agents that report nothing themselves is `engine-observed`; for agents that expose their usage through any reachable surface, a `self-reported` shim is equally conformant — both guarantee that delayed batches reconcile without double-counting.
+
 ## Optional Sections
 
 ### `[interaction]`
@@ -133,7 +143,9 @@ Interaction channel wiring. Optional: omitting this section entirely still means
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `channel` | closed enum | The interaction channel. Currently the only recognized value is `"stdio"` (the spawned child's OS stdin pipe) — an unrecognized value is rejected at parse time. |
+| `channel` | closed enum | The interaction channel: `"stdio"` (the spawned child's OS stdin pipe) or `"http"` (an HTTP-native interaction surface, e.g. an agent's loopback server). An unrecognized value is rejected at parse time. |
+
+`"http"` is documentary vocabulary (contract v1, CP-6.5-a option (i)): it names where the adapter's agent really takes interaction, so an HTTP-native agent declares `interaction` supported honestly. v1 ships no engine-side HTTP delivery — the engine does not branch on the declared channel, and `kt agent send` still writes the child's stdin; an adapter whose agent cannot read stdin should declare `interaction` unsupported on OSes where that is true (an adapter whose ONLY capability key is declared unsupported everywhere is rejected as non-viable). A real HTTP send implementation is a post-v1 change under the [versioning policy](adapter-contract.md#versioning).
 
 ### `[config]` — unified → native config mapping
 
@@ -159,9 +171,14 @@ Notes:
 - A documented key the adapter maps nowhere is a silent no-op — not every adapter supports every unified key.
 - `agent.*` pass-through keys are delivered verbatim (by convention, as an env var named by the key tail) without a mapping entry.
 - For a `secret:NAME` value, the resolved cleartext is delivered into the native target while every Ktesio display of the same key stays masked. Prefer `env`/`file` targets over `flag` for secret-carrying keys — an argv flag is visible to other local users on the process list.
+- **Agents with JSON-native config**: v1's documented pattern is env-content delivery — map a unified key to the agent's config-content environment variable (e.g. `OPENCODE_CONFIG_CONTENT`) and the start seam delivers the value with no file format or placement question. A format-qualified `file` target (JSON alongside TOML) is reserved post-v1; the current `file` target renders a TOML document only.
+- **`{env:VAR}` substitution honesty** (contract v1 rider): some agents substitute `{env:VAR}` placeholders in their own config and render an **unset variable as an empty string, silently**. An adapter to such an agent MUST map every substituted key through a delivery that guarantees the variable is set — or fail the render with a named reason — before the child launches. A silently-empty rendered config is a contract violation, not a quirk to tolerate.
+- **Self-updating agents** (contract v1): an adapter for an agent that downloads its own updates MUST map that agent's update-disable mechanism (env or config) so the pinned, supervised binary stays pinned. The adapter docs must additionally state whether the agent's config chain contains a higher-authority (managed/MDM) layer that can override supervisor-delivered values, so an operator on a managed machine can verify the pin survived.
+- **Isolation keys**: an adapter documents which environment levers give each Agent Instance its own data/config roots (for Hermes, `HERMES_HOME`; for XDG-based agents like opencode, `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). Per-instance isolated roots inside each Agent Home are the RECOMMENDED normative posture (they make shared-root concurrency out of scope); where a lever is an undocumented agent interface, say so and re-validate it per pinned release. Per-OS support levels remain the declaration's own honesty job — an agent whose vendor recommends a compatibility layer on Windows is best declared `best-effort` there, but that cap is the adapter author's choice, not a contract mandate.
 
 ## See Also
 
+- [Adapter Contract](adapter-contract.md) — the versioned contract this manifest speaks: negotiation, versioning/deprecation policy, and the ratified v1 decisions.
 - [Command reference](commands.md) — the `kt agent` commands and unified config keys.
 - [Architecture](architecture.md) — the Adapter Contract, the Usage Ledger, and budget enforcement.
 - [The Conformance Test Kit](testing.md#the-conformance-test-kit) — add `ktesio-conformance` as a dev-dependency and prove your `adapter.toml` honors the contract from your own `#[test]`.

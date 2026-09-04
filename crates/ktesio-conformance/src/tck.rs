@@ -823,9 +823,9 @@ fn heartbeat_lines(agent_log: &Path) -> usize {
 /// (`None` = no pause declaration at all); `interaction_current_os` declares
 /// the interaction level for the current OS, and guarantees it on the other
 /// modeled OSes (probes never rely on interaction — the level only shapes the
-/// projection). `contract_version` is `"0.1.0"` for the plain fixtures and
-/// `"0.3.0"` for the engine-observed one (the version that contract
-/// understands `metering.base_url` in).
+/// projection). `contract_version` is `"1.0.0"` for every probe fixture:
+/// contract v1 (story 6-6) is the frozen, negotiated surface, and the
+/// engine's registration gate refuses any other major.
 #[allow(clippy::too_many_arguments)]
 fn write_probe_manifest(
     dir: &Path,
@@ -1056,7 +1056,7 @@ fn crash_leg_inner(facade: &::ktesio_engine::Blocking<'_>) -> Result<(), String>
         None,
         "guaranteed",
         "self-reported",
-        "0.1.0",
+        "1.0.0",
         None,
     )
     .map_err(|e| format!("crash manifest: {e}"))?;
@@ -1285,7 +1285,7 @@ fn pause_guaranteed_inner(
         Some("guaranteed"),
         "guaranteed",
         "self-reported",
-        "0.1.0",
+        "1.0.0",
         None,
     )
     .map_err(|e| format!("pause probe manifest: {e}"))?;
@@ -1773,7 +1773,7 @@ fn self_reported_metering_inner(
         None,
         "guaranteed",
         "self-reported",
-        "0.1.0",
+        "1.0.0",
         None,
     )?;
     facade
@@ -1838,8 +1838,8 @@ fn engine_observed_metering_inner(
         .prefix("ktesio-tck-obs-")
         .tempdir()
         .map_err(|e| format!("probe tempdir: {e}"))?;
-    // The observed probe: contract "0.3.0" (the version whose contract
-    // understands `metering.base_url`), the observed-call flags, the
+    // The observed probe: contract "1.0.0" (contract v1, which carries
+    // `metering.base_url`), the observed-call flags, the
     // `metering.base_url` → env `OPENAI_BASE_URL` mapping the engine's
     // injection rides, and the `model` mapping.
     let config_section = concat!(
@@ -1854,7 +1854,7 @@ fn engine_observed_metering_inner(
         None,
         "guaranteed",
         "engine-observed",
-        "0.3.0",
+        "1.0.0",
         Some(config_section),
     )?;
     facade
@@ -1972,7 +1972,7 @@ fn memory_inner(
         None,
         "guaranteed",
         "self-reported",
-        "0.1.0",
+        "1.0.0",
         Some(&config_section),
     )?;
     facade
@@ -2082,7 +2082,7 @@ fn interaction_inner(
         None,
         interaction_probe_level(level),
         "self-reported",
-        "0.1.0",
+        "1.0.0",
         None,
     )?;
     facade
@@ -2283,7 +2283,7 @@ mod tests {
             Some(level),
             "guaranteed",
             "self-reported",
-            "0.1.0",
+            "1.0.0",
             Some(
                 "\n[config.model]\nenv = \"MODEL\"\n\n[config.\"memory.dir\"]\n\
                  env = \"TCK_SUBJECT_MEMORY\"\n",
@@ -2346,7 +2346,7 @@ mod tests {
         //   harness's own healthy fixtures and still pass their sections.
         // * The suite still completes every section — never aborts mid-suite.
         let manifest_body = format!(
-            "\ncontract_version = \"0.1.0\"\n\n[adapter]\nkind = \"tck-fail-adapter\"\n\n             [lifecycle.start]\nexec = \"./tck-missing-agent\"\nargs = []\n\n             [capabilities.pause]\n{os} = \"unsupported\"\n\n             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\n             windows = \"guaranteed\"\nother = \"guaranteed\"\n\n             [metering]\nsource = \"self-reported\"\n\n             [config.\"model\"]\nenv = \"MODEL\"\n",
+            "\ncontract_version = \"1.0.0\"\n\n[adapter]\nkind = \"tck-fail-adapter\"\n\n             [lifecycle.start]\nexec = \"./tck-missing-agent\"\nargs = []\n\n             [capabilities.pause]\n{os} = \"unsupported\"\n\n             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\n             windows = \"guaranteed\"\nother = \"guaranteed\"\n\n             [metering]\nsource = \"self-reported\"\n\n             [config.\"model\"]\nenv = \"MODEL\"\n",
             os = current_os_key()
         );
         std::fs::write(dir.path().join("adapter.toml"), manifest_body)
@@ -2463,7 +2463,7 @@ mod tests {
         let other = other_os_key();
         let manifest = format!(
             r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "tck-no-pause-adapter"
@@ -2535,7 +2535,7 @@ source = "self-reported"
             Some("best-effort"),
             "guaranteed",
             "engine-observed",
-            "0.3.0",
+            "1.0.0",
             Some(
                 "\n[config.model]\nenv = \"MODEL\"\n\n[config.\"metering.base_url\"]\n\
                  env = \"OPENAI_BASE_URL\"\n\n[config.\"memory.dir\"]\n\
@@ -2798,7 +2798,7 @@ source = "self-reported"
             None,
             "guaranteed",
             "self-reported",
-            "0.1.0",
+            "1.0.0",
             None,
         )
         .expect("write wait probe manifest");
@@ -2990,7 +2990,7 @@ source = "self-reported"
             Some("guaranteed"),
             "guaranteed",
             "self-reported",
-            "0.1.0",
+            "1.0.0",
             None,
         )
         .expect("write slowbeat manifest");
@@ -3031,7 +3031,7 @@ source = "self-reported"
         let dump = dir.path().join("config-dump.txt");
         let manifest = format!(
             r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "tck-nodecl-adapter"
@@ -3097,7 +3097,7 @@ env = "MODEL"
         let dump = blocked.join("config-dump.txt");
         let manifest = format!(
             r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "tck-baddump-adapter"
@@ -3464,7 +3464,7 @@ env = "MODEL"
 
         // No config rules at all.
         let undeclared = write(
-            "contract_version = \"0.1.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n",
+            "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n",
         );
         assert!(matches!(
             config_probe_scope(&undeclared),
@@ -3473,7 +3473,7 @@ env = "MODEL"
 
         // Only flag/file targets: env delivery is the only provable channel.
         let no_env = write(
-            "contract_version = \"0.1.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.temperature]\nflag = \"--temp\"\n\n[config.seed]\nfile = { path = \"config/agent.toml\", key = \"llm.seed\" }\n",
+            "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.temperature]\nflag = \"--temp\"\n\n[config.seed]\nfile = { path = \"config/agent.toml\", key = \"llm.seed\" }\n",
         );
         assert!(matches!(
             config_probe_scope(&no_env),
@@ -3482,7 +3482,7 @@ env = "MODEL"
 
         // Env rules (plus a reserved key that must be filtered out).
         let env = write(
-            "contract_version = \"0.1.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.model]\nenv = \"MODEL\"\n\n[config.\"memory.dir\"]\nenv = \"IGNORED\"\n",
+            "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.model]\nenv = \"MODEL\"\n\n[config.\"memory.dir\"]\nenv = \"IGNORED\"\n",
         );
         match config_probe_scope(&env) {
             Ok(ConfigScope::Env(rules)) => {
@@ -3513,7 +3513,7 @@ env = "MODEL"
         };
 
         let undeclared = write(
-            "contract_version = \"0.1.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n",
+            "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n",
         );
         match run_config_mapping(&facade, dir.path(), Some(&undeclared)) {
             SectionResult::NotApplicable { reason } => {
@@ -3523,7 +3523,7 @@ env = "MODEL"
         }
 
         let no_env = write(
-            "contract_version = \"0.1.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.temperature]\nflag = \"--temp\"\n",
+            "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.temperature]\nflag = \"--temp\"\n",
         );
         match run_config_mapping(&facade, dir.path(), Some(&no_env)) {
             SectionResult::NotApplicable { reason } => {
@@ -3552,7 +3552,7 @@ env = "MODEL"
             None,
             "guaranteed",
             "self-reported",
-            "0.1.0",
+            "1.0.0",
             None,
         )
         .expect("write no-echo manifest");
@@ -3591,7 +3591,7 @@ env = "MODEL"
             None,
             "guaranteed",
             "self-reported",
-            "0.1.0",
+            "1.0.0",
             None,
         )
         .expect("write terminal probe manifest");

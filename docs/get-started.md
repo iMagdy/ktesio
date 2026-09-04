@@ -37,7 +37,7 @@ Ktesio registers an agent through an **adapter** — either a native builtin (`-
 Create a directory `my-agent/` containing `adapter.toml`:
 
 ```toml
-contract_version = "0.4.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "my-agent"

@@ -54,7 +54,7 @@ fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str], config_section: Op
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"

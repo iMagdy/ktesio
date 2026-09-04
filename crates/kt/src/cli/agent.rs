@@ -24,12 +24,13 @@ use ktesio_engine::{
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentDuplicateName, AgentInteractionTimedOut,
-    AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentIo,
-    AgentLaunchFailed, AgentManifestInvalid, AgentManifestNotFound, AgentManifestUnreadable,
-    AgentMemoryHotSwap, AgentMemoryKindConflict, AgentNoCapabilities, AgentNoMeteringSource,
-    AgentNotFound, AgentNotRunning, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore,
-    AgentUnknownConfigKey, AgentUnknownKind,
+    AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible, AgentDuplicateName,
+    AgentInteractionTimedOut, AgentInteractionUnavailable, AgentInvalidName,
+    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+    AgentManifestNotFound, AgentManifestUnreadable, AgentMemoryHotSwap, AgentMemoryKindConflict,
+    AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
+    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
+    AgentUnknownKind,
 };
 use crate::ui;
 
@@ -236,6 +237,90 @@ impl FleetUsageDocument {
             totals,
         }
     }
+}
+
+/// The memory-document schema version (story 6-6 — the deferred Epic-5 wire
+/// surface, frozen at the Adapter Contract v1 freeze).
+///
+/// A NEW content-family constant (value `1`), minted per the CLI's documented
+/// rule that `schema_version` tracks the serialized CONTENT-TYPE FAMILY, not
+/// the command: the fleet-content commands (`list`/`show`/`usage`) ride
+/// [`FLEET_SCHEMA_VERSION`], `config get` has [`CONFIG_GET_SCHEMA_VERSION`],
+/// `logs` uses the engine's `LOG_SCHEMA_VERSION` — and the memory commands now
+/// own this one. The `memory attach|detach --json` documents are a v1
+/// compatibility surface (PRD §7): any key change is the ONE intentional,
+/// announced edit the freeze policy allows, never silent drift.
+const MEMORY_SCHEMA_VERSION: u32 = 1;
+
+/// The `kt agent memory attach --json` document (story 6-6, AD-14).
+///
+/// Carries the attached backing's full typed read: the kind and guarantee
+/// level in their snake_case wire forms (`filesystem`/`native`,
+/// `managed_dir_byte_durable`/`home_persistence_only` — the stable strings
+/// reserved for exactly this freeze and adopted VERBATIM), the engine-computed
+/// managed directory (DC-1), and the DC-10 delivery fact (`declared`: whether
+/// the adapter's declared config mapping targets the reserved `memory.dir`
+/// key — always `false` for a `native` backing, which delivers nothing).
+#[derive(Serialize)]
+struct MemoryAttachDocument {
+    /// The memory-document schema version ([`MEMORY_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// The Agent Instance the backing was attached to.
+    instance: String,
+    /// The backing kind (snake_case wire form, verbatim).
+    kind: String,
+    /// The NFR-7 guarantee level (snake_case wire form, verbatim).
+    guarantee: String,
+    /// The engine-computed managed directory (created for `filesystem`; the
+    /// computed location only for `native`).
+    dir: String,
+    /// Whether the adapter's declared config mapping targets the reserved
+    /// `memory.dir` key (the DC-10 delivery fact; always `false` for `native`).
+    declared: bool,
+}
+
+/// The `kt agent memory detach --json` document (story 6-6, AD-14). The
+/// detachment is metadata-only, so the document is intentionally minimal: the
+/// versioned confirmation that NOTHING is attached anymore. It deliberately
+/// carries NO path — `kt` never constructs the managed-directory name itself
+/// (DC-1), and after a detach the engine reports no attachment to quote.
+#[derive(Serialize)]
+struct MemoryDetachDocument {
+    /// The memory-document schema version ([`MEMORY_SCHEMA_VERSION`]).
+    schema_version: u32,
+    /// The Agent Instance the backing was detached from.
+    instance: String,
+}
+
+/// Serialize the attach result into the pretty `memory attach --json` document
+/// (a versioned [`MemoryAttachDocument`]). Pure (no engine, no I/O) so it is
+/// unit-testable in-process; the CLI just prints the returned string.
+fn memory_attach_json(
+    instance: String,
+    kind: MemoryBackingKind,
+    guarantee: GuaranteeLevel,
+    dir: String,
+    declared: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let document = MemoryAttachDocument {
+        schema_version: MEMORY_SCHEMA_VERSION,
+        instance,
+        kind: kind.as_str().to_string(),
+        guarantee: guarantee.as_str().to_string(),
+        dir,
+        declared,
+    };
+    serde_json::to_string_pretty(&document).map_err(|e| serialize_error("memory attachment", e))
+}
+
+/// Serialize the detach result into the pretty `memory detach --json` document
+/// (a versioned [`MemoryDetachDocument`]). Pure, as above.
+fn memory_detach_json(instance: String) -> Result<String, Box<dyn std::error::Error>> {
+    let document = MemoryDetachDocument {
+        schema_version: MEMORY_SCHEMA_VERSION,
+        instance,
+    };
+    serde_json::to_string_pretty(&document).map_err(|e| serialize_error("memory detachment", e))
 }
 
 /// Serialize the composed [`FleetListing`] into the pretty `list --json` document (a
@@ -1669,9 +1754,9 @@ fn render_effective_config(
     ui::print_table(&title, &columns, &rows);
 }
 
-/// `kt agent memory attach <name> --kind <kind>` — attach a Memory Backing to
-/// an Agent Instance (story 5-1, FR-15, spine AD-11; `native` behavior is
-/// story 5-2).
+/// `kt agent memory attach <name> --kind <kind> [--json]` — attach a Memory
+/// Backing to an Agent Instance (story 5-1, FR-15, spine AD-11; `native`
+/// behavior is story 5-2).
 ///
 /// The instance name is validated FIRST (the shipped 4-3 M2 convention: a
 /// malformed name is a usage error, exit `2`, uniformly), then the `--kind`
@@ -1682,11 +1767,21 @@ fn render_effective_config(
 /// directory inside the Agent Home for `filesystem` (for `native` nothing is
 /// created — the delegation is metadata) and persists the attachment; this
 /// command only displays the path the ENGINE returned (DC-1 — `kt` never joins
-/// "memory" itself). Human output only (A-3/DC-6): a confirmation naming the
+/// "memory" itself). Human mode (A-3/DC-6): a confirmation naming the
 /// instance, the kind, its NFR-7 guarantee sentence, and the managed path on
-/// stdout; diagnostics on stderr (AD-12). No `--json` (story 5-2 Q-1 ratified:
-/// the wire surface is deferred to Epic 6).
-pub fn memory_attach(name: &str, kind: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// stdout; diagnostics on stderr (AD-12).
+///
+/// `--json` (story 6-6: Epic 5's deferred wire surface, frozen at the contract
+/// v1 freeze with the typed snake_case [`MemoryBackingKind`]/[`GuaranteeLevel`]
+/// strings adopted VERBATIM) writes a single versioned
+/// [`MemoryAttachDocument`] to STDOUT and nothing else there (AD-14). Only
+/// THIS mode performs the extra `memory_status` read-back that fills
+/// `declared` (the DC-10 delivery fact: whether the adapter's declared config
+/// mapping actually targets the reserved key — always `false` for `native`)
+/// and `guarantee`; the human path stays byte-identical to its pre-freeze
+/// behavior (one attach call, the guarantee computed locally from the kind),
+/// so it can never fail where it succeeded before the wire existed.
+pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the name BEFORE anything else so a malformed name exits 2
     // uniformly (never 3 via a lookup miss), per the test-pinned convention.
     validate_instance_name(name)?;
@@ -1704,39 +1799,89 @@ pub fn memory_attach(name: &str, kind: &str) -> Result<(), Box<dyn std::error::E
         }
     };
     let engine = open_engine()?;
-    match engine.blocking().attach_memory(name, backing_kind) {
-        Ok(dir) => {
-            ui::success(format!(
-                "Attached {} Memory Backing to Agent Instance {}",
-                kind,
-                ui::skill_name(name)
-            ));
-            // NFR-7 boundary statement (DC-6): one sentence naming what is
-            // guaranteed versus delegated, worded once in the engine so every
-            // surface agrees.
-            println!(
-                "{}",
-                GuaranteeLevel::for_kind(backing_kind).boundary_statement()
-            );
-            // Command result to stdout: the managed path, received from the
-            // engine (DC-1) — never constructed here. For `native` this is the
-            // COMPUTED location only (nothing was created).
-            println!("{}", dir.display());
-            Ok(())
-        }
-        Err(err) => Err(map_error(err)),
+    let dir = match engine.blocking().attach_memory(name, backing_kind) {
+        Ok(dir) => dir,
+        Err(err) => return Err(map_error(err)),
+    };
+    if json {
+        // The DC-10 delivery fact + the typed guarantee, read back from the
+        // engine (kt re-derives neither — AD-2). JSON-only: the human path
+        // below must not gain an extra engine round-trip (or a new failure
+        // mode) just because the wire surface exists. Right after a
+        // successful attach the backing exists, so `None` is unreachable in
+        // practice; it is an error, not a panic.
+        let status = match engine.blocking().memory_status(name) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                return Err(AgentIo {
+                    message: format!(
+                        "Attached the Memory Backing to '{name}', but the engine reports no \
+                         attachment; re-run kt agent memory attach {name} --kind {kind} --json."
+                    ),
+                }
+                .into())
+            }
+            Err(err) => return Err(map_error(err)),
+        };
+        // A machine-consumable document must never carry U+FFFD replacement
+        // characters: a managed path that is not valid UTF-8 is a NAMED error,
+        // not a lossy silent rewrite.
+        let dir = dir.to_str().ok_or_else(|| -> Box<dyn std::error::Error> {
+            AgentIo {
+                message: format!(
+                    "The managed Memory Backing directory for '{name}' is not valid UTF-8 \
+                     ('{}'); the --json document cannot represent it. Re-register the instance \
+                     at a UTF-8 path.",
+                    dir.display()
+                ),
+            }
+            .into()
+        })?;
+        let document = memory_attach_json(
+            name.to_string(),
+            status.kind,
+            status.guarantee,
+            dir.to_string(),
+            status.declared,
+        )?;
+        println!("{document}");
+        return Ok(());
     }
+    ui::success(format!(
+        "Attached {} Memory Backing to Agent Instance {}",
+        kind,
+        ui::skill_name(name)
+    ));
+    // NFR-7 boundary statement (DC-6): one sentence naming what is
+    // guaranteed versus delegated, worded once in the engine so every
+    // surface agrees.
+    println!(
+        "{}",
+        GuaranteeLevel::for_kind(backing_kind).boundary_statement()
+    );
+    // Command result to stdout: the managed path, received from the
+    // engine (DC-1) — never constructed here. For `native` this is the
+    // COMPUTED location only (nothing was created).
+    println!("{}", dir.display());
+    Ok(())
 }
 
-/// `kt agent memory detach <name>` — detach an Agent Instance's Memory Backing
-/// (story 5-1). METADATA ONLY: the managed directory and its contents remain on
-/// disk (operator data is never silently deleted); a later re-attach re-adopts
-/// them. Same terminal-state guard as attach — no hot-swap, no force escape.
-pub fn memory_detach(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// `kt agent memory detach <name> [--json]` — detach an Agent Instance's Memory
+/// Backing (story 5-1). METADATA ONLY: the managed directory and its contents
+/// remain on disk (operator data is never silently deleted); a later re-attach
+/// re-adopts them. Same terminal-state guard as attach — no hot-swap, no force
+/// escape. `--json` (story 6-6's deferred wire surface) emits a versioned
+/// [`MemoryDetachDocument`] and nothing else on stdout (AD-14).
+pub fn memory_detach(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     validate_instance_name(name)?;
     let engine = open_engine()?;
     match engine.blocking().detach_memory(name) {
         Ok(()) => {
+            if json {
+                let document = memory_detach_json(name.to_string())?;
+                println!("{document}");
+                return Ok(());
+            }
             ui::success(format!(
                 "Detached the Memory Backing from Agent Instance {} (the managed directory \
                  and its contents remain on disk)",
@@ -1931,6 +2076,18 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             message: format!(
                 "The adapter manifest at '{path}' is invalid: {detail}. Fix the named section \
                  and try again."
+            ),
+        }
+        .into(),
+        // Story 6-6 (FR-30, the v1 freeze): the manifest is well-formed but its
+        // contract MAJOR does not negotiate with this engine. `detail` already
+        // names BOTH versions and quotes the compatibility rule (rendered once
+        // in ktesio-adapter-api), so this arm adds only the remediation.
+        RegistryError::ContractIncompatible { path, detail } => AgentContractIncompatible {
+            message: format!(
+                "The adapter manifest at '{path}' cannot load: {detail}. Ask the adapter author \
+                 to retarget the manifest's contract_version to this engine's contract major — \
+                 see docs/adapter-contract.md."
             ),
         }
         .into(),
@@ -2261,6 +2418,109 @@ mod tests {
             ktesio_engine::ports::StoreError::Backend("db gone".into()),
         ));
         assert!(store.to_string().contains("State store error"));
+    }
+
+    #[test]
+    fn map_error_renders_the_contract_incompatible_rejection() {
+        // Story 6-6 (FR-30): the negotiation rejection keeps BOTH versions +
+        // the rule from the engine's message verbatim, and adds the
+        // retarget-the-manifest remediation. The rule literal below is pinned
+        // against the REAL message in the engine's
+        // `incompatible_major_fails_naming_both_versions_and_the_rule` (kt
+        // depends on the engine's surface, not the adapter-api crate
+        // directly), so text drift fails there first.
+        let detail = "incompatible adapter contract: manifest declares 2.1.0, engine speaks \
+                      1.0.0 — compatible iff the major versions match (contract v1 policy, \
+                      docs/adapter-contract.md#versioning)";
+        let err = map_error(RegistryError::ContractIncompatible {
+            path: "/x/adapter.toml".into(),
+            detail: detail.to_string(),
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("/x/adapter.toml"), "{msg}");
+        assert!(msg.contains("2.1.0"), "names the manifest version: {msg}");
+        assert!(msg.contains("1.0.0"), "names the engine version: {msg}");
+        assert!(
+            msg.contains("compatible iff the major versions match"),
+            "quotes the rule: {msg}"
+        );
+        assert!(
+            msg.contains("docs/adapter-contract.md"),
+            "points at the policy page: {msg}"
+        );
+    }
+
+    #[test]
+    fn memory_json_serializers_pin_the_frozen_documents() {
+        // In-process half of the freeze fixtures (the end-to-end key-set
+        // assertions live in agent_cli.rs): the documents' key-sets, the
+        // MEMORY_SCHEMA_VERSION literal, and the verbatim snake_case wire
+        // strings are pinned here too, so a wire change cannot slip past the
+        // binary-spawning suite alone.
+        let attach: serde_json::Value = serde_json::from_str(
+            &memory_attach_json(
+                "demo".to_string(),
+                MemoryBackingKind::Filesystem,
+                GuaranteeLevel::ManagedDirByteDurable,
+                "/home/agents/demo/memory".to_string(),
+                true,
+            )
+            .expect("serialize"),
+        )
+        .expect("parse");
+        assert_eq!(
+            sorted(attach.as_object().expect("object")),
+            [
+                "declared",
+                "dir",
+                "guarantee",
+                "instance",
+                "kind",
+                "schema_version"
+            ]
+        );
+        assert_eq!(attach["schema_version"], serde_json::json!(1));
+        assert_eq!(attach["kind"], serde_json::json!("filesystem"));
+        assert_eq!(
+            attach["guarantee"],
+            serde_json::json!("managed_dir_byte_durable")
+        );
+        assert_eq!(attach["declared"], serde_json::json!(true));
+
+        let native: serde_json::Value = serde_json::from_str(
+            &memory_attach_json(
+                "nat".to_string(),
+                MemoryBackingKind::Native,
+                GuaranteeLevel::HomePersistenceOnly,
+                "/home/agents/nat/memory".to_string(),
+                false,
+            )
+            .expect("serialize"),
+        )
+        .expect("parse");
+        assert_eq!(native["kind"], serde_json::json!("native"));
+        assert_eq!(
+            native["guarantee"],
+            serde_json::json!("home_persistence_only")
+        );
+        assert_eq!(native["declared"], serde_json::json!(false));
+
+        let detach: serde_json::Value =
+            serde_json::from_str(&memory_detach_json("demo".to_string()).expect("serialize"))
+                .expect("parse");
+        assert_eq!(
+            sorted(detach.as_object().expect("object")),
+            ["instance", "schema_version"]
+        );
+        assert_eq!(detach["schema_version"], serde_json::json!(1));
+        assert_eq!(detach["instance"], serde_json::json!("demo"));
+    }
+
+    /// Sorted JSON object keys, for the in-process frozen key-set pins.
+    fn sorted(keys: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+        let mut keys: Vec<String> = keys.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 
     #[test]

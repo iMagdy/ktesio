@@ -9,6 +9,16 @@ Release notes are generated when a version tag is published.
 
 The tag workflow updates the GitHub Release immediately and then opens a pull request that refreshes this file and the root `CHANGELOG.md`.
 
+> **Compatibility notice — announced ahead of the next release (Adapter Contract v1 freeze).**
+> Per the deprecation policy ratified by Islam on 2026-09-04 (*within a major, deprecations announced ≥1 minor ahead via CHANGELOG/RELEASE_NOTES + doc notices; removals only at next major; enforced by semver-checks CI*):
+>
+> - **The Adapter Contract is frozen at v1 (`1.0.0`)**. The engine negotiates at registration: a manifest with a different contract **major** fails to load naming both versions and the rule (*compatible iff the major versions match*). Pre-v1 `0.x` values are not grandfathered — set `contract_version = "1.0.0"` in your `adapter.toml`. Strict `X.Y.Z` parsing; prerelease/build suffixes negotiate by major. See the new [Adapter Contract](adapter-contract.md#versioning) page.
+> - **New `--json` surface on the memory commands** (the ONE announced key-set edit, frozen with contract v1): `kt agent memory attach --json` emits `{ schema_version, instance, kind, guarantee, dir, declared }` with the typed snake_case strings (`filesystem`/`native`, `managed_dir_byte_durable`/`home_persistence_only`); `kt agent memory detach --json` emits `{ schema_version, instance }`. Human output is unchanged; the Story 4-3 frozen key-set assertions were re-pinned in the same change and no other frozen set moved.
+> - `[interaction].channel` accepts `"http"` in addition to `"stdio"` (additive vocabulary; the engine does not branch on it in v1).
+> - The CI `semver` job's cache is version-keyed, version-verified on restore, and conditionally saved (AI-3); the job remains dormant (notice-only) until the crates publish (story 7-4).
+>
+> *Placement note: this banner sits above the first `## ` heading deliberately — `scripts/generate_release_docs.py::upsert_release_section` inserts generated release sections above the first `## ` heading, so a `## Unreleased` heading would be buried at the next tag; the header region is never touched. At the release cut that ships the freeze, move this content into the release section and delete the banner.*
+
 ## v0.6.0
 
 Ktesio is repositioned as an agent runner: `kt` runs AI agents like services — supervising their lifecycle, metering real token usage, and enforcing dollar budgets.

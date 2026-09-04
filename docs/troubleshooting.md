@@ -14,6 +14,18 @@ description: Common Ktesio install, registration, config, and lifecycle issues w
 
 See the [adapter manifest reference](manifest.md) for the required shape.
 
+## "Incompatible Adapter Contract" at Registration
+
+`kt agent register --manifest <path>` refuses the manifest with a message like:
+
+```text
+incompatible adapter contract: manifest declares 2.1.0, engine speaks 1.0.0 — compatible iff the major versions match (contract v1 policy, docs/adapter-contract.md#versioning)
+```
+
+Since contract v1 the engine **negotiates**: a manifest whose `contract_version` **major** differs from the engine's does not load. The fix belongs to the adapter author, not the CLI: set `contract_version = "1.0.0"` in the manifest (strict `X.Y.Z` — no `v` prefix, no partials; prerelease suffixes such as `1.0.0-rc.1` parse and negotiate by major). Pre-v1 `0.x` values are not grandfathered. The versioning and deprecation policy is at [the Adapter Contract page](adapter-contract.md#versioning).
+
+Related: `kt agent memory attach <name> --kind <kind> --json` and `kt agent memory detach <name> --json` emit versioned documents (`schema_version: 1`) whose key-sets are frozen compatibility surfaces — if one stops parsing for you after an upgrade, an unannounced wire change has occurred; check the release notes.
+
 ## Agent Won't Start ("no launch command")
 
 The native `mock` kind is a registration/config fixture with no launch command, so `kt agent start` fails for it:

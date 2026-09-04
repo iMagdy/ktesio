@@ -71,6 +71,17 @@ pub struct AgentManifestInvalid {
     pub message: String,
 }
 
+/// A manifest targets a different Adapter Contract MAJOR than the engine speaks
+/// (story 6-6, FR-30). The message names BOTH versions and quotes the
+/// compatibility rule; classified as exit `1` (the general/internal catch-all —
+/// the frozen 4-3 exit-code table gained no new number).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::contract_incompatible))]
+pub struct AgentContractIncompatible {
+    pub message: String,
+}
+
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
 #[diagnostic(code(ktesio::agent::manifest_unreadable))]

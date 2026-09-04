@@ -66,7 +66,7 @@ fn write_interaction_manifest(
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -258,7 +258,7 @@ fn send_input_on_unsupported_interaction_fails_fast_with_no_io() {
     let bin = ktesio_conformance::fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "unsup"
@@ -668,7 +668,7 @@ fn unsupported_interaction_agent_that_sniffs_stdin_at_startup_reaches_running_pr
     // entry; the per-OS projection this test cares about is unaffected).
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "sniffer"

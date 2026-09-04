@@ -70,7 +70,7 @@ Register an agent, give it a budget, inspect it, and run it under supervision.
 An agent is registered through an `adapter.toml` that declares how to launch it, its per-OS capabilities, and its metering source. Create a directory `my-agent/` with an `adapter.toml`:
 
 ```toml
-contract_version = "0.4.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "my-agent"
@@ -192,6 +192,7 @@ Plainly, four sections exercise **your adapter itself** — capability projectio
 - [Installation](docs/installation.md)
 - [Command reference](docs/commands.md)
 - [Adapter manifest (`adapter.toml`)](docs/manifest.md)
+- [Adapter Contract](docs/adapter-contract.md)
 - [Architecture](docs/architecture.md)
 - [Testing](docs/testing.md)
 - [Release process](docs/release-process.md)
