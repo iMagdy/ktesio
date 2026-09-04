@@ -191,6 +191,23 @@ pub enum RegistryError {
         detail: String,
     },
 
+    /// A manifest adapter declares a `contract_version` whose MAJOR differs
+    /// from this engine's Adapter Contract (story 6-6, FR-30 — the v1 freeze;
+    /// registration refuses the load). Distinct from
+    /// [`RegistryError::ManifestInvalid`] because the manifest is well-formed —
+    /// the VERSION does not negotiate — and the remediation belongs to the
+    /// adapter author (retarget the manifest's `contract_version`), not to a
+    /// section edit. `detail` names BOTH versions and quotes the compatibility
+    /// rule (rendered from `ktesio_adapter_api::ContractVersionError`, so the
+    /// rule text lives in one place).
+    #[error("adapter.toml at {path} is incompatible: {detail}")]
+    ContractIncompatible {
+        /// The manifest path.
+        path: String,
+        /// The both-versions + rule message from the negotiation.
+        detail: String,
+    },
+
     /// An adapter declared no viable Metering Source and was rejected at
     /// registration (story 1.3; FR-19 hard line, AC4). Names the adapter.
     #[error("adapter '{adapter}' declares no viable Metering Source; add a `[metering]` section")]

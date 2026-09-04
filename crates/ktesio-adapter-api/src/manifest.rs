@@ -32,6 +32,7 @@ use thiserror::Error;
 use crate::capability::CapabilityDeclaration;
 use crate::config::ConfigMapping;
 use crate::metering::MeteringSource;
+use crate::STRICT_SEMVER_REQUIREMENT;
 
 /// The parsed `adapter.toml` (spine AD-3 manifest schema).
 ///
@@ -42,7 +43,14 @@ use crate::metering::MeteringSource;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// The Adapter Contract version this manifest targets (e.g. `"0.1.0"`).
+    /// The Adapter Contract version this manifest targets (e.g. `"1.0.0"`).
+    ///
+    /// A STRICT `X.Y.Z` semver version (AI-6, resolved at the 6-6 freeze): no
+    /// `v` prefix and no partial versions (`1`, `1.0`) — those fail
+    /// [`Manifest::validate`] naming the field. A prerelease/build suffix
+    /// (`1.0.0-rc.1+build.5`) parses as semver and negotiates by MAJOR only
+    /// (see `crate::negotiate_contract_version`); the versioning policy at
+    /// `docs/adapter-contract.md#versioning` states the full stance.
     pub contract_version: Option<String>,
     /// Adapter identity (`kind`, optional `name`).
     pub adapter: Option<AdapterIdentity>,
@@ -111,7 +119,8 @@ pub struct Metering {
     pub source: MeteringSource,
 }
 
-/// The declared interaction channel kind (spine AD-12, story 4.1).
+/// The declared interaction channel kind (spine AD-12, story 4.1; vocabulary
+/// extended at the 6-6 freeze via CP-6.5-a option (i)).
 ///
 /// A CLOSED set: the manifest's `[interaction]` `channel` is validated at
 /// PARSE time (an unrecognized value is REJECTED, mirroring
@@ -124,20 +133,31 @@ pub struct Metering {
 /// channel = "stdio"
 /// ```
 ///
-/// Single variant this story (`Stdio`) — in v1 the ONLY implemented
-/// interaction channel is the spawned child's OS stdin pipe: every adapter
-/// that can actually run (the native mock or a manifest adapter) is spawned
-/// through the identical `ProcessBackend`/`SpawnSpec` mechanism, so there is
-/// no second channel to model yet. Mirrors the "seed, not freeze" discipline
-/// [`crate::Capability`]/[`crate::SupportLevel`] already follow: additively
-/// extensible, NOT built to negotiate a set here. A future channel (e.g.
-/// Hermes' own native channel mapping, epic 6) adds a second variant only
-/// once a real second implementation exists.
+/// Two variants as of contract v1 (story 6-6, CP-6.5-a ratified option (i)):
+///
+/// * [`InteractionChannelKind::Stdio`] — the spawned child's OS stdin pipe.
+/// * [`InteractionChannelKind::Http`] — an HTTP-native interaction surface
+///   (e.g. an agent exposing `POST /session/:id/message` over a loopback
+///   server). Declaring it is DOCUMENTARY vocabulary: it names the adapter's
+///   real transport so a manifest is honest about where interaction happens,
+///   and it lets an HTTP-native agent declare `interaction` supported instead
+///   of being forced into an unregisterable all-unsupported declaration.
+///   v1 ships NO engine-side HTTP delivery: the engine never branches on the
+///   declared channel — the AD-12 stdin pipe stays unconditional, and a
+///   `send_input` on an Http-declared adapter still writes the child's stdin
+///   (failing fast typed when unsupported). A real HTTP `send_input`
+///   implementation is a post-v1 change (R1's deferred TCK leg), and it would
+///   arrive under the published policy at `docs/adapter-contract.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InteractionChannelKind {
-    /// The spawned child's OS stdin pipe — the only implemented channel (v1).
+    /// The spawned child's OS stdin pipe — the channel the engine actually
+    /// delivers through today.
     Stdio,
+    /// An HTTP-native interaction surface (CP-6.5-a option (i), v1
+    /// vocabulary). Documentary in v1: the engine does not branch on it, and
+    /// no engine-side HTTP send implementation exists yet.
+    Http,
 }
 
 impl InteractionChannelKind {
@@ -145,6 +165,7 @@ impl InteractionChannelKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             InteractionChannelKind::Stdio => "stdio",
+            InteractionChannelKind::Http => "http",
         }
     }
 }
@@ -161,8 +182,8 @@ impl std::fmt::Display for InteractionChannelKind {
 /// gets the AD-12 default — the engine unconditionally pipes stdin for every
 /// spawned process (story 4.1 Task 1), regardless of what (or whether) this
 /// section says. Declaring the section only firms up, documentarily, WHICH
-/// channel the adapter author expects; the engine does not branch on it (v1
-/// has exactly one implemented channel).
+/// channel the adapter author expects; the engine does not branch on it (the
+/// AD-12 stdin pipe is unconditional for every spawn).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Interaction {
@@ -275,15 +296,24 @@ impl Manifest {
     /// section. Order is stable (contract version → adapter identity → lifecycle
     /// → capabilities → metering) so diagnostics are deterministic.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        // contract_version present, non-empty, AND a real semver version (so 6.6
-        // can build negotiation on it — a garbage string like "banana" is not a
-        // version the contract can reason about). The error names the field.
+        // contract_version present, non-empty, AND a real semver version (the
+        // negotiation in `crate::negotiate_contract_version` builds on it). The
+        // parse is STRICT `X.Y.Z` (AI-6, resolved at the 6-6 freeze): no `v`
+        // prefix, no partial versions — the error documents the requirement
+        // because the field doc alone is not what an operator sees when a load
+        // fails. The error names the field.
         match &self.contract_version {
             Some(v) if !v.trim().is_empty() => {
                 if semver::Version::parse(v.trim()).is_err() {
                     return Err(ManifestError::InvalidField {
                         field: "`contract_version`".to_string(),
-                        detail: format!("'{v}' is not a valid semver version"),
+                        // The requirement clause interpolates the SHARED
+                        // `STRICT_SEMVER_REQUIREMENT` const — the same single
+                        // source `ContractVersionError::Unparseable` quotes —
+                        // so the two identical rejections cannot drift apart.
+                        detail: format!(
+                            "'{v}' is not a valid semver version ({STRICT_SEMVER_REQUIREMENT})"
+                        ),
                     });
                 }
             }
@@ -423,7 +453,7 @@ mod tests {
 
     /// A complete, valid manifest covering every section.
     const VALID: &str = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "demo"
@@ -483,7 +513,7 @@ channel = "stdio"
 
     #[test]
     fn missing_contract_version_names_the_field() {
-        let toml = VALID.replace("contract_version = \"0.1.0\"\n", "");
+        let toml = VALID.replace("contract_version = \"1.0.0\"\n", "");
         let m = Manifest::from_toml_str(&toml).expect("parse");
         let err = m.validate().unwrap_err();
         assert!(
@@ -494,7 +524,7 @@ channel = "stdio"
 
     #[test]
     fn empty_contract_version_is_rejected() {
-        let toml = VALID.replace("contract_version = \"0.1.0\"", "contract_version = \"\"");
+        let toml = VALID.replace("contract_version = \"1.0.0\"", "contract_version = \"\"");
         let m = Manifest::from_toml_str(&toml).expect("parse");
         let err = m.validate().unwrap_err();
         assert!(err.to_string().contains("contract_version"), "{err}");
@@ -505,7 +535,7 @@ channel = "stdio"
         // F5: a present, non-empty but non-semver contract_version is rejected
         // (parsed with semver::Version::parse), naming the field.
         let toml = VALID.replace(
-            "contract_version = \"0.1.0\"",
+            "contract_version = \"1.0.0\"",
             "contract_version = \"banana\"",
         );
         let m = Manifest::from_toml_str(&toml).expect("parse");
@@ -515,6 +545,51 @@ channel = "stdio"
             "got {err}"
         );
         assert!(err.to_string().contains("banana"), "got {err}");
+    }
+
+    #[test]
+    fn contract_version_strict_parse_edges_are_rejected_with_the_requirement_documented() {
+        // AI-6, resolved at the 6-6 freeze: the parse stays STRICT `X.Y.Z` —
+        // `1` and `1.0` are not versions, `v1.0.0` is not the field's grammar.
+        // Each rejection's detail STATES the requirement (an operator reading
+        // the diagnostic learns the rule without opening the docs).
+        for bad in ["1", "1.0", "v1.0.0"] {
+            let toml = VALID.replace(
+                "contract_version = \"1.0.0\"",
+                &format!("contract_version = \"{bad}\""),
+            );
+            let m = Manifest::from_toml_str(&toml).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("contract_version")),
+                "{bad:?}: got {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains(bad), "{bad:?}: {text}");
+            assert!(
+                text.contains(crate::STRICT_SEMVER_REQUIREMENT),
+                "{bad:?}: the diagnostic must quote the SHARED strict-parse requirement \
+                 verbatim (drift check — the same const backs                  `ContractVersionError::Unparseable`): {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_version_prerelease_and_build_metadata_parse_and_validate() {
+        // AI-6's documented stance: `semver::Version::parse` accepts
+        // prerelease/build-metadata suffixes, and negotiation compares majors
+        // only — so a same-major prerelease manifest is a VALID manifest here
+        // (the ENGINE's registration negotiation decides compatibility; see
+        // `crate::negotiate_contract_version`'s tests).
+        for good in ["1.0.0-rc.1", "1.2.3+build.7", "1.0.0-beta.2+meta"] {
+            let toml = VALID.replace(
+                "contract_version = \"1.0.0\"",
+                &format!("contract_version = \"{good}\""),
+            );
+            let m = Manifest::from_toml_str(&toml).expect("parse");
+            m.validate()
+                .unwrap_or_else(|e| panic!("{good} must validate: {e}"));
+        }
     }
 
     #[test]
@@ -670,18 +745,42 @@ channel = "stdio"
 
     #[test]
     fn invalid_interaction_channel_fails_to_parse_naming_interaction() {
-        // Story 4.1 AC-E: `[interaction].channel` is a closed enum (single
-        // variant `Stdio` this story), so an unrecognized value (e.g. "http")
-        // fails at PARSE, not merely accepted-and-ignored. Mirrors
+        // Story 4.1 AC-E: `[interaction].channel` is a closed enum (stdio and
+        // http since the 6-6 freeze), so an unrecognized value fails at PARSE,
+        // not merely accepted-and-ignored. Mirrors
         // `invalid_metering_source_fails_to_parse_naming_metering`: the raw
         // serde message does not name the section, so `from_toml_str`
         // attributes it to `[interaction]`.
-        let toml = VALID.replace("channel = \"stdio\"", "channel = \"http\"");
+        let toml = VALID.replace("channel = \"stdio\"", "channel = \"carrier-pigeon\"");
         let err = Manifest::from_toml_str(&toml).unwrap_err();
         assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
         assert!(err.to_string().contains("[interaction]"), "got {err}");
-        assert!(err.to_string().contains("http"), "got {err}");
+        assert!(err.to_string().contains("carrier-pigeon"), "got {err}");
         assert!(err.to_string().contains("channel"), "got {err}");
+    }
+
+    #[test]
+    fn http_interaction_channel_is_v1_vocabulary_and_round_trips() {
+        // CP-6.5-a option (i), ratified at the 6-6 freeze: `http` is a legal
+        // `[interaction].channel` value — the additive vocabulary an
+        // HTTP-native agent (e.g. opencode) declares instead of being forced
+        // into an unregisterable all-unsupported interaction declaration. The
+        // engine does not branch on it (the stdin pipe stays unconditional);
+        // this vocabulary is documentary, and both variants' `as_str`/
+        // `Display` stay in lockstep.
+        let toml = VALID.replace("channel = \"stdio\"", "channel = \"http\"");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.interaction.as_ref().unwrap().channel,
+            InteractionChannelKind::Http
+        );
+        assert_eq!(InteractionChannelKind::Http.as_str(), "http");
+        assert_eq!(InteractionChannelKind::Stdio.as_str(), "stdio");
+        assert_eq!(
+            InteractionChannelKind::Http.to_string(),
+            InteractionChannelKind::Http.as_str()
+        );
     }
 
     #[test]
@@ -716,7 +815,7 @@ channel = "stdio"
     fn invalid_metering_source_that_is_a_valid_interaction_channel_name_still_names_metering() {
         // The mirror direction of the M3 fix: `[metering].source = "stdio"`
         // is an INVALID source (only "self-reported"/"engine-observed" are
-        // valid) that ALSO happens to be the one valid
+        // valid) that ALSO happens to be a valid
         // `InteractionChannelKind` variant name. Must still name
         // `[metering]`, never `[interaction]` — confirms the "expected ..."
         // clause disambiguation is symmetric, not merely patched for the
@@ -815,7 +914,7 @@ channel = "stdio"
     fn accessors_default_when_sections_absent() {
         // A near-empty manifest: accessors return safe defaults/None without
         // panicking (validation is what rejects it).
-        let m = Manifest::from_toml_str("contract_version = \"0.1.0\"").expect("parse");
+        let m = Manifest::from_toml_str("contract_version = \"1.0.0\"").expect("parse");
         assert!(m.capability_declaration().is_empty());
         assert_eq!(m.metering_source(), None);
         assert_eq!(m.adapter_kind(), None);

@@ -29,6 +29,8 @@ STALE_PATTERNS = [
     # (narrow patterns so version-history files keep passing).
     "contract_version = \"0.3.0\"",
     'contract_version "0.3.0"',
+    "contract_version = \"0.4.0\"",
+    'contract_version "0.4.0"',
 ]
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")

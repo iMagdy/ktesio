@@ -376,6 +376,22 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
+      - name: Resolve the cargo-semver-checks version (AI-3)
+        id: semver_version
+        run: |
+          set -euo pipefail
+          user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          # The cache key must name a CONTENT hash, never a constant (AI-3): it
+          # carries the resolved cargo-semver-checks version so a toolchain
+          # update gets a fresh key. Non-fatal on crates.io trouble — an
+          # "unknown" suffix degrades to an unpinned key, never a red gate.
+          version="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 "https://crates.io/api/v1/crates/cargo-semver-checks" | sed -n 's/.*"max_version":"\([^"]*\)".*/\1/p' || true)"
+          # Guard the resolved value (AI-3 hardening): an error body, JSON
+          # drift, or any non-triple must never reach a `cargo install
+          # --version <garbage>` under set -e — degrade to "unknown" (presence
+          # check) instead of a red gate.
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version=unknown
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -385,18 +401,26 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Cache cargo-semver-checks binary
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Restore cargo-semver-checks binary
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Persist the source-installed cargo-semver-checks so the armed gate
-          # does not rebuild it (~10 min) on every fresh runner (AI-1).
-          key: ${{ runner.os }}-cargo-semver-checks-bin
+          # does not rebuild it (~10 min) on every fresh runner (AI-1). AI-3:
+          # the key carries the resolved version AND the save below fires only
+          # when an install actually ran — with the old constant key, a dormant
+          # run (gate unpublished pre-7-4, so no install ever executed) froze an
+          # entry without the binary under the ONE key the armed gate needed,
+          # forcing a rebuild on every armed run.
+          key: ${{ runner.os }}-cargo-semver-checks-bin-${{ steps.semver_version.outputs.version }}
+          restore-keys: ${{ runner.os }}-cargo-semver-checks-bin-
           path: |
             ~/.cargo/bin
       - name: Check public API semver (ktesio-engine, ktesio-adapter-api)
+        id: semver_check
         shell: bash
         run: |
           set -euo pipefail
+          version="${{ steps.semver_version.outputs.version }}"
           user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
@@ -406,7 +430,26 @@ jobs:
                 # build while the gate is dormant (no published baseline yet).
                 # Explicit +stable (see fmt job): keep the semver gate on latest
                 # stable; the root pin governs only local bare cargo.
-                command -v cargo-semver-checks >/dev/null 2>&1 || cargo +stable install cargo-semver-checks --locked
+                # AI-3: the cached binary must MATCH the resolved version, not
+                # merely exist — restore-keys can legitimately restore an
+                # OLDER version's binary, and trusting `command -v` there
+                # would silently skip the pinned install and break the
+                # version-keyed promise. When the version could not be
+                # resolved, degrade to the presence check (never-red).
+                if [ "$version" = "unknown" ]; then
+                  if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+                    cargo +stable install cargo-semver-checks --locked
+                    echo "installed=true" >> "$GITHUB_OUTPUT"
+                  fi
+                else
+                  # `|| true` rescues set -o pipefail when the binary is absent
+                  # (a failed probe must read "no cached version", never abort the job).
+                  cached="$(cargo +stable cargo-semver-checks --version 2>/dev/null | tail -n 1 | awk '{print $NF}' || true)"
+                  if [ "$cached" != "$version" ]; then
+                    cargo +stable install cargo-semver-checks --locked --version "$version"
+                    echo "installed=true" >> "$GITHUB_OUTPUT"
+                  fi
+                fi
                 cargo +stable semver-checks check-release -p "$crate"
                 ;;
               404)
@@ -421,6 +464,16 @@ jobs:
                 ;;
             esac
           done
+      - name: Save cargo-semver-checks binary (only when an install ran)
+        if: steps.semver_check.outputs.installed == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # AI-3: the save is CONDITIONAL (an install actually ran) and keyed
+          # on the resolved version — a dormant run can never freeze an empty
+          # entry under a key the armed gate later restores.
+          key: ${{ runner.os }}-cargo-semver-checks-bin-${{ steps.semver_version.outputs.version }}
+          path: |
+            ~/.cargo/bin
 
   msrv:
     name: msrv

@@ -240,12 +240,20 @@ enum MemoryCommands {
         /// The Memory Backing kind to attach (accepted: filesystem, native)
         #[arg(long)]
         kind: String,
+        /// Emit the attachment as a machine-readable JSON document (AD-14;
+        /// story 6-6's deferred wire surface, frozen at the contract v1 freeze)
+        #[arg(long)]
+        json: bool,
     },
     /// Detach an Agent Instance's Memory Backing (metadata only: the managed
     /// directory and its contents remain on disk; requires a terminal state)
     Detach {
         /// Name of the Agent Instance
         name: String,
+        /// Emit the detachment as a machine-readable JSON document (AD-14;
+        /// story 6-6's deferred wire surface, frozen at the contract v1 freeze)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -347,8 +355,10 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 } => cli::agent::config_get(&name, key.as_deref(), json, reveal),
             },
             AgentCommands::Memory { command } => match command {
-                MemoryCommands::Attach { name, kind } => cli::agent::memory_attach(&name, &kind),
-                MemoryCommands::Detach { name } => cli::agent::memory_detach(&name),
+                MemoryCommands::Attach { name, kind, json } => {
+                    cli::agent::memory_attach(&name, &kind, json)
+                }
+                MemoryCommands::Detach { name, json } => cli::agent::memory_detach(&name, json),
             },
         },
         None => {

@@ -52,7 +52,7 @@ fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -434,7 +434,7 @@ fn breach_action_pause_on_an_unsupported_adapter_stays_running_and_still_records
     let bin = ktesio_conformance::fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "nopause"

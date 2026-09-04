@@ -25,7 +25,7 @@
 //! | Code | Meaning | Mapped from (`crate::error` diagnostics) |
 //! |------|---------|------------------------------------------|
 //! | `0` | Success | `Ok(())` |
-//! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, + any unmapped error |
+//! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, + any unmapped error |
 //! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName` |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
 //! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict` |
@@ -136,8 +136,9 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         ExitCode::TimedOut
     // 1 — general/internal error AND the documented catch-all. This arm covers
     // the modeled code-1 diagnostics (`AgentIo`, `AgentStore`, `AgentConfig`,
-    // `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentManifestUnreadable`,
-    // `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`) AND any
+    // `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`,
+    // `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`,
+    // `SelfUpdateFailed`) AND any
     // OTHER `dyn Error` not matched above — including a future diagnostic added
     // without a classifier arm — so an unclassified error preserves the pre-4-3
     // "every runtime error → 1" behavior rather than panicking. Its mapping to
@@ -154,8 +155,9 @@ mod tests {
     // The code-1 diagnostics are only constructed in these tests (the classifier
     // reaches them through the catch-all, so they are not named in `classify`).
     use crate::error::{
-        AgentConfig, AgentIo, AgentLaunchFailed, AgentManifestInvalid, AgentManifestUnreadable,
-        AgentNoCapabilities, AgentNoMeteringSource, AgentStore, SelfUpdateFailed,
+        AgentConfig, AgentContractIncompatible, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+        AgentManifestUnreadable, AgentNoCapabilities, AgentNoMeteringSource, AgentStore,
+        SelfUpdateFailed,
     };
 
     /// Box a diagnostic exactly as the `map_*` mappers do (`.into()`), so the
@@ -195,6 +197,9 @@ mod tests {
             }),
             boxed(AgentManifestInvalid {
                 message: "invalid".into(),
+            }),
+            boxed(AgentContractIncompatible {
+                message: "incompatible contract".into(),
             }),
             boxed(AgentManifestUnreadable {
                 message: "unreadable".into(),

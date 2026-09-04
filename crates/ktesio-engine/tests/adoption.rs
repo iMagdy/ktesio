@@ -36,7 +36,7 @@ fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -626,7 +626,7 @@ fn launch_failed_instance_surfaces_its_cause_via_instance_status() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "bad"

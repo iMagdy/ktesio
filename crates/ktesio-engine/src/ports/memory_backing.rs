@@ -203,6 +203,26 @@ mod tests {
     }
 
     #[test]
+    fn wire_strings_are_pinned_verbatim() {
+        // The 6-6 freeze adopted these snake_case strings VERBATIM as the
+        // `--json` wire contract (docs/adapter-contract.md); the round-trip
+        // test above is swap-invariant (it cannot tell `filesystem` from
+        // `native` so long as they differ), so the exact literals are pinned
+        // here by VALUE. Changing one is a breaking v1 wire change: announce
+        // it, then edit this assertion deliberately.
+        assert_eq!(MemoryBackingKind::Filesystem.as_str(), "filesystem");
+        assert_eq!(MemoryBackingKind::Native.as_str(), "native");
+        assert_eq!(
+            GuaranteeLevel::ManagedDirByteDurable.as_str(),
+            "managed_dir_byte_durable"
+        );
+        assert_eq!(
+            GuaranteeLevel::HomePersistenceOnly.as_str(),
+            "home_persistence_only"
+        );
+    }
+
+    #[test]
     fn from_wire_rejects_unknown() {
         // The rejection branch is part of the contract (a future/typo'd token
         // must not decode into a real kind).

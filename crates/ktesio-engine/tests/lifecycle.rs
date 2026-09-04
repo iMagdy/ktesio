@@ -29,7 +29,7 @@ fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -137,7 +137,7 @@ fn failed_launch_lands_in_failed_with_preserved_diagnostic_no_zombie() {
     let manifest = TempDir::new().unwrap();
     // Point exec at a non-existent program (NOT fake_agent).
     let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "bad"
@@ -288,7 +288,7 @@ fn stop_escalates_to_forced_kill_and_records_it() {
     let manifest = TempDir::new().unwrap();
     // A manifest whose start exec is `sh -c 'trap "" TERM; sleep 60'`.
     let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "stubborn"
@@ -377,7 +377,7 @@ fn stop_rescues_a_usage_line_flushed_during_the_kill_window() {
     let script = format!("trap 'cat {}' TERM; sleep 60", emit_path.display());
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "emitter"

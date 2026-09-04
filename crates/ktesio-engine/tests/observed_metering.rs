@@ -177,7 +177,7 @@ fn write_observed_manifest(dir: &Path, kind: &str, args: &[&str]) {
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.3.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -693,8 +693,9 @@ fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
     // a manifest with NO `[metering]` section is REJECTED at registration with the
     // section-naming diagnostic. Adding the engine-observed INGESTION path must NOT
     // weaken this. (The 1-3 assertion owns the primary guard; this proves 3-4 did not
-    // regress it, AND that `engine-observed` is itself a VALID declaration today — no
-    // contract change needed, CONTRACT_VERSION stays 0.3.0.)
+    // regress it, AND that `engine-observed` is itself a VALID declaration under
+    // contract v1 — story 6-6 froze it at 1.0.0 with `engine-observed` in the
+    // vocabulary.)
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     let engine = open(&state);
@@ -703,7 +704,7 @@ fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
     // (1) A manifest with NO [metering] section is still rejected (the hard line).
     let bin = ktesio_conformance::fake_agent_bin();
     let no_metering = format!(
-        "contract_version = \"0.3.0\"\n[adapter]\nkind = \"nomet\"\n\
+        "contract_version = \"1.0.0\"\n[adapter]\nkind = \"nomet\"\n\
          [lifecycle.start]\nexec = {exec:?}\n\
          [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n",
         exec = bin.to_string_lossy(),
@@ -720,8 +721,8 @@ fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
         "the rejection names the missing metering section: {err}"
     );
 
-    // (2) `engine-observed` IS a valid declaration under the current contract — a
-    // manifest declaring it REGISTERS with no contract change (0.3.0 unchanged).
+    // (2) `engine-observed` IS a valid declaration under contract v1 — a
+    // manifest declaring it REGISTERS under the frozen 1.0.0 contract.
     let observed_manifest = TempDir::new().unwrap();
     write_observed_manifest(observed_manifest.path(), "obsok", &["--linger-ms", "1000"]);
     facade
@@ -729,7 +730,7 @@ fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
             "obsok",
             &AdapterRef::Manifest(observed_manifest.path().to_path_buf()),
         )
-        .expect("an engine-observed manifest registers under CONTRACT_VERSION 0.3.0");
+        .expect("an engine-observed manifest registers under CONTRACT_VERSION 1.0.0");
 }
 
 /// Recursively read EVERY file under `dir` and return the first path whose bytes

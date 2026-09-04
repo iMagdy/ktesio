@@ -104,7 +104,7 @@ fn state_persists_across_reopen() {
 
 /// A complete valid `adapter.toml` written into a manifest directory fixture.
 const FIXTURE_MANIFEST: &str = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "fixture"

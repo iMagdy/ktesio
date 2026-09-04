@@ -61,7 +61,7 @@ fn write_logs_manifest(dir: &Path, kind: &str, args: &[&str], level: &str) {
         .join(", ");
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -503,7 +503,7 @@ fn output_capture_is_unconditional_regardless_of_declared_interaction_support() 
     let bin = ktesio_conformance::fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "unsup"
@@ -1088,7 +1088,7 @@ fn write_yes_manifest(dir: &Path, pid_marker: &Path) {
     let shell_cmd = format!("echo $$ > '{}'; exec yes", pid_marker.display());
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "sigpipe-probe"

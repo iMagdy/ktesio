@@ -3320,7 +3320,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "contract_version = \"0.1.0\"\n\n\
+            "contract_version = \"1.0.0\"\n\n\
              [adapter]\nkind = \"{kind}\"\n\n\
              [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n\n\
              [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
@@ -3355,7 +3355,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!(
-            "contract_version = \"0.1.0\"\n\n\
+            "contract_version = \"1.0.0\"\n\n\
              [adapter]\nkind = \"{kind}\"\n\n\
              [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n\n\
              [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\

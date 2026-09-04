@@ -48,7 +48,7 @@ fn write_pause_manifest(dir: &Path, kind: &str, args: &[&str], pause_level_curre
     // "unsupported" proof the caller passes a body with no current-OS entry.
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "{kind}"
@@ -319,7 +319,7 @@ fn unsupported_pause_fails_fast_with_no_state_change_and_no_event() {
     let bin = ktesio_conformance::fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "unsup"

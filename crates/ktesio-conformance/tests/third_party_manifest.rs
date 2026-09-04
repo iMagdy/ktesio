@@ -25,7 +25,7 @@ fn write_adapter(dir: &Path) {
     let exec = ktesio_conformance::fake_agent_bin();
     let body = format!(
         r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "third-party-adapter"

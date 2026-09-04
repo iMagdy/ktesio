@@ -215,14 +215,33 @@ Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names it
 ```bash
 kt agent memory attach demo --kind filesystem
 kt agent memory attach demo --kind native
+kt agent memory attach demo --kind filesystem --json
 ```
 
 Arguments:
 
 - `<name>` — the Agent Instance to attach the backing to.
 - `--kind <kind>` — the backing kind: `filesystem` or `native`. The full vocabulary grows without a breaking change.
+- `--json` — emit the attachment as a machine-readable JSON document (below) instead of the human confirmation.
 
-The confirmation names the kind and prints one boundary sentence stating exactly what is guaranteed versus delegated, then the managed directory path alone on the final stdout line (scripts can read the last line); diagnostics go to stderr. For `native`, that path is the computed location only — nothing was created there.
+The human confirmation names the kind and prints one boundary sentence stating exactly what is guaranteed versus delegated, then the managed directory path alone on the final stdout line (scripts can read the last line); diagnostics go to stderr. For `native`, that path is the computed location only — nothing was created there.
+
+### `memory attach --json`
+
+`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the adapter's declared config mapping targets the reserved `memory.dir` key, i.e. whether the injected path will actually reach the agent (always `false` for `native`, which delivers nothing):
+
+```json
+{
+  "schema_version": 1,
+  "instance": "demo",
+  "kind": "filesystem",
+  "guarantee": "managed_dir_byte_durable",
+  "dir": "/home/you/.local/share/kt/agents/demo/memory",
+  "declared": true
+}
+```
+
+A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false`. The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
 
 For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 
@@ -246,9 +265,24 @@ Detach an Agent Instance's Memory Backing.
 
 ```bash
 kt agent memory detach demo
+kt agent memory detach demo --json
 ```
 
+Arguments:
+
+- `<name>` — the Agent Instance to detach the backing from.
+- `--json` — emit the detachment as a machine-readable JSON document instead of the human confirmation.
+
 Detach is metadata-only: the attachment is removed, but the managed directory **and its contents remain on disk** — your data is never silently deleted, and re-attaching later re-adopts the existing contents. The same terminal-state requirement applies as `attach`.
+
+With `--json`, stdout carries the versioned confirmation document and nothing else. It is intentionally minimal — the versioned proof that nothing is attached anymore; it carries no path (Ktesio never constructs the managed-directory name itself, and after a detach the engine reports no attachment to quote):
+
+```json
+{
+  "schema_version": 1,
+  "instance": "demo"
+}
+```
 
 ## Memory guarantees at a glance
 

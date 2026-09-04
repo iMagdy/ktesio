@@ -160,6 +160,21 @@ pub enum AdapterResolveError {
         detail: String,
     },
 
+    /// The manifest targets a different Adapter Contract MAJOR than this engine
+    /// speaks (story 6-6, FR-30 — the v1 freeze). Registration REFUSES the load
+    /// naming BOTH versions and quoting the compatibility rule; `detail`
+    /// carries that message verbatim (rendered from
+    /// [`ktesio_adapter_api::ContractVersionError`], so the rule text lives in
+    /// ONE place). Distinct from [`AdapterResolveError::ManifestInvalid`]: the
+    /// manifest is well-formed — it is the VERSION that does not negotiate.
+    #[error("adapter.toml at {path} is incompatible: {detail}")]
+    ContractIncompatible {
+        /// The manifest path.
+        path: String,
+        /// The both-versions + rule message from the negotiation.
+        detail: String,
+    },
+
     /// The adapter declared no viable Metering Source (FR-19 hard line, AC4).
     ///
     /// For a manifest this is caught by [`Manifest::validate`] (a missing
@@ -665,6 +680,25 @@ fn resolve_manifest(path: &Path) -> Result<ResolvedAdapter, AdapterResolveError>
         .validate()
         .map_err(|e| to_invalid(&manifest_path, e))?;
 
+    // Contract v1 negotiation (story 6-6, FR-30): registration REFUSES a
+    // manifest whose contract major differs from this engine's, naming both
+    // versions and quoting the rule. This is THE load gate — native builtins
+    // are compiled against this crate (always compatible), and the start path
+    // launches from the registration-time snapshot, so a manifest can only
+    // enter the fleet through here. A pre-v1 `0.x` manifest is NOT
+    // grandfathered: the contract was never published under 0.x.
+    let manifest_version = manifest
+        .contract_version
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    if let Err(negotiation) = ktesio_adapter_api::negotiate_contract_version(manifest_version) {
+        return Err(AdapterResolveError::ContractIncompatible {
+            path: manifest_path.to_string_lossy().into_owned(),
+            detail: negotiation.to_string(),
+        });
+    }
+
     // Validated: the declaration is non-empty and a viable source is present.
     let metering_source =
         manifest
@@ -734,6 +768,9 @@ impl From<AdapterResolveError> for crate::domain::RegistryError {
             AdapterResolveError::ManifestInvalid { path, detail } => {
                 R::ManifestInvalid { path, detail }
             }
+            AdapterResolveError::ContractIncompatible { path, detail } => {
+                R::ContractIncompatible { path, detail }
+            }
             AdapterResolveError::NoMeteringSource { adapter } => R::NoMeteringSource { adapter },
             AdapterResolveError::NoCapabilities { adapter } => R::NoCapabilities { adapter },
         }
@@ -747,7 +784,7 @@ mod tests {
     use tempfile::TempDir;
 
     const VALID_MANIFEST: &str = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "demo"
@@ -842,6 +879,130 @@ source = "self-reported"
         }
     }
 
+    // ---- Story 6-6: contract v1 negotiation at registration (FR-30) ----
+
+    #[test]
+    fn same_major_manifest_loads_under_contract_v1() {
+        // The freeze fixture, positive leg: a manifest declaring the engine's
+        // own contract major registers cleanly. Prerelease/build-metadata
+        // suffixes of the same major negotiate by MAJOR only (AI-6 stance).
+        for version in ["\"1.0.0\"", "\"1.9.9\"", "\"1.0.0-rc.1+build.5\""] {
+            let tmp = TempDir::new().unwrap();
+            let body = VALID_MANIFEST.replace(
+                "contract_version = \"1.0.0\"",
+                &format!("contract_version = {version}"),
+            );
+            write_manifest(tmp.path(), &body);
+            let resolved = resolve(&AdapterRef::Manifest(tmp.path().to_path_buf()))
+                .unwrap_or_else(|e| panic!("{version} must load: {e}"));
+            assert_eq!(resolved.kind(), "demo", "{version}");
+        }
+    }
+
+    #[test]
+    fn incompatible_major_fails_naming_both_versions_and_the_rule() {
+        // The freeze fixture, negative leg (FR-30's informative rejection): a
+        // manifest whose contract major differs from the engine's fails to load
+        // naming BOTH versions AND quoting the compatibility rule. The set
+        // includes prerelease/build-metadata spellings of a different major —
+        // an AI-64 pass (M3, 2026-09-04) proved a `|| !pre.is_empty()` hole
+        // survives when only plain majors are fixed, so suffixes must be
+        // exercised here too (they parse fine and reach the negotiation).
+        for version in ["2.1.0", "2.0.0-rc.1", "2.0.0+build.9"] {
+            let tmp = TempDir::new().unwrap();
+            let body = VALID_MANIFEST.replace(
+                "contract_version = \"1.0.0\"",
+                &format!("contract_version = \"{version}\""),
+            );
+            write_manifest(tmp.path(), &body);
+            let err = resolve(&AdapterRef::Manifest(tmp.path().to_path_buf())).unwrap_err();
+            match err {
+                AdapterResolveError::ContractIncompatible { path, detail } => {
+                    assert!(path.ends_with(MANIFEST_FILE), "{path}");
+                    assert!(
+                        detail.contains(version),
+                        "names the manifest version: {detail}"
+                    );
+                    assert!(
+                        detail.contains(ktesio_adapter_api::CONTRACT_VERSION),
+                        "names the engine version: {detail}"
+                    );
+                    assert!(
+                        detail.contains(ktesio_adapter_api::COMPATIBILITY_RULE),
+                        "quotes the rule: {detail}"
+                    );
+                }
+                other => panic!("expected ContractIncompatible for {version}, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pre_v1_manifest_majors_are_not_grandfathered() {
+        // Ratified at the 6-6 checkpoint: the 0.x seeds were never published, so
+        // a manifest still targeting them is INCOMPATIBLE with contract v1 —
+        // no back-compat obligation exists.
+        for version in ["0.1.0", "0.3.0", "0.4.0"] {
+            let tmp = TempDir::new().unwrap();
+            let body = VALID_MANIFEST.replace(
+                "contract_version = \"1.0.0\"",
+                &format!("contract_version = \"{version}\""),
+            );
+            write_manifest(tmp.path(), &body);
+            let err = resolve(&AdapterRef::Manifest(tmp.path().to_path_buf())).unwrap_err();
+            assert!(
+                matches!(err, AdapterResolveError::ContractIncompatible { .. }),
+                "{version} must be refused: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_negotiation_runs_after_per_field_validation() {
+        // Ordering pin: an INCOMPATIBLE version on an otherwise-invalid
+        // manifest reports the SECTION problem first (validate() precedes
+        // negotiation), so the diagnostic names the deeper defect.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "2.0.0"
+
+[adapter]
+kind = "demo"
+
+[capabilities.pause]
+linux = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#;
+        write_manifest(tmp.path(), body);
+        let err = resolve(&AdapterRef::Manifest(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            matches!(err, AdapterResolveError::ManifestInvalid { .. }),
+            "the missing [lifecycle] section must win: {err}"
+        );
+    }
+
+    #[test]
+    fn registry_maps_contract_incompatible_for_kt() {
+        // The RegistryError surface keeps the both-versions + rule message so
+        // kt's diagnostic quotes it verbatim.
+        let err: crate::domain::RegistryError = AdapterResolveError::ContractIncompatible {
+            path: "/x/adapter.toml".to_string(),
+            detail: "manifest declares 2.1.0, engine speaks 1.0.0".to_string(),
+        }
+        .into();
+        assert!(
+            matches!(
+                err,
+                crate::domain::RegistryError::ContractIncompatible { .. }
+            ),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("2.1.0") && text.contains("1.0.0"), "{text}");
+    }
+
     #[test]
     fn manifest_with_no_metering_is_rejected_as_invalid_naming_metering() {
         // AC4 at the manifest layer: a missing [metering] fails validate() and
@@ -922,7 +1083,7 @@ source = "self-reported"
         // A manifest adapter's [lifecycle.start] exec/args/env become the launch.
         let tmp = TempDir::new().unwrap();
         let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "demo"
 [lifecycle.start]
@@ -948,7 +1109,7 @@ source = "self-reported"
         // registration and the start path need never re-read the manifest.
         let tmp = TempDir::new().unwrap();
         let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "demo"
 [lifecycle.start]
@@ -1046,7 +1207,7 @@ source = "self-reported"
         // table override).
         let tmp = TempDir::new().unwrap();
         let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "hermes"
 [lifecycle.start]
@@ -1092,7 +1253,7 @@ source = "self-reported"
         // launch resolver guards defensively.)
         let tmp = TempDir::new().unwrap();
         let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "demo"
 [lifecycle.stop]
@@ -1376,7 +1537,7 @@ source = "self-reported"
         // A manifest adapter's mapping comes from its parsed [config] section.
         let tmp = TempDir::new().unwrap();
         let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "demo"
 [lifecycle.start]
@@ -1419,7 +1580,7 @@ flag = "--model"
         // re-validate at registration, so this start-time check is its ONLY guard).
         let tmp = TempDir::new().unwrap();
         let body = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 [adapter]
 kind = "demo"
 [lifecycle.start]

@@ -1814,7 +1814,7 @@ mod tests {
     // ---- Story 1.3: adapter resolution + validation at registration ----
 
     const VALID_MANIFEST: &str = r#"
-contract_version = "0.1.0"
+contract_version = "1.0.0"
 
 [adapter]
 kind = "demo-manifest"
