@@ -195,7 +195,11 @@ pub struct ConformanceReport {
     /// finding B8). A report from a contract-gated engine can now SAY which
     /// contract major produced the pass instead of leaving a wrong-major
     /// manifest as a generic all-fail "registration failed". Additive field
-    /// under the documented bump policy: `schema_version` stays put.
+    /// under the documented bump policy: `schema_version` stays put, and
+    /// `#[serde(default)]` keeps archived pre-field reports (same
+    /// schema_version 1) deserializing — an empty string means "produced by
+    /// a pre-`contract_version` harness".
+    #[serde(default)]
     pub contract_version: String,
     /// The adapter kind under test.
     pub adapter_kind: String,
@@ -2220,10 +2224,18 @@ impl UpstreamStub {
                     Self::serve_one(stream);
                 }
                 // Nothing pending: nap briefly and re-check the stop flag.
+                // (The 5 ms nap only lives for the engine-observed section's
+                // duration — a test-scoped listener, not a long-lived server.)
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => break,
+                // Transient accept errors (ECONNABORTED, EMFILE, …) must NOT
+                // kill the stub: a silently-dead listener makes the section
+                // fail far from the cause. Only the stop flag ends the loop;
+                // anything else naps and retries.
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         });
         Self {
@@ -3748,5 +3760,18 @@ env = "MODEL"
             ::ktesio_adapter_api::CONTRACT_VERSION
         );
         assert_eq!(back.adapter_kind, "round-trip");
+    }
+
+    /// Archived reports from BEFORE the `contract_version` field landed carry
+    /// the same `schema_version: 1` and no such key — `#[serde(default)]`
+    /// keeps them deserializing (review finding: an additive field must not
+    /// break the deserialization direction of the bump policy).
+    #[test]
+    fn archived_report_json_without_contract_version_still_deserializes() {
+        let legacy = r#"{"schema_version":1,"adapter_kind":"old","sections":[]}"#;
+        let back: ConformanceReport = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(back.schema_version, REPORT_SCHEMA_VERSION);
+        assert_eq!(back.adapter_kind, "old");
+        assert_eq!(back.contract_version, "", "empty = produced pre-field");
     }
 }

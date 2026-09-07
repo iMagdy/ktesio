@@ -168,11 +168,15 @@ See the [command reference](docs/commands.md) for arguments, flags, and the unif
 If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a native adapter crate), the **Conformance Test Kit** proves it honors the Adapter Contract — the same controls, metering honesty, and capability declarations every built-in adapter is held to. Add one dev-dependency and one `#[test]`:
 
 ```toml
+# Pin a full commit SHA: until the crates publish (story 7-4) a bare `git =`
+# dependency floats on this repo's default-branch HEAD, and a breaking
+# report-shape change would break your build without you moving. Update the
+# pin deliberately.
 [dev-dependencies]
 # The kit is not published to a registry yet — depend on it by git until
 # then (a workspace-relative path like `../ktesio-conformance` only works
 # inside this repository; a git dependency works for any third party):
-ktesio-conformance = { git = "https://github.com/iMagdy/ktesio" }
+ktesio-conformance = { git = "https://github.com/iMagdy/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
 ```
 
 ```rust

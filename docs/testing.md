@@ -85,8 +85,12 @@ The **Conformance Test Kit (TCK)** is the systematic proof that an adapter honor
 A third-party adapter crate adds `ktesio-conformance` as a **dev-dependency** — before the crates publish (story 7-4), the workable pre-publish form is a git dependency:
 
 ```toml
+# Pin a full commit SHA: until the crates publish (story 7-4) a bare `git =`
+# dependency floats on this repo's default-branch HEAD, and a breaking
+# report-shape change would break your build without you moving. Update the
+# pin deliberately.
 [dev-dependencies]
-ktesio-conformance = { git = "https://github.com/iMagdy/ktesio" }
+ktesio-conformance = { git = "https://github.com/iMagdy/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
 ```
 
 Then author the `adapter.toml` and invoke the harness from the crate's own `#[test]`: `run_mock_conformance(&manifest_dir)` (the manifest shape) or `run_conformance(&TckAdapter::Native(kind.into()))` (a native builtin registered by kind). The caller asserts on the report (`is_conformant()`, `section(id)`, `failures()`) — the `tests/third_party_manifest.rs` file in `ktesio-conformance` is the exact third-party shape.

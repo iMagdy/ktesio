@@ -30,3 +30,6 @@ __pycache__/
 # Personal overrides need no rule here: the installer ships its own
 # _bmad/custom/.gitignore ("*.user.toml"), so _bmad/custom/config.user.toml
 # stays local on its own.
+
+# Retrospective/build review inputs — working artifacts, never committed
+_bmad-output/implementation-artifacts/story-*-review-diff.patch

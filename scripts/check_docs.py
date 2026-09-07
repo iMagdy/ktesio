@@ -37,6 +37,24 @@ STALE_PATTERNS = [
     'contract_version "0.3.0"',
     "contract_version = \"0.4.0\"",
     'contract_version "0.4.0"',
+    # Single-quote / compact spellings of the same stale seeds (review finding:
+    # the guard listed only double-quoted spaced forms; TOML accepts all four).
+    "contract_version = '0.1.0'",
+    "contract_version='0.1.0'",
+    "contract_version = '0.2.0'",
+    "contract_version='0.2.0'",
+    "contract_version = '0.3.0'",
+    "contract_version='0.3.0'",
+    "contract_version = '0.4.0'",
+    "contract_version='0.4.0'",
+    # Regression guards for two FIXED stale texts (epic-6 retro remediation):
+    # the breach-event field list that omitted the dollar dimension (the fix
+    # reads "… metering source, timestamp — the dimension is `tokens` or
+    # `dollars` …"), and the hermes native-memory misstatement (commands).
+    # Deliberately narrow: "(tokens only)" alone also appears in legitimate
+    # token-total prose.
+    "timestamp; tokens only",
+    "own[s] their memory entirely",
 ]
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")

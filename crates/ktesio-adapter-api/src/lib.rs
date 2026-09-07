@@ -43,10 +43,11 @@
 //! ([`negotiate_contract_version`]). The `cargo-semver-checks` CI job guards
 //! the crate's Rust API on two baselines: an **armed in-repo baseline** that
 //! diffs this surface against the contract-v1 freeze commit (`4119db3`) on
-//! every run (retro #160 — an unannounced public-item removal/rename fails
-//! CI), and the crates.io-published baseline, which stays dormant
-//! (notice-only) until the crates publish at story 7-4. The docs say so
-//! plainly.
+//! every run (retro #160 — any breaking public-surface change vs the freeze
+//! baseline fails CI, announced or not; announcement enforcement is review
+//! discipline in the pre-publish window), and the crates.io-published
+//! baseline, which stays dormant (notice-only) until the crates publish at
+//! story 7-4. The docs say so plainly.
 
 mod adapter;
 mod capability;

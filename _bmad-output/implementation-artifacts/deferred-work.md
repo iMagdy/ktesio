@@ -1,5 +1,10 @@
 # Deferred Work
 
+<!-- Entry convention (epic-6 retro, item 8): `summary:` states the gap; `evidence:` says why it is
+     real; `resolved: <what landed> <date>` is the LAST key of the entry, appended only when the fix
+     ships (with the PR/commit ref). An entry WITHOUT a `resolved:` line is open — the file is swept
+     at each retrospective. -->
+
 Findings surfaced incidentally during quick-dev reviews that are out of scope for the triggering change. Collected for later focused attention.
 
 ## Resolution convention (adopted 2026-09-05, epic-6 retro action item 8 / issue #167)
@@ -73,3 +78,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK harness is non-configurable — private 30s section timeout, fixed temp state root, no per-section selection — limiting third-party CI environments.
   evidence: Story 6-4 adversarial review (blind-hunter); API-surface design beyond story 6-4's captured intent; candidate for a future ergonomics story alongside the 6-6 contract freeze.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-epic-6-retro-remediation.md` (epic-6 retro #163/B11 residual)
+  summary: The subject-declared `memory.dir` delivery proof covers only the hermes builtin (an engine test over the shim `--dump` seam); a THIRD-PARTY manifest adapter's own declared delivery is still proven only on the TCK probe twin's env var — the memory section has no subject-delivery leg for manifest subjects.
+  evidence: Retro remediation review (blind-hunter finding on the remediation diff, 2026-09-05): closing it generally needs a subject `--dump` seam convention for manifest adapters, which is a contract/docs decision (document the `--dump` proof convention) rather than test-only work.

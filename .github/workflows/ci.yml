@@ -440,6 +440,14 @@ jobs:
               # probe cannot run; install must replace, not abort.
               cargo +stable install cargo-semver-checks --locked --force
               echo "installed=true" >> "$GITHUB_OUTPUT"
+            else
+              # Presence is not runnability: a cache-restored binary that
+              # cannot execute would red the ARMED baseline run below on
+              # infra, not on a surface break. Verify, replace if broken.
+              cargo-semver-checks --version >/dev/null 2>&1 || {
+                cargo +stable install cargo-semver-checks --locked --force
+                echo "installed=true" >> "$GITHUB_OUTPUT"
+              }
             fi
           else
             # Probe the binary DIRECTLY, never as `cargo cargo-semver-checks`:
@@ -459,24 +467,32 @@ jobs:
           fi
           # ARMED in-repo baseline guard (#160, epic-6 retro A1): diff the
           # frozen adapter-contract v1 Rust surface of ktesio-adapter-api
-          # against the freeze commit 4119db3. Until 7-4 publishes a crates.io
-          # baseline (the flow below stays dormant, emitting its notice), THIS
-          # run fails red on any unannounced public-item removal/rename —
-          # no other gate catches that today. `--baseline-rev` is a stable
-          # cargo-semver-checks CLI flag (verified on the installed stable
-          # build; a local run vs 4119db3 is green and a surface break fails
-          # with `function_missing` major checks). When 7-4 arms the crates.io
-          # flow, this in-repo run may be retired or kept as the fast
-          # pre-publish guard — retiring it is a docs+comment change, not a
-          # gate removal.
+          # against the freeze commit 4119db3. The guard fires on ANY breaking
+          # surface change vs the baseline (removal, rename, signature) —
+          # whether or not it was announced; announcement enforcement is
+          # review discipline until 7-4 gives the crates.io flow a real
+          # baseline to diff release-to-release.
+          #
+          # Maintenance: at the NEXT contract major (a deliberate, announced
+          # v2 freeze), update this SHA — and its copy in
+          # scripts/test_automation.py — to the new freeze commit. The baseline
+          # build resolves the freeze commit's OWN dependencies; if one is ever
+          # yanked/deleted upstream, the guard reds on infra — bump the SHA to
+          # a known-good commit rather than debugging the gate. The cat-file
+          # check below keeps a history-rewrite/GC failure a CLEAR error
+          # instead of a confusing semver-checks resolution abort.
+          git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit} || {
+            echo "::error::semver baseline rev 4119db37… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
+            exit 1
+          }
           cargo +stable semver-checks check-release -p ktesio-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
               200)
-                # The binary was ensured above (the in-repo guard needs it
-                # every run); this crates.io branch re-probes and only
-                # reinstalls on a genuine version mismatch.
+                # The binary was ensured above; the crates.io baseline (once
+                # story 7-4 publishes) is the authoritative release-to-release
+                # gate — no version re-probe happens here.
                 cargo +stable semver-checks check-release -p "$crate"
                 ;;
               404)

@@ -32,8 +32,4 @@ Both upstreams move fast (opencode ships multiple releases per week; Hermes merg
 
 ## Troubleshooting: hermes won't launch
 
-- **`hermes: command not found` (or an equivalent launch failure naming the executable)** — the `hermes` binary is not on the `PATH` of the environment `kt` (or the process that started it) runs in. Install Hermes and make sure a plain `hermes --version` works in the same shell/account `kt` runs under; a `kt` daemonized or launched from a different context may see a different `PATH`.
-- **Gateway starts and immediately fails** — check `kt agent logs <name>` for the gateway's own startup error (port conflicts, an existing per-profile service gateway, a refusing `--force`). The declared launch is foreground (`gateway run --external-supervisor`); a Hermes profile already supervised by its own OS service must be stopped there first.
-- **Behavior drift after a Hermes upgrade** — check this page's validation pin: if the pin names an older version than you installed, re-validate (or pin your installed version down) before trusting lifecycle/metering behavior; see [the re-validation duty](#the-re-validation-duty).
-
-See [troubleshooting](troubleshooting.md) for the general Ktesio failure surfaces.
+Launch failures (`hermes: command not found`, immediate `failed`, or behavior drift after a Hermes upgrade) are diagnosed in [the canonical troubleshooting section](troubleshooting.md#hermes-wont-launch-command-not-found--immediate-failure) — kept in one place so the two pages cannot drift. This page owns the validation pins and the re-validation duty; that page owns the failure surfaces.

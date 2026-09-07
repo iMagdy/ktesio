@@ -100,48 +100,15 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
     let _env_guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- Sandbox setup: the PATH shim + the shim script (linger so the
-    // harness's lifecycle/pause sections can drive the subject).
+    // harness's lifecycle/pause sections can drive the subject). The guard
+    // restores the env in Drop — panic-safe by construction.
     let shim_dir = TempDir::new().unwrap();
     let _shim = install_shim(&shim_dir);
-
-    let original_path = std::env::var_os("PATH").map(|v| v.to_os_string());
-    let original_shim_args = std::env::var_os("HERMES_SHIM_ARGS");
-    let joined = {
-        let mut paths: Vec<PathBuf> =
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-        paths.insert(0, shim_dir.path().to_path_buf());
-        std::env::join_paths(paths).expect("join PATH")
-    };
-    // SAFETY: process-global mutation, done ONCE at this test's start before
-    // any child spawn, and RESTORED at the end (teardown below) — the same
-    // discipline `tests/hermes.rs` records for its PATH-dependent test.
-    unsafe {
-        std::env::set_var("PATH", &joined);
-        std::env::set_var("HERMES_SHIM_ARGS", "--linger-ms 600000");
-    }
+    let _env = unsafe { EnvRestore::install(&shim_dir, "--linger-ms 600000") };
 
     // THE harness call: register the shipping hermes builtin with a fresh
     // engine and run every section.
     let report: ConformanceReport = run_conformance(&TckAdapter::Native("hermes".to_string()));
-
-    // ---- Teardown BEFORE asserting, so a failing assert cannot leak the
-    // process-global mutation into other tests (review blind-3 discipline).
-    match original_path {
-        Some(original) => unsafe {
-            std::env::set_var("PATH", original);
-        },
-        None => unsafe {
-            std::env::remove_var("PATH");
-        },
-    }
-    match original_shim_args {
-        Some(original) => unsafe {
-            std::env::set_var("HERMES_SHIM_ARGS", original);
-        },
-        None => unsafe {
-            std::env::remove_var("HERMES_SHIM_ARGS");
-        },
-    }
 
     // ---- The report contract.
     assert_eq!(report.adapter_kind, "hermes");
@@ -215,6 +182,73 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
 /// test per binary" discipline, kept honest with a second such test.
 static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Panic-safe restore of the process-global env mutation: takes the originals
+/// at construction and restores them in `Drop`, so a panic anywhere between
+/// mutate and teardown cannot leak `PATH`/`HERMES_SHIM_ARGS` into this
+/// binary's other tests (review finding — the manual restore blocks only
+/// covered the non-panicking path).
+struct EnvRestore {
+    path: Option<std::ffi::OsString>,
+    shim_args: Option<std::ffi::OsString>,
+}
+
+impl EnvRestore {
+    /// Capture the originals and install the shim dir at the front of `PATH`
+    /// plus the scripted shim args. SAFETY: process-global mutation, performed
+    /// under [`PATH_LOCK`], before any child spawn.
+    unsafe fn install(shim_dir: &TempDir, shim_args: &str) -> Self {
+        let original_path = std::env::var_os("PATH").map(|v| v.to_os_string());
+        let original_shim_args = std::env::var_os("HERMES_SHIM_ARGS");
+        let joined = {
+            let mut paths: Vec<PathBuf> =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+            paths.insert(0, shim_dir.path().to_path_buf());
+            std::env::join_paths(paths).expect("join PATH")
+        };
+        unsafe {
+            std::env::set_var("PATH", &joined);
+            std::env::set_var("HERMES_SHIM_ARGS", shim_args);
+        }
+        Self {
+            path: original_path,
+            shim_args: original_shim_args,
+        }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        // SAFETY: restoring the captured originals under the same PATH_LOCK
+        // journey that installed them.
+        unsafe {
+            match self.path.take() {
+                Some(original) => std::env::set_var("PATH", original),
+                None => std::env::remove_var("PATH"),
+            }
+            match self.shim_args.take() {
+                Some(original) => std::env::set_var("HERMES_SHIM_ARGS", original),
+                None => std::env::remove_var("HERMES_SHIM_ARGS"),
+            }
+        }
+    }
+}
+
+/// Stops the named instance on Drop — a subject started with a 10-minute
+/// `--linger-ms` must never outlive a failed test (review finding: the
+/// success-path-only `stop` left a running orphan on any mid-closure error).
+struct StopOnDrop<'a, 'e> {
+    facade: &'a ktesio_engine::Blocking<'e>,
+    name: &'a str,
+}
+
+impl Drop for StopOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self
+            .facade
+            .stop(self.name, Some(std::time::Duration::from_secs(5)));
+    }
+}
+
 /// Retro #163 (finding B11): the memory section's probe twin proves the
 /// attach/deliver/detach MECHANISM, but on the probe's own declared env var —
 /// the SUBJECT's own declared delivery (hermes: `memory.dir` → `HERMES_HOME`)
@@ -228,30 +262,15 @@ fn hermes_subject_receives_the_managed_memory_dir_through_hermes_home() {
     let _env_guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- Sandbox setup: the PATH shim; the shim script carries the dump
-    // seam (plus linger so the started subject stays up while we poll).
+    // seam (plus linger so the started subject stays up while we poll). The
+    // guard restores the env in Drop — panic-safe by construction.
     let shim_dir = TempDir::new().unwrap();
     let _shim = install_shim(&shim_dir);
     let state = TempDir::new().unwrap();
     let dump = state.path().join("hermes-subject-memory-dump.txt");
     let dump_str = dump.to_string_lossy().into_owned();
-
-    let original_path = std::env::var_os("PATH").map(|v| v.to_os_string());
-    let original_shim_args = std::env::var_os("HERMES_SHIM_ARGS");
-    let joined = {
-        let mut paths: Vec<PathBuf> =
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-        paths.insert(0, shim_dir.path().to_path_buf());
-        std::env::join_paths(paths).expect("join PATH")
-    };
-    // SAFETY: process-global mutation, performed under PATH_LOCK, before any
-    // child spawn, and RESTORED before any assert (teardown below).
-    unsafe {
-        std::env::set_var("PATH", &joined);
-        std::env::set_var(
-            "HERMES_SHIM_ARGS",
-            format!("--dump {dump_str} --linger-ms 600000"),
-        );
-    }
+    let _env =
+        unsafe { EnvRestore::install(&shim_dir, &format!("--dump {dump_str} --linger-ms 600000")) };
 
     // Drive the SUBJECT through the public engine API (the same surface the
     // harness itself drives).
@@ -277,6 +296,13 @@ fn hermes_subject_receives_the_managed_memory_dir_through_hermes_home() {
         facade
             .start("hermes")
             .map_err(|e| format!("subject start: {e}"))?;
+        // From here to the end of the closure the subject is RUNNING with a
+        // 10-minute linger: the guard stops it on EVERY exit path, success or
+        // error — a failed proof must not orphan the process.
+        let _stop_guard = StopOnDrop {
+            facade: &facade,
+            name: "hermes",
+        };
         // EXACT-value proof: the subject's process received precisely the
         // managed dir through HERMES_HOME (the `env=` dump-line shape).
         let needle = format!("env=HERMES_HOME={}", managed.display());
@@ -297,6 +323,9 @@ fn hermes_subject_receives_the_managed_memory_dir_through_hermes_home() {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        // Detach needs a TERMINAL state: stop explicitly first (the guard
+        // below stays as the safety net for the error paths, and re-stopping
+        // a stopped instance is a swallowed no-op).
         let _ = facade.stop("hermes", Some(std::time::Duration::from_secs(5)));
         facade
             .detach_memory("hermes")
@@ -304,24 +333,5 @@ fn hermes_subject_receives_the_managed_memory_dir_through_hermes_home() {
         Ok(())
     };
     let outcome = subject_delivery();
-
-    // ---- Teardown BEFORE asserting (review blind-3 discipline).
-    match original_path {
-        Some(original) => unsafe {
-            std::env::set_var("PATH", original);
-        },
-        None => unsafe {
-            std::env::remove_var("PATH");
-        },
-    }
-    match original_shim_args {
-        Some(original) => unsafe {
-            std::env::set_var("HERMES_SHIM_ARGS", original);
-        },
-        None => unsafe {
-            std::env::remove_var("HERMES_SHIM_ARGS");
-        },
-    }
-
     outcome.unwrap_or_else(|detail| panic!("hermes subject memory delivery: {detail}"));
 }
