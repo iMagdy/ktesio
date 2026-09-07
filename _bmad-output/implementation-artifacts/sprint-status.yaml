@@ -93,8 +93,8 @@ development_status:
   6-5-validate-the-contract-against-opencode-on-paper: done  # 🎉 MERGED to main 2026-09-04 as 067c4a2 (PR #156 squash: 5d60f3f). Paper artifacts: characterization + conformance mapping pinned to anomalyco/opencode v1.18.27 @ 4b7e19e. 6 newly-opencode-covered axes of 23; CP-6.5-a…f proposals + freeze risks R1-R11 handed to 6-6 (none silently absorbed). 3 review lenses → 13 patches applied. No production code changes.
   6-6-freeze-and-publish-the-adapter-contract-v1: done  # 🎉 MERGED to main 2026-09-04 as 4119db3 (PR #157 squash: dc29e86). Adapter Contract v1 FROZEN: CONTRACT_VERSION 1.0.0 + same-major negotiation (both versions + rule named on rejection; 0.x not grandfathered; AI-6 closed); the ONE announced key-set edit (memory attach/detach --json, wire strings verbatim); CP-6.5-a..f + R1-R11 all verdicted; deprecation policy ratified (AI-68 closed); AI-3 cache fix landed. AI-64 independent mutation pass: 15 mutations, 14 killed, 1 hole closed with re-applied-mutation proof. 3 lenses + AI-64 → 18 patches. Battery: 1050 tests, 95.19%, 23 docs files. EPIC 6 COMPLETE.
   epic-6-retrospective: done
-  epic-7: backlog
-  7-1-drive-every-capability-through-the-library-alone: backlog
+  epic-7: in-progress
+  7-1-drive-every-capability-through-the-library-alone: review  # 2026-09-09: implemented + 3-lens review + 13 patches (breach-latch range semantics, orphan guard, torn-read tolerance, shared timing consts). Shared uj3 module in conformance; host test drives the full flow facade-only; CLI journey proves behavioral identity. No unreachable capability found. Lands in the epic-7 PR.
   7-2-subscribe-to-engine-events-with-stable-schemas: backlog
   7-3-embed-clean-no-tty-no-prompts-blocking-facade: backlog
   7-4-prove-the-boundary-and-publish-the-crates: backlog

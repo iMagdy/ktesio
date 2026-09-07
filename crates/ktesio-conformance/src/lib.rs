@@ -10,6 +10,13 @@
 //! * A **mock native adapter** ([`MockAdapter`]) and an **inert scripted fake
 //!   agent** ([`ScriptedFakeAgent`]), the reusable fixtures the engine's
 //!   lifecycle/governance tests (and the TCK's own probes) build on.
+//! * [`uj3`] — the story 7-1 shared UJ-3 flow expectations: the fixture
+//!   manifest, config keys/values, budget/rate/cap numbers, and assertion
+//!   helpers the LIBRARY host test (`ktesio-engine`'s `tests/
+//!   uj3_library_host.rs`) and the `kt` CLI journey test
+//!   (`crates/kt/tests/agent_cli.rs`) BOTH consume, so the two paths are
+//!   provably behaviorally identical. Test infrastructure — never a driving
+//!   surface (its own module docs carry the boundary).
 //!
 //! ## Dependency boundary (CRITICAL — why this is a DEV fixture downstream)
 //!
@@ -41,6 +48,7 @@ use ktesio_adapter_api::{
 };
 
 pub mod tck;
+pub mod uj3;
 
 pub use tck::{
     run_conformance, run_mock_conformance, section_ids, ConformanceReport, SectionReport,
