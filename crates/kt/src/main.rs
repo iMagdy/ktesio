@@ -27,6 +27,9 @@ Example:
 
 const AGENT_AFTER_HELP: &str = "\
 Details:
+  An agent is a third-party program you run — a personal agent such as Hermes
+  Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI —
+  that kt launches, supervises, meters, and budgets as a process.
   Manages Agent Instances in the Fleet. register creates an isolated Agent Home
   under a unique name from a native adapter (--kind) or a manifest adapter
   (--manifest <dir-or-file>), validating its Capability Declaration and Metering

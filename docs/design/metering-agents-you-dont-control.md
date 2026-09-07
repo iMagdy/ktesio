@@ -7,7 +7,7 @@ description: Why Ktesio meters an agent's model traffic at a boundary the agent 
 
 *Islam Magdy — creator of Ktesio · 7 September 2026*
 
-A long-running AI agent is a process that spends money every time it wakes up. An agent that loops, retries, or gets stuck in a tool cycle can write thousands of lines on next month's invoice before anyone looks.
+A long-running AI agent is a process that spends money every time it wakes up. By agent I mean a program you run for yourself that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. One that loops, retries, or gets stuck in a tool cycle can write thousands of lines on next month's invoice before anyone looks.
 
 What is new is how casually we run them. A service gets a supervisor, a restart policy, logs you can read after it dies, and a metric somebody is paged on. An agent gets a terminal window and a shell script. Nobody can stop it cleanly, nobody knows what it consumed in the last hour, and the first honest accounting arrives weeks later on a bill. I built Ktesio to run agents with the discipline I expect from services: start them, stop them, pause them, and know what they cost while they run, not after.
 

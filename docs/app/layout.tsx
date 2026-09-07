@@ -6,11 +6,11 @@ import { Provider } from './provider';
 
 export const metadata: Metadata = {
   description:
-    'Developer documentation for Ktesio, a Rust CLI for installing and sharing reusable agent skills.',
+    'Developer documentation for Ktesio, a Rust CLI and engine that runs AI agents like services: supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
   metadataBase: new URL('https://docs.ktesio.dev'),
   openGraph: {
     description:
-      'Developer documentation for Ktesio, a Rust CLI for installing and sharing reusable agent skills.',
+      'Developer documentation for Ktesio, a Rust CLI and engine that runs AI agents like services: supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
     images: ['/assets/ktesio-banner.png'],
     siteName: 'Ktesio Docs',
     title: 'Ktesio Docs',

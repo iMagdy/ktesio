@@ -10,6 +10,8 @@
 
 Ktesio is a Rust CLI and engine that **runs AI agents like services** — supervise their lifecycle, meter real token usage, and enforce dollar budgets. Register any agent, start and stop it under supervision, watch what it actually consumes, and set token and cost ceilings that stop runaway spend the moment they are crossed.
 
+**What "agent" means here.** A third-party program you run on your own machine or server that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Ktesio launches, supervises, meters, and budgets that program as a process. It is not a framework for writing agents, and it is not an agent itself.
+
 ## Why Ktesio?
 
 Long-running AI agents are processes that cost money on every call. Ktesio treats them like the services they are:
@@ -201,7 +203,7 @@ Plainly, four sections exercise **your adapter itself** — capability projectio
 
 ## Project Status
 
-Ktesio is early and moving fast. The lifecycle, layered configuration, secrets, the Usage Ledger, token budgets, dollar cost caps, and engine-observed metering are implemented today. A supervising daemon (durable cross-invocation supervision and a Host event stream) and a richer native adapter surface are on the roadmap.
+Ktesio is early and moving fast. The lifecycle, layered configuration, secrets, the Usage Ledger, token budgets, dollar cost caps, and engine-observed metering are implemented today. The Hermes Agent adapter ships as a native builtin (`--kind hermes`); OpenCode has been validated against the Adapter Contract on paper, with no shipped adapter yet; any other agent registers through an `adapter.toml` manifest that declares how to launch it and where its usage numbers come from. A supervising daemon (durable cross-invocation supervision and a Host event stream) and a richer native adapter surface are on the roadmap.
 
 ## License
 

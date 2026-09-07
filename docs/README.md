@@ -9,6 +9,8 @@ description: Run AI agents like services — supervise their lifecycle, meter re
 
 Welcome to the Ktesio docs. Ktesio is a Rust CLI and engine that **runs AI agents like services**: register any agent, supervise its lifecycle, meter its real token usage, and enforce token and dollar budgets. These pages explain how to install it, run agents, configure them, and contribute.
 
+By *agent* these pages mean a third-party program you run for yourself that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Ktesio runs that program as a supervised, metered process; it is not a framework for writing agents.
+
 ## Start Here
 
 - [Getting started](get-started.md)

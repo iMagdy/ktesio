@@ -25,7 +25,7 @@ Examples of larger changes:
 - Security-sensitive logic
 - Breaking changes
 - Changes to public APIs or file formats
-- Features related to future agent support
+- Adapter Contract changes or new agent adapters
 
 ## Contributor License Agreement
 

@@ -1,8 +1,10 @@
 # Agent Notes
 
-Ktesio is being repositioned from a skills package manager into a unified
-runner for personal agents (runtime controls, config, memory wiring, token
-limits, and cost caps). Planning for that pivot runs through the BMAD Method;
+Ktesio runs third-party AI agents like services — personal agents such as
+Hermes Agent or OpenClaw, and coding agents such as OpenCode or GitHub Copilot
+CLI — with runtime controls, config, memory wiring, token limits, and cost caps.
+It was repositioned from a skills package manager; the legacy skill-manager
+command surface was removed in v0.6.0. Planning runs through the BMAD Method;
 its artifacts (`_bmad-output/` — plans, specs, sprint status, retrospectives)
 and its toolchain (`_bmad/`) are **tracked in git** and are part of the repo's
 open workflow record (the 2026-08-27 reversal in `.gitignore` documents why:
@@ -13,8 +15,8 @@ changes that make them stale.
 When working here:
 
 - Prefer the public docs in `README.md` and `docs/` for current, shipping
-  behavior (the `kt` skills CLI). Treat the runner pivot as in progress: do
-  not document or ship runner features until their BMAD story lands.
+  behavior (the `kt agent` runner). Runner features land story by story;
+  document each one in the same change that ships it.
 - Before handing off code changes, run:
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets -- -D warnings`

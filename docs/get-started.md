@@ -5,7 +5,7 @@ description: Register an AI agent, give it a budget, inspect it, and run it unde
 
 # Quickstart
 
-This guide runs an agent through Ktesio end to end: register it, budget it, inspect the Fleet, and drive its lifecycle.
+This guide runs an agent through Ktesio end to end: register it, budget it, inspect the Fleet, and drive its lifecycle. The agent can be any third-party agent program you can launch as a process: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI.
 
 ## Install Ktesio
 
