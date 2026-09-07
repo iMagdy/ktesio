@@ -12,6 +12,8 @@
     "adapter-contract",
     "---Internals---",
     "architecture",
+    "---Design---",
+    "design/metering-agents-you-dont-control",
     "---Project Workflows---",
     "testing",
     "contributing",
