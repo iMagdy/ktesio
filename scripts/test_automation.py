@@ -407,6 +407,39 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn('if [ "$cached" != "$version" ]; then', ci)
         # The old constant key must not resurface.
         self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
+        # In-repo baseline guard (#160, epic-6 retro A1): the frozen
+        # ktesio-adapter-api v1 surface is diffed against the contract-v1
+        # freeze commit on EVERY run — the crates.io gate below it stays
+        # dormant (404 -> notice) until story 7-4, so this run is the active
+        # guard against an unannounced public-item removal/rename. The
+        # baseline rev must be the full freeze-commit SHA; `--baseline-rev`
+        # is a stable cargo-semver-checks flag (verified locally: green vs
+        # 4119db3, `function_missing` failure on a removed pub item).
+        self.assertIn(
+            "cargo +stable semver-checks check-release -p ktesio-adapter-api "
+            "--baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e",
+            ci,
+        )
+        # The baseline lookup needs full history: the semver job's checkout
+        # must override the default shallow clone. Scoped to the SEMVER JOB
+        # BLOCK ONLY (up to the next job heading): a `fetch-depth: 0` in some
+        # later job must not false-pass the semver checkout's pin.
+        semver_start = ci.index("\n  semver:")
+        # The next JOB heading is the next line at exactly two-space indent
+        # starting a word (`\n  <name>:`) — lines inside the job are indented
+        # four or more spaces, so a naive "next two spaces" slice would cut
+        # inside the job body and empty the assertion's haystack.
+        import re as _re
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[semver_start + 1 :])
+        semver_job = ci[semver_start : semver_start + 1 + next_job.start()]
+        self.assertIn("fetch-depth: 0", semver_job)
+        # The baseline rev must be verified resolvable BEFORE the gate runs —
+        # a history rewrite/shallow clone is a CLEAR infra error, never a
+        # confusing semver-checks resolution abort. Maintenance contract: at
+        # the next contract major, bump the SHA here AND in ci.yml together.
+        self.assertIn(
+            "git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit}", ci
+        )
 
     def test_ci_enforces_msrv_floor(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(

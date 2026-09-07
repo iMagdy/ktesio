@@ -147,8 +147,9 @@ impl AgentAdapter for MockAdapter {
     }
 
     // Lifecycle ops intentionally use the trait's default (unavailable) bodies:
-    // execution is story 1-4. Overriding them here with real process spawning is
-    // explicitly out of scope this story.
+    // the mock is an INERT fixture — it spawns nothing, and the engine's
+    // supervisor owns real execution. Overriding them with process spawning is
+    // explicitly out of scope for a conformance fixture.
 }
 
 /// One step in a [`ScriptedFakeAgent`]'s canned lifecycle script.
@@ -218,7 +219,7 @@ impl ScriptedFakeAgent {
 pub fn probe_inert_start(adapter: &MockAdapter) -> AdapterError {
     adapter
         .start()
-        .expect_err("mock start must be inert (unavailable) until story 1-4")
+        .expect_err("mock start must be inert (the trait's unavailable default body)")
 }
 
 /// Locate the `fake_agent` test helper binary (story 1.4, AD-3).

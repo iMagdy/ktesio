@@ -11,16 +11,16 @@
 //! * **accessors** for the adapter's [`CapabilityDeclaration`] and
 //!   [`MeteringSource`], which the engine reads at registration.
 //!
-//! ## NOTHING is executed this story (CRITICAL boundary)
+//! ## The trait declares; the engine executes (durable boundary)
 //!
 //! Lifecycle EXECUTION — actually starting/stopping/pausing a process, the
-//! manifest executor, the process launch — is **story 1-4**. This story stores
-//! and validates declarations and templates only. The lifecycle methods exist so
-//! the interface is complete (a native adapter can implement them; the mock does,
-//! inertly) and so the trait documents what manifest templates must cover. The
-//! engine's registration path calls **only** the accessors, never a lifecycle
-//! op. `[ASSUMPTION]` the exact lifecycle method set is minimal and seeded here;
-//! 1-4 and the conformance TCK (6.4) widen it.
+//! process launch — lives in the ENGINE's supervisor and its process backends,
+//! never in this crate. The lifecycle methods exist so the interface is
+//! complete (a native adapter can implement them; the mock does, inertly) and
+//! so the trait documents what manifest templates must cover. The engine's
+//! registration path calls **only** the accessors, never a lifecycle op; the
+//! default lifecycle bodies report [`AdapterError::Unavailable`] so an inert
+//! adapter fails explicitly, never silently.
 
 use thiserror::Error;
 
@@ -28,12 +28,13 @@ use crate::capability::CapabilityDeclaration;
 use crate::config::ConfigMapping;
 use crate::metering::MeteringSource;
 
-/// An error from an adapter lifecycle op (spine AD-3; seed surface).
+/// An error from an adapter lifecycle op (spine AD-3).
 ///
-/// `thiserror`, never `miette` (adapter-api conventions). Kept minimal this
-/// story — real execution failures (spawn errors, timeouts) are modeled by the
-/// executor in 1-4. The single variant lets the inert mock return a typed error
-/// shape without implying any process semantics yet.
+/// `thiserror`, never `miette` (adapter-api conventions). Real execution
+/// failures (spawn errors, timeouts) are modeled by the engine's executor; the
+/// single [`AdapterError::Unavailable`] variant lets an inert adapter (the
+/// trait's default bodies, the mock fixture) return a typed error shape
+/// without implying any process semantics.
 #[derive(Debug, Error)]
 pub enum AdapterError {
     /// The lifecycle op is not available (e.g. an inert fixture, or a capability
@@ -53,8 +54,9 @@ pub enum AdapterError {
 /// an engine-side view built from a validated `adapter.toml`. The engine treats
 /// both identically through the accessors (AD-3 "two kinds, one trait").
 ///
-/// The trait is deliberately small this story. Lifecycle methods are present but
-/// **unused by the engine** (execution is 1-4); only [`AgentAdapter::kind`],
+/// The trait is deliberately small. The engine's supervisor drives the
+/// lifecycle through its own process backends (an adapter's trait lifecycle
+/// methods are the DECLARATION surface, not the execution path); only [`AgentAdapter::kind`],
 /// [`AgentAdapter::capabilities`], and [`AgentAdapter::metering_source`] are read
 /// at registration.
 pub trait AgentAdapter {
@@ -88,39 +90,50 @@ pub trait AgentAdapter {
         ConfigMapping::default()
     }
 
-    /// Start the agent. **Not executed this story** (1-4 owns execution).
+    /// Start the agent.
     ///
-    /// A native adapter implements the real launch in 1-4; here the method
-    /// exists to complete the interface. The default body reports the op as
-    /// unavailable so an accidental early call is explicit rather than silent.
+    /// The default body reports the op as unavailable so an adapter that does
+    /// not implement it (e.g. an inert fixture) fails explicitly rather than
+    /// silently; adapters with a real launch override this op.
     fn start(&self) -> Result<(), AdapterError> {
         Err(AdapterError::Unavailable {
             op: "start",
-            reason: "lifecycle execution is not implemented until story 1-4".to_string(),
+            reason:
+                "this adapter does not implement lifecycle ops (the trait's inert default body)"
+                    .to_string(),
         })
     }
 
-    /// Stop the agent. **Not executed this story** (1-4 owns execution).
+    /// Stop the agent. The default body reports the op as unavailable (an
+    /// inert adapter fails explicitly, never silently).
     fn stop(&self) -> Result<(), AdapterError> {
         Err(AdapterError::Unavailable {
             op: "stop",
-            reason: "lifecycle execution is not implemented until story 1-4".to_string(),
+            reason:
+                "this adapter does not implement lifecycle ops (the trait's inert default body)"
+                    .to_string(),
         })
     }
 
-    /// Pause the agent. **Not executed this story** (1-4/1-5 own execution).
+    /// Pause the agent. The default body reports the op as unavailable (an
+    /// inert adapter fails explicitly, never silently).
     fn pause(&self) -> Result<(), AdapterError> {
         Err(AdapterError::Unavailable {
             op: "pause",
-            reason: "lifecycle execution is not implemented until story 1-4".to_string(),
+            reason:
+                "this adapter does not implement lifecycle ops (the trait's inert default body)"
+                    .to_string(),
         })
     }
 
-    /// Resume the agent. **Not executed this story** (1-4/1-5 own execution).
+    /// Resume the agent. The default body reports the op as unavailable (an
+    /// inert adapter fails explicitly, never silently).
     fn resume(&self) -> Result<(), AdapterError> {
         Err(AdapterError::Unavailable {
             op: "resume",
-            reason: "lifecycle execution is not implemented until story 1-4".to_string(),
+            reason:
+                "this adapter does not implement lifecycle ops (the trait's inert default body)"
+                    .to_string(),
         })
     }
 }
@@ -169,12 +182,17 @@ mod tests {
     }
 
     #[test]
-    fn default_lifecycle_ops_report_unavailable_this_story() {
+    fn default_lifecycle_ops_report_unavailable_with_an_honest_reason() {
+        // Retro #163 (finding B9): the frozen default bodies name their
+        // inertness plainly — no stale development-story reference survives in
+        // a public error surface.
         let p = probe();
         for result in [p.start(), p.stop(), p.pause(), p.resume()] {
             let err = result.unwrap_err();
             let AdapterError::Unavailable { reason, .. } = &err;
-            assert!(reason.contains("1-4"), "{err}");
+            assert!(reason.contains("does not implement lifecycle ops"), "{err}");
+            assert!(reason.contains("inert default"), "{err}");
+            assert!(!reason.contains("story"), "{err}");
         }
     }
 

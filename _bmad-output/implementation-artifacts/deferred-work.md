@@ -1,6 +1,15 @@
 # Deferred Work
 
+<!-- Entry convention (epic-6 retro, item 8): `summary:` states the gap; `evidence:` says why it is
+     real; `resolved: <what landed> <date>` is the LAST key of the entry, appended only when the fix
+     ships (with the PR/commit ref). An entry WITHOUT a `resolved:` line is open — the file is swept
+     at each retrospective. -->
+
 Findings surfaced incidentally during quick-dev reviews that are out of scope for the triggering change. Collected for later focused attention.
+
+## Resolution convention (adopted 2026-09-05, epic-6 retro action item 8 / issue #167)
+
+When a deferred entry is fixed, its bullet gains a trailing marker line — `resolved: <ref> <date>` — naming the PR, commit, or change that resolved it and the date. Resolved entries STAY listed (the record of what was once deferred is part of the audit trail); a sweep greps for entries without a `resolved:` marker. Un-resolved entries have no marker, so "still open" is greppable as the absence of `resolved:` within the entry.
 
 ## From AI-17 (pin workspace toolchain to 1.96.1) — review, 2026-07-06
 
@@ -48,12 +57,14 @@ Findings surfaced incidentally during quick-dev reviews that are out of scope fo
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: No user-facing doc that `model` is a silent no-op for the hermes kind (Decision 6) — discoverable only in code comments/tests.
   evidence: `docs/commands.md` hermes paragraph documents HERMES_HOME mapping but not the deliberately unmapped `model` key; pre-existing gap unrelated to the 13 triaged findings.
+  resolved: PR #152 (docs/editorial) 2026-09-04 — the hermes paragraph now names `model` as a deliberately unmapped key.
 
 ## Deferred from: code review of spec-6-3-govern-and-interact-with-hermes-end-to-end-uj-1-for-real (2026-08-31)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-3-govern-and-interact-with-hermes-end-to-end-uj-1-for-real.md`
   summary: architecture.md:68 breach-record sentence's "(…; tokens only)" parenthetical is stale since story 3-3 — `BudgetBreachEvent` also carries `dimension` plus `dollar_limit`/`dollar_observed`/`estimate_label` on dollar breaches (event.rs:507-525).
   evidence: The rewritten Budget-enforcement paragraph kept the pre-existing parenthetical; the dollar fields shipped in story 3-3 and the sentence was out of this story's minimal-edit scope.
+  resolved: epic-6-retro remediation PR (docs hygiene batch, #165/D2) 2026-09-05 — the sentence now names `dimension` and the additive dollar fields.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK polling helpers hard-code engine storage internals (usage_events/agent_instances SQLite schema, agents/<name>/logs/agent.log path, adapter.json snapshot layout) instead of public engine seams.
@@ -67,3 +78,7 @@ Findings surfaced incidentally during quick-dev reviews that are out of scope fo
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK harness is non-configurable — private 30s section timeout, fixed temp state root, no per-section selection — limiting third-party CI environments.
   evidence: Story 6-4 adversarial review (blind-hunter); API-surface design beyond story 6-4's captured intent; candidate for a future ergonomics story alongside the 6-6 contract freeze.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-epic-6-retro-remediation.md` (epic-6 retro #163/B11 residual)
+  summary: The subject-declared `memory.dir` delivery proof covers only the hermes builtin (an engine test over the shim `--dump` seam); a THIRD-PARTY manifest adapter's own declared delivery is still proven only on the TCK probe twin's env var — the memory section has no subject-delivery leg for manifest subjects.
+  evidence: Retro remediation review (blind-hunter finding on the remediation diff, 2026-09-05): closing it generally needs a subject `--dump` seam convention for manifest adapters, which is a contract/docs decision (document the `--dump` proof convention) rather than test-only work.

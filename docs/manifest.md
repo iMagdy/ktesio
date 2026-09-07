@@ -139,7 +139,7 @@ The engine stamps the Run id, the instance, the Metering Source, and the timesta
 
 ### `[interaction]`
 
-Interaction channel wiring. Optional: omitting this section entirely still means `"stdio"` — the engine unconditionally pipes stdin for every spawned process, regardless of what (or whether) this section says.
+Interaction channel wiring. Optional: omitting this section entirely still means `"stdio"` — the declared channel is documentary (the engine never branches on it); the stdin pipe follows the adapter's `interaction` **capability declaration** instead, delivered iff the current-OS level is `guaranteed`/`best-effort` (see [the Adapter Contract](adapter-contract.md#interaction-channels)).
 
 | Field | Type | Meaning |
 |-------|------|---------|

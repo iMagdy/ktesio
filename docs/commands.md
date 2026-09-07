@@ -50,7 +50,9 @@ kt agent show demo
 kt agent show demo --json
 ```
 
-The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.## `kt agent usage [<name>] [--json]`
+The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.
+
+## `kt agent usage [<name>] [--json]`
 
 Read Usage Ledger totals for one instance, or for the whole Fleet.
 
@@ -210,7 +212,7 @@ kt agent remove my-agent --force
 Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
 
 - **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
-- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Ktesio guarantees only that the Agent Home itself persists. Attaching it creates no directory. On adapters that own their memory entirely (e.g. `hermes`), the engine does not inject a `HERMES_HOME`-style environment override at start either — the agent's own mechanism locates its home; Ktesio surfaces the computed path for reference only.
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Ktesio guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
 
 ```bash
 kt agent memory attach demo --kind filesystem
@@ -228,7 +230,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
 
 ### `memory attach --json`
 
-`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the adapter's declared config mapping targets the reserved `memory.dir` key, i.e. whether the injected path will actually reach the agent (always `false` for `native`, which delivers nothing):
+`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the injected path will actually reach the agent. `declared` reads `true` when the attached backing is `filesystem` AND the adapter's declared config mapping targets the reserved `memory.dir` key (the builtin `hermes` does — its mapping delivers `memory.dir` as `HERMES_HOME` — so a hermes instance with a filesystem backing reads `"declared": true`). It reads `false` when the mapping targets nothing, and also when the attached backing is `native` — for a `native` backing the `false` means "no delivery is offered", not "the adapter declined": nothing is delivered at start, so there is no delivery to declare.
 
 ```json
 {
@@ -241,7 +243,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
 }
 ```
 
-A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false`. The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
+A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false` (no delivery is offered for a `native` backing — see above; this says nothing about the adapter, and a `hermes` instance with a `filesystem` backing reads `true`). The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
 
 For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Ktesio says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 
@@ -354,7 +356,7 @@ Every `kt` command returns one of these numeric exit codes, so failures can be b
 | Code | Meaning | Typical causes |
 |------|---------|----------------|
 | `0` | Success | The command completed; `--help` and `--version` also exit `0` |
-| `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter declaring no capabilities or no metering source, a failed self-update |
+| `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter manifest whose `contract_version` major does not match this engine's (the FR-30 negotiation gate — the error names both versions and the rule), an adapter declaring no capabilities or no metering source, a failed self-update |
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
 | `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
