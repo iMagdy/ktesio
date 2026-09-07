@@ -52,7 +52,7 @@ The bet is that consistency itself is the product. Agents become interchangeable
 
 *Downstream workflows must use these terms exactly; synonyms are a discipline violation.*
 
-- **Agent** — a third-party personal-agent program (e.g. Hermes Agent) that Ktesio runs. Not authored by Ktesio.
+- **Agent** — a third-party agent program that Ktesio runs: a personal agent (e.g. Hermes Agent, OpenClaw) or a coding agent (e.g. opencode, GitHub Copilot CLI). Not authored by Ktesio. `[FIXED — clarified by Islam 2026-09-07: coding agents are in scope by definition, not only by FR-29's choice of opencode as the second agent.]`
 - **Adapter** — the integration component that makes one Agent runnable by the Engine by satisfying the Adapter Contract. One Adapter per Agent kind.
 - **Adapter Contract** — the versioned, documented specification an Adapter implements: lifecycle operations, config mapping, Metering Source declaration, memory attachment, interaction channel, and a Capability Declaration.
 - **Capability Declaration** — the Adapter's machine-readable statement of which controls it supports as *guaranteed*, *best-effort*, or *unsupported* (e.g. pause: best-effort).
