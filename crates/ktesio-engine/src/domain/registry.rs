@@ -786,7 +786,9 @@ impl Registry {
     /// [`crate::adapter::resolve_start_launch`] using the kind + manifest path
     /// (which resolves a launchable native builtin's code-declared launch since
     /// story 6-2, keeps erroring `NativeHasNoLaunch` for inert natives like
-    /// `mock`, and re-reads the manifest for a legacy snapshot).
+    /// `mock`, re-reads the manifest for a legacy snapshot, and RE-NEGOTIATES
+    /// the contract version on that re-read — retro #161 — so a manifest
+    /// drifted to a foreign major after registration fails the start).
     pub(crate) fn adapter_launch_facts(
         &self,
         name: &InstanceName,

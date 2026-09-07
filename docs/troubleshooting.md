@@ -36,6 +36,14 @@ native adapter kind 'mock' has no launch command; supply a manifest adapter
 
 Register a **manifest adapter** whose `[lifecycle.start]` declares a real `exec` to start a process.
 
+## Hermes Won't Launch ("command not found" / immediate failure)
+
+The `hermes` builtin launches the real Hermes gateway by the bare executable name `hermes`, resolved through the `PATH` of the environment `kt` runs in — Ktesio does not bundle or install it.
+
+- **`hermes: command not found` (a launch failure naming the executable)** — install Hermes and confirm a plain `hermes --version` works in the same shell/account `kt` runs under; a `kt` started from a different context may see a different `PATH`.
+- **Starts, then lands `failed`** — read `kt agent logs <name>` for the gateway's own startup error (port conflict, or a Hermes profile already supervised by its own OS service; the declared launch is the foreground `gateway run --external-supervisor`, so stop the service-managed gateway first).
+- **Behavior drift after a Hermes upgrade** — check [the supported-agents page](agents.md) validation pin and its re-validation duty before trusting lifecycle/metering behavior.
+
 ## Agent Shows `failed` After Starting
 
 A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. A later, separate `kt agent list` then reports the instance as `failed` because the supervised process is gone.

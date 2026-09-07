@@ -20,6 +20,7 @@ Welcome to the Ktesio docs. Ktesio is a Rust CLI and engine that **runs AI agent
 
 - [Adapter Contract](adapter-contract.md)
 - [Adapter manifest (`adapter.toml`)](manifest.md)
+- [Supported agents](agents.md)
 - [Architecture](architecture.md)
 
 ## Design

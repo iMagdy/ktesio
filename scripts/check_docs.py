@@ -27,7 +27,12 @@ STALE_PATTERNS = [
     "most kt commands need git at runtime",
     'depends_on "git"',
     # Older contract revisions must not resurface outside CHANGELOG/release notes
-    # (narrow patterns so version-history files keep passing).
+    # (narrow patterns so version-history files keep passing). The freeze policy
+    # names the WHOLE 0.x seed family — 0.1.0/0.2.0 included (retro #165, D3).
+    "contract_version = \"0.1.0\"",
+    'contract_version "0.1.0"',
+    "contract_version = \"0.2.0\"",
+    'contract_version "0.2.0"',
     "contract_version = \"0.3.0\"",
     'contract_version "0.3.0"',
     "contract_version = \"0.4.0\"",

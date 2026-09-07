@@ -1776,8 +1776,11 @@ fn render_effective_config(
 /// strings adopted VERBATIM) writes a single versioned
 /// [`MemoryAttachDocument`] to STDOUT and nothing else there (AD-14). Only
 /// THIS mode performs the extra `memory_status` read-back that fills
-/// `declared` (the DC-10 delivery fact: whether the adapter's declared config
-/// mapping actually targets the reserved key — always `false` for `native`)
+/// `declared` (the DC-10 delivery fact: whether the injected path will actually
+/// reach the agent — `true` only for a `filesystem` backing whose adapter maps
+/// `memory.dir` (the `hermes` builtin does, via `HERMES_HOME`); `false` for a
+/// mapping-less adapter and also for a `native` backing, where it means "no
+/// delivery is offered", not "the adapter declined")
 /// and `guarantee`; the human path stays byte-identical to its pre-freeze
 /// behavior (one attach call, the guarantee computed locally from the kind),
 /// so it can never fail where it succeeded before the wire existed.
@@ -1821,7 +1824,13 @@ pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn s
                 }
                 .into())
             }
-            Err(err) => return Err(map_error(err)),
+            // Retro #166 (finding B10): by this point the attach PERSISTED —
+            // the backing REMAINS attached — so an errored read-back must say
+            // so, never surface as a generic failure an operator could read
+            // as "the attach failed". Name the partial state + the remediation
+            // (the same-kind re-attach is an idempotent success, and
+            // `memory detach` undoes it).
+            Err(err) => return Err(attach_readback_failed(name, kind, &err).into()),
         };
         // A machine-consumable document must never carry U+FFFD replacement
         // characters: a managed path that is not valid UTF-8 is a NAMED error,
@@ -1864,6 +1873,23 @@ pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn s
     // COMPUTED location only (nothing was created).
     println!("{}", dir.display());
     Ok(())
+}
+
+/// Compose the `memory attach --json` read-back-failure diagnostic (retro
+/// #166, finding B10). The caller only reaches here AFTER the attach
+/// persisted, so the message must name the partial state — the backing
+/// REMAINS attached, nothing was rolled back — plus the underlying cause and
+/// both remediations, never a generic failure an operator could read as "the
+/// attach failed".
+fn attach_readback_failed(name: &str, kind: &str, err: &RegistryError) -> AgentIo {
+    AgentIo {
+        message: format!(
+            "Attached the Memory Backing to '{name}', but reading the attachment back failed: \
+             {err}. The attachment REMAINS attached (nothing was rolled back) — re-run \
+             `kt agent memory attach {name} --kind {kind} --json` (a same-kind re-attach is an \
+             idempotent success) or undo it with `kt agent memory detach {name}`."
+        ),
+    }
 }
 
 /// `kt agent memory detach <name> [--json]` — detach an Agent Instance's Memory
@@ -2447,6 +2473,43 @@ mod tests {
         assert!(
             msg.contains("docs/adapter-contract.md"),
             "points at the policy page: {msg}"
+        );
+    }
+
+    #[test]
+    fn attach_readback_failure_names_the_persisted_attachment() {
+        // Retro #166 (finding B10): after a persisted attach, an errored
+        // --json read-back must name the partial state — the backing REMAINS
+        // attached — plus the underlying cause and both remediations, never a
+        // generic failure an operator could read as "the attach failed".
+        // (The read-back cannot be faulted end-to-end without a store-fault
+        // harness, so the composed diagnostic is pinned at this seam.)
+        let err = attach_readback_failed(
+            "demo",
+            "filesystem",
+            &RegistryError::Io {
+                name: "demo".into(),
+                path: "/x/agents/demo".into(),
+                source: std::io::Error::other("boom"),
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Attached the Memory Backing to 'demo'"),
+            "names the completed attach: {msg}"
+        );
+        assert!(
+            msg.contains("REMAINS attached"),
+            "names the partial state: {msg}"
+        );
+        assert!(msg.contains("boom"), "carries the underlying cause: {msg}");
+        assert!(
+            msg.contains("kt agent memory attach demo --kind filesystem --json"),
+            "gives the re-run remediation: {msg}"
+        );
+        assert!(
+            msg.contains("kt agent memory detach demo"),
+            "gives the undo remediation: {msg}"
         );
     }
 

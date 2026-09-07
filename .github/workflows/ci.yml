@@ -374,6 +374,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The armed in-repo baseline guard (#160, epic-6 retro A1) diffs the
+          # frozen adapter-api surface against the contract-v1 freeze commit
+          # 4119db3. The default shallow clone cannot resolve a historical
+          # rev, so this job fetches full history for the baseline lookup.
+          fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Resolve the cargo-semver-checks version (AI-3)
@@ -422,43 +428,55 @@ jobs:
           set -euo pipefail
           version="${{ steps.semver_version.outputs.version }}"
           user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          # Install the binary UP FRONT: the armed in-repo baseline guard below
+          # runs on EVERY push, so the old "lazy install inside the armed
+          # branch" dormancy no longer applies — the adapter-api surface is
+          # guarded in-repo even while the crates.io baseline stays dormant
+          # until story 7-4. Same +stable + --locked + version-pin +
+          # unknown-degrade idiom as before (AI-3).
+          if [ "$version" = "unknown" ]; then
+            if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+              # --force: a cache restore can have left a binary the
+              # probe cannot run; install must replace, not abort.
+              cargo +stable install cargo-semver-checks --locked --force
+              echo "installed=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # Probe the binary DIRECTLY, never as `cargo cargo-semver-checks`:
+            # that asks cargo for an external subcommand named
+            # cargo-semver-checks, i.e. a binary called
+            # cargo-cargo-semver-checks, which does not exist — the
+            # probe read empty, the mismatch guard reinstalled over the
+            # just-restored cache, and cargo install aborted (red gate
+            # on every cache-hit run). `|| true` rescues set -o
+            # pipefail when the binary is absent (a failed probe must
+            # read "no cached version", never abort the job).
+            cached="$(cargo-semver-checks --version 2>/dev/null | tail -n 1 | awk '{print $NF}' || true)"
+            if [ "$cached" != "$version" ]; then
+              cargo +stable install cargo-semver-checks --locked --force --version "$version"
+              echo "installed=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          # ARMED in-repo baseline guard (#160, epic-6 retro A1): diff the
+          # frozen adapter-contract v1 Rust surface of ktesio-adapter-api
+          # against the freeze commit 4119db3. Until 7-4 publishes a crates.io
+          # baseline (the flow below stays dormant, emitting its notice), THIS
+          # run fails red on any unannounced public-item removal/rename —
+          # no other gate catches that today. `--baseline-rev` is a stable
+          # cargo-semver-checks CLI flag (verified on the installed stable
+          # build; a local run vs 4119db3 is green and a surface break fails
+          # with `function_missing` major checks). When 7-4 arms the crates.io
+          # flow, this in-repo run may be retired or kept as the fast
+          # pre-publish guard — retiring it is a docs+comment change, not a
+          # gate removal.
+          cargo +stable semver-checks check-release -p ktesio-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
               200)
-                # Install lazily inside the armed branch: skips the ~10-minute
-                # build while the gate is dormant (no published baseline yet).
-                # Explicit +stable (see fmt job): keep the semver gate on latest
-                # stable; the root pin governs only local bare cargo.
-                # AI-3: the cached binary must MATCH the resolved version, not
-                # merely exist — restore-keys can legitimately restore an
-                # OLDER version's binary, and trusting `command -v` there
-                # would silently skip the pinned install and break the
-                # version-keyed promise. When the version could not be
-                # resolved, degrade to the presence check (never-red).
-                if [ "$version" = "unknown" ]; then
-                  if ! command -v cargo-semver-checks >/dev/null 2>&1; then
-                    # --force: a cache restore can have left a binary the
-                    # probe cannot run; install must replace, not abort.
-                    cargo +stable install cargo-semver-checks --locked --force
-                    echo "installed=true" >> "$GITHUB_OUTPUT"
-                  fi
-                else
-                  # Probe the binary DIRECTLY, never as `cargo cargo-semver-checks`:
-                  # that asks cargo for an external subcommand named
-                  # cargo-semver-checks, i.e. a binary called
-                  # cargo-cargo-semver-checks, which does not exist — the
-                  # probe read empty, the mismatch guard reinstalled over the
-                  # just-restored cache, and cargo install aborted (red gate
-                  # on every cache-hit run). `|| true` rescues set -o
-                  # pipefail when the binary is absent (a failed probe must
-                  # read "no cached version", never abort the job).
-                  cached="$(cargo-semver-checks --version 2>/dev/null | tail -n 1 | awk '{print $NF}' || true)"
-                  if [ "$cached" != "$version" ]; then
-                    cargo +stable install cargo-semver-checks --locked --force --version "$version"
-                    echo "installed=true" >> "$GITHUB_OUTPUT"
-                  fi
-                fi
+                # The binary was ensured above (the in-repo guard needs it
+                # every run); this crates.io branch re-probes and only
+                # reinstalls on a genuine version mismatch.
                 cargo +stable semver-checks check-release -p "$crate"
                 ;;
               404)

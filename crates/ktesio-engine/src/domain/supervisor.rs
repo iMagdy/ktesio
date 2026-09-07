@@ -544,7 +544,10 @@ impl Supervisor {
         // (the agent spawned with the right binary but ZERO args). Fall back to
         // re-reading the manifest ONLY when the snapshot carries no launch: a
         // native adapter (→ NativeHasNoLaunch, preserved) or an instance
-        // registered before the launch was persisted (legacy snapshot).
+        // registered before the launch was persisted (legacy snapshot). The
+        // fallback RE-NEGOTIATES the contract version (retro #161): the file on
+        // disk may have drifted since registration, and a manifest edited to a
+        // foreign major must fail the start, not bypass the 6-6 load gate.
         let mut launch = match persisted_launch {
             Some(launch) => launch,
             None => adapter::resolve_start_launch(&kind, manifest_path.as_deref())

@@ -407,6 +407,24 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn('if [ "$cached" != "$version" ]; then', ci)
         # The old constant key must not resurface.
         self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
+        # In-repo baseline guard (#160, epic-6 retro A1): the frozen
+        # ktesio-adapter-api v1 surface is diffed against the contract-v1
+        # freeze commit on EVERY run — the crates.io gate below it stays
+        # dormant (404 -> notice) until story 7-4, so this run is the active
+        # guard against an unannounced public-item removal/rename. The
+        # baseline rev must be the full freeze-commit SHA; `--baseline-rev`
+        # is a stable cargo-semver-checks flag (verified locally: green vs
+        # 4119db3, `function_missing` failure on a removed pub item).
+        self.assertIn(
+            "cargo +stable semver-checks check-release -p ktesio-adapter-api "
+            "--baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e",
+            ci,
+        )
+        # The baseline lookup needs full history: the semver job's checkout
+        # must override the default shallow clone (scoped to the semver job
+        # so other jobs' checkouts are not disturbed).
+        semver_job = ci[ci.index("\n  semver:") :]
+        self.assertIn("fetch-depth: 0", semver_job)
 
     def test_ci_enforces_msrv_floor(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(

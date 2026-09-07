@@ -73,7 +73,11 @@
 //!   delivery fact → a probe with the same declaration receives the managed
 //!   dir through its declared env var → detach clears it. Adapters that
 //!   declare no `memory.dir` mapping read `not_applicable` (delivery is
-//!   offered, not imposed).
+//!   offered, not imposed); a declaration that cannot be re-read FAILS the
+//!   section naming the cause (never a fabricated "maps nothing"). The
+//!   SUBJECT's own declared delivery is proven for the shipping hermes
+//!   builtin by the hermes pass (`hermes_tck.rs`: the subject's process
+//!   receives the managed dir as `HERMES_HOME`).
 //! * `interaction` — Guaranteed/BestEffort: send_input reaches a running
 //!   agent (echo proof in its log); Unsupported: fails fast
 //!   `CapabilityUnsupported` on a probe.
@@ -186,6 +190,13 @@ pub struct ConformanceReport {
     /// The report schema version ([`REPORT_SCHEMA_VERSION`]) — pinned by
     /// consuming gates before the entries are trusted.
     pub schema_version: u32,
+    /// The Adapter Contract version the run was governed by — the engine's
+    /// negotiated [`ktesio_adapter_api::CONTRACT_VERSION`] (retro #163,
+    /// finding B8). A report from a contract-gated engine can now SAY which
+    /// contract major produced the pass instead of leaving a wrong-major
+    /// manifest as a generic all-fail "registration failed". Additive field
+    /// under the documented bump policy: `schema_version` stays put.
+    pub contract_version: String,
     /// The adapter kind under test.
     pub adapter_kind: String,
     /// Per-section outcomes, in the fixed section order.
@@ -268,25 +279,31 @@ impl TckAdapter {
     /// supplied (that file IS the declaration the engine registered — the
     /// engine has no separate persisted copy of the mapping), so the source is
     /// caller-controlled by nature. For a NATIVE adapter the declaration is
-    /// the engine's compiled-in builtin table. The memory section's
-    /// applicability rides on this fact.
-    fn declares_memory_dir(&self) -> bool {
+    /// the engine's compiled-in builtin table (no I/O — cannot fail).
+    ///
+    /// A manifest re-read/parse FAILURE is `Err` (retro #163, finding B11):
+    /// it must FAIL the memory section, never collapse to `false` — a
+    /// collapsed `false` would report `not_applicable` ("maps no reserved
+    /// key"), a lie about a declaration the harness could not read.
+    fn declares_memory_dir(&self) -> Result<bool, String> {
         match self {
-            TckAdapter::Manifest(dir) => std::fs::read_to_string(dir.join("adapter.toml"))
-                .ok()
-                .and_then(|text| ::ktesio_adapter_api::Manifest::from_toml_str(&text).ok())
-                .is_some_and(|manifest| {
-                    manifest
-                        .config_mapping()
-                        .target(::ktesio_engine::domain::MEMORY_DIR_KEY)
-                        .is_some()
-                }),
-            TckAdapter::Native(kind) => ::ktesio_engine::adapter::native_config_mapping(kind)
+            TckAdapter::Manifest(dir) => {
+                let path = dir.join("adapter.toml");
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("could not re-read {}: {e}", path.display()))?;
+                let manifest = ::ktesio_adapter_api::Manifest::from_toml_str(&text)
+                    .map_err(|e| format!("could not re-parse {}: {e}", path.display()))?;
+                Ok(manifest
+                    .config_mapping()
+                    .target(::ktesio_engine::domain::MEMORY_DIR_KEY)
+                    .is_some())
+            }
+            TckAdapter::Native(kind) => Ok(::ktesio_engine::adapter::native_config_mapping(kind)
                 .is_some_and(|mapping| {
                     mapping
                         .target(::ktesio_engine::domain::MEMORY_DIR_KEY)
                         .is_some()
-                }),
+                })),
         }
     }
 }
@@ -385,7 +402,9 @@ fn conformance_inner(adapter: &TckAdapter) -> Result<ConformanceReport, String> 
     // The subject's declared `memory.dir` delivery fact (the memory section's
     // applicability input): manifest subjects read their own adapter.toml;
     // native subjects consult the engine's builtin table — both are the
-    // REGISTERED declaration, never a caller-supplied copy.
+    // REGISTERED declaration, never a caller-supplied copy. A re-read failure
+    // is carried as `Err` and FAILS the memory section (retro #163, finding
+    // B11) — it must never collapse to "declares nothing".
     let declares_memory_dir = adapter.declares_memory_dir();
 
     // The registered adapter snapshot (the launchability + metering truth).
@@ -508,7 +527,16 @@ fn conformance_inner(adapter: &TckAdapter) -> Result<ConformanceReport, String> 
 
     sections.push(SectionReport {
         section: section_ids::MEMORY.to_string(),
-        result: run_memory(&facade, state.path(), launchable, declares_memory_dir),
+        result: match &declares_memory_dir {
+            // A declaration we cannot re-read is a FAIL naming the cause —
+            // never a `not_applicable` derived from a fabricated "maps
+            // nothing" (retro #163, finding B11).
+            Err(detail) => SectionResult::fail(format!(
+                "the declaration could not be re-read to decide the memory section's \
+                 applicability: {detail}"
+            )),
+            Ok(declares) => run_memory(&facade, state.path(), launchable, *declares),
+        },
     });
 
     sections.push(SectionReport {
@@ -530,6 +558,7 @@ fn conformance_inner(adapter: &TckAdapter) -> Result<ConformanceReport, String> 
 
     Ok(ConformanceReport {
         schema_version: REPORT_SCHEMA_VERSION,
+        contract_version: ::ktesio_adapter_api::CONTRACT_VERSION.to_string(),
         adapter_kind: registered.kind.clone(),
         sections,
     })
@@ -562,6 +591,7 @@ fn registration_failure_report(adapter: &TckAdapter, detail: String) -> Conforma
     };
     ConformanceReport {
         schema_version: REPORT_SCHEMA_VERSION,
+        contract_version: ::ktesio_adapter_api::CONTRACT_VERSION.to_string(),
         adapter_kind: kind,
         sections: vec![
             SectionReport {
@@ -2171,18 +2201,29 @@ impl UpstreamStub {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let served_t = served.clone();
         let stop_t = stop.clone();
-        let handle = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if stop_t.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
+        // Non-blocking accept + a stop-flag poll (retro #163, finding B11): a
+        // BLOCKING `listener.incoming()` loop only re-checks `stop` AFTER it
+        // accepts a stream, so a drop whose wake-up connect ever failed left
+        // `join()` blocked forever. Here the loop re-checks the flag every
+        // few milliseconds on its own — shutdown can no longer depend on the
+        // wake-up connect succeeding.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking loopback upstream");
+        let handle = std::thread::spawn(move || loop {
+            if stop_t.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    served_t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Self::serve_one(stream);
                 }
-                match stream {
-                    Ok(stream) => {
-                        served_t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Self::serve_one(stream);
-                    }
-                    Err(_) => break,
+                // Nothing pending: nap briefly and re-check the stop flag.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
+                Err(_) => break,
             }
         });
         Self {
@@ -2239,11 +2280,12 @@ impl UpstreamStub {
 impl Drop for UpstreamStub {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Wake the accept loop (a connect from localhost breaks the poll).
-        if let Ok(_stream) = std::net::TcpStream::connect(self.base_url.replacen("http://", "", 1))
-        {
-            // The connect itself wakes the accept loop; the stream is dropped.
-        }
+        // Wake the accept loop early (a connect from localhost breaks the
+        // poll nap). Best-effort: the accept loop's own stop-flag poll is the
+        // GUARANTEED shutdown path (retro #163, finding B11) — a failed
+        // connect can no longer leave `join()` blocked forever, and an
+        // in-flight `serve_one` is bounded by its 5s read timeout.
+        let _ = std::net::TcpStream::connect(self.base_url.replacen("http://", "", 1));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -2608,6 +2650,7 @@ source = "self-reported"
     fn report_aggregation_units() {
         let report = ConformanceReport {
             schema_version: REPORT_SCHEMA_VERSION,
+            contract_version: ::ktesio_adapter_api::CONTRACT_VERSION.to_string(),
             adapter_kind: "unit".to_string(),
             sections: vec![
                 SectionReport {
@@ -3673,6 +3716,7 @@ env = "MODEL"
     fn report_round_trips_through_serde_with_schema_version() {
         let report = ConformanceReport {
             schema_version: REPORT_SCHEMA_VERSION,
+            contract_version: ::ktesio_adapter_api::CONTRACT_VERSION.to_string(),
             adapter_kind: "round-trip".to_string(),
             sections: vec![
                 SectionReport {
@@ -3693,9 +3737,16 @@ env = "MODEL"
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains("\"schema_version\":1"), "{json}");
+        // The negotiated contract version rides on every report (retro #163,
+        // finding B8) — pinned as the verbatim wire value.
+        assert!(json.contains("\"contract_version\":\"1.0.0\""), "{json}");
         let back: ConformanceReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, report);
         assert_eq!(back.schema_version, REPORT_SCHEMA_VERSION);
+        assert_eq!(
+            back.contract_version,
+            ::ktesio_adapter_api::CONTRACT_VERSION
+        );
         assert_eq!(back.adapter_kind, "round-trip");
     }
 }

@@ -1,0 +1,39 @@
+---
+title: Supported Agents
+description: The agents Ktesio's adapters target, the exact versions each adapter was validated against, the PATH requirement, and the re-validation duty.
+---
+
+# Supported Agents
+
+Ktesio runs agents as adapter-backed processes: the built-in `hermes` native adapter targets the Hermes gateway, and any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
+
+| Agent | Adapter | Validation status | Validated against | Evidence |
+|-------|---------|-------------------|-------------------|----------|
+| Hermes (NousResearch) | native builtin (`--kind hermes`) | **Run-verified** — launched, supervised, and driven end-to-end (lifecycle, metering, budget, memory) under the recorded isolation sandbox | `v0.20.5` @ `41447a6d7063b2772b0c2f26a5b22d9bd444fb43` (2026-08-25) | the story 6-1 primary-source verification note plus the story 6-2/6-3 conformance passes |
+| opencode (anomalyco) | manifest adapter shape (no builtin) | **Paper-validated** — primary-source characterization + conformance mapping; never launched by this repo | `v1.18.27` @ `4b7e19e315cca414121ba1d61523fef74bb3ae8b` (2026-09-02 release) | the story 6-5 characterization + conformance-mapping notes that fed the contract-v1 freeze |
+
+## Hermes (`--kind hermes`)
+
+The `hermes` builtin is compiled into the engine and declares a FIXED launch — `hermes gateway run --external-supervisor` — so Ktesio supervises a foreground gateway process instead of the agent's own service manager. What the adapter declares:
+
+- **Config mapping**: only the reserved `memory.dir` key → env `HERMES_HOME` (attaching a `filesystem` Memory Backing gives the gateway its per-instance home; with no backing attached the gateway receives NO `HERMES_HOME` and falls back to its own default home — see [the command reference](commands.md#kt-agent-memory-attach-name---kind-kind)). The unified `model` key is a documented no-op for hermes.
+- **Capabilities**: pause `best-effort` and interaction `guaranteed` on every OS; metering `self-reported`.
+- **PATH requirement**: the launch's `exec` is the bare word `hermes`, resolved through the operator's `PATH` at start. Ktesio does not bundle, install, or pin the Hermes binary — you install it (per Hermes' own docs), keep it on the `PATH` of the environment `kt` runs in, and `kt agent start` resolves it like any other program. A start whose `hermes` cannot resolve fails with the engine's launch-failure diagnostic naming the executable.
+
+**Validation pin**: the adapter's behavior was verified against Hermes at `v0.20.5`, commit `41447a6d7063b2772b0c2f26a5b22d9bd444fb43` (verified 2026-08-25). CI never launches the real gateway: the conformance passes run under the recorded `hermes_shim` PATH-sim sandbox (an isolated stand-in that re-execs a test helper), so the suite is deterministic and network-free — the real-binary validation is the pinned manual pass recorded above it.
+
+## opencode (paper-validated)
+
+opencode has no builtin adapter: it integrates as a manifest adapter whose `[lifecycle.start]` points at its `serve` command, declaring `interaction: http` (the additive documentary channel) with `XDG_DATA_HOME` + `XDG_CONFIG_HOME` as its isolation levers. Its contract behavior was **validated on paper only** — a primary-source characterization of the `v1.18.27` sources plus a conformance mapping that shaped the Adapter Contract v1 freeze. Nothing in this repository has launched opencode; treat its adapter shape as a starting point and re-validate before relying on it.
+
+## The re-validation duty
+
+Both upstreams move fast (opencode ships multiple releases per week; Hermes merges near-daily). Every version pin on this page is a **stale-the-moment-it-is-written** snapshot by design: the pins make the validation auditable, not permanent. Whoever touches an adapter — or ships a release that leans on one — re-validates against the pinned release before trusting agent-specific behavior, and moves the pin forward with fresh evidence. The contract's honor-system duties (the `{env:VAR}` render guarantee, self-update pinning, config-layer disclosure — see [the Adapter Contract](adapter-contract.md#what-is-checked-versus-honored-the-tcks-honest-reach)) are exactly the parts re-validation must cover, because no automated section can.
+
+## Troubleshooting: hermes won't launch
+
+- **`hermes: command not found` (or an equivalent launch failure naming the executable)** — the `hermes` binary is not on the `PATH` of the environment `kt` (or the process that started it) runs in. Install Hermes and make sure a plain `hermes --version` works in the same shell/account `kt` runs under; a `kt` daemonized or launched from a different context may see a different `PATH`.
+- **Gateway starts and immediately fails** — check `kt agent logs <name>` for the gateway's own startup error (port conflicts, an existing per-profile service gateway, a refusing `--force`). The declared launch is foreground (`gateway run --external-supervisor`); a Hermes profile already supervised by its own OS service must be stopped there first.
+- **Behavior drift after a Hermes upgrade** — check this page's validation pin: if the pin names an older version than you installed, re-validate (or pin your installed version down) before trusting lifecycle/metering behavior; see [the re-validation duty](#the-re-validation-duty).
+
+See [troubleshooting](troubleshooting.md) for the general Ktesio failure surfaces.

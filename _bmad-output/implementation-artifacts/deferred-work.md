@@ -2,6 +2,10 @@
 
 Findings surfaced incidentally during quick-dev reviews that are out of scope for the triggering change. Collected for later focused attention.
 
+## Resolution convention (adopted 2026-09-05, epic-6 retro action item 8 / issue #167)
+
+When a deferred entry is fixed, its bullet gains a trailing marker line — `resolved: <ref> <date>` — naming the PR, commit, or change that resolved it and the date. Resolved entries STAY listed (the record of what was once deferred is part of the audit trail); a sweep greps for entries without a `resolved:` marker. Un-resolved entries have no marker, so "still open" is greppable as the absence of `resolved:` within the entry.
+
 ## From AI-17 (pin workspace toolchain to 1.96.1) — review, 2026-07-06
 
 - **Contributor docs still tell contributors to run bare `cargo` (fmt/clippy/test).** With the new `rust-toolchain.toml`, bare `cargo` resolves to the MSRV (1.96.1) locally for contributors without a `RUSTUP_TOOLCHAIN` override, while CI's fmt/clippy/test jobs now gate on latest `stable` (explicit `+stable`). This local-vs-CI toolchain skew is intentional but is not documented in the other contributor-facing files. Consider a one-line note (or a `+stable` reproduction hint) in: `CONTRIBUTING.md` (~L89-91), `docs/contributing.md` (~L15-24), `AGENTS.md` (~L14-16), `.github/pull_request_template.md` (~L7-9), `docs/github-repository-audit-checklist.md` (~L167-169), `.agents/skills/kt-release/SKILL.md` (~L58), and `scripts/prepare_kt_release.py` (~L244-246). `docs/testing.md` already documents the split; the rest do not. Low severity (surfaces as an occasional new-stable clippy/rustfmt CI nit, not a shipped bug).
@@ -48,12 +52,14 @@ Findings surfaced incidentally during quick-dev reviews that are out of scope fo
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: No user-facing doc that `model` is a silent no-op for the hermes kind (Decision 6) — discoverable only in code comments/tests.
   evidence: `docs/commands.md` hermes paragraph documents HERMES_HOME mapping but not the deliberately unmapped `model` key; pre-existing gap unrelated to the 13 triaged findings.
+  resolved: PR #152 (docs/editorial) 2026-09-04 — the hermes paragraph now names `model` as a deliberately unmapped key.
 
 ## Deferred from: code review of spec-6-3-govern-and-interact-with-hermes-end-to-end-uj-1-for-real (2026-08-31)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-3-govern-and-interact-with-hermes-end-to-end-uj-1-for-real.md`
   summary: architecture.md:68 breach-record sentence's "(…; tokens only)" parenthetical is stale since story 3-3 — `BudgetBreachEvent` also carries `dimension` plus `dollar_limit`/`dollar_observed`/`estimate_label` on dollar breaches (event.rs:507-525).
   evidence: The rewritten Budget-enforcement paragraph kept the pre-existing parenthetical; the dollar fields shipped in story 3-3 and the sentence was out of this story's minimal-edit scope.
+  resolved: epic-6-retro remediation PR (docs hygiene batch, #165/D2) 2026-09-05 — the sentence now names `dimension` and the additive dollar fields.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK polling helpers hard-code engine storage internals (usage_events/agent_instances SQLite schema, agents/<name>/logs/agent.log path, adapter.json snapshot layout) instead of public engine seams.

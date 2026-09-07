@@ -10,6 +10,7 @@
     "commands",
     "manifest",
     "adapter-contract",
+    "agents",
     "---Internals---",
     "architecture",
     "---Design---",
@@ -18,6 +19,7 @@
     "testing",
     "contributing",
     "release-process",
+    "github-repository-audit-checklist",
     "---Release Notes---",
     "RELEASE_NOTES"
   ]

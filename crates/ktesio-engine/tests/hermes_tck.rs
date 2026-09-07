@@ -16,12 +16,14 @@
 //! The harness's own probe fixtures exec `fake_agent` by ABSOLUTE path, so the
 //! PATH shim only ever captures the hermes-kind subject.
 //!
-//! **PATH discipline** (process-global, `unsafe` under edition 2024): exactly
-//! one `#[test]` here mutates the environment, at its start, before any child
-//! is spawned, and RESTORES both `PATH` and `HERMES_SHIM_ARGS` at teardown.
-//! Under nextest this binary is its own process; under plain `cargo test`
-//! binaries run sequentially — and no other test in this file touches the
-//! environment.
+//! **PATH discipline** (process-global, `unsafe` under edition 2024): the
+//! tests here that mutate the environment do so ONCE at their start, before
+//! any child is spawned, and RESTORE both `PATH` and `HERMES_SHIM_ARGS` at
+//! teardown. Under nextest each test is its own process; under plain
+//! `cargo test` a binary's tests run on parallel threads, so every
+//! env-mutating test here holds the shared `PATH_LOCK` mutex for its whole
+//! mutate→spawn→restore journey (the old "exactly one env-mutating test per
+//! binary" rule, kept honest when the subject-delivery test joined).
 //!
 //! ## Expected report shape (derived from Hermes' declaration, not hardcoded
 //! per adapter — the harness derives it from the registered snapshot; these
@@ -42,6 +44,7 @@ use std::path::PathBuf;
 use ktesio_conformance::{
     run_conformance, section_ids, ConformanceReport, SectionResult, TckAdapter,
 };
+use ktesio_engine::{AdapterRef, Engine, MemoryBackingKind};
 use tempfile::TempDir;
 
 /// Copy the committed `hermes_shim` launcher onto PATH as `hermes<EXE_SUFFIX>`
@@ -92,6 +95,10 @@ fn install_shim(shim_dir: &TempDir) -> PathBuf {
 /// journey (see the module doc's PATH discipline).
 #[test]
 fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
+    // Serialize with this binary's OTHER PATH-mutating test (plain `cargo
+    // test` runs a binary's tests on parallel threads; see PATH_LOCK).
+    let _env_guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // ---- Sandbox setup: the PATH shim + the shim script (linger so the
     // harness's lifecycle/pause sections can drive the subject).
     let shim_dir = TempDir::new().unwrap();
@@ -194,4 +201,127 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
         }
         other => panic!("expected NotApplicable for config_mapping, got {other:?}"),
     }
+
+    // The report carries the contract version the run was governed by
+    // (retro #163, finding B8) — the frozen v1 this engine negotiates.
+    assert_eq!(report.contract_version, "1.0.0");
+}
+
+/// The serialization lock for THIS binary's PATH-mutating tests. Plain
+/// `cargo test` runs a binary's tests on parallel threads (nextest gives each
+/// test its own process, where the lock is a no-op), so the two tests that
+/// mutate the process-global `PATH`/`HERMES_SHIM_ARGS` must hold this lock for
+/// the whole mutate→spawn→restore journey — the "exactly one env-mutating
+/// test per binary" discipline, kept honest with a second such test.
+static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Retro #163 (finding B11): the memory section's probe twin proves the
+/// attach/deliver/detach MECHANISM, but on the probe's own declared env var —
+/// the SUBJECT's own declared delivery (hermes: `memory.dir` → `HERMES_HOME`)
+/// was never exercised by the kit. This test drives the hermes SUBJECT itself
+/// through the kit's shim sandbox with a `--dump` seam scripted onto the shim,
+/// attaches a filesystem backing, starts the subject, and proves the managed
+/// Memory Backing dir reached the SUBJECT'S process as `HERMES_HOME` — the
+/// exact delivery the contract claims for a declared mapping.
+#[test]
+fn hermes_subject_receives_the_managed_memory_dir_through_hermes_home() {
+    let _env_guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- Sandbox setup: the PATH shim; the shim script carries the dump
+    // seam (plus linger so the started subject stays up while we poll).
+    let shim_dir = TempDir::new().unwrap();
+    let _shim = install_shim(&shim_dir);
+    let state = TempDir::new().unwrap();
+    let dump = state.path().join("hermes-subject-memory-dump.txt");
+    let dump_str = dump.to_string_lossy().into_owned();
+
+    let original_path = std::env::var_os("PATH").map(|v| v.to_os_string());
+    let original_shim_args = std::env::var_os("HERMES_SHIM_ARGS");
+    let joined = {
+        let mut paths: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        paths.insert(0, shim_dir.path().to_path_buf());
+        std::env::join_paths(paths).expect("join PATH")
+    };
+    // SAFETY: process-global mutation, performed under PATH_LOCK, before any
+    // child spawn, and RESTORED before any assert (teardown below).
+    unsafe {
+        std::env::set_var("PATH", &joined);
+        std::env::set_var(
+            "HERMES_SHIM_ARGS",
+            format!("--dump {dump_str} --linger-ms 600000"),
+        );
+    }
+
+    // Drive the SUBJECT through the public engine API (the same surface the
+    // harness itself drives).
+    let subject_delivery = || -> Result<(), String> {
+        let engine = Engine::open(Some(state.path().to_path_buf()))
+            .map_err(|e| format!("engine open: {e}"))?;
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter("hermes", &AdapterRef::Native("hermes".to_string()))
+            .map_err(|e| format!("register: {e}"))?;
+        let managed = facade
+            .attach_memory("hermes", MemoryBackingKind::Filesystem)
+            .map_err(|e| format!("attach_memory: {e}"))?;
+        // The subject's OWN declared delivery fact (DC-10): hermes maps the
+        // reserved key, so `declared` must read true for the subject itself.
+        let status = facade
+            .memory_status("hermes")
+            .map_err(|e| format!("memory_status: {e}"))?
+            .ok_or("memory_status read None after attach")?;
+        if !status.declared {
+            return Err("the hermes subject's own `declared` fact must read true".to_string());
+        }
+        facade
+            .start("hermes")
+            .map_err(|e| format!("subject start: {e}"))?;
+        // EXACT-value proof: the subject's process received precisely the
+        // managed dir through HERMES_HOME (the `env=` dump-line shape).
+        let needle = format!("env=HERMES_HOME={}", managed.display());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let hit = std::fs::read_to_string(&dump)
+                .map(|text| text.lines().any(|line| line == needle))
+                .unwrap_or(false);
+            if hit {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "the hermes subject never received the managed memory dir through \
+                     HERMES_HOME (expected `{needle}` in {})",
+                    dump.display()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let _ = facade.stop("hermes", Some(std::time::Duration::from_secs(5)));
+        facade
+            .detach_memory("hermes")
+            .map_err(|e| format!("detach_memory: {e}"))?;
+        Ok(())
+    };
+    let outcome = subject_delivery();
+
+    // ---- Teardown BEFORE asserting (review blind-3 discipline).
+    match original_path {
+        Some(original) => unsafe {
+            std::env::set_var("PATH", original);
+        },
+        None => unsafe {
+            std::env::remove_var("PATH");
+        },
+    }
+    match original_shim_args {
+        Some(original) => unsafe {
+            std::env::set_var("HERMES_SHIM_ARGS", original);
+        },
+        None => unsafe {
+            std::env::remove_var("HERMES_SHIM_ARGS");
+        },
+    }
+
+    outcome.unwrap_or_else(|detail| panic!("hermes subject memory delivery: {detail}"));
 }

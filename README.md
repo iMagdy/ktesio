@@ -169,9 +169,10 @@ If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a
 
 ```toml
 [dev-dependencies]
-# The kit is not published to a registry yet — depend on it by git or path
-# until then:
-ktesio-conformance = { path = "../ktesio-conformance" }
+# The kit is not published to a registry yet — depend on it by git until
+# then (a workspace-relative path like `../ktesio-conformance` only works
+# inside this repository; a git dependency works for any third party):
+ktesio-conformance = { git = "https://github.com/iMagdy/ktesio" }
 ```
 
 ```rust

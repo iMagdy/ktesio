@@ -241,6 +241,23 @@ pub enum LaunchResolveError {
         path: String,
     },
 
+    /// The re-read manifest targets a different Adapter Contract MAJOR than
+    /// this engine speaks (retro #161 — the fallback-path gate). The start
+    /// fallback re-reads `adapter.toml` when no launch was snapshotted at
+    /// registration (legacy snapshot); without this re-check, a manifest
+    /// edited to a foreign major AFTER registering would start through the
+    /// fallback, bypassing the 6-6 load gate. Mirrors
+    /// [`AdapterResolveError::ContractIncompatible`]: names BOTH versions and
+    /// quotes the rule; `detail` carries that message verbatim (rendered from
+    /// [`ktesio_adapter_api::ContractVersionError`]).
+    #[error("adapter.toml at {path} is incompatible: {detail}")]
+    ContractIncompatible {
+        /// The manifest path.
+        path: String,
+        /// The both-versions + rule message from the negotiation.
+        detail: String,
+    },
+
     /// The adapter is a native builtin with no launch command (e.g. `mock`, the
     /// inert conformance stand-in). Launchable native builtins (`hermes` since
     /// story 6-2) declare their start launch in code and resolve before this
@@ -287,6 +304,14 @@ pub enum LaunchResolveError {
 ///   [`LaunchResolveError::NativeHasNoLaunch`].
 ///
 /// PARSE only — executes nothing here (the supervisor spawns).
+///
+/// The fallback re-read RE-NEGOTIATES the contract version (retro #161, FR-30):
+/// this path runs when no launch was snapshotted at registration (a legacy
+/// snapshot), so the file on disk may have drifted since the registration-time
+/// gate ran — without the re-check, a manifest edited to a foreign major after
+/// registering would start through the fallback and bypass the 6-6 load gate.
+/// A native adapter cannot drift (it is compiled against this crate), so the
+/// gate is manifest-path-only, exactly like registration.
 pub fn resolve_start_launch(
     kind: &str,
     manifest_path: Option<&Path>,
@@ -310,6 +335,21 @@ pub fn resolve_start_launch(
             path: manifest_path.to_string_lossy().into_owned(),
             detail: e.to_string(),
         })?;
+    // Fallback-path negotiation gate (retro #161): same rule, same error text
+    // as registration (`AdapterResolveError::ContractIncompatible`) — both
+    // versions named, the rule quoted — so a drifted manifest fails the start
+    // instead of launching under a contract this engine does not speak.
+    let manifest_version = manifest
+        .contract_version
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    if let Err(negotiation) = ktesio_adapter_api::negotiate_contract_version(manifest_version) {
+        return Err(LaunchResolveError::ContractIncompatible {
+            path: manifest_path.to_string_lossy().into_owned(),
+            detail: negotiation.to_string(),
+        });
+    }
     start_launch_from_manifest(&manifest).ok_or_else(|| LaunchResolveError::NoStartTemplate {
         path: manifest_path.to_string_lossy().into_owned(),
     })
@@ -1269,6 +1309,69 @@ source = "self-reported"
             matches!(err, LaunchResolveError::NoStartTemplate { .. }),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn resolve_start_launch_renegotiates_a_drifted_contract_major() {
+        // Retro #161 (finding B1): the launch-less/legacy start fallback
+        // re-reads adapter.toml. A manifest EDITED to a foreign major after
+        // registering must FAIL the fallback start — naming BOTH versions and
+        // quoting the rule — not slip through the re-read and bypass the 6-6
+        // registration gate.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "2.1.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "demo-agent"
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_start_launch("demo", Some(&path)).unwrap_err();
+        let LaunchResolveError::ContractIncompatible {
+            path: err_path,
+            detail,
+        } = err
+        else {
+            panic!("expected ContractIncompatible on the fallback re-read, got {err:?}");
+        };
+        assert_eq!(err_path, path.to_string_lossy());
+        // Both versions named + the rule quoted (the same message the
+        // registration gate renders from ContractVersionError).
+        assert!(detail.contains("2.1.0"), "manifest version named: {detail}");
+        assert!(
+            detail.contains(ktesio_adapter_api::CONTRACT_VERSION),
+            "engine version named: {detail}"
+        );
+        assert!(
+            detail.contains(ktesio_adapter_api::COMPATIBILITY_RULE),
+            "rule quoted: {detail}"
+        );
+    }
+
+    #[test]
+    fn resolve_start_launch_fallback_still_accepts_same_major() {
+        // The gate is major-only (FR-30): a same-major edit (e.g. a prerelease
+        // spelling of 1.x) still resolves through the fallback.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.9.0-rc.1"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "demo-agent"
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let launch = resolve_start_launch("demo", Some(&path)).unwrap();
+        assert_eq!(launch.exec, "demo-agent");
     }
 
     #[test]
