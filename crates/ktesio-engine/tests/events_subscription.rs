@@ -953,11 +953,7 @@ fn interleaved_instances_keep_per_instance_fifo() {
         uj3::EMIT_EVENTS,
         Duration::from_secs(30),
     );
-    for name in ["fifo-usage-a", "fifo-usage-b"] {
-        facade
-            .stop(name, Some(uj3::STOP_WINDOW))
-            .unwrap_or_else(|e| panic!("stop {name}: {e}"));
-    }
+    uj3::stop_all_resilient(&facade, &["fifo-usage-a", "fifo-usage-b"], uj3::STOP_WINDOW);
     barrier(&facade);
 
     let (events, lagged) = drain(&mut sub);
