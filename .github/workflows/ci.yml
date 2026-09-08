@@ -633,11 +633,18 @@ jobs:
             exit 1
           }
           cargo +stable semver-checks check-release -p ktesio-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
-          git cat-file -e 8a8b3285bffc8b814d5effbd807f3236e53d0b99^{commit} || {
+          git cat-file -e 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755^{commit} || {
             echo "::error::semver baseline rev 8a8b328… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
             exit 1
           }
-          cargo +stable semver-checks check-release -p ktesio-engine --baseline-rev 8a8b3285bffc8b814d5effbd807f3236e53d0b99
+
+          # BASELINE-REV CONSTRAINT (learned 2026-09-09): this repo squash-merges,
+          # so branch commits never enter main history — a baseline rev MUST be a
+          # main-side commit (an earlier landing or a merge commit) or the cat-file
+          # check reds every post-merge run (8a8b328 was a branch-only commit and
+          # did exactly that). Bump baselines only to main-history revs at
+          # deliberate freeze points, together with scripts/test_automation.py.
+          cargo +stable semver-checks check-release -p ktesio-engine --baseline-rev 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in

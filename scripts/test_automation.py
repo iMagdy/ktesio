@@ -433,10 +433,10 @@ class ReleaseDocsTests(unittest.TestCase):
         # (two here, two in ci.yml) together at the next deliberate freeze.
         self.assertIn(
             "cargo +stable semver-checks check-release -p ktesio-engine "
-            "--baseline-rev 8a8b3285bffc8b814d5effbd807f3236e53d0b99",
+            "--baseline-rev 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755",
             ci,
         )
-        self.assertIn("git cat-file -e 8a8b3285bffc8b814d5effbd807f3236e53d0b99^{commit}", ci)
+        self.assertIn("git cat-file -e 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755^{commit}", ci)
         # The baseline lookup needs full history: the semver job's checkout
         # must override the default shallow clone. Scoped to the SEMVER JOB
         # BLOCK ONLY (up to the next job heading): a `fetch-depth: 0` in some
