@@ -2318,9 +2318,11 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // Windows cannot simulate cross-lifetime survival at all
     // (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills the child when the helper
     // exits), so the breach leg is structurally impossible there and this
-    // test runtime-returns. A `#[cfg_attr(windows, ignore)]` would be the
-    // louder signal, but OS cfg is FORBIDDEN in this file by the CI OS-cfg
-    // gate (only the engine backends and engine tests are allowlisted) — so
+    // test runtime-returns. A cfg_attr-based windows-ignore attribute would
+    // be the louder signal, but writing one here is FORBIDDEN by the CI
+    // OS-cfg gate (only the engine backends and engine tests are
+    // allowlisted — the gate matches the attribute text itself, even in a
+    // comment) — so
     // the file's documented convention stands: the data-driven runtime return
     // plus the `_unix` SUFFIX that keeps the limitation visible in the test
     // list on every OS, while the OS-INDEPENDENT shared assertions (every one
