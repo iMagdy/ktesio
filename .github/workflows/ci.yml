@@ -212,6 +212,14 @@ jobs:
         # sees it. Explicit +stable (see fmt job).
         run: cargo +stable build --release --example embedding-quickstart -p ktesio-engine
       - name: Run the embedding quickstart (hermetic)
+        # Ubuntu-scoped BY JOB DESIGN: this whole `build` job runs on
+        # ubuntu-latest only (the build matrix is the `test` job's), so the
+        # run step needs no `runner.os == 'Linux'` guard — the binary path
+        # (`target/release/examples/embedding-quickstart`, no .exe suffix)
+        # can never meet a Windows/macOS runner here. The example itself is
+        # still COMPILED on all three OS legs (see the embed-clean/build
+        # surfaces that run in the 3-OS `test` matrix); only the hermetic
+        # run is ubuntu-scoped.
         # The example is also RUNNABLE hermetically, so this gate is "works",
         # not just "compiles": its only subprocess is a re-exec of itself
         # idling under a hard 120 s cap (see the example's header), everything

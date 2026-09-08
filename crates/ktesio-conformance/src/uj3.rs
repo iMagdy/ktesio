@@ -195,8 +195,14 @@ pub fn flow_config_pairs() -> Vec<(&'static str, &'static str)> {
 ///
 /// * `contract_version = "1.0.0"` — the negotiated contract major,
 /// * `pause` + `interaction` **guaranteed on all three OSes** so the default
-///   pause Breach Action is a real cross-OS suspension and the committed
-///   `paused` state is deterministic everywhere,
+///   pause Breach Action lands the committed `paused` state deterministically
+///   everywhere — which is what the assertions pin. HONESTY about the
+///   suspension itself (the engine's own honesty ceiling: a guaranteed pause
+///   on Windows reads `not_applicable`): on Unix the suspension is a real
+///   SIGSTOP freeze (the emitter is frozen mid-batch); on Windows it is
+///   cooperative best-effort with no hard suspension (the emitter keeps
+///   running through the pause) — which is exactly why the flow's usage
+///   assertions are committed RANGES, not exact counts,
 /// * `metering.source = "self-reported"` (a viable source — registers),
 /// * `[lifecycle.start]` execs the conformance `fake_agent` with
 ///   `--emit-usage 5 --linger-ms 600000` (emits the known batch, then idles so
@@ -212,6 +218,15 @@ pub fn write_flow_manifest(dir: &Path) -> PathBuf {
         )
     });
     let bin = crate::fake_agent_bin();
+    // A non-UTF8 exec path would be silently munged by to_string_lossy into
+    // a launch that never resolves (the TOML wire is UTF-8 regardless) —
+    // fail loudly instead (the perf-budgets harness precedent).
+    let bin = bin.to_str().unwrap_or_else(|| {
+        panic!(
+            "the fake_agent path {} is not valid UTF-8; the TOML manifest requires a UTF-8 path",
+            bin.display()
+        )
+    });
     let body = format!(
         r#"
 contract_version = "{contract_version}"
@@ -241,7 +256,7 @@ env = "{model_env}"
 "#,
         contract_version = CONTRACT_VERSION,
         kind = MANIFEST_KIND,
-        exec = bin.to_string_lossy(),
+        exec = bin,
         emit = EMIT_EVENTS,
         metering = METERING_SOURCE,
         model_env = MODEL_ENV_VAR,
@@ -904,8 +919,11 @@ mod tests {
         assert!(text.contains(&format!("source = \"{METERING_SOURCE}\"")));
         assert!(text.contains(&format!("--emit-usage\", \"{EMIT_EVENTS}\"")));
         assert!(text.contains(&format!("env = \"{MODEL_ENV_VAR}\"")));
-        // Pause + interaction guaranteed on all three modeled OSes: the default
-        // pause Breach Action must be a real cross-OS suspension.
+        // Pause + interaction guaranteed on all three modeled OSes: the
+        // default pause Breach Action lands the committed `paused` state
+        // deterministically everywhere (a real SIGSTOP freeze on Unix;
+        // cooperative best-effort on Windows — hence the usage RANGE
+        // assertions, never exact counts).
         for os in ["linux", "macos", "windows"] {
             assert!(
                 text.matches(&format!("{os} = \"guaranteed\"")).count() >= 2,

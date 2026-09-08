@@ -170,10 +170,16 @@ fn main() {
 /// docs/manifest.md for the full schema.
 fn write_manifest(dir: &Path) -> PathBuf {
     let exec = std::env::current_exe().expect("resolve this example's binary");
+    // A non-UTF8 binary path would be silently munged by to_string_lossy
+    // into a launch that never resolves (the TOML wire is UTF-8 regardless)
+    // — fail loudly instead (the perf-budgets harness precedent).
+    let exec = exec.to_str().expect(
+        "this example's binary path is not valid UTF-8; the TOML manifest requires a UTF-8 path",
+    );
     // Forward slashes only: a Windows path's backslashes would need TOML
     // escaping inside this basic string, and Windows file APIs accept
     // forward-slash paths, so replace them instead of escaping.
-    let exec = exec.to_string_lossy().replace('\\', "/");
+    let exec = exec.replace('\\', "/");
     std::fs::create_dir_all(dir).expect("create the manifest dir");
     let body = format!(
         r#"

@@ -634,6 +634,8 @@ So that embedding is real, not theoretical. (FR-31)
 **Then** every §4.1–4.9 capability used is reachable and behaviorally identical to the kt path (assertions shared between both test suites)
 **And** any capability found unreachable is closed in this story
 
+*(2026-09-09: §4.9 skills provisioning is owned by Epic 8 post-pivot; §4.8 is discharged by the story's own host test; §4.4/§4.6 facade reachability cited from the Epic-6 e2e.)*
+
 ### Story 7.2: Subscribe to engine events with stable schemas
 
 As a Host,
@@ -672,6 +674,8 @@ So that I can depend on what the CLI depends on. (FR-32; distribution convention
 **When** the release lands
 **Then** a build-level check proves kt uses only public engine API (violations fail CI) and cargo-semver-checks guards both crates
 **And** ktesio-engine + ktesio-adapter-api publish to crates.io with an embedding quickstart doc (host example compiles in CI)
+
+*(2026-09-09: publication PREPARED AND HELD by Islam's standing no-deployment instruction; the machinery is complete per docs/release-process.md and executes on his explicit go.)*
 
 ### Story 7.5: Benchmark the performance budgets
 

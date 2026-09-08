@@ -300,7 +300,8 @@ fn usage_of(events: &[EngineEvent]) -> Vec<ktesio_engine::UsageUpdateEvent> {
 
 /// The committed ledger ROW COUNT for `name` (the `metering.rs` poll target).
 fn usage_row_count(state_dir: &Path, name: &str) -> u64 {
-    let conn = rusqlite::Connection::open(state_dir.join("state.db")).expect("open state db");
+    let conn = rusqlite::Connection::open(state_dir.join(ktesio_engine::paths::STATE_DB_FILE))
+        .expect("open state db");
     conn.query_row(
         "SELECT COUNT(*) FROM usage_events e \
          JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1",

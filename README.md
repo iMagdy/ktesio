@@ -20,6 +20,7 @@ Long-running AI agents are processes that cost money on every call. Ktesio treat
 - **Metering — real token usage.** Every registered agent declares a Metering Source, and the engine records real per-run and cumulative token totals into a durable Usage Ledger. Usage is either **self-reported** by the agent or **engine-observed** through a loopback proxy, so governance never depends on the agent's cooperation.
 - **Budgets & cost control — ceilings that actually stop spend.** Set per-run and cumulative **token** budgets, and (with a configured Rate) **dollar** cost caps. Each carries a Breach Action — `pause`, `stop`, or `warn` — enforced the instant a ceiling is reached, in the same commit path as the usage that crossed it. Every dollar figure is integer micro-dollars, labeled an estimate.
 - **One vocabulary, any agent.** Register a native builtin, or bring your own agent with a small `adapter.toml` manifest that declares how to launch it, its per-OS capabilities, and its metering source. Configure every agent through one layered-TOML config with per-value provenance and `secret:NAME` references that stay masked in Ktesio's surfaces.
+- **Embedding — a library, not just a CLI.** The engine is an embeddable Rust library (`ktesio-engine`) with a blocking facade and a subscribe surface, so a host application drives the whole fleet — lifecycle, configuration, budgets, and events — without the CLI. See [Embedding the engine](docs/embedding.md).
 
 ## Install
 
@@ -209,7 +210,7 @@ Plainly, four sections exercise **your adapter itself** — capability projectio
 
 ## Project Status
 
-Ktesio is early and moving fast. The lifecycle, layered configuration, secrets, the Usage Ledger, token budgets, dollar cost caps, and engine-observed metering are implemented today. The Hermes Agent adapter ships as a native builtin (`--kind hermes`); OpenCode has been validated against the Adapter Contract on paper, with no shipped adapter yet; any other agent registers through an `adapter.toml` manifest that declares how to launch it and where its usage numbers come from. A supervising daemon (durable cross-invocation supervision and a Host event stream) and a richer native adapter surface are on the roadmap.
+Ktesio is early and moving fast. The lifecycle, layered configuration, secrets, the Usage Ledger, token budgets, dollar cost caps, and engine-observed metering are implemented today — as is the event stream: a host (or any Rust consumer) can subscribe to lifecycle, breach, and usage events through `Engine::subscribe` / `Blocking::subscribe` on the embedded engine. The Hermes Agent adapter ships as a native builtin (`--kind hermes`); OpenCode has been validated against the Adapter Contract on paper, with no shipped adapter yet; any other agent registers through an `adapter.toml` manifest that declares how to launch it and where its usage numbers come from. A supervising daemon (durable cross-invocation supervision) and a richer native adapter surface are on the roadmap.
 
 ## License
 

@@ -1280,6 +1280,24 @@ impl Blocking<'_> {
 /// carries. Consume the subscription on your OWN thread (`std::thread::spawn`
 /// or the host's executor), or take [`Engine::subscribe`]'s raw receiver and
 /// `await` it inside the runtime instead.
+///
+/// ## The runtime-keepalive contract (a Host must DROP its subscriptions)
+///
+/// This struct holds an `Arc` to the engine's runtime — deliberately a STRONG
+/// handle, not a `Weak`. The consequence is a runtime-lifetime contract a
+/// host must know: **while any [`EventSubscription`] is alive, the engine's
+/// async runtime stays alive**, even after the `Engine` (and every facade
+/// view of it) has been dropped. This is what makes a subscription usable for
+/// the natural drain-at-shutdown pattern (drop the engine, then keep reading
+/// the already-published events to the tail); it cannot deadlock or dangle —
+/// `recv` simply keeps serving buffered events, and returns
+/// `RecvError::Closed` once the buffer is drained and the engine's sender
+/// side is gone. The flip side: a host that leaks a subscription leaks the
+/// runtime's threads with it. **To release the runtime, drop every
+/// [`EventSubscription`] (and then the engine).** A `Weak` handle was
+/// considered and rejected: a runtime that could vanish under a live
+/// subscription would turn `recv` into a surprise-panic surface, which is
+/// worse for an embedder than an explicit drop obligation.
 pub struct EventSubscription {
     rx: broadcast::Receiver<EngineEvent>,
     rt: Arc<Runtime>,

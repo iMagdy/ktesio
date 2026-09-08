@@ -64,13 +64,17 @@
 //! synchronously inside the ingestion path, and every wait polls the COMMITTED
 //! state (`uj3::wait_for_state`, the same reader both suites share). The
 //! manifest declares pause `guaranteed` on all three OSes, so the default
-//! pause Breach Action is a real cross-OS suspension and the committed
-//! `paused` state is deterministic everywhere — no `OsId` gate anywhere. All
+//! pause Breach Action lands the committed `paused` state deterministically
+//! everywhere — which is what the assertions pin (no `OsId` gate anywhere).
+//! HONESTY about the suspension itself: on Unix it is a real SIGSTOP freeze;
+//! on Windows it is cooperative best-effort with no hard suspension — exactly
+//! why the usage assertions are committed RANGES, not exact counts. All
 //! timing comes from the shared module's constants (poll budget, stop
 //! window) — never an inline restatement. One honesty note: the POST-STOP
 //! ledger is a committed RANGE, not an exact total — the breach's suspension
-//! can freeze the emitter at event 3, 4, or 5 (see
-//! `uj3::assert_stopped_usage` for the exact shape of the range).
+//! can freeze the emitter at event 3, 4, or 5 on Unix (and on Windows the
+//! cooperative pause simply lets the batch finish) — see
+//! `uj3::assert_stopped_usage` for the exact shape of the range.
 
 use ktesio_conformance::uj3;
 use ktesio_engine::{AdapterRef, ConfigLayer, Engine, LifecycleState};

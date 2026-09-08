@@ -27,10 +27,22 @@
 //!    exact shape: `fleet()` + find — reported as `usage_via_fleet` because it
 //!    includes the fleet listing's cost; it is NOT an independent kind).
 //!    p50/p95/p99 are reported per kind; the GATE is on the overall p99 (the
-//!    worst kind) < 1 s. On CI a failed read gate retries ONCE after a 30 s
-//!    cool-down and gates on the second run (the house flake policy: a
-//!    co-tenant stall must not red an ordinary PR; local runs are
+//!    worst kind) < 1 s — a STRICT `<` (the budget's own prose): a p99
+//!    exactly at 1000.0 ms fails. On CI a failed read gate retries ONCE
+//!    after a 30 s cool-down and gates on the second run (the house flake
+//!    policy: a co-tenant stall must not red an ordinary PR; local runs are
 //!    single-shot).
+//! 3. **Subscriber-active overhead (reported, NOT gated)** — NFR-4's gated
+//!    figures above are measured with ZERO subscribers; the epic ships a
+//!    subscription surface, so after the gated measurements the harness
+//!    attaches ONE active subscriber and re-measures a single steady-state
+//!    window plus the same read kinds, REPORTING those figures and their
+//!    deltas vs the unsubscribed baseline (the report's
+//!    `subscriber_overhead` block). Measured-and-reported only: no
+//!    ratified subscriber-active budget exists (proposed deferred work), so
+//!    these numbers never gate and cannot fail the run. The addendum runs
+//!    AFTER the gated phases so it cannot contaminate them, and the startup
+//!    liveness check counts its window against the fixture's orphan bound.
 //!
 //! It prints a machine-readable JSON report to stdout (the measured record —
 //! the CI perf-budgets job log is its canonical home, and the job uploads the
@@ -54,7 +66,8 @@
 //! three windows. The factor is a DOCUMENTED shared-runner tolerance, printed
 //! in the report (`ci_tolerance.factor`) and in the job log; it is NOT a
 //! relaxation of the budget — the 2% strict budget is what local runs gate,
-//! reads and RSS gate at budget everywhere, and every report carries both the
+//! reads and RSS gate at budget on every gate platform (ubuntu CI; strict
+//! local macOS), and every report carries both the
 //! strict-budget margin and the applied tolerance.
 //!
 //! ## Why an example (explicit gating, not `#[ignore]` sprawl)
@@ -107,10 +120,9 @@
 //!   shipping `cargo tree -p ktesio -e normal,build` is unchanged). The
 //!   hand-rolled `/proc` alternative would have been platform-lying; Windows
 //!   needs the crate regardless.
-//! * Platform scope of the gates: enforced on ubuntu CI and strict on local
-//!   macOS/Windows runs; Windows figures are measured-and-reported (sysinfo's
-//!   `memory()` is the working-set-size analog there), not a ratified
-//!   gate platform.
+//! * Platform scope of the gates: enforced on ubuntu CI; strict local gating
+//!   on macOS; Windows is measured-and-reported (sysinfo's `memory()` is the
+//!   working-set-size analog there) — NEVER a gate platform.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -155,10 +167,25 @@ const HEARTBEAT_MS: u64 = 1000;
 
 /// The idle agents' self-exit fallback — the ORPHAN BOUND: if the harness
 /// dies mid-run, any leaked agent self-exits within 60 s instead of
-/// lingering. Every legitimate schedule (setup + windows + reads, even with
-/// the CI retry cool-down) either measures within this bound or no longer
-/// depends on the agents being alive.
+/// lingering. The bound is no longer enforced only by this comment: at
+/// startup, [`check_liveness_schedule`] asserts it strictly covers the whole
+/// measurement schedule (settle + every window — including the
+/// subscriber-overhead addendum window — plus gaps and a margin); the read
+/// phase does not depend on agent liveness (the read assertions check
+/// returned content, never Running state) and teardown stops the idlers
+/// regardless, so the bound ends at the last window, not at process exit.
 const AGENT_LINGER_MS: u64 = 60_000;
+
+/// The scheduling margin [`check_liveness_schedule`] adds on top of the
+/// measurement windows: the between-window gaps plus slack for scheduler
+/// jitter. Deliberately small — the read phase does not need agent liveness.
+const LIVENESS_MARGIN: Duration = Duration::from_secs(5);
+
+/// The hard cap on `PERF_BUDGETS_READ_ITERATIONS` — an absurd override must
+/// not multiply the run time (and the report size) without bound. Clamping
+/// is LOUD (a stderr note, via [`clamp_read_iterations`]); the cap itself is
+/// pinned by a unit test.
+const MAX_READ_ITERATIONS: u64 = 100_000;
 
 /// The config leaf the setup writes to every instance so the timed
 /// `effective_config` read is a REAL read whose content can be asserted.
@@ -230,6 +257,44 @@ fn ci_mode_from(explicit: Option<&str>, ambient: Option<&str>) -> Result<bool, S
     }
 }
 
+/// Pure clamp for the read-iteration override: returns the effective value
+/// (at least 1 — zero iterations cannot summarize) and whether
+/// [`MAX_READ_ITERATIONS`] was applied (so the caller can note it on stderr
+/// — a clamp is never silent).
+fn clamp_read_iterations(raw: u64) -> (usize, bool) {
+    let capped = raw.min(MAX_READ_ITERATIONS);
+    (capped.max(1) as usize, capped != raw)
+}
+
+/// The startup liveness assertion (the orphan bound was previously enforced
+/// only by a comment): [`AGENT_LINGER_MS`] must strictly cover the ENTIRE
+/// window schedule the heartbeat idlers must survive — the settle, EVERY
+/// steady-state window (including the subscriber-overhead addendum window,
+/// so callers pass the gated window count + 1), the 1 s gaps between
+/// windows, and [`LIVENESS_MARGIN`]. An `Err` names the shortfall so `main`
+/// can exit loudly instead of measuring self-exited (dead) idlers.
+fn check_liveness_schedule(
+    settle: Duration,
+    window_count: usize,
+    window: Duration,
+) -> Result<(), String> {
+    let gaps_ms = window_count.saturating_sub(1) as u128 * 1000; // 1 s between windows
+    let schedule_ms = settle.as_millis() + window_count as u128 * window.as_millis() + gaps_ms;
+    let required_ms = schedule_ms + LIVENESS_MARGIN.as_millis();
+    if u128::from(AGENT_LINGER_MS) > required_ms {
+        Ok(())
+    } else {
+        Err(format!(
+            "the orphan bound AGENT_LINGER_MS={AGENT_LINGER_MS} ms does not cover the \
+             measurement schedule ({schedule_ms} ms of settle + windows + gaps, plus a {} ms \
+             margin) — the heartbeat idlers would self-exit mid-window and the figures \
+             would measure nothing; shrink PERF_BUDGETS_SETTLE_MS / PERF_BUDGETS_WINDOW_MS \
+             or raise the fixture's --linger-ms with the spec record",
+            LIVENESS_MARGIN.as_millis()
+        ))
+    }
+}
+
 /// The run configuration, resolved from the environment once. Clamps are
 /// loud (a stderr note) and bounded: settle ≥ 1 s, window ∈ [10 s, 1 h]
 /// (the spec's ≥ 10 s floor; the 1 h cap keeps a stray override from hanging
@@ -245,7 +310,13 @@ struct HarnessConfig {
 
 impl HarnessConfig {
     fn from_env() -> Self {
-        let read_iterations = env_u64("PERF_BUDGETS_READ_ITERATIONS", 200).max(1) as usize;
+        let (read_iterations, iterations_clamped) =
+            clamp_read_iterations(env_u64("PERF_BUDGETS_READ_ITERATIONS", 200));
+        if iterations_clamped {
+            note(&format!(
+                "PERF_BUDGETS_READ_ITERATIONS above the {MAX_READ_ITERATIONS} cap — clamped"
+            ));
+        }
         let settle_ms = env_u64("PERF_BUDGETS_SETTLE_MS", 2_000);
         let settle = if settle_ms < 1_000 {
             note(&format!(
@@ -373,6 +444,70 @@ impl SteadyFigures {
     }
 }
 
+/// The subscriber-overhead addendum figures: the SAME per-instance steady
+/// figures and overall read p99 measured with ONE active subscriber
+/// attached, plus the deltas vs the unsubscribed baseline. Pure delta math,
+/// pinned by tests. MEASURED-AND-REPORTED ONLY — no ratified
+/// subscriber-active budget exists (the deferred-work entry proposes one),
+/// so these figures never gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SubscriberOverhead {
+    cpu_per_instance_pct: f64,
+    rss_per_instance_mib_mean: f64,
+    read_p99_overall_ms: f64,
+    cpu_delta_pct_points: f64,
+    rss_delta_mib: f64,
+    read_p99_delta_ms: f64,
+}
+
+impl SubscriberOverhead {
+    fn new(
+        baseline: &SteadyFigures,
+        baseline_p99_ms: f64,
+        with_subscriber: &SteadyFigures,
+        with_subscriber_p99_ms: f64,
+    ) -> Self {
+        Self {
+            cpu_per_instance_pct: with_subscriber.cpu_per_instance_pct,
+            rss_per_instance_mib_mean: with_subscriber.rss_per_instance_mib,
+            read_p99_overall_ms: with_subscriber_p99_ms,
+            cpu_delta_pct_points: with_subscriber.cpu_per_instance_pct
+                - baseline.cpu_per_instance_pct,
+            rss_delta_mib: with_subscriber.rss_per_instance_mib - baseline.rss_per_instance_mib,
+            read_p99_delta_ms: with_subscriber_p99_ms - baseline_p99_ms,
+        }
+    }
+}
+
+/// The comparison direction a gate applies: `Le` (`measured ≤ budget`) or
+/// `Lt` (`measured < budget`). The read budget's prose is "< 1 s" — a
+/// STRICT inequality — so a p99 EXACTLY at 1000.0 ms must fail it; the
+/// RSS/CPU budgets are "≤ budget" ceilings, so exactly-at passes there. The
+/// direction is carried per gate (and printed in the report) so the gate
+/// math cannot silently soften a "<" into a "≤".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateBound {
+    Le,
+    Lt,
+}
+
+impl GateBound {
+    fn holds(self, measured: f64, effective_budget: f64) -> bool {
+        match self {
+            GateBound::Le => measured <= effective_budget,
+            GateBound::Lt => measured < effective_budget,
+        }
+    }
+
+    /// The wire form printed in the report's `gates` array.
+    fn as_str(self) -> &'static str {
+        match self {
+            GateBound::Le => "<=",
+            GateBound::Lt => "<",
+        }
+    }
+}
+
 /// One gate's verdict. `budget` is the STRICT budget; `effective_budget` is
 /// what this run gated on (the strict budget × this run's tolerance), and
 /// `strict_margin` = strict budget − measured (negative on a CI pass that
@@ -381,6 +516,7 @@ impl SteadyFigures {
 struct GateVerdict {
     name: &'static str,
     hard: bool,
+    bound: GateBound,
     measured: f64,
     budget: f64,
     effective_budget: f64,
@@ -397,46 +533,67 @@ struct GateReport {
 }
 
 /// Evaluate every gate per the documented policy: reads and RSS (mean AND
-/// max-spike) gate at strict budget everywhere; CPU gates strict (×1.0)
-/// locally and at the named shared-runner tolerance (×1.5) on CI.
+/// max-spike) gate at strict budget on every gate platform (ubuntu CI; strict
+/// local macOS — Windows is measured-and-reported, never a gate platform);
+/// CPU gates strict (×1.0)
+/// locally and at the named shared-runner tolerance (×1.5) on CI. The read
+/// gate uses the STRICT `<` bound (the budget is "< 1 s" — exactly-at
+/// fails); the RSS/CPU ceilings use `≤`.
 fn evaluate_gates(overall_p99_ms: f64, steady: &SteadyFigures, tolerance: f64) -> GateReport {
     let verdicts = vec![
-        gate("read_p99_lt_1s", overall_p99_ms, BUDGET_READ_P99_MS, 1.0),
+        gate(
+            "read_p99_lt_1s",
+            overall_p99_ms,
+            BUDGET_READ_P99_MS,
+            1.0,
+            GateBound::Lt,
+        ),
         gate(
             "rss_per_instance_le_50mib",
             steady.rss_per_instance_mib,
             BUDGET_RSS_PER_INSTANCE_MIB,
             1.0,
+            GateBound::Le,
         ),
         gate(
             "rss_max_spike_le_2x_budget",
             steady.rss_max_per_instance_mib,
             BUDGET_RSS_PER_INSTANCE_MIB * RSS_SPIKE_TOLERANCE,
             1.0,
+            GateBound::Le,
         ),
         gate(
             "cpu_per_instance_le_2pct",
             steady.cpu_per_instance_pct,
             BUDGET_CPU_PER_INSTANCE_PCT,
             tolerance,
+            GateBound::Le,
         ),
     ];
     let passed = verdicts.iter().all(|v| v.passed);
     GateReport { verdicts, passed }
 }
 
-/// One gate: `measured ≤ budget × tolerance` (strict when tolerance is 1.0).
-fn gate(name: &'static str, measured: f64, budget: f64, tolerance: f64) -> GateVerdict {
+/// One gate: `measured` against `budget × tolerance` in the gate's own bound
+/// direction (strict when tolerance is 1.0).
+fn gate(
+    name: &'static str,
+    measured: f64,
+    budget: f64,
+    tolerance: f64,
+    bound: GateBound,
+) -> GateVerdict {
     let effective_budget = budget * tolerance;
     GateVerdict {
         name,
         hard: true,
+        bound,
         measured,
         budget,
         effective_budget,
         tolerance,
         strict_margin: budget - measured,
-        passed: measured <= effective_budget,
+        passed: bound.holds(measured, effective_budget),
     }
 }
 
@@ -446,10 +603,18 @@ fn gate(name: &'static str, measured: f64, budget: f64, tolerance: f64) -> GateV
 
 fn main() {
     let config = HarnessConfig::from_env();
+    // The liveness gate BEFORE anything is spawned: the orphan bound must
+    // cover the gated windows PLUS the subscriber-overhead addendum window
+    // (the same heartbeat idlers are measured in both).
+    if let Err(reason) = check_liveness_schedule(config.settle, config.windows + 1, config.window) {
+        note(&format!("{reason} — exiting 2"));
+        std::process::exit(2);
+    }
     note(&format!(
         "ktesio perf-budgets harness (story 7-5 / NFR-4): fleet={FLEET_SIZE} \
          running={RUNNING_COUNT} read_iterations={} window={:?} settle={:?} \
-         windows={} ci={}",
+         windows={} ci={} (plus a one-window subscriber-overhead addendum, \
+         measured-and-reported, not gated)",
         config.read_iterations, config.window, config.settle, config.windows, config.ci,
     ));
 
@@ -529,7 +694,8 @@ fn main() {
     let mut p99 = overall_read_p99(&reads);
     if config.ci && p99 >= BUDGET_READ_P99_MS {
         note(&format!(
-            "read gate over budget on CI (p99 {p99:.3} ms) — cooling down {:?} and \
+            "read gate at-or-over budget on CI (p99 {p99:.3} ms; the gate is strict <) — \
+             cooling down {:?} and \
              retrying ONCE (the gate applies to the second run)",
             READ_RETRY_COOLDOWN
         ));
@@ -540,6 +706,27 @@ fn main() {
     }
     note("read-latency measurement complete");
 
+    // ---- Measure (3): subscriber-active overhead — MEASURED-AND-REPORTED,
+    // never gated. NFR-4's gated figures above are ZERO-subscriber figures
+    // by design; the epic ships a subscription surface, so the harness also
+    // measures the SAME per-instance figures and read p99 with ONE active
+    // subscriber attached and reports the delta vs the unsubscribed baseline.
+    // It runs AFTER the gated measurements (so it cannot contaminate them),
+    // uses ONE steady-state window even in CI mode (context, not gates), and
+    // the heartbeat idlers must still be alive — which is why the startup
+    // liveness check counts this window too. A ratified subscriber-active
+    // budget is proposed deferred work; until one exists these numbers only
+    // inform.
+    note("subscriber-overhead addendum: attaching ONE active subscriber");
+    let subscription = facade.subscribe();
+    let sub_steady = measure_steady_windows(&config, 1);
+    // The same re-settle discipline as the unsubscribed pass.
+    std::thread::sleep(Duration::from_secs(1));
+    let sub_reads = measure_read_latency(&facade, &names, config.read_iterations);
+    let sub_p99 = overall_read_p99(&sub_reads);
+    drop(subscription); // release the runtime handle before teardown
+    note("subscriber-overhead addendum complete");
+
     // ---- Report BEFORE teardown, so the measured record survives any
     // teardown trouble; the exit code still reflects the gates. ----
     let figures = SteadyFigures::new(
@@ -548,6 +735,13 @@ fn main() {
         steady.rss_bytes_max,
         running_count,
     );
+    let sub_figures = SteadyFigures::new(
+        sub_steady.median_cpu_aggregate_pct,
+        sub_steady.median_rss_bytes_mean,
+        sub_steady.rss_bytes_max,
+        running_count,
+    );
+    let subscriber_overhead = SubscriberOverhead::new(&figures, p99, &sub_figures, sub_p99);
     let tolerance = if config.ci {
         CI_CPU_TOLERANCE_FACTOR
     } else {
@@ -564,6 +758,7 @@ fn main() {
         read_attempts,
         tolerance,
         &gates,
+        &subscriber_overhead,
     );
     print_report(&report, &gates);
     if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
@@ -688,20 +883,27 @@ struct SteadyMeasurements {
     first_sample_skipped: bool,
 }
 
+/// The gated steady-state phase: `config.windows` windows (one locally;
+/// median-of-three on CI).
+fn measure_steady_state(config: &HarnessConfig) -> SteadyMeasurements {
+    measure_steady_windows(config, config.windows)
+}
+
 /// Sample the ENGINE process (= this process: the harness owns the `Engine`)
-/// for `config.windows` windows. sysinfo computes a process's CPU% from the
+/// for `window_count` windows. sysinfo computes a process's CPU% from the
 /// delta between two refreshes, so the FIRST refresh only primes the baseline
 /// and each subsequent 1 s-apart refresh yields the usage for the interval
 /// since the previous one — the main thread sleeps between refreshes, so the
 /// sampled figure is the engine's idle supervision cost, not loop cost. The
 /// first sample of each window is DISCARDED (its interval overlaps whatever
 /// ran before it — setup, or the previous window — so it is residue, not
-/// steady state).
-fn measure_steady_state(config: &HarnessConfig) -> SteadyMeasurements {
+/// steady state). The gated phase passes `config.windows`; the
+/// subscriber-overhead addendum passes ONE window.
+fn measure_steady_windows(config: &HarnessConfig, window_count: usize) -> SteadyMeasurements {
     let pid = Pid::from_u32(std::process::id());
     let mut sys = System::new();
-    let mut windows = Vec::with_capacity(config.windows);
-    for window_index in 0..config.windows {
+    let mut windows = Vec::with_capacity(window_count);
+    for window_index in 0..window_count {
         if window_index > 0 {
             // A short gap between windows so each median candidate is an
             // independent, separately-primed measurement.
@@ -856,7 +1058,9 @@ fn elapsed_ms(started: Instant) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Build the machine-readable report (schema v1) from the measurements and
-/// the gate evaluation. Pure — no printing, no environment access.
+/// the gate evaluation. Pure — no printing, no environment access. The
+/// schema stays v1: the subscriber-overhead block is ADDITIVE (the AD-14
+/// convention — additive fields keep the version).
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     config: &HarnessConfig,
@@ -868,6 +1072,7 @@ fn build_report(
     read_attempts: usize,
     tolerance: f64,
     gates: &GateReport,
+    subscriber_overhead: &SubscriberOverhead,
 ) -> serde_json::Value {
     let mut per_kind = serde_json::Map::new();
     for stats in reads {
@@ -886,6 +1091,7 @@ fn build_report(
             serde_json::json!({
                 "name": v.name,
                 "hard": v.hard,
+                "bound": v.bound.as_str(),
                 "measured": v.measured,
                 "budget": v.budget,
                 "effective_budget": v.effective_budget,
@@ -917,7 +1123,7 @@ fn build_report(
             "state_root": "hermetic temp dir (removed at teardown)",
         },
         "methodology": {
-            "order": "setup -> settle -> steady-state window(s) -> re-settle -> read latency",
+            "order": "setup -> settle -> steady-state window(s) -> re-settle -> read latency -> subscriber-overhead addendum (one window + reads, reported only)",
             "read_iterations": config.read_iterations,
             "read_kinds": reads.iter().map(|k| k.name).collect::<Vec<_>>(),
             "read_spread": "per-instance reads round-robin across the fleet (iteration i -> instance i % 25)",
@@ -939,6 +1145,18 @@ fn build_report(
         },
         "read_latency_ms": per_kind,
         "read_p99_overall_ms": overall_p99_ms,
+        "subscriber_overhead": {
+            "policy": "measured-and-REPORTED, never gated — no ratified subscriber-active budget exists yet (proposed deferred work); the gated figures in this report are ZERO-subscriber figures by design",
+            "subscriber_count": 1,
+            "window_count": 1,
+            "window_note": "one steady-state window even in CI mode — these figures are context, not gates",
+            "cpu_percent_per_instance": subscriber_overhead.cpu_per_instance_pct,
+            "cpu_delta_vs_unsubscribed_pct_points": subscriber_overhead.cpu_delta_pct_points,
+            "rss_mib_per_instance_mean": subscriber_overhead.rss_per_instance_mib_mean,
+            "rss_delta_vs_unsubscribed_mib": subscriber_overhead.rss_delta_mib,
+            "read_p99_overall_ms": subscriber_overhead.read_p99_overall_ms,
+            "read_p99_delta_vs_unsubscribed_ms": subscriber_overhead.read_p99_delta_ms,
+        },
         "read_gate_retry": {
             "policy": "CI mode retries ONCE after a 30 s cool-down and gates on the second run (house pattern: a co-tenant stall must not red an ordinary PR); local runs are single-shot",
             "attempts": read_attempts,
@@ -969,13 +1187,14 @@ fn build_report(
             "applies_to": "cpu_per_instance gate only, CI mode only",
             "applied": tolerance != 1.0,
             "effective_cpu_budget_pct": BUDGET_CPU_PER_INSTANCE_PCT * tolerance,
-            "policy": "reads and RSS gate at budget everywhere; CPU gates strict (x1.0) locally and at the named shared-runner tolerance (x1.5) on CI — over the median of three windows — where co-tenant noise is uncontrollable",
+            "policy": "reads and RSS gate at budget on every gate platform (ubuntu CI; strict local macOS — Windows is measured-and-reported, never a gate platform); CPU gates strict (x1.0) locally and at the named shared-runner tolerance (x1.5) on CI — over the median of three windows — where co-tenant noise is uncontrollable",
         },
         "gates": verdicts,
         "notes": [
             "units: the gate is 50 MiB/instance (derived from raw bytes); this reconciles with NFR-4's '50MB' prose intent — documented in docs/testing.md",
-            "platform scope: gates are enforced on ubuntu CI and strict locally on macOS; Windows figures are measured-and-reported (sysinfo's memory() is the working-set-size analog there), not a ratified gate platform",
+            "platform scope: gates are enforced on ubuntu CI; strict local gating on macOS; Windows figures are measured-and-reported (sysinfo's memory() is the working-set-size analog there), never a gate platform",
             "the per-instance budgets mean MARGINAL supervision overhead: the fixed engine cost amortizes over the running count (see the consts' budget-assumption docs)",
+            "subscriber overhead is measured separately (the subscriber_overhead block, ONE active subscriber) and REPORTED, not gated — the gated figures are zero-subscriber by design; a ratified subscriber-active budget is proposed deferred work",
         ],
         "status": if gates.passed { "pass" } else { "fail" },
     })
@@ -1003,6 +1222,20 @@ fn print_report(report: &serde_json::Value, gates: &GateReport) {
             steady["rss_mib_aggregate_median"],
             steady["rss_mib_per_instance_mean"],
             steady["rss_mib_per_instance_max"],
+        );
+    }
+    if let Some(sub) = report["subscriber_overhead"].as_object() {
+        println!(
+            "PERF BUDGETS — with ONE active subscriber (measured-and-REPORTED, not gated): \
+             CPU {:.4}%/instance ({:+.4} pts vs unsubscribed); RSS mean {:.2} MiB/instance \
+             ({:+.2} MiB); reads p99 {:.3} ms ({:+.3} ms vs unsubscribed). \
+             No ratified subscriber-active budget exists yet.",
+            sub["cpu_percent_per_instance"],
+            sub["cpu_delta_vs_unsubscribed_pct_points"],
+            sub["rss_mib_per_instance_mean"],
+            sub["rss_delta_vs_unsubscribed_mib"],
+            sub["read_p99_overall_ms"],
+            sub["read_p99_delta_vs_unsubscribed_ms"],
         );
     }
     let tolerance_applied = report["ci_tolerance"]["applied"].as_bool().unwrap_or(false);
@@ -1362,5 +1595,95 @@ mod tests {
         assert!(figures.cpu_per_instance_pct.is_infinite());
         let gates = evaluate_gates(5.0, &figures, 1.0);
         assert!(!gates.passed, "zero running instances must fail closed");
+    }
+
+    #[test]
+    fn the_fixture_consts_pin_the_nfr4_premise() {
+        // NFR-4's premise is a 25-instance Fleet with 10 instances RUNNING —
+        // the per-instance budgets mean MARGINAL overhead over exactly these
+        // counts. Same precedent as the 7-2 schema pins: a budget premise is
+        // a const pin with an assertion, not a comment.
+        assert_eq!(FLEET_SIZE, 25);
+        assert_eq!(RUNNING_COUNT, 10);
+    }
+
+    #[test]
+    fn read_p99_gate_is_strict_at_the_budget_boundary() {
+        // The read budget's prose is "< 1 s" — a STRICT inequality. A p99
+        // EXACTLY at 1000.0 ms must FAIL (the Lt bound; a soft `<=` here
+        // would pass a read that only just met the ceiling the budget
+        // excludes); just under it passes. The RSS/CPU ceilings keep their
+        // `≤` bounds (exactly-at-budget passes there — pinned by
+        // cpu_normalization_uses_the_running_count).
+        let at = evaluate_gates(1000.0, &healthy_steady(), 1.0);
+        assert!(
+            !at.verdicts[0].passed,
+            "a p99 exactly at the 1000 ms budget must FAIL the strict < read gate: {at:?}"
+        );
+        assert_eq!(at.verdicts[0].bound, GateBound::Lt);
+        assert_eq!(at.verdicts[1].bound, GateBound::Le);
+        assert_eq!(at.verdicts[3].bound, GateBound::Le);
+        let under = evaluate_gates(999.999, &healthy_steady(), 1.0);
+        assert!(under.verdicts[0].passed, "just under the budget passes");
+    }
+
+    #[test]
+    fn read_iterations_cap_is_loud_and_bounded() {
+        // Under the cap: unchanged, no clamp. At the cap: allowed. One over:
+        // clamped to the cap WITH the loud flag (main notes it on stderr).
+        // Zero still clamps up to one (a zero-iteration run cannot
+        // summarize) without claiming the cap was applied.
+        assert_eq!(clamp_read_iterations(200), (200, false));
+        assert_eq!(clamp_read_iterations(MAX_READ_ITERATIONS), (100_000, false));
+        assert_eq!(
+            clamp_read_iterations(MAX_READ_ITERATIONS + 1),
+            (100_000, true)
+        );
+        assert_eq!(clamp_read_iterations(u64::MAX), (100_000, true));
+        assert_eq!(clamp_read_iterations(0), (1, false));
+    }
+
+    #[test]
+    fn the_default_schedules_fit_the_orphan_bound() {
+        // CI: settle 2 s + (3 gated + 1 addendum)×12 s windows + 3×1 s gaps
+        // + 5 s margin = 58 s, strictly inside the 60 s orphan bound.
+        check_liveness_schedule(
+            Duration::from_secs(2),
+            CI_STEADY_WINDOWS + 1,
+            Duration::from_secs(12),
+        )
+        .expect("the default CI schedule must fit the orphan bound");
+        // Local: one gated window + the addendum window.
+        check_liveness_schedule(Duration::from_secs(2), 1 + 1, Duration::from_secs(12))
+            .expect("the default local schedule must fit the orphan bound");
+    }
+
+    #[test]
+    fn a_schedule_that_outgrows_the_orphan_bound_is_rejected() {
+        // 2 s settle + 2×30 s windows + 1 s gap + 5 s margin = 68 s > 60 s:
+        // the idlers would self-exit mid-window, so the check must reject.
+        let err = check_liveness_schedule(Duration::from_secs(2), 1 + 1, Duration::from_secs(30))
+            .expect_err("a schedule past the orphan bound must be rejected");
+        assert!(err.contains("AGENT_LINGER_MS"), "names the bound: {err}");
+    }
+
+    #[test]
+    fn subscriber_overhead_reports_deltas_against_the_baseline() {
+        // The addendum's whole point: WITH-subscriber figures plus their
+        // deltas vs the unsubscribed baseline — signed, so an improvement
+        // reports negative and an overhead reports positive.
+        let baseline = SteadyFigures::new(10.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let with_sub = SteadyFigures::new(12.0, 120.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let overhead = SubscriberOverhead::new(&baseline, 5.0, &with_sub, 7.5);
+        assert!((overhead.cpu_per_instance_pct - 1.2).abs() < 1e-9);
+        assert!((overhead.rss_per_instance_mib_mean - 12.0).abs() < 1e-9);
+        assert!((overhead.read_p99_overall_ms - 7.5).abs() < 1e-9);
+        assert!((overhead.cpu_delta_pct_points - 0.2).abs() < 1e-9);
+        assert!((overhead.rss_delta_mib - 2.0).abs() < 1e-9);
+        assert!((overhead.read_p99_delta_ms - 2.5).abs() < 1e-9);
+        // A negative delta (subscriber costs nothing here) stays negative —
+        // the sign is information, never abs()-ed away.
+        let cheaper = SubscriberOverhead::new(&baseline, 5.0, &baseline, 4.0);
+        assert!(cheaper.read_p99_delta_ms < 0.0);
     }
 }

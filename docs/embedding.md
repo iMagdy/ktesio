@@ -19,14 +19,26 @@ to an exact revision:
 
 ```toml
 [dependencies]
-ktesio-engine = { git = "https://github.com/iMagdy/ktesio", rev = "FULL_COMMIT_SHA" }
+ktesio-engine = { git = "https://github.com/iMagdy/ktesio", rev = "<full-commit-sha>" }
 ```
 
 Pin a **full-length commit SHA**, never a branch: a pinned `rev` makes your
 build reproducible and upgrades deliberate (the engine's public surface is
 CI-guarded against breaking changes between freezes, but a moving target is
-still a moving target). After the publish executes (see
-[the release runbook](release-process.md#publishing-the-engine-crates-on-hold)),
+still a moving target).
+
+**Which SHA to pin:** the embedding surface (the `blocking()` facade plus the
+event bus) stabilized at commit `8a8b328` — story 7-3's freeze, now guarded by
+the CI semver gate against that exact baseline. Pin **any commit at or after
+it**; the newest `main` commit you are comfortable with is the right default.
+To fetch a current full SHA to pin:
+
+```bash
+git rev-parse origin/main
+```
+
+(paste the full 40-character output as your `rev`). After the publish executes
+(see [the release runbook](release-process.md#publishing-the-engine-crates-on-hold)),
 switch to the versioned crates.io form — the facade you compile against does
 not change:
 
@@ -70,7 +82,7 @@ with a reason and a remediation instead of panicking.
 ## The event bus
 
 `engine.subscribe()` hands you a receiver over a bounded, ordered event bus.
-Three rules cover the whole contract:
+Four rules cover the whole contract:
 
 1. **Subscribe before it happens.** A receiver observes only events committed
    after it subscribed, in commit order, per-instance FIFO. Anything earlier is
@@ -82,6 +94,13 @@ Three rules cover the whole contract:
    fall more than its capacity behind, your next receive observes `Lagged` and
    resynchronizes at the tail — the dropped events stay readable in the
    durable logs. Drain promptly or poll `try_recv` on your own cadence.
+4. **Delivery is at-most-once in the crash window.** Events are appended to
+   the durable record first, then published; a process crash between the two
+   loses that one event from the *stream* — the durable record stays complete,
+   and the query APIs (`transition_events`, `budget_breach_events`, the usage
+   ledger reads) are the recourse: they always return the committed truth
+   regardless of any crash. Treat the stream as a live notification surface,
+   never as your only copy.
 
 ## The quickstart example
 

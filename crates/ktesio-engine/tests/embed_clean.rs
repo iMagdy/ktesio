@@ -66,7 +66,8 @@
 //!    diagnostics were originally missed), `#[cfg(...)]` gates are
 //!    recognized as test gates only when they actually select test builds
 //!    (`not(test)` keeps production code scanned), and an unreadable source
-//!    file PANICS with its path instead of silently meaning "unscanned".
+//!    file or directory PANICS with its path instead of silently meaning
+//!    "unscanned".
 //! 3. **The blocking-coverage inventory audit** — every `pub async fn` in
 //!    the WHOLE production crate (not just `engine.rs` — an
 //!    `impl Engine { pub async fn … }` in another module cannot escape the
@@ -489,12 +490,16 @@ fn fleet_entry(facade: &ktesio_engine::Blocking<'_>) -> ktesio_engine::FleetEntr
 /// Recursively visit every `.rs` file under `dir`, calling `f(rel_path,
 /// contents)` with the `/`-normalized path relative to `dir` (the
 /// `budget.rs` audit walker, extended with the relative path). An unreadable
-/// file PANICS with its path — a read failure must never silently mean
-/// "unscanned".
+/// FILE or DIRECTORY PANICS with its path — a read failure must never
+/// silently mean "unscanned": a directory whose `read_dir` fails would
+/// otherwise vacuously pass the audit as an unvisited subtree.
 fn visit_rs(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "could not read directory {} for the audit scan: {e}",
+            dir.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -1271,5 +1276,42 @@ fn kt_consumes_the_engine_only_through_the_blocking_facade() {
         tokio_refs.is_empty(),
         "kt must not declare a tokio dependency (the facade is the only runtime \
          bridge): {tokio_refs:?}"
+    );
+}
+
+#[test]
+fn the_memory_attach_json_readback_error_arm_routes_to_attach_readback_failed() {
+    let kt_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../kt/src")
+        .canonicalize()
+        .expect("kt's src tree sits beside the engine crate in the workspace");
+
+    // Retro #166 finding B10's operator contract, pinned at the SOURCE level
+    // (the embed-clean audit's fragment-pin pattern: a UNIQUE fragment that
+    // must match EXACTLY ONE site). The `memory attach --json` read-back Err
+    // arm must route to `attach_readback_failed` — the composer that names
+    // the PERSISTED attachment (the backing remains attached) and both
+    // remediations. Only the composer is unit-tested, so reverting the arm
+    // to a generic error map would pass every existing test while silently
+    // losing the contract; this pin closes that gap. 0 hits = the arm was
+    // reverted or reworded; >1 = a duplicate appeared; both require
+    // re-review. Matching runs on string-cleaned, comment-stripped code
+    // lines, so a doc mention or a log message can never satisfy it.
+    let arm = scan(&kt_src, &|line| {
+        line.contains("Err(err) => return Err(attach_readback_failed(name, kind, &err).into())")
+    });
+    assert_eq!(
+        arm.len(),
+        1,
+        "the memory attach --json read-back Err arm must route through \
+         attach_readback_failed at EXACTLY ONE site — 0 means the arm was \
+         reverted or reworded (the persisted-attachment contract is lost), \
+         >1 means a duplicate appeared; both require re-review: {:?}",
+        arm.iter().map(Finding::describe).collect::<Vec<_>>()
+    );
+    assert!(
+        arm[0].file.ends_with("cli/agent.rs"),
+        "the arm lives in kt's agent command surface: {}",
+        arm[0].describe()
     );
 }

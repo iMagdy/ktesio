@@ -83,7 +83,10 @@ context: []
   separate decision). This completes, not changes, the "EVERY held action,
   nothing ambiguous" requirement. The hold itself is untouched: no publish
   (not even dry-run), no tags, no releases, no tap pushes; `publish = false`
-  still present in all four manifests.
+  still present in all four manifests. **Supersession, stated explicitly: the
+  frozen Design Notes' publish order (adapter-api → engine, omitting hermes)
+  is SUPERSEDED by the runbook's chain (adapter-api → adapters-hermes →
+  engine); the change log governs.**
 
 ## Design Notes
 
