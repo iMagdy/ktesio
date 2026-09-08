@@ -201,6 +201,39 @@ jobs:
         # Explicit +stable (see fmt job): CI build sanity on latest stable; the
         # root pin governs only local bare cargo.
         run: cargo +stable build --release
+      - name: Build the embedding quickstart example (story 7-4)
+        # The publish capstone's compile-level proof: the quickstart is HOST
+        # code — it links only ktesio-engine's public facade (no kt, no
+        # ktesio-conformance) — so building it in CI proves the embedding
+        # surface compiles from outside the engine crate, exactly what a
+        # crates.io host will do once the HELD publish runs
+        # (docs/release-process.md). Keeping the build in this job means a
+        # facade regression reds the ordinary build gate before any host ever
+        # sees it. Explicit +stable (see fmt job).
+        run: cargo +stable build --release --example embedding-quickstart -p ktesio-engine
+      - name: Run the embedding quickstart (hermetic)
+        # The example is also RUNNABLE hermetically, so this gate is "works",
+        # not just "compiles": its only subprocess is a re-exec of itself
+        # idling under a hard 120 s cap (see the example's header), everything
+        # runs on a per-process temp-dir root, and every leg (register →
+        # configure → subscribe → start → observe → stop) ASSERTS instead of
+        # printing — the configure read-back, the at-least-one-event drain,
+        # the running state, and the Fleet budget row — so a failure exits
+        # nonzero and reds this job. One short-lived process spawn, no
+        # external service, no network, no fixture crates. The step-level
+        # timeout is independent of (and far tighter than) the agent's own
+        # 120 s idle cap, and the binary is asserted present first so a
+        # build-step regression fails with a CLEAR message, not a confusing
+        # "file not found".
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/embedding-quickstart || {
+            echo "::error::embedding-quickstart binary not found at target/release/examples/embedding-quickstart — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/embedding-quickstart
 
   docs:
     name: docs
@@ -375,10 +408,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # The armed in-repo baseline guard (#160, epic-6 retro A1) diffs the
-          # frozen adapter-api surface against the contract-v1 freeze commit
-          # 4119db3. The default shallow clone cannot resolve a historical
-          # rev, so this job fetches full history for the baseline lookup.
+          # The armed in-repo baseline guard (#160, epic-6 retro A1; engine arm
+          # in story 7-4) diffs TWO frozen surfaces against their freeze
+          # commits: ktesio-adapter-api against the contract-v1 freeze commit
+          # 4119db3, and ktesio-engine against the embedding-surface freeze
+          # commit 8a8b328 (see the baseline comment below for why the two
+          # SHAs differ). The default shallow clone cannot resolve a
+          # historical rev, so this job fetches full history for the baseline
+          # lookups.
           fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
@@ -428,11 +465,12 @@ jobs:
           set -euo pipefail
           version="${{ steps.semver_version.outputs.version }}"
           user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
-          # Install the binary UP FRONT: the armed in-repo baseline guard below
-          # runs on EVERY push, so the old "lazy install inside the armed
-          # branch" dormancy no longer applies — the adapter-api surface is
-          # guarded in-repo even while the crates.io baseline stays dormant
-          # until story 7-4. Same +stable + --locked + version-pin +
+          # Install the binary UP FRONT: the armed in-repo baseline guards below
+          # run on EVERY push, so the old "lazy install inside the armed
+          # branch" dormancy no longer applies — the adapter-api and engine
+          # surfaces are guarded in-repo even while the crates.io baselines
+          # stay dormant until the held publish executes
+          # (docs/release-process.md). Same +stable + --locked + version-pin +
           # unknown-degrade idiom as before (AI-3).
           if [ "$version" = "unknown" ]; then
             if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -465,38 +503,58 @@ jobs:
               echo "installed=true" >> "$GITHUB_OUTPUT"
             fi
           fi
-          # ARMED in-repo baseline guard (#160, epic-6 retro A1): diff the
-          # frozen adapter-contract v1 Rust surface of ktesio-adapter-api
-          # against the freeze commit 4119db3. The guard fires on ANY breaking
-          # surface change vs the baseline (removal, rename, signature) —
-          # whether or not it was announced; announcement enforcement is
-          # review discipline until 7-4 gives the crates.io flow a real
-          # baseline to diff release-to-release.
+          # ARMED in-repo baseline guards (#160, epic-6 retro A1; ktesio-engine
+          # armed in story 7-4): diff the FROZEN public surfaces against their
+          # freeze commits. The guard fires on ANY breaking surface change vs
+          # the baseline (removal, rename, signature) — whether or not it was
+          # announced; announcement enforcement is review discipline until the
+          # crates.io flow gives each crate a real release-to-release baseline
+          # (the dormant per-crate crates.io loop below arms at first publish).
           #
-          # Maintenance: at the NEXT contract major (a deliberate, announced
-          # v2 freeze), update this SHA — and its copy in
-          # scripts/test_automation.py — to the new freeze commit. The baseline
-          # build resolves the freeze commit's OWN dependencies; if one is ever
-          # yanked/deleted upstream, the guard reds on infra — bump the SHA to
-          # a known-good commit rather than debugging the gate. The cat-file
-          # check below keeps a history-rewrite/GC failure a CLEAR error
-          # instead of a confusing semver-checks resolution abort.
+          # TWO baselines, two honest freeze points:
+          # * ktesio-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
+          #   contract surface has been frozen since story 6-6.
+          # * ktesio-engine @ 8a8b328 — the EMBEDDING-surface freeze (stories
+          #   7-1/7-2/7-3 landed; story 7-4 arms the guard). Deliberately NOT
+          #   4119db3: the engine's surface was legitimately still growing when
+          #   the contract froze (the freeze itself added the
+          #   `LaunchResolveError::ContractIncompatible` variant to an engine
+          #   error enum, and the lifecycle/events stories reshaped more) — the
+          #   engine was `publish = false` throughout, so those were allowed
+          #   evolution, and a 4119db3 baseline would red CI on that honest
+          #   history. The embedding surface the hosts see freezes at 7-3's
+          #   commit instead. Same mechanism, same pins, same bump procedure.
+          #
+          # Maintenance: at the next deliberate freeze (a contract-v2 freeze
+          # for adapter-api, or an announced engine major), update the SHAs
+          # here — and their copies in scripts/test_automation.py — together.
+          # The baseline builds resolve the freeze commit's OWN dependencies;
+          # if one is ever yanked/deleted upstream, the guard reds on infra —
+          # bump the SHA to a known-good commit rather than debugging the
+          # gate. The cat-file checks below keep a history-rewrite/GC failure
+          # a CLEAR error instead of a confusing semver-checks resolution
+          # abort.
           git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit} || {
             echo "::error::semver baseline rev 4119db37… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
             exit 1
           }
           cargo +stable semver-checks check-release -p ktesio-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
+          git cat-file -e 8a8b3285bffc8b814d5effbd807f3236e53d0b99^{commit} || {
+            echo "::error::semver baseline rev 8a8b328… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
+            exit 1
+          }
+          cargo +stable semver-checks check-release -p ktesio-engine --baseline-rev 8a8b3285bffc8b814d5effbd807f3236e53d0b99
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
               200)
                 # The binary was ensured above; the crates.io baseline (once
-                # story 7-4 publishes) is the authoritative release-to-release
-                # gate — no version re-probe happens here.
+                # the held publish runs) is the authoritative
+                # release-to-release gate — no version re-probe happens here.
                 cargo +stable semver-checks check-release -p "$crate"
                 ;;
               404)
-                echo "::notice::${crate} has no published baseline on crates.io yet; the semver gate arms at first publish (story 7-4)."
+                echo "::notice::${crate} has no published baseline on crates.io yet; the crates.io release-to-release gate arms at first publish (the HELD publish runbook, docs/release-process.md)."
                 ;;
               000|429|5[0-9][0-9])
                 echo "::notice::crates.io returned transient status ${status} for ${crate}; skipping the semver check this run."

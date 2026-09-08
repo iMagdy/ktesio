@@ -11,6 +11,7 @@
     "manifest",
     "adapter-contract",
     "agents",
+    "embedding",
     "---Internals---",
     "architecture",
     "---Design---",

@@ -200,6 +200,7 @@ Plainly, four sections exercise **your adapter itself** — capability projectio
 - [Command reference](docs/commands.md)
 - [Adapter manifest (`adapter.toml`)](docs/manifest.md)
 - [Adapter Contract](docs/adapter-contract.md)
+- [Embedding the engine (library quickstart)](docs/embedding.md)
 - [Architecture](docs/architecture.md)
 - [Testing](docs/testing.md)
 - [Release process](docs/release-process.md)

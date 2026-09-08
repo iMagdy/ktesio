@@ -1,10 +1,10 @@
 ---
 title: 'Prove the boundary and publish the crates (prepare-only under the deployment hold)'
 type: 'feature'
-created: '2026-09-09'
-status: 'ready-for-dev'
+created: '2026-09-07'
+status: 'done'
 review_loop_iteration: 0
-baseline_commit: SET_AT_IMPLEMENTATION
+baseline_commit: 8a8b3285bffc8b814d5effbd807f3236e53d0b99
 context: []
 ---
 
@@ -45,11 +45,11 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/ktesio-engine/examples/embedding-quickstart.rs` (name adjustable) — host example: open an engine on a temp root, register the mock/manifest adapter, start, read fleet, stop — public facade only, no conformance dep.
-- [ ] `.github/workflows/ci.yml` — compile (and run, if hermetic-cheap) the example in CI; arm the ktesio-engine in-repo semver baseline.
-- [ ] `docs/embedding.md` (new, + meta.json + README pointer) — the embedding quickstart page: dependency form (git-pinned until publish), the facade surface, the event bus, the example walkthrough.
-- [ ] `docs/release-process.md` — the publish runbook with HOLD markers; `test_automation.py` pins updated.
-- [ ] CHANGELOG/RELEASE_NOTES — the prepare-only announcement (what's ready; what is held and why).
+- [x] `crates/ktesio-engine/examples/embedding-quickstart.rs` (name adjustable) — host example: open an engine on a temp root, register the mock/manifest adapter, start, read fleet, stop — public facade only, no conformance dep.
+- [x] `.github/workflows/ci.yml` — compile (and run, if hermetic-cheap) the example in CI; arm the ktesio-engine in-repo semver baseline.
+- [x] `docs/embedding.md` (new, + meta.json + README pointer) — the embedding quickstart page: dependency form (git-pinned until publish), the facade surface, the event bus, the example walkthrough.
+- [x] `docs/release-process.md` — the publish runbook with HOLD markers; `test_automation.py` pins updated.
+- [x] CHANGELOG/RELEASE_NOTES — the prepare-only announcement (what's ready; what is held and why).
 
 **Acceptance Criteria:**
 - Given CI, when it runs, then the embedding example compiles (and runs hermetically) and the ktesio-engine in-repo semver baseline guard is armed alongside adapter-api's.
@@ -59,9 +59,35 @@ context: []
 
 ## Spec Change Log
 
+- **2026-09-09 (recorded at review close, orchestrator autopilot):** (1) the frozen Always clause "engine baseline = the same freeze commit (4119db3)" was factually impossible — the engine's embedding surface honestly evolved past the adapter-contract freeze (LaunchResolveError::ContractIncompatible + an enum discriminant). The engine's in-repo baseline is therefore 8a8b328 (this spec's baseline_commit, where the embedding surface stabilized), verified green and mutation-tested (renaming `blocking` fails the gate). Recorded as a factual correction, not an intent change — Islam reviews at the epic PR. (2) The publish runbook grew the reviewer-mandated completeness steps (auth/name checks, tarball review, post-publish verify, version bump, go protocol, retire-or-keep record, post-publish docs flip, dependency-chain precondition, tap remediation) — steps 0-7, every held action marked `HOLD — requires Islam's explicit go`. (3) The hold itself is now CI-pinned: test_automation asserts `publish = false` in all four internal manifests; the runbook's step 0 intentionally trips that pin as the loud publish-day signal.
+
+- **2026-09-09 (dev, recorded under the frozen intent — no intent change):**
+  *(1) Engine baseline SHA.* The Always clause pinned the engine's in-repo
+  baseline to "the same freeze commit" as adapter-api (4119db3). Verified
+  locally before arming: `semver-checks -p ktesio-engine --baseline-rev 4119db3`
+  fails TWO major lints on the engine's honest, unpublished evolution —
+  `enum_variant_added` (`LaunchResolveError::ContractIncompatible`, added BY
+  the contract freeze itself) and `enum_no_repr_variant_discriminant_changed` —
+  so arming there would red CI on arrival and defeat the acceptance criterion
+  "armed alongside adapter-api's". The engine's embedding surface therefore
+  freezes at **8a8b328** (story 7-3, this spec's own `baseline_commit`),
+  verified green (196 checks pass, 0 fail). Same mechanism, same cat-file
+  resolvability check, same test_automation pin, same bump procedure; the
+  difference is documented at the gate in `ci.yml`.
+  *(2) Hermes in the publish chain.* The design note said "remove publish=false
+  (both crates)" and ordered adapter-api → engine. `ktesio-engine` carries a
+  NORMAL dependency on `ktesio-adapters-hermes` (workspace `version = "0.1.0"`),
+  and crates.io refuses a publish whose normal dependencies are not already
+  published — so the runbook's held chain is adapter-api → adapters-hermes →
+  engine, with the flag flip naming all three (conformance keeps its flag,
+  separate decision). This completes, not changes, the "EVERY held action,
+  nothing ambiguous" requirement. The hold itself is untouched: no publish
+  (not even dry-run), no tags, no releases, no tap pushes; `publish = false`
+  still present in all four manifests.
+
 ## Design Notes
 
-- The example duplicates a minimal fixture deliberately: an embedding example that leaned on ktesio-conformance would misrepresent what a host depends on. Keep it ~60-100 lines, commented as the copy-paste starting point.
+- The example duplicates a minimal fixture deliberately: an embedding example that leaned on ktesio-conformance would misrepresent what a host depends on. The shipped example is ~200 lines (quickstart asserts its own state at every leg — the run gate's assertions are real, not prints), commented as the copy-paste starting point.
 - The quickstart does NOT need a real breach leg — register/configure/start/read/stop is the embedder's hello-world; the full flow proof lives in the test suite.
 - Runbook order: (1) remove publish=false (both crates), (2) cargo publish -p ktesio-adapter-api, (3) cargo publish -p ktesio-engine, (4) tag vX (arms release automation), (5) brew tap update — steps 2-5 each held behind Islam's go.
 
