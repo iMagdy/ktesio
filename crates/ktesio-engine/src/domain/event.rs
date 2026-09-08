@@ -3,16 +3,19 @@
 //! A [`TransitionEvent`] is the "event" for this story: a RECORDED state
 //! transition carrying the prior state, the new state, a cause, and an RFC 3339
 //! UTC timestamp. It is a versioned serde struct so story 7-2 (the host
-//! subscription bus) and `kt --json` (story 1-7 / 4-3) reuse the SAME schema
-//! ("one event schema, two consumers"). [`TransitionEvent::schema_version`] is
-//! carried from the start so the schema can evolve compatibly.
+//! subscription bus — shipped as `Engine::subscribe`) and `kt --json` (story
+//! 1-7 / 4-3) reuse the SAME schema ("one event schema, two consumers").
+//! [`TransitionEvent::schema_version`] is carried from the start so the schema
+//! can evolve compatibly.
 //!
 //! ## Boundary (what this is NOT)
 //!
 //! This story SEEDS the struct and RECORDS it (to the per-instance log, and
-//! returns it so tests can assert). It does NOT build the bounded-channel
-//! subscription bus — that is story 7-2. AC1's "each transition emits an event"
-//! is satisfied here by "each transition records a `TransitionEvent`".
+//! returns it so tests can assert). The bounded-channel subscription bus it
+//! seeds for is story 7-2's (shipped: `Engine::subscribe` /
+//! `Blocking::subscribe` over the `domain::bus` [`crate::EngineEvent`]
+//! wrapper). AC1's "each transition emits an event" is satisfied here by "each
+//! transition records a `TransitionEvent`".
 
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +52,7 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 /// The schema version stamped on the `kt --json` Fleet document (story 1-7,
 /// AD-14).
 ///
-/// AD-14 requires `kt --json` and the (future 7-2) Host event stream to be ONE
+/// AD-14 requires `kt --json` and the 7-2 Host event stream to be ONE
 /// contract, so the Fleet document is a versioned serde struct just like
 /// [`TransitionEvent`]. This starts at the SAME value as [`EVENT_SCHEMA_VERSION`]
 /// so the two versioning stories begin aligned; it is a SEPARATE constant so the
@@ -62,7 +65,7 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 /// `budget`/`usage`) is transparently backward-additive and did NOT bump it. Story
 /// 3-5 bumps it **1 → 2**: the `list --json` document GAINS a first-class top-level
 /// `totals` object (the Fleet-WIDE [`crate::FleetTotals`] aggregate) that consumers
-/// and the future 7-2 Host stream will want to negotiate on. The change is ADDITIVE
+/// and the 7-2 Host stream will want to negotiate on. The change is ADDITIVE
 /// — a v2 reader parses every v1 document (no field is renamed or removed), and a v1
 /// consumer that ignores the new `totals` still parses `instances` — but the bump is
 /// the honest signal that a new first-class field exists, matching the 1-7/3-1/3-3
@@ -78,7 +81,7 @@ pub const FLEET_SCHEMA_VERSION: u32 = 2;
 /// AD-14 names "breaches" explicitly among the versioned engine event structs the
 /// subscription API + `kt --json` share. 3-2 FREEZES the breach-event wire shape
 /// now — a versioned serde struct carrying the TOKEN breach fields — so `kt --json`
-/// and the future 7-2 Host stream cannot drift into two dialects. A SEPARATE
+/// and the 7-2 Host stream cannot drift into two dialects. A SEPARATE
 /// constant from the sibling schemas ([`EVENT_SCHEMA_VERSION`],
 /// [`FLEET_SCHEMA_VERSION`], [`crate::USAGE_SCHEMA_VERSION`]) — the wire shapes
 /// evolve independently, so a change to one must not force a version bump on the
@@ -333,7 +336,7 @@ impl TransitionCause {
 /// AD-14's "one event schema, two consumers" rule extends to the unified
 /// attributed-output stream: [`LogLine`] joins [`TransitionEvent`] /
 /// [`BudgetBreachEvent`] as a versioned serde struct so `kt agent logs` and
-/// any future 7-2 Host stream negotiate on the SAME shape. Starts at 1,
+/// the 7-2 Host event bus negotiate on the SAME shape. Starts at 1,
 /// aligned with its siblings. Bumped only on an INCOMPATIBLE change; adding a
 /// field is backward-additive and does NOT bump it.
 pub const LOG_SCHEMA_VERSION: u32 = 1;
@@ -430,7 +433,7 @@ impl LogLine {
 /// Emitted on every transition the supervisor applies, carrying everything AC1
 /// requires: prior state, new state, cause, timestamp — plus the instance name
 /// and the schema version. Serde-serializable so it round-trips through the
-/// per-instance log and (later) the 7-2 bus / `--json`.
+/// per-instance log, the 7-2 event bus, and `--json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionEvent {
     /// The event schema version ([`EVENT_SCHEMA_VERSION`]).
@@ -492,7 +495,8 @@ impl TransitionEvent {
 /// parses every token breach unchanged and never sees a dollar field it does not
 /// understand — so [`BUDGET_SCHEMA_VERSION`] does NOT bump. The wire carries INTEGER
 /// MICROS + the label, NEVER a pre-formatted `$` string (AD-14 — a Host formats its
-/// own currency). Full subscription DELIVERY is 7-2's; 3-2/3-3 record + freeze the
+/// own currency). Subscription DELIVERY shipped in story 7-2 (published onto the
+/// event bus right after the breach-log append); 3-2/3-3 record + freeze the
 /// struct.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetBreachEvent {
