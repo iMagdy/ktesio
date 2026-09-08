@@ -58,7 +58,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ktesio_conformance::uj3;
+use ktesio_conformance::uj3::{self, committed_usage_rows, usage_from_payload, CommittedUsage};
 use ktesio_engine::{
     broadcast, AdapterRef, BreachDimension, Engine, EngineEvent, RestartPolicy, TransitionCause,
     TransitionEvent, BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION,
@@ -290,49 +290,13 @@ fn usage_of(events: &[EngineEvent]) -> Vec<ktesio_engine::UsageUpdateEvent> {
 }
 
 // ---------------------------------------------------------------------------
-// Committed-ledger readers (the metering.rs mechanism: a direct read-only
-// connection to the same state DB the engine commits to; rowid order IS the
-// commit order)
+// Committed-ledger reading (the SHARED uj3 readers: a direct read-only
+// connection to the same state DB the engine commits to, over the
+// engine-published STATE_DB_FILE constant; rowid order IS the commit order).
+// The `CommittedUsage` projection + `committed_usage_rows` live in
+// `ktesio_conformance::uj3` so this suite and the 7-3 collision test compare
+// received streams against the ledger through ONE shape.
 // ---------------------------------------------------------------------------
-
-/// One committed `usage_events` row, projected onto the fields a
-/// [`ktesio_engine::UsageUpdateEvent`] payload carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CommittedUsage {
-    run_id: String,
-    input_tokens: u64,
-    output_tokens: u64,
-    metering_source: String,
-    sequence: u64,
-    occurred_at: String,
-}
-
-/// The committed ledger rows for `name`, in COMMIT ORDER (SQLite `rowid`).
-fn committed_usage_rows(state_dir: &Path, name: &str) -> Vec<CommittedUsage> {
-    let conn = rusqlite::Connection::open(state_dir.join("state.db")).expect("open state db");
-    let mut stmt = conn
-        .prepare(
-            "SELECT e.run_id, e.input_tokens, e.output_tokens, e.metering_source, \
-             e.sequence, e.occurred_at \
-             FROM usage_events e \
-             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1 \
-             ORDER BY e.rowid",
-        )
-        .expect("prepare the ledger read");
-    let rows = stmt
-        .query_map([name], |r| {
-            Ok(CommittedUsage {
-                run_id: r.get::<_, String>(0)?,
-                input_tokens: r.get::<_, i64>(1)?.max(0) as u64,
-                output_tokens: r.get::<_, i64>(2)?.max(0) as u64,
-                metering_source: r.get::<_, String>(3)?,
-                sequence: r.get::<_, i64>(4)?.max(0) as u64,
-                occurred_at: r.get::<_, String>(5)?,
-            })
-        })
-        .expect("query the ledger");
-    rows.map(|r| r.expect("ledger row")).collect()
-}
 
 /// The committed ledger ROW COUNT for `name` (the `metering.rs` poll target).
 fn usage_row_count(state_dir: &Path, name: &str) -> u64 {
@@ -365,7 +329,8 @@ fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64, within: Dura
 }
 
 /// Payload FIDELITY: the received usage stream must equal the committed ledger
-/// rows EXACTLY — one payload per row, field-for-field, in commit order.
+/// rows EXACTLY — one payload per row, field-for-field, in commit order (the
+/// projection through the SHARED `uj3::usage_from_payload` shape).
 fn assert_usage_matches_rows(
     usage: &[ktesio_engine::UsageUpdateEvent],
     rows: &[CommittedUsage],
@@ -380,18 +345,11 @@ fn assert_usage_matches_rows(
         rows.len()
     );
     for (u, r) in usage.iter().zip(rows) {
-        assert_eq!(u.event.run_id.as_str(), r.run_id, "{what}: run_id");
-        assert_eq!(u.event.input_tokens, r.input_tokens, "{what}: input_tokens");
         assert_eq!(
-            u.event.output_tokens, r.output_tokens,
-            "{what}: output_tokens"
+            &usage_from_payload(u),
+            r,
+            "{what}: the payload must equal the committed row field-for-field"
         );
-        assert_eq!(
-            u.event.metering_source, r.metering_source,
-            "{what}: metering_source"
-        );
-        assert_eq!(u.event.sequence, r.sequence, "{what}: sequence");
-        assert_eq!(u.event.occurred_at, r.occurred_at, "{what}: occurred_at");
     }
 }
 

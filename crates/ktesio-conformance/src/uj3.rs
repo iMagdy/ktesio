@@ -20,8 +20,18 @@
 //! * the committed-state readers + poller ([`committed_state`],
 //!   [`wait_for_state`], [`read_breach_events`], [`read_transition_events`])
 //!   copied from the engine's `tests/budget.rs` mechanism so BOTH suites share
-//!   it (the engine layout — `state.db`, `agents/<name>/logs/*.log` — is
-//!   identical under a library `Engine::open` root and a `kt` state dir).
+//!   it (the engine layout — `state.db` via the engine-published
+//!   `paths::STATE_DB_FILE`, `agents/<name>/logs/*.log` — is identical under a
+//!   library `Engine::open` root and a `kt` state dir),
+//! * the usage-ledger reader + received-stream projection + the raw-receiver
+//!   drain ([`committed_usage_rows`], [`usage_from_payload`],
+//!   [`drain_receiver`]) — the ONE comparison shape for story 7-2's "the
+//!   received usage stream equals the committed ledger rows exactly"
+//!   guarantee, consumed by both the 7-2 acceptance suite and the 7-3
+//!   collision test, and
+//! * assertion helpers over OBSERVED reads (state, breach/transition events,
+//!   [`FleetEntry`]/[`UsageView`] rows) — each expectation stated ONCE here,
+//!   never re-stated inline by either suite.
 //!
 //! Both consumers dev-depend on this crate; dev-deps never cross the shipping
 //! boundary gate (`cargo tree -p ktesio -e normal,build` stays clean). A test
@@ -53,8 +63,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ktesio_engine::{
-    BreachAction, BreachDimension, BreachScope, BudgetBreachEvent, EstimateLabel, FleetEntry,
-    LifecycleState, Micros, TransitionCause, TransitionEvent, UsageView,
+    broadcast, BreachAction, BreachDimension, BreachScope, BudgetBreachEvent, EngineEvent,
+    EstimateLabel, FleetEntry, LifecycleState, Micros, TransitionCause, TransitionEvent,
+    UsageUpdateEvent, UsageView,
 };
 
 // ---------------------------------------------------------------------------
@@ -247,9 +258,11 @@ env = "{model_env}"
 /// The committed Lifecycle State for `name`, read via a direct read-only
 /// connection to the SAME state DB the engine commits to (deterministic
 /// committed state — never a wall-clock guess). The layout is identical under
-/// a library `Engine::open(root)` and a `kt` state dir: `<root>/state.db`.
+/// a library `Engine::open(root)` and a `kt` state dir: `<root>/state.db`
+/// (the engine-published `paths::STATE_DB_FILE` name).
 pub fn committed_state(state_dir: &Path, name: &str) -> Option<String> {
-    let conn = rusqlite::Connection::open(state_dir.join("state.db")).ok()?;
+    let conn =
+        rusqlite::Connection::open(state_dir.join(ktesio_engine::paths::STATE_DB_FILE)).ok()?;
     // A SHORT busy timeout: the poller may read while another engine session
     // (e.g. the kt CLI journey's live helper) is mid-commit, and a plain
     // read hitting that lock fails instantly — silently burning the caller's
@@ -343,6 +356,107 @@ fn read_json_lines<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> V
                 .unwrap_or_else(|e| panic!("{what} log line does not parse: {e}\n{line}"))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Usage-ledger readers + received-stream projection + subscription drain
+// (shared by the 7-2 acceptance suite and the 7-3 collision test — the ONE
+// place the "received usage stream == committed ledger rows" comparison
+// shape is defined; observation infrastructure, never a driving surface)
+// ---------------------------------------------------------------------------
+
+/// One committed `usage_events` row, projected onto EXACTLY the fields a
+/// [`UsageUpdateEvent`] payload carries — the comparison shape for the
+/// "the received usage stream equals the committed ledger rows field-for-field,
+/// in commit order" guarantee (story 7-2). `PartialEq` so a whole stream can
+/// be compared to the committed rows with one `Vec` equality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedUsage {
+    /// The Run the measurement was committed under (the strongest per-engine
+    /// identity field — two engines' Run-id sets must be disjoint).
+    pub run_id: String,
+    /// The self-reported/engine-observed input tokens.
+    pub input_tokens: u64,
+    /// The self-reported/engine-observed output tokens.
+    pub output_tokens: u64,
+    /// The Metering Source wire string stamped on the row.
+    pub metering_source: String,
+    /// The agent-supplied, per-Run-monotonic dedup ordinal.
+    pub sequence: u64,
+    /// The RFC 3339 timestamp the engine stamped at commit.
+    pub occurred_at: String,
+}
+
+/// The committed ledger rows for `name` under `state_dir`, in COMMIT ORDER
+/// (SQLite `rowid` — the `metering.rs` reader mechanism, shared shape).
+/// Read over `<state_dir>/<paths::STATE_DB_FILE>` — the engine-published
+/// constant, never a hand-typed file name.
+pub fn committed_usage_rows(state_dir: &Path, name: &str) -> Vec<CommittedUsage> {
+    let conn = rusqlite::Connection::open(state_dir.join(ktesio_engine::paths::STATE_DB_FILE))
+        .expect("open state db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.run_id, e.input_tokens, e.output_tokens, e.metering_source, \
+             e.sequence, e.occurred_at \
+             FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1 \
+             ORDER BY e.rowid",
+        )
+        .expect("prepare the ledger read");
+    let rows = stmt
+        .query_map([name], |r| {
+            Ok(CommittedUsage {
+                run_id: r.get::<_, String>(0)?,
+                input_tokens: r.get::<_, i64>(1)?.max(0) as u64,
+                output_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                metering_source: r.get::<_, String>(3)?,
+                sequence: r.get::<_, i64>(4)?.max(0) as u64,
+                occurred_at: r.get::<_, String>(5)?,
+            })
+        })
+        .expect("query the ledger");
+    rows.map(|r| r.expect("ledger row")).collect()
+}
+
+/// Project a RECEIVED [`UsageUpdateEvent`] payload onto the same
+/// [`CommittedUsage`] shape, so a subscriber's stream and the committed rows
+/// compare with plain `Vec` equality (the payload FIDELITY check).
+pub fn usage_from_payload(event: &UsageUpdateEvent) -> CommittedUsage {
+    CommittedUsage {
+        run_id: event.event.run_id.as_str().to_string(),
+        input_tokens: event.event.input_tokens,
+        output_tokens: event.event.output_tokens,
+        metering_source: event.event.metering_source.clone(),
+        sequence: event.event.sequence,
+        occurred_at: event.event.occurred_at.clone(),
+    }
+}
+
+/// Drain a RAW `Engine::subscribe()` receiver to its current tail with
+/// `try_recv` (the story-7-2 helper for the async subscription surface).
+/// Exact, never racy: callers invoke this only AFTER every publishing call
+/// has returned (each publish completes under the supervisor lock before its
+/// facade call returns — after a committed-state wait plus ONE
+/// supervisor-lock-taking read as the barrier, everything published is
+/// already buffered). Returns the received events plus the TOTAL dropped
+/// count if the receiver lagged past the bus capacity (`Lagged` is not an
+/// event; counts ACCUMULATE with saturating adds).
+pub fn drain_receiver(
+    sub: &mut broadcast::Receiver<EngineEvent>,
+) -> (Vec<EngineEvent>, Option<u64>) {
+    let mut events = Vec::new();
+    let mut lagged: Option<u64> = None;
+    loop {
+        match sub.try_recv() {
+            Ok(event) => events.push(event),
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                lagged = Some(lagged.unwrap_or(0).saturating_add(n));
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return (events, lagged);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
