@@ -478,11 +478,13 @@ class ReleaseDocsTests(unittest.TestCase):
         )
 
         build_start = ci.index("- name: Build release binary")
-        # The next JOB heading bounds the build job's own script text.
+        # The next JOB heading bounds the build job's own script text; a
+        # missing match (job LAST in the file) slices to end-of-file instead.
         import re as _re
 
         next_job = _re.search(r"\n  [A-Za-z_-]", ci[build_start + 1 :])
-        build_job = ci[build_start : build_start + 1 + next_job.start()]
+        build_end = build_start + 1 + next_job.start() if next_job else len(ci)
+        build_job = ci[build_start:build_end]
         self.assertIn(
             "cargo +stable build --release --example embedding-quickstart -p ktesio-engine",
             build_job,
@@ -494,6 +496,80 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("test -x target/release/examples/embedding-quickstart", build_job)
         self.assertIn("target/release/examples/embedding-quickstart", build_job)
         self.assertTrue(example.is_file(), "the quickstart example must exist")
+
+    def test_ci_perf_budgets_job_runs_the_harness_blocking(self) -> None:
+        # Story 7-5 (NFR-4): the designated perf job runs the perf-budgets
+        # harness on every PR and GATES the measured budgets — reads p99 and
+        # RSS/instance gate hard; CPU/instance carries the harness's
+        # documented shared-runner tolerance over a median-of-3 window in CI.
+        # Guard the whole shape so the gate cannot silently drop out: the job
+        # exists, builds the release example, carries the stale-helper rm +
+        # rebuild guard (the harness SPAWNS fake_agent, so the test/coverage
+        # -job rule "any job that spawns agents carries it" applies), runs
+        # the binary BLOCKING (the run block's last line IS the bare binary
+        # invocation, and the block contains no failure-swallowing idiom),
+        # uploads the JSON report artifact, and the harness example file
+        # itself exists.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        example = (
+            release_docs.ROOT
+            / "crates"
+            / "ktesio-engine"
+            / "examples"
+            / "perf-budgets.rs"
+        )
+        job_start = ci.index("  perf-budgets:")
+        import re as _re
+
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[job_start + 1 :])
+        # The perf job may be LAST in the file — slice to end-of-file then.
+        job_end = job_start + 1 + next_job.start() if next_job else len(ci)
+        perf_job = ci[job_start:job_end]
+        self.assertIn("name: perf-budgets", perf_job)
+        self.assertIn("runs-on: ubuntu-latest", perf_job)
+        self.assertIn(
+            "cargo +stable build --release -p ktesio-engine --example perf-budgets",
+            perf_job,
+        )
+        # The stale-helper guard: rm + explicit rebuild for the fake_agent
+        # this harness spawns (same defect class the test job hit twice).
+        self.assertIn(
+            "rm -f target/release/fake_agent target/release/fake_agent.exe", perf_job
+        )
+        self.assertIn(
+            "cargo +stable build --release -p ktesio-conformance --bin fake_agent",
+            perf_job,
+        )
+        # Blocking, pinned structurally beyond substrings: the RUN step's
+        # block must END on the bare binary invocation (optional leading
+        # whitespace) — a tee/pipe/&& suffix could swallow the harness's
+        # nonzero exit — and must contain no failure-swallowing idiom.
+        run_step = perf_job.index("- name: Run the perf harness")
+        run_text = perf_job[perf_job.index("run: |", run_step) :]
+        next_step = _re.search(r"\n      - name:", run_text[1:])
+        run_block = (
+            run_text[: 1 + next_step.start()] if next_step else run_text
+        )
+        last_line = next(
+            line for line in reversed(run_block.splitlines()) if line.strip()
+        )
+        self.assertRegex(
+            last_line, r"^\s*target/release/examples/perf-budgets\s*$"
+        )
+        self.assertNotIn("|| true", run_block)
+        self.assertNotIn("exit 0", run_block)
+        # The measured record is also uploaded as the job's artifact (even on
+        # a red run): the harness writes it via the env var, the upload step
+        # publishes it, and the upload is not skipped on failure.
+        self.assertIn("PERF_BUDGETS_REPORT_PATH: perf-budgets-report.json", perf_job)
+        self.assertIn("actions/upload-artifact@", perf_job)
+        upload = perf_job[perf_job.index("- name: Upload the measured report") :]
+        self.assertIn("if: always()", upload)
+        self.assertIn("actions/upload-artifact@", upload)
+        self.assertIn("perf-budgets-report.json", upload)
+        self.assertTrue(example.is_file(), "the perf-budgets harness example must exist")
 
     def test_publish_hold_pinned_in_all_four_internal_manifests(self) -> None:
         # Story 7-4's non-negotiable, PINNED like any other invariant: the
@@ -528,11 +604,14 @@ class ReleaseDocsTests(unittest.TestCase):
         )
 
         # MSRV job installs the pinned floor toolchain explicitly and checks the
-        # whole workspace against it. Keep the version in lockstep with
-        # rust-version in the root Cargo.toml [workspace.package].
+        # whole workspace against it — --all-targets, so the DEV-dependencies
+        # (notably the story-7-5 perf harness's sysinfo) compile on the floor
+        # too and a future sysinfo MSRV bump past 1.96.1 reds the msrv job.
+        # Keep the version in lockstep with rust-version in the root
+        # Cargo.toml [workspace.package].
         self.assertIn("name: msrv", ci)
         self.assertIn("rustup toolchain install 1.96.1 --profile minimal", ci)
-        self.assertIn("cargo +1.96.1 check --workspace", ci)
+        self.assertIn("cargo +1.96.1 check --workspace --all-targets", ci)
 
         cargo_toml = (release_docs.ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('rust-version = "1.96.1"', cargo_toml)

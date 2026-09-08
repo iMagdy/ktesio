@@ -235,6 +235,92 @@ jobs:
           }
           target/release/examples/embedding-quickstart
 
+  perf-budgets:
+    name: perf-budgets
+    # Story 7-5 (NFR-4): the DESIGNATED performance job. NFR-4's budgets
+    # (reads < 1s on a 25-instance Fleet; supervision overhead <= 2% CPU and
+    # <= 50MB RSS per running instance) are benchmarked here on every PR —
+    # measured, not assumed — and a regression FAILS this job (blocking; the
+    # run step is never allowed to fail). Gate policy (the harness prints it,
+    # with all measured numbers, as a JSON report in this job's log — the
+    # measured record of record, also uploaded as this job's artifact): reads
+    # p99 and RSS/instance gate hard at budget; CPU/instance gates strict
+    # (x1.0) locally and carries the harness's DOCUMENTED shared-runner
+    # tolerance (x1.5, named in the report) over the MEDIAN OF THREE windows
+    # here, because a hosted runner's co-tenant noise is uncontrollable.
+    # Gated separately from the standard test matrix (a dedicated ubuntu job,
+    # not a matrix leg) so the measurement is comparable run-to-run and
+    # perf-noise flakiness can never spill into the ordinary test gates.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build the perf harness (release profile)
+        # Release profile: the measurement must not pay dev-profile build
+        # noise. Explicit +stable (see fmt job): the root rust-toolchain.toml
+        # pins only local bare cargo; MSRV floor: the `msrv` job.
+        run: cargo +stable build --release -p ktesio-engine --example perf-budgets
+      - name: Rebuild the fake_agent helper (stale-helper guard)
+        # The SAME stale-helper guard the test + coverage jobs carry (and
+        # scripts/test_automation.py enforces for any job that spawns
+        # agents): this job's target/ cache key is Cargo.lock-derived, so a
+        # helper-only change cannot bust it and a frozen binary would
+        # silently ignore newer flags (unknown args are `_ => {}`). The
+        # harness resolves the helper at target/release/fake_agent; rm +
+        # explicit rebuild makes that deterministic instead of racing the
+        # lib's on-demand build fallback (the build-dir lock contention
+        # flake). hermes_shim is NOT needed here — the harness spawns only
+        # fake_agent.
+        shell: bash
+        run: |
+          rm -f target/release/fake_agent target/release/fake_agent.exe
+          cargo +stable build --release -p ktesio-conformance --bin fake_agent
+      - name: Run the perf harness (NFR-4 budgets; regressions fail this job)
+        # Blocking by design: a budget regression (reads p99 over 1s, RSS
+        # over 50 MiB/instance or its 2x spike guard, CPU over its applicable
+        # budget) exits nonzero and reds this job, per the AC "regressions
+        # fail the perf job". The runner's ambient CI=true env switches the
+        # harness into its documented CI mode (median-of-3 windows + the
+        # tolerance, and the reads gate's one 30s-cool-down retry). The env
+        # var also makes the harness write the JSON report to a file, which
+        # the step below uploads as the job's artifact — the run line itself
+        # stays the bare binary invocation so the step cannot silently
+        # swallow a nonzero exit.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets
+      - name: Upload the measured report (artifact)
+        # The measured record of record also lives in this job's log; the
+        # artifact makes it downloadable for trend inspection. `if: always()`
+        # so a red (regression) run's numbers are preserved too — that is
+        # exactly when the record matters most.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-budgets-report
+          path: perf-budgets-report.json
+          if-no-files-found: warn
+
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -598,7 +684,12 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-msrv-
       - name: Check workspace builds on the MSRV
-        run: cargo +1.96.1 check --workspace
+        # --all-targets (not just the lib graph) so the DEV-dependencies
+        # compile on the pinned floor too: the story-7-5 perf harness carries
+        # `sysinfo` as a benchmark-gated dev-dep, and a future sysinfo MSRV
+        # bump past 1.96.1 must red HERE (on a lockfile refresh), not in a
+        # contributor's local build.
+        run: cargo +1.96.1 check --workspace --all-targets
 
   coverage:
     name: coverage

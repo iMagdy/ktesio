@@ -1,0 +1,1366 @@
+//! The performance-budgets harness (story 7-5, NFR-4) — MEASURE, don't assume.
+//!
+//! NFR-4's budgets — read commands < 1 s on a 25-instance Fleet; supervision
+//! overhead ≤ 2% CPU and ≤ 50 MB RSS per running instance — were PRD
+//! placeholders marked "for architecture to validate". This harness turns
+//! them into measured, gated numbers: it builds a real 25-instance Fleet
+//! fixture (manifest agents on the conformance `fake_agent`, a subset
+//! RUNNING), drives the PUBLIC facade only (`Engine::blocking()` — the same
+//! embedding surface `kt` drives, consistent with stories 7-1/7-3), and
+//! measures, in this fixed order (fixture startup is entirely OUTSIDE the
+//! timed windows: setup → settle → steady-state window → re-settle → reads):
+//!
+//! 1. **Steady-state supervision overhead** — with the running subset idling
+//!    (`fake_agent --heartbeat-ms 1000` — heartbeat only, no usage emission,
+//!    so the engine is supervising, not metering), the ENGINE PROCESS's
+//!    aggregate CPU% and RSS are sampled once per second over a ≥ 10 s window
+//!    (the first sample is discarded — it carries the phase's residue), AFTER
+//!    a settle period. On CI the window runs THREE times and the gate uses
+//!    the MEDIAN window (the stability mechanism for noisy shared runners);
+//!    locally it runs once. Per-instance = figure / the actually-Running
+//!    count sampled at measurement time.
+//! 2. **Read latency** — over `READ_ITERATIONS` iterations, each of the read
+//!    kinds the CLI itself uses: `fleet()` (the `kt agent list` read),
+//!    `instance_status()` (spread across the Fleet round-robin), the
+//!    `effective_config()` read (`kt agent config get`; the configured value
+//!    is asserted), and the per-instance usage read (`kt agent usage <name>`'s
+//!    exact shape: `fleet()` + find — reported as `usage_via_fleet` because it
+//!    includes the fleet listing's cost; it is NOT an independent kind).
+//!    p50/p95/p99 are reported per kind; the GATE is on the overall p99 (the
+//!    worst kind) < 1 s. On CI a failed read gate retries ONCE after a 30 s
+//!    cool-down and gates on the second run (the house flake policy: a
+//!    co-tenant stall must not red an ordinary PR; local runs are
+//!    single-shot).
+//!
+//! It prints a machine-readable JSON report to stdout (the measured record —
+//! the CI perf-budgets job log is its canonical home, and the job uploads the
+//! JSON as a workflow artifact via `PERF_BUDGETS_REPORT_PATH`) and GATES:
+//!
+//! | gate                        | local + CI | budget                          |
+//! |-----------------------------|------------|---------------------------------|
+//! | read p99                    | hard       | < 1000 ms                       |
+//! | RSS mean / instance         | hard       | ≤ 50 MiB                        |
+//! | RSS max spike / instance    | hard       | ≤ 2 × 50 MiB (leak guard)       |
+//! | CPU / instance              | hard       | ≤ 2% strict (local)             |
+//! | CPU / instance              | hard       | ≤ 2% × `shared_runner_tolerance` (CI) |
+//!
+//! ## The CI tolerance policy (named, not hidden)
+//!
+//! `CI_CPU_TOLERANCE_FACTOR` = 1.5. The CPU budget is strict (×1.0) on local
+//! runs. GitHub shared runners are noisy neighbors — an unknown co-tenant can
+//! steal cycles from under the sampling window — so in CI (the `CI` env the
+//! runner sets, overridable with `PERF_BUDGETS_CI=1|0`; any other value exits
+//! 2) the CPU gate runs at ×1.5 (3% per instance) AND takes the median of
+//! three windows. The factor is a DOCUMENTED shared-runner tolerance, printed
+//! in the report (`ci_tolerance.factor`) and in the job log; it is NOT a
+//! relaxation of the budget — the 2% strict budget is what local runs gate,
+//! reads and RSS gate at budget everywhere, and every report carries both the
+//! strict-budget margin and the applied tolerance.
+//!
+//! ## Why an example (explicit gating, not `#[ignore]` sprawl)
+//!
+//! `cargo test --workspace --all-targets` COMPILES this file and RUNS its
+//! `#[cfg(test)]` module (the example's unit tests) but never executes the
+//! harness itself — an example's `main` runs only when invoked explicitly.
+//! That is the whole gate: the wall-clock measurement stays out of ordinary
+//! test runs without a single `#[ignore]`d test, while the GATE MATH
+//! (percentiles, worst-kind selection, per-instance normalization, CI-mode
+//! parsing, tolerance selection, pass/fail evaluation) is pinned by tests so
+//! it cannot silently weaken — a budget change must consciously edit the
+//! assertions. Run the harness locally:
+//!
+//! ```bash
+//! cargo run --release --example perf-budgets -p ktesio-engine
+//! ```
+//!
+//! (From the workspace root, so the on-demand `fake_agent` build below lands
+//! in the same `target/`.) The CI perf-budgets job builds the release example
+//! + helper explicitly and runs the binary — its regressions FAIL that job.
+//!
+//! ## Measurement honesty
+//!
+//! * CPU% is sysinfo's two-refresh delta for ONE pid — the harness process
+//!   itself, which owns the `Engine` (its runtime threads + supervisor ARE
+//!   the engine; the harness is the embedding host). Between consecutive
+//!   refreshes the main thread sleeps, so the sampled CPU is the engine's
+//!   idle supervision cost, not measurement-loop cost. sysinfo's process
+//!   CPU% can exceed 100 on many cores (it is the per-core SUM) — that is
+//!   the "aggregate" figure the budget divides. Both contamination
+//!   directions are acknowledged: measuring reads BEFORE the window would
+//!   inflate the CPU samples with read-phase activity (the fixed order
+//!   measures steady-state FIRST, avoiding it), and the window's own
+//!   background leaves the runtime warm for the reads (a short re-settle
+//!   absorbs it).
+//! * RSS is the engine process's resident set ONLY. The supervised agents'
+//!   own memory is their own (separate processes) — per the spec's design
+//!   note it is NOT supervision overhead, and the report says so. The mean
+//!   is gated, the max is reported and spike-guarded at 2× budget, and the
+//!   scope note acknowledges that the allocator may retain pages from
+//!   earlier phases (registration/start/sampling) in the engine process.
+//! * Window coverage: the 12 s window validates heartbeat-frequency
+//!   supervision work (the reaper cadence + per-second log captures).
+//!   LONGER-period supervision tasks (sweeps, retention) are NOT captured;
+//!   a longer local window is available via `PERF_BUDGETS_WINDOW_MS` (clamped
+//!   to [10 s, 1 h]).
+//! * Process metrics come from `sysinfo` — the DEV-dependency the spec
+//!   record sanctions (dev-only, benchmark-gated, NFR-8-compatible: the
+//!   shipping `cargo tree -p ktesio -e normal,build` is unchanged). The
+//!   hand-rolled `/proc` alternative would have been platform-lying; Windows
+//!   needs the crate regardless.
+//! * Platform scope of the gates: enforced on ubuntu CI and strict on local
+//!   macOS/Windows runs; Windows figures are measured-and-reported (sysinfo's
+//!   `memory()` is the working-set-size analog there), not a ratified
+//!   gate platform.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use ktesio_engine::{AdapterRef, Blocking, ConfigLayer, Engine, FleetEntry, LifecycleState};
+use sysinfo::{Pid, ProcessesToUpdate, System};
+
+// ---------------------------------------------------------------------------
+// Pinned fixture + budget constants (the spec's numbers, stated once)
+// ---------------------------------------------------------------------------
+
+/// The Fleet size the budgets are written against (NFR-4: "25-instance Fleet").
+///
+/// ## Budget assumption (conscious-edit notice)
+///
+/// NFR-4's per-instance figures mean MARGINAL supervision overhead: the fixed
+/// engine cost (runtime + registry + reaper) amortizes over
+/// [`RUNNING_COUNT`], and only the per-instance marginal work (heartbeat
+/// capture, poll entries) scales with it. These two counts are PART OF THE
+/// BUDGET'S MEANING — a future edit that changes [`FLEET_SIZE`] or
+/// [`RUNNING_COUNT`] must consciously revisit the budget with the maintainer
+/// (the spec-7.5 remedy: a documented budget-update proposal, never a silent
+/// gate tweak).
+const FLEET_SIZE: usize = 25;
+
+/// How many of the registered instances are RUNNING via the facade start —
+/// the steady-state denominator (see the budget assumption on [`FLEET_SIZE`]).
+const RUNNING_COUNT: usize = 10;
+
+/// The registered-instance name prefix (names are `perf-00` … `perf-24` —
+/// valid `[a-z0-9][a-z0-9_-]*` instance names).
+const INSTANCE_PREFIX: &str = "perf-";
+
+/// The manifest adapter kind (a flow-local identity; nothing builtin answers
+/// to it — the uj3 fixture's shape, renamed for this harness).
+const MANIFEST_KIND: &str = "perfbudgets";
+
+/// The idle agents' heartbeat cadence: the ONLY work a running instance does
+/// during the steady-state window (no usage emission — the engine supervises
+/// and captures, it does not meter).
+const HEARTBEAT_MS: u64 = 1000;
+
+/// The idle agents' self-exit fallback — the ORPHAN BOUND: if the harness
+/// dies mid-run, any leaked agent self-exits within 60 s instead of
+/// lingering. Every legitimate schedule (setup + windows + reads, even with
+/// the CI retry cool-down) either measures within this bound or no longer
+/// depends on the agents being alive.
+const AGENT_LINGER_MS: u64 = 60_000;
+
+/// The config leaf the setup writes to every instance so the timed
+/// `effective_config` read is a REAL read whose content can be asserted.
+const MODEL_KEY: &str = "model";
+const MODEL_VALUE: &str = "perf-model";
+
+/// The ratified budgets (NFR-4). These are the numbers the harness gates on.
+const BUDGET_READ_P99_MS: f64 = 1000.0;
+const BUDGET_CPU_PER_INSTANCE_PCT: f64 = 2.0;
+const BUDGET_RSS_PER_INSTANCE_MIB: f64 = 50.0;
+/// The RSS spike/leak guard: a single window sample exceeding twice the
+/// per-instance budget fails the run even when the mean is fine.
+const RSS_SPIKE_TOLERANCE: f64 = 2.0;
+
+/// The DOCUMENTED shared-runner tolerance factor for the CPU gate in CI only
+/// (see the module docs). Named here and in every report — never hidden.
+const CI_CPU_TOLERANCE_FACTOR: f64 = 1.5;
+
+/// The read-gate retry (CI mode only): one cool-down + re-measure, gated on
+/// the second run — the house pattern so a co-tenant stall cannot red an
+/// ordinary PR. Local runs never retry.
+const READ_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How many steady-state windows CI mode samples (median-of-3); local runs
+/// sample one.
+const CI_STEADY_WINDOWS: usize = 3;
+
+/// The report schema version (bump only on a breaking shape change; additive
+/// fields keep it — the AD-14 convention).
+const REPORT_SCHEMA_VERSION: u64 = 1;
+
+// ---------------------------------------------------------------------------
+// Environment (tunables + CI detection) — invalid values are LOUD, never silent
+// ---------------------------------------------------------------------------
+
+/// Progress diagnostics → stderr (CLI-first discipline: stdout is the report).
+fn note(message: &str) {
+    eprintln!("[perf-budgets] {message}");
+}
+
+/// Read a non-negative integer env override; an unparsable value WARNS and
+/// falls back to the default (never a silent fallback, never a crash).
+fn env_u64(key: &str, default: u64) -> u64 {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                note(&format!(
+                    "invalid {key}={raw:?} (not a non-negative integer) — using default {default}"
+                ));
+                default
+            }
+        },
+    }
+}
+
+/// Pure CI-mode selection: an explicit `PERF_BUDGETS_CI` of `1`/`0` wins;
+/// anything ELSE is an ERROR (the caller exits 2 — a typoed override must
+/// never silently pick a mode); unset falls to the GitHub-runner `CI` env.
+fn ci_mode_from(explicit: Option<&str>, ambient: Option<&str>) -> Result<bool, String> {
+    match explicit {
+        Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(other) => Err(format!(
+            "PERF_BUDGETS_CI must be \"1\" or \"0\", got {other:?}"
+        )),
+        None => Ok(matches!(ambient, Some("true") | Some("1"))),
+    }
+}
+
+/// The run configuration, resolved from the environment once. Clamps are
+/// loud (a stderr note) and bounded: settle ≥ 1 s, window ∈ [10 s, 1 h]
+/// (the spec's ≥ 10 s floor; the 1 h cap keeps a stray override from hanging
+/// the CI job).
+struct HarnessConfig {
+    read_iterations: usize,
+    settle: Duration,
+    window: Duration,
+    sample_interval: Duration,
+    windows: usize,
+    ci: bool,
+}
+
+impl HarnessConfig {
+    fn from_env() -> Self {
+        let read_iterations = env_u64("PERF_BUDGETS_READ_ITERATIONS", 200).max(1) as usize;
+        let settle_ms = env_u64("PERF_BUDGETS_SETTLE_MS", 2_000);
+        let settle = if settle_ms < 1_000 {
+            note(&format!(
+                "PERF_BUDGETS_SETTLE_MS={settle_ms} below the 1000 ms floor — clamped"
+            ));
+            Duration::from_millis(1_000)
+        } else {
+            Duration::from_millis(settle_ms)
+        };
+        let window_ms = env_u64("PERF_BUDGETS_WINDOW_MS", 12_000);
+        let window_ms = if !(10_000..=3_600_000).contains(&window_ms) {
+            note(&format!(
+                "PERF_BUDGETS_WINDOW_MS={window_ms} outside [10000, 3600000] — clamped"
+            ));
+            window_ms.clamp(10_000, 3_600_000)
+        } else {
+            window_ms
+        };
+        let ci = match ci_mode_from(
+            std::env::var("PERF_BUDGETS_CI").ok().as_deref(),
+            std::env::var("CI").ok().as_deref(),
+        ) {
+            Ok(ci) => ci,
+            Err(reason) => {
+                note(&format!("{reason} — exiting 2"));
+                std::process::exit(2);
+            }
+        };
+        let windows = if ci { CI_STEADY_WINDOWS } else { 1 };
+        Self {
+            read_iterations,
+            settle,
+            window: Duration::from_millis(window_ms),
+            sample_interval: Duration::from_secs(1),
+            windows,
+            ci,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure gate math (pinned by the #[cfg(test)] module below — the alarm cannot
+// silently weaken: a budget or evaluation change must edit those assertions)
+// ---------------------------------------------------------------------------
+
+/// One read kind's summarized latency statistics (milliseconds).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReadStats {
+    name: &'static str,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    samples: usize,
+}
+
+/// Summarize one read kind's raw samples (sorts in place; nearest-rank).
+fn summarize_read(name: &'static str, samples_ms: &mut [f64]) -> ReadStats {
+    samples_ms.sort_by(|a, b| a.total_cmp(b));
+    ReadStats {
+        name,
+        p50: percentile(samples_ms, 50.0),
+        p95: percentile(samples_ms, 95.0),
+        p99: percentile(samples_ms, 99.0),
+        max: samples_ms.last().copied().unwrap_or(0.0),
+        samples: samples_ms.len(),
+    }
+}
+
+/// The worst kind's p99 — the value the read gate applies, because the budget
+/// is "< 1 s for read commands", i.e. EVERY read command.
+fn overall_read_p99(reads: &[ReadStats]) -> f64 {
+    reads
+        .iter()
+        .map(|r| r.p99)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Nearest-rank percentile over an ASCENDING-sorted sample list.
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    let rank = ((pct / 100.0) * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[(rank - 1).min(sorted.len() - 1)]
+}
+
+/// Median over an ASCENDING-sorted list (mean of the two middles when even).
+fn median(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    match n {
+        0 => 0.0,
+        odd if odd % 2 == 1 => sorted[odd / 2],
+        _ => (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0,
+    }
+}
+
+/// Per-instance normalization: AGGREGATE figure / actually-Running count
+/// (the budget's "per running instance" division).
+fn per_instance(aggregate: f64, running_count: usize) -> f64 {
+    if running_count == 0 {
+        return f64::INFINITY;
+    }
+    aggregate / running_count as f64
+}
+
+/// The normalized steady-state figures the gates consume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SteadyFigures {
+    cpu_per_instance_pct: f64,
+    rss_per_instance_mib: f64,
+    rss_max_per_instance_mib: f64,
+}
+
+impl SteadyFigures {
+    fn new(
+        median_cpu_aggregate_pct: f64,
+        median_rss_bytes_mean: f64,
+        rss_bytes_max: u64,
+        running_count: usize,
+    ) -> Self {
+        const MIB: f64 = 1024.0 * 1024.0;
+        Self {
+            cpu_per_instance_pct: per_instance(median_cpu_aggregate_pct, running_count),
+            rss_per_instance_mib: per_instance(median_rss_bytes_mean / MIB, running_count),
+            rss_max_per_instance_mib: per_instance(rss_bytes_max as f64 / MIB, running_count),
+        }
+    }
+}
+
+/// One gate's verdict. `budget` is the STRICT budget; `effective_budget` is
+/// what this run gated on (the strict budget × this run's tolerance), and
+/// `strict_margin` = strict budget − measured (negative on a CI pass that
+/// only cleared the tolerance).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GateVerdict {
+    name: &'static str,
+    hard: bool,
+    measured: f64,
+    budget: f64,
+    effective_budget: f64,
+    tolerance: f64,
+    strict_margin: f64,
+    passed: bool,
+}
+
+/// The complete gate evaluation for one run.
+#[derive(Clone, Debug, PartialEq)]
+struct GateReport {
+    verdicts: Vec<GateVerdict>,
+    passed: bool,
+}
+
+/// Evaluate every gate per the documented policy: reads and RSS (mean AND
+/// max-spike) gate at strict budget everywhere; CPU gates strict (×1.0)
+/// locally and at the named shared-runner tolerance (×1.5) on CI.
+fn evaluate_gates(overall_p99_ms: f64, steady: &SteadyFigures, tolerance: f64) -> GateReport {
+    let verdicts = vec![
+        gate("read_p99_lt_1s", overall_p99_ms, BUDGET_READ_P99_MS, 1.0),
+        gate(
+            "rss_per_instance_le_50mib",
+            steady.rss_per_instance_mib,
+            BUDGET_RSS_PER_INSTANCE_MIB,
+            1.0,
+        ),
+        gate(
+            "rss_max_spike_le_2x_budget",
+            steady.rss_max_per_instance_mib,
+            BUDGET_RSS_PER_INSTANCE_MIB * RSS_SPIKE_TOLERANCE,
+            1.0,
+        ),
+        gate(
+            "cpu_per_instance_le_2pct",
+            steady.cpu_per_instance_pct,
+            BUDGET_CPU_PER_INSTANCE_PCT,
+            tolerance,
+        ),
+    ];
+    let passed = verdicts.iter().all(|v| v.passed);
+    GateReport { verdicts, passed }
+}
+
+/// One gate: `measured ≤ budget × tolerance` (strict when tolerance is 1.0).
+fn gate(name: &'static str, measured: f64, budget: f64, tolerance: f64) -> GateVerdict {
+    let effective_budget = budget * tolerance;
+    GateVerdict {
+        name,
+        hard: true,
+        measured,
+        budget,
+        effective_budget,
+        tolerance,
+        strict_margin: budget - measured,
+        passed: measured <= effective_budget,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The harness
+// ---------------------------------------------------------------------------
+
+fn main() {
+    let config = HarnessConfig::from_env();
+    note(&format!(
+        "ktesio perf-budgets harness (story 7-5 / NFR-4): fleet={FLEET_SIZE} \
+         running={RUNNING_COUNT} read_iterations={} window={:?} settle={:?} \
+         windows={} ci={}",
+        config.read_iterations, config.window, config.settle, config.windows, config.ci,
+    ));
+
+    // ---- Hermetic fixture root: a temp state dir + temp manifest dir, both
+    // removed at teardown (TempDir drops delete the whole tree). ----
+    let state = tempfile::TempDir::new().expect("create the hermetic state root");
+    let manifest_tmp = tempfile::TempDir::new().expect("create the manifest dir");
+    let fake_agent = locate_fake_agent();
+    let manifest_dir = write_heartbeat_manifest(manifest_tmp.path(), &fake_agent);
+
+    let engine = Engine::open(Some(state.path().to_path_buf())).expect("open the engine");
+    let facade = engine.blocking();
+
+    // ---- Setup (NOT a timed window): register 25, seed a real config leaf
+    // (so the timed config read is assertable), start 10 under the guard. ----
+    let names: Vec<String> = (0..FLEET_SIZE)
+        .map(|i| format!("{INSTANCE_PREFIX}{i:02}"))
+        .collect();
+    for name in &names {
+        facade
+            .register_with_adapter(name, &AdapterRef::Manifest(manifest_dir.clone()))
+            .unwrap_or_else(|e| panic!("register {name} failed: {e}"));
+        facade
+            .set_config(name, MODEL_KEY, MODEL_VALUE)
+            .unwrap_or_else(|e| panic!("seed config on {name} failed: {e}"));
+    }
+    note(&format!(
+        "registered {FLEET_SIZE} instances (config leaf seeded)"
+    ));
+    let mut guard = RunningGuard::new(&facade, &names[..RUNNING_COUNT]);
+    for name in &names[..RUNNING_COUNT] {
+        facade
+            .start(name)
+            .unwrap_or_else(|e| panic!("start {name} failed: {e}"));
+        let status = facade
+            .instance_status(name)
+            .unwrap_or_else(|e| panic!("status read for {name} failed: {e}"));
+        assert_eq!(
+            status.instance.state,
+            LifecycleState::Running,
+            "{name} must be Running after start"
+        );
+    }
+    // The per-instance normalization divides by the ACTUALLY-Running count,
+    // sampled at measurement time — never the intended count.
+    let running_count = sample_running_count(&facade, &names);
+    assert!(
+        running_count > 0,
+        "no instance is Running — the steady-state budget is meaningless over zero running instances"
+    );
+    if running_count != RUNNING_COUNT {
+        note(&format!(
+            "WARNING: {running_count} instances Running (expected {RUNNING_COUNT}) — \
+             normalizing over the ACTUAL count"
+        ));
+    }
+    note(&format!(
+        "{running_count} instances RUNNING (heartbeat-only idlers); settling {:?}",
+        config.settle
+    ));
+    std::thread::sleep(config.settle);
+
+    // ---- Measure (1): steady-state ENGINE-process CPU% / RSS (median of the
+    // configured window count). ----
+    let steady = measure_steady_state(&config);
+    note("steady-state sampling complete");
+
+    // A short re-settle so the window's background does not bleed into the
+    // read-latency samples (see the contamination note in the report).
+    std::thread::sleep(Duration::from_secs(1));
+
+    // ---- Measure (2): read latency through the public facade. CI mode only:
+    // a failed read gate retries ONCE after a cool-down and gates on the
+    // second run (a co-tenant stall must not red an ordinary PR). ----
+    let mut read_attempts = 1usize;
+    let mut reads = measure_read_latency(&facade, &names, config.read_iterations);
+    let mut p99 = overall_read_p99(&reads);
+    if config.ci && p99 >= BUDGET_READ_P99_MS {
+        note(&format!(
+            "read gate over budget on CI (p99 {p99:.3} ms) — cooling down {:?} and \
+             retrying ONCE (the gate applies to the second run)",
+            READ_RETRY_COOLDOWN
+        ));
+        std::thread::sleep(READ_RETRY_COOLDOWN);
+        reads = measure_read_latency(&facade, &names, config.read_iterations);
+        p99 = overall_read_p99(&reads);
+        read_attempts = 2;
+    }
+    note("read-latency measurement complete");
+
+    // ---- Report BEFORE teardown, so the measured record survives any
+    // teardown trouble; the exit code still reflects the gates. ----
+    let figures = SteadyFigures::new(
+        steady.median_cpu_aggregate_pct,
+        steady.median_rss_bytes_mean,
+        steady.rss_bytes_max,
+        running_count,
+    );
+    let tolerance = if config.ci {
+        CI_CPU_TOLERANCE_FACTOR
+    } else {
+        1.0
+    };
+    let gates = evaluate_gates(p99, &figures, tolerance);
+    let report = build_report(
+        &config,
+        &reads,
+        p99,
+        &steady,
+        &figures,
+        running_count,
+        read_attempts,
+        tolerance,
+        &gates,
+    );
+    print_report(&report, &gates);
+    if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
+        match serde_json::to_string_pretty(&report)
+            .map_err(|e| e.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
+        {
+            Ok(()) => note(&format!("JSON report written to {path}")),
+            Err(e) => note(&format!(
+                "could not write the JSON report to {path} ({e}) — the stdout report \
+                 (the measured record) is unaffected"
+            )),
+        }
+    }
+
+    // ---- Teardown (best-effort; a stop failure is noted, never a panic —
+    // and the RunningGuard below would retry it on unwind anyway). ----
+    let mut all_stopped = true;
+    for name in guard.names() {
+        if let Err(e) = facade.stop(name, Some(Duration::from_secs(5))) {
+            all_stopped = false;
+            note(&format!(
+                "stop {name} failed during teardown ({e}); the agent's own \
+                 --linger-ms bound ({AGENT_LINGER_MS} ms) caps any orphan"
+            ));
+        }
+    }
+    guard.defuse_if(all_stopped);
+    drop(guard);
+    drop(engine);
+    drop(state);
+    drop(manifest_tmp);
+    note("teardown complete: running instances stopped, hermetic roots removed");
+
+    if !gates.passed {
+        // The measured record is already on stdout; exit nonzero so the CI
+        // perf-budgets job (and any local gate runner) fails on the regression.
+        std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunningGuard — teardown on ANY exit path
+// ---------------------------------------------------------------------------
+
+/// Arms the running-instance list for best-effort teardown on EVERY exit
+/// path: the explicit teardown defuses it, but a panic (or an early exit
+/// between start and teardown) unwinds through Drop, which stops every
+/// running instance before the process dies. Best-effort: a stop failure
+/// during Drop is swallowed — the fixture's `--linger-ms` bound caps any
+/// orphan either way.
+struct RunningGuard<'a> {
+    facade: &'a Blocking<'a>,
+    names: Vec<String>,
+    armed: bool,
+}
+
+impl<'a> RunningGuard<'a> {
+    fn new(facade: &'a Blocking<'a>, names: &[String]) -> Self {
+        Self {
+            facade,
+            names: names.to_vec(),
+            armed: true,
+        }
+    }
+
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Disarm after a successful explicit teardown (Drop then does nothing).
+    /// Left ARMED when any stop failed, so Drop retries them best-effort.
+    fn defuse_if(&mut self, all_stopped: bool) {
+        if all_stopped {
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        note("unwound before explicit teardown — best-effort stopping running instances");
+        for name in &self.names {
+            let _ = self.facade.stop(name, Some(Duration::from_secs(2)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Measurement (1): steady-state engine-process CPU% / RSS
+// ---------------------------------------------------------------------------
+
+/// One steady-state window's aggregates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowSample {
+    /// Mean aggregate engine-process CPU% across this window's counted
+    /// samples (the per-core SUM — can exceed 100 on a multicore host).
+    cpu_pct_aggregate_mean: f64,
+    /// Mean engine-process RSS across this window's counted samples, in bytes.
+    rss_bytes_mean: f64,
+    /// Max engine-process RSS across this window's counted samples, in bytes.
+    rss_bytes_max: u64,
+    /// How many samples were COUNTED (the first is always discarded).
+    samples: usize,
+}
+
+/// All steady-state windows, reduced to the figures the report + gates use.
+#[derive(Clone, Debug, PartialEq)]
+struct SteadyMeasurements {
+    windows: Vec<WindowSample>,
+    /// The MEDIAN window's aggregate CPU% (of one window locally; of three
+    /// on CI — the stability mechanism for shared-runner noise).
+    median_cpu_aggregate_pct: f64,
+    /// The median window's mean RSS, in bytes.
+    median_rss_bytes_mean: f64,
+    /// The max RSS over EVERY sample of EVERY window, in bytes (reported and
+    /// spike-guarded, never mean-smoothed away).
+    rss_bytes_max: u64,
+    first_sample_skipped: bool,
+}
+
+/// Sample the ENGINE process (= this process: the harness owns the `Engine`)
+/// for `config.windows` windows. sysinfo computes a process's CPU% from the
+/// delta between two refreshes, so the FIRST refresh only primes the baseline
+/// and each subsequent 1 s-apart refresh yields the usage for the interval
+/// since the previous one — the main thread sleeps between refreshes, so the
+/// sampled figure is the engine's idle supervision cost, not loop cost. The
+/// first sample of each window is DISCARDED (its interval overlaps whatever
+/// ran before it — setup, or the previous window — so it is residue, not
+/// steady state).
+fn measure_steady_state(config: &HarnessConfig) -> SteadyMeasurements {
+    let pid = Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    let mut windows = Vec::with_capacity(config.windows);
+    for window_index in 0..config.windows {
+        if window_index > 0 {
+            // A short gap between windows so each median candidate is an
+            // independent, separately-primed measurement.
+            std::thread::sleep(config.sample_interval);
+        }
+        let primed = sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        assert_eq!(primed, 1, "the engine process (self) must be sampleable");
+        let sample_count =
+            (config.window.as_secs_f64() / config.sample_interval.as_secs_f64()).round() as usize;
+        let mut cpu = Vec::with_capacity(sample_count);
+        let mut rss = Vec::with_capacity(sample_count);
+        for _ in 0..sample_count {
+            std::thread::sleep(config.sample_interval);
+            let updated = sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            assert_eq!(
+                updated, 1,
+                "the engine process must stay alive while sampling"
+            );
+            let process = sys.process(pid).expect("the refreshed engine process");
+            cpu.push(f64::from(process.cpu_usage()));
+            rss.push(process.memory());
+        }
+        let _ = cpu.drain(..1.min(cpu.len()));
+        let _ = rss.drain(..1.min(rss.len()));
+        assert!(!cpu.is_empty(), "a window must count at least one sample");
+        windows.push(WindowSample {
+            cpu_pct_aggregate_mean: cpu.iter().sum::<f64>() / cpu.len() as f64,
+            rss_bytes_mean: rss.iter().sum::<u64>() as f64 / rss.len() as f64,
+            rss_bytes_max: *rss.iter().max().expect("non-empty samples"),
+            samples: rss.len(),
+        });
+    }
+    let mut cpu_means: Vec<f64> = windows.iter().map(|w| w.cpu_pct_aggregate_mean).collect();
+    let mut rss_means: Vec<f64> = windows.iter().map(|w| w.rss_bytes_mean).collect();
+    cpu_means.sort_by(|a, b| a.total_cmp(b));
+    rss_means.sort_by(|a, b| a.total_cmp(b));
+    SteadyMeasurements {
+        median_cpu_aggregate_pct: median(&cpu_means),
+        median_rss_bytes_mean: median(&rss_means),
+        rss_bytes_max: windows
+            .iter()
+            .map(|w| w.rss_bytes_max)
+            .max()
+            .unwrap_or_default(),
+        first_sample_skipped: true,
+        windows,
+    }
+}
+
+/// The actually-Running count across the whole fixture, sampled through the
+/// facade (never the intended count).
+fn sample_running_count(facade: &Blocking<'_>, names: &[String]) -> usize {
+    names
+        .iter()
+        .filter(|name| {
+            facade
+                .instance_status(name)
+                .map(|status| status.instance.state == LifecycleState::Running)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+// ---------------------------------------------------------------------------
+// Measurement (2): read latency
+// ---------------------------------------------------------------------------
+
+/// Drive `READ_ITERATIONS` iterations of the four read kinds. Each iteration
+/// spreads the per-instance reads across the Fleet round-robin (iteration `i`
+/// lands on instance `i % 25`) and asserts the reads actually returned the
+/// right content — a read that silently degraded must not count as a fast
+/// read.
+fn measure_read_latency(
+    facade: &Blocking<'_>,
+    names: &[String],
+    iterations: usize,
+) -> Vec<ReadStats> {
+    let mut fleet = Vec::with_capacity(iterations);
+    let mut status = Vec::with_capacity(iterations);
+    let mut config = Vec::with_capacity(iterations);
+    let mut usage = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        let name = names[i % names.len()].as_str();
+
+        let t = Instant::now();
+        let entries = facade.fleet().expect("fleet read");
+        fleet.push(elapsed_ms(t));
+        assert_eq!(
+            entries.len(),
+            FLEET_SIZE,
+            "fleet read must list the whole fixture"
+        );
+
+        let t = Instant::now();
+        let state = facade.instance_status(name).expect("instance_status read");
+        status.push(elapsed_ms(t));
+        assert_eq!(
+            state.instance.name.as_str(),
+            name,
+            "instance_status must return the requested instance"
+        );
+
+        let t = Instant::now();
+        let effective = facade
+            .effective_config(name, ConfigLayer::empty())
+            .expect("effective_config read");
+        config.push(elapsed_ms(t));
+        assert_eq!(
+            effective.value_display(MODEL_KEY).as_deref(),
+            Some(MODEL_VALUE),
+            "the seeded config leaf must read back through the timed read"
+        );
+
+        // The per-instance usage read, EXACTLY as `kt agent usage <name>`
+        // performs it through the facade: `fleet()` then find. Reported as
+        // `usage_via_fleet` — it includes the fleet listing's cost and is
+        // NOT an independent read kind.
+        let t = Instant::now();
+        let entry = usage_read(facade, name);
+        usage.push(elapsed_ms(t));
+        assert_eq!(
+            entry.name.as_str(),
+            name,
+            "the usage read found its instance"
+        );
+    }
+    vec![
+        summarize_read("fleet", &mut fleet),
+        summarize_read("instance_status", &mut status),
+        summarize_read("effective_config", &mut config),
+        summarize_read("usage_via_fleet", &mut usage),
+    ]
+}
+
+/// `kt agent usage <name>`'s exact facade shape (the CLI has no narrower
+/// per-instance usage query — this IS the public usage read).
+fn usage_read(facade: &Blocking<'_>, name: &str) -> FleetEntry {
+    facade
+        .fleet()
+        .expect("usage read: fleet")
+        .into_iter()
+        .find(|e| e.name.as_str() == name)
+        .expect("usage read: the instance is in the Fleet")
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+// ---------------------------------------------------------------------------
+// Report (pure build + print split, so tests pin the math, not the printing)
+// ---------------------------------------------------------------------------
+
+/// Build the machine-readable report (schema v1) from the measurements and
+/// the gate evaluation. Pure — no printing, no environment access.
+#[allow(clippy::too_many_arguments)]
+fn build_report(
+    config: &HarnessConfig,
+    reads: &[ReadStats],
+    overall_p99_ms: f64,
+    steady: &SteadyMeasurements,
+    figures: &SteadyFigures,
+    running_count: usize,
+    read_attempts: usize,
+    tolerance: f64,
+    gates: &GateReport,
+) -> serde_json::Value {
+    let mut per_kind = serde_json::Map::new();
+    for stats in reads {
+        per_kind.insert(
+            stats.name.to_string(),
+            serde_json::json!({
+                "p50_ms": stats.p50, "p95_ms": stats.p95, "p99_ms": stats.p99,
+                "max_ms": stats.max, "samples": stats.samples,
+            }),
+        );
+    }
+    let verdicts: Vec<serde_json::Value> = gates
+        .verdicts
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "name": v.name,
+                "hard": v.hard,
+                "measured": v.measured,
+                "budget": v.budget,
+                "effective_budget": v.effective_budget,
+                "tolerance": v.tolerance,
+                "strict_margin": v.strict_margin,
+                "status": if v.passed { "pass" } else { "fail" },
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "story": "7-5",
+        "budget_source": "NFR-4",
+        "ci_mode": config.ci,
+        "environment": {
+            "git_sha": git_short_sha(),
+            "os": std::env::consts::OS,
+            "cpu_model": host_cpu_model(),
+            "logical_cores": host_logical_cores(),
+            "ci": config.ci,
+            "tolerance_factor": tolerance,
+        },
+        "fixture": {
+            "fleet_size": FLEET_SIZE,
+            "running_instances": running_count,
+            "running_instances_sampled_at_measurement": true,
+            "idle_behavior": format!("fake_agent --heartbeat-ms {HEARTBEAT_MS} (heartbeat only; no usage emission)"),
+            "orphan_bound_ms": AGENT_LINGER_MS,
+            "state_root": "hermetic temp dir (removed at teardown)",
+        },
+        "methodology": {
+            "order": "setup -> settle -> steady-state window(s) -> re-settle -> read latency",
+            "read_iterations": config.read_iterations,
+            "read_kinds": reads.iter().map(|k| k.name).collect::<Vec<_>>(),
+            "read_spread": "per-instance reads round-robin across the fleet (iteration i -> instance i % 25)",
+            "usage_kind_note": "usage_via_fleet mirrors kt agent usage <name>'s exact facade shape (fleet() + find) and therefore INCLUDES the fleet listing's cost — it is not an independent read kind",
+            "steady_state_window_secs": config.window.as_secs_f64(),
+            "steady_state_windows": steady.windows.len(),
+            "steady_state_selection": if steady.windows.len() > 1 { "median window (CI stability mechanism)" } else { "single window (local strict)" },
+            "first_sample_skipped": steady.first_sample_skipped,
+            "settle_secs": config.settle.as_secs_f64(),
+            "sample_interval_secs": config.sample_interval.as_secs_f64(),
+            "process_metrics_source": "sysinfo (dev-dep), two-refresh CPU delta, one-second samples",
+            "cpu_scope": "ENGINE process aggregate (per-core sum) — the harness process that owns the Engine runtime",
+            "rss_scope": "ENGINE process resident set only; the supervised agents' own memory is their own, NOT supervision overhead; the allocator may retain pages from earlier phases (registration/start/sampling) in this figure",
+            "contamination_notes": [
+                "reads-before-window would inflate the CPU samples with read-phase activity — the fixed order (steady first) avoids that direction",
+                "the window's background leaves the runtime warm for the reads — a short re-settle (1 s) absorbs the other direction",
+            ],
+            "window_coverage": "the window validates heartbeat-frequency supervision work (reaper cadence + per-second log captures); longer-period supervision tasks (sweeps, retention) are NOT captured — lengthen locally via PERF_BUDGETS_WINDOW_MS (clamped to [10s, 1h])",
+        },
+        "read_latency_ms": per_kind,
+        "read_p99_overall_ms": overall_p99_ms,
+        "read_gate_retry": {
+            "policy": "CI mode retries ONCE after a 30 s cool-down and gates on the second run (house pattern: a co-tenant stall must not red an ordinary PR); local runs are single-shot",
+            "attempts": read_attempts,
+            "retry_applied": read_attempts > 1,
+        },
+        "steady_state": {
+            "windows": steady.windows.iter().map(|w| serde_json::json!({
+                "cpu_percent_aggregate_mean": w.cpu_pct_aggregate_mean,
+                "rss_mib_mean": w.rss_bytes_mean / (1024.0 * 1024.0),
+                "rss_mib_max": w.rss_bytes_max as f64 / (1024.0 * 1024.0),
+                "samples": w.samples,
+            })).collect::<Vec<_>>(),
+            "cpu_percent_aggregate_median": steady.median_cpu_aggregate_pct,
+            "rss_mib_aggregate_median": steady.median_rss_bytes_mean / (1024.0 * 1024.0),
+            "cpu_percent_per_instance": figures.cpu_per_instance_pct,
+            "rss_mib_per_instance_mean": figures.rss_per_instance_mib,
+            "rss_mib_per_instance_max": figures.rss_max_per_instance_mib,
+        },
+        "budgets": {
+            "read_p99_ms": BUDGET_READ_P99_MS,
+            "cpu_per_instance_pct": BUDGET_CPU_PER_INSTANCE_PCT,
+            "rss_per_instance_mib": BUDGET_RSS_PER_INSTANCE_MIB,
+            "rss_spike_factor": RSS_SPIKE_TOLERANCE,
+        },
+        "ci_tolerance": {
+            "name": "shared_runner_tolerance",
+            "factor": CI_CPU_TOLERANCE_FACTOR,
+            "applies_to": "cpu_per_instance gate only, CI mode only",
+            "applied": tolerance != 1.0,
+            "effective_cpu_budget_pct": BUDGET_CPU_PER_INSTANCE_PCT * tolerance,
+            "policy": "reads and RSS gate at budget everywhere; CPU gates strict (x1.0) locally and at the named shared-runner tolerance (x1.5) on CI — over the median of three windows — where co-tenant noise is uncontrollable",
+        },
+        "gates": verdicts,
+        "notes": [
+            "units: the gate is 50 MiB/instance (derived from raw bytes); this reconciles with NFR-4's '50MB' prose intent — documented in docs/testing.md",
+            "platform scope: gates are enforced on ubuntu CI and strict locally on macOS; Windows figures are measured-and-reported (sysinfo's memory() is the working-set-size analog there), not a ratified gate platform",
+            "the per-instance budgets mean MARGINAL supervision overhead: the fixed engine cost amortizes over the running count (see the consts' budget-assumption docs)",
+        ],
+        "status": if gates.passed { "pass" } else { "fail" },
+    })
+}
+
+/// Print the human summary (stdout — this is output, not diagnostics) and the
+/// JSON block that ends the report.
+fn print_report(report: &serde_json::Value, gates: &GateReport) {
+    let overall = report["read_p99_overall_ms"].as_f64().unwrap_or(0.0);
+    println!("PERF BUDGETS — reads p99 (overall worst kind): {overall:.3} ms (budget < {BUDGET_READ_P99_MS} ms)");
+    if let Some(kinds) = report["read_latency_ms"].as_object() {
+        for (name, stats) in kinds {
+            println!(
+                "  {name:<22} p50={:>9.3} ms  p95={:>9.3} ms  p99={:>9.3} ms",
+                stats["p50_ms"], stats["p95_ms"], stats["p99_ms"],
+            );
+        }
+    }
+    if let Some(steady) = report["steady_state"].as_object() {
+        println!(
+            "PERF BUDGETS — steady state ({} window(s), median selected, first sample skipped): engine CPU {:.3}% aggregate → {:.4}%/instance; RSS mean {:.2} MiB → {:.2} MiB/instance (max {:.2} MiB/instance)",
+            steady["windows"].as_array().map(Vec::len).unwrap_or(0),
+            steady["cpu_percent_aggregate_median"],
+            steady["cpu_percent_per_instance"],
+            steady["rss_mib_aggregate_median"],
+            steady["rss_mib_per_instance_mean"],
+            steady["rss_mib_per_instance_max"],
+        );
+    }
+    let tolerance_applied = report["ci_tolerance"]["applied"].as_bool().unwrap_or(false);
+    if tolerance_applied {
+        println!(
+            "CI mode: the DOCUMENTED shared-runner tolerance factor {} applies to the CPU gate ONLY \
+             (strict {}% → effective {}% per instance), over the median of {} windows. Reads and RSS gate at budget.",
+            report["ci_tolerance"]["factor"],
+            BUDGET_CPU_PER_INSTANCE_PCT,
+            report["ci_tolerance"]["effective_cpu_budget_pct"],
+            report["methodology"]["steady_state_windows"],
+        );
+    } else {
+        println!(
+            "Local mode: strict budgets gate (CPU {}%/instance, RSS {} MiB/instance, reads p99 < {} ms).",
+            BUDGET_CPU_PER_INSTANCE_PCT, BUDGET_RSS_PER_INSTANCE_MIB, BUDGET_READ_P99_MS
+        );
+    }
+    for verdict in &gates.verdicts {
+        println!(
+            "  gate {:<28} measured={:>10.4}  effective_budget={:>10.4}  margin(vs strict)={:>10.4}  {}",
+            verdict.name,
+            verdict.measured,
+            verdict.effective_budget,
+            verdict.strict_margin,
+            if verdict.passed { "PASS" } else { "FAIL" },
+        );
+    }
+    let status = if gates.passed { "pass" } else { "fail" };
+    println!("PERF BUDGETS: {status}");
+    println!("\n----- perf-budgets report (JSON, schema v{REPORT_SCHEMA_VERSION}) -----");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report).expect("serialize the report")
+    );
+}
+
+/// The short commit SHA of the tree the harness ran against (best-effort:
+/// "unknown" when git is unavailable — the record must stay self-describing).
+fn git_short_sha() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The host CPU's brand string, for the report's environment block.
+fn host_cpu_model() -> String {
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    sys.cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim().to_string())
+        .filter(|brand| !brand.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The host's logical core count, for the report's environment block.
+fn host_logical_cores() -> usize {
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    sys.cpus().len()
+}
+
+// ---------------------------------------------------------------------------
+// The fixture (the uj3 `write_flow_manifest` shape, heartbeat legs)
+// ---------------------------------------------------------------------------
+
+/// Locate the conformance `fake_agent` helper from THIS example's binary.
+///
+/// `ktesio_conformance::fake_agent_bin()` cannot be reused here: it resolves
+/// relative to a TEST binary's `deps/` directory, and an example runs from
+/// `target/<profile>/examples/` — so the same resolution is replicated with
+/// the `examples` hop, plus an identical on-demand-build fallback that passes
+/// an explicit `--target-dir` (derived from this binary's own path, which
+/// already respects `CARGO_TARGET_DIR`) so the helper lands exactly where the
+/// candidate lives regardless of the invoking shell's cwd.
+fn locate_fake_agent() -> PathBuf {
+    let mut dir = std::env::current_exe().expect("resolve the running example binary");
+    dir.pop(); // drop the example binary name → .../examples
+    if dir.ends_with("examples") {
+        dir.pop(); // → .../target/<profile>
+    }
+    let candidate = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
+    if candidate.exists() {
+        return candidate;
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut build = std::process::Command::new(&cargo);
+    build
+        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
+        .env_remove("RUSTC_WRAPPER");
+    if dir.ends_with("release") {
+        build.arg("--release");
+    }
+    if let Some(target_root) = dir.parent() {
+        build.arg("--target-dir").arg(target_root);
+    }
+    let status = build
+        .status()
+        .expect("spawn cargo to build the fake_agent helper");
+    if !(status.success() && candidate.exists()) {
+        panic!(
+            "fake_agent helper not found at {} and the on-demand build did not produce it \
+             (status: {status:?}). Run `cargo build -p ktesio-conformance --bin fake_agent` \
+             from the workspace root, then re-run the harness.",
+            candidate.display()
+        );
+    }
+    candidate
+}
+
+/// Write the fixture manifest (`adapter.toml`): the established
+/// `uj3::write_flow_manifest` shape — contract v1, per-OS capability
+/// declaration, self-reported metering, a `[config.model]` env mapping —
+/// with HEARTBEAT legs instead of usage emission: the running subset idles
+/// (`--heartbeat-ms` only) so the steady-state window measures supervision,
+/// not metering ingestion, and a 60 s self-exit bounds any orphan. All
+/// FLEET_SIZE instances register under this ONE manifest (the same adapter
+/// kind repeated — exactly like registering N `mock` instances; instance
+/// NAMES are what must be fleet-unique).
+fn write_heartbeat_manifest(dir: &Path, exec: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("create the manifest dir");
+    // A non-UTF8 exec path would be silently munged by to_string_lossy into a
+    // launch that never resolves — fail loudly instead.
+    let exec = exec.to_str().unwrap_or_else(|| {
+        panic!(
+            "the fake_agent path {} is not valid UTF-8; the TOML manifest requires a UTF-8 path",
+            exec.display()
+        )
+    });
+    let exec = exec.replace('\\', "/");
+    let body = format!(
+        r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "{MANIFEST_KIND}"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--heartbeat-ms", "{HEARTBEAT_MS}", "--linger-ms", "{AGENT_LINGER_MS}"]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config.model]
+env = "MODEL"
+"#
+    );
+    std::fs::write(dir.join("adapter.toml"), body).expect("write adapter.toml");
+    dir.to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// Gate-math tests (run by `cargo test --all-targets` — NOT the harness)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uniform(n: usize, ms: f64) -> Vec<f64> {
+        vec![ms; n]
+    }
+
+    /// n−3 fast + a 3-sample tail so nearest-rank p99 lands exactly at
+    /// `p99` (rank ceil(0.99·n) hits the second-to-last tail sample) and max
+    /// is a distinct value above it.
+    fn kind_with_p99(name: &'static str, p99: f64, n: usize) -> ReadStats {
+        let mut samples = uniform(n - 3, 1.0);
+        samples.push(p99);
+        samples.push(p99);
+        samples.push(p99 + 100.0);
+        summarize_read(name, &mut samples)
+    }
+
+    fn fast_reads() -> Vec<ReadStats> {
+        vec![
+            summarize_read("fleet", &mut uniform(200, 5.0)),
+            summarize_read("instance_status", &mut uniform(200, 0.5)),
+            summarize_read("effective_config", &mut uniform(200, 0.2)),
+            summarize_read("usage_via_fleet", &mut uniform(200, 5.0)),
+        ]
+    }
+
+    fn healthy_steady() -> SteadyFigures {
+        SteadyFigures::new(10.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10)
+    }
+
+    #[test]
+    fn all_fast_reads_and_healthy_steady_pass() {
+        let gates = evaluate_gates(overall_read_p99(&fast_reads()), &healthy_steady(), 1.0);
+        assert!(gates.passed, "every gate must pass: {gates:?}");
+    }
+
+    #[test]
+    fn one_kind_with_p99_1500ms_fails_the_overall_gate() {
+        let mut reads = fast_reads();
+        reads.push(kind_with_p99("slow_kind", 1500.0, 200));
+        let overall = overall_read_p99(&reads);
+        assert!(
+            (overall - 1500.0).abs() < 1e-9,
+            "the overall p99 must be the worst kind's 1500ms tail: {overall}"
+        );
+        let gates = evaluate_gates(overall, &healthy_steady(), 1.0);
+        assert!(!gates.passed, "a 1500ms p99 kind must fail the read gate");
+        assert!(!gates.verdicts[0].passed);
+        assert!(
+            gates.verdicts[0].strict_margin < 0.0,
+            "the strict margin must be negative on the failure"
+        );
+    }
+
+    #[test]
+    fn rss_mean_over_budget_fails() {
+        // 600 MiB aggregate over 10 running = 60 MiB/instance > 50.
+        let steady = SteadyFigures::new(10.0, 600.0 * 1024.0 * 1024.0, 600_000_000, 10);
+        let gates = evaluate_gates(5.0, &steady, 1.0);
+        assert!(
+            !gates.verdicts[1].passed,
+            "60 MiB/instance must fail: {gates:?}"
+        );
+        assert!(!gates.passed);
+    }
+
+    #[test]
+    fn rss_normalization_divides_by_running_count() {
+        // 400 MiB aggregate over 10 running = 40 MiB/instance — WITHIN the
+        // 50 MiB mean budget: the budget is per-INSTANCE marginal overhead,
+        // not an aggregate cap, and this pins exactly that division (the
+        // gate consumes the divided figure, never the aggregate).
+        let steady = SteadyFigures::new(10.0, 400.0 * 1024.0 * 1024.0, 400_000_000, 10);
+        assert!((steady.rss_per_instance_mib - 40.0).abs() < 1e-9);
+        let gates = evaluate_gates(5.0, &steady, 1.0);
+        assert!(gates.verdicts[1].passed);
+        // The SAME aggregate over TWO running instances = 200 MiB/instance —
+        // both the mean gate and the spike guard must fail.
+        let few = SteadyFigures::new(10.0, 400.0 * 1024.0 * 1024.0, 400_000_000, 2);
+        let gates = evaluate_gates(5.0, &few, 1.0);
+        assert!(!gates.verdicts[1].passed);
+        assert!(!gates.verdicts[2].passed);
+    }
+
+    #[test]
+    fn rss_max_spike_over_double_budget_fails_even_with_a_fine_mean() {
+        // Mean 40 MiB/instance is fine; one sample spikes the max to
+        // 120 MiB/instance > 2 × 50 — the leak guard must fail the run.
+        let steady = SteadyFigures::new(10.0, 400.0 * 1024.0 * 1024.0, 1200 * 1024 * 1024, 10);
+        assert!((steady.rss_per_instance_mib - 40.0).abs() < 1e-9);
+        let gates = evaluate_gates(5.0, &steady, 1.0);
+        assert!(
+            !gates.verdicts[2].passed,
+            "a 120 MiB/instance spike must fail"
+        );
+        assert!(!gates.passed);
+    }
+
+    #[test]
+    fn cpu_gate_is_strict_locally_and_tolerant_on_ci() {
+        // 2.5%/instance: over the strict 2% budget, under the CI 2% × 1.5 = 3%.
+        let steady = SteadyFigures::new(25.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let local = evaluate_gates(5.0, &steady, 1.0);
+        assert!(!local.verdicts[3].passed, "2.5%/instance must fail strict");
+        assert!(!local.passed);
+        let ci = evaluate_gates(5.0, &steady, CI_CPU_TOLERANCE_FACTOR);
+        assert!(ci.verdicts[3].passed, "2.5%/instance must pass at x1.5");
+        assert!((ci.verdicts[3].effective_budget - 3.0).abs() < 1e-9);
+        assert!((ci.verdicts[3].tolerance - 1.5).abs() < 1e-9);
+        // The tolerance applies to the CPU gate ONLY.
+        assert!((ci.verdicts[1].effective_budget - BUDGET_RSS_PER_INSTANCE_MIB).abs() < 1e-9);
+        assert!((ci.verdicts[0].effective_budget - BUDGET_READ_P99_MS).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cpu_normalization_uses_the_running_count() {
+        // 20% aggregate over 10 running = 2%/instance: exactly at the strict
+        // budget (the gate is <=, so this passes); the same aggregate over
+        // 5 running = 4%/instance fails it.
+        let at_budget = SteadyFigures::new(20.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        assert!(evaluate_gates(5.0, &at_budget, 1.0).verdicts[3].passed);
+        let over = SteadyFigures::new(20.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 5);
+        assert!(!evaluate_gates(5.0, &over, 1.0).verdicts[3].passed);
+    }
+
+    #[test]
+    fn ci_mode_parses_every_form() {
+        assert!(ci_mode_from(Some("1"), None).unwrap());
+        assert!(!ci_mode_from(Some("0"), None).unwrap());
+        // Garbage is an ERROR (main exits 2) — never a silent mode pick.
+        assert!(ci_mode_from(Some("garbage"), None).is_err());
+        assert!(ci_mode_from(Some(""), None).is_err());
+        // Unset: fall to the runner's CI env (GitHub sets "true").
+        assert!(ci_mode_from(None, Some("true")).unwrap());
+        assert!(ci_mode_from(None, Some("1")).unwrap());
+        assert!(!ci_mode_from(None, None).unwrap());
+        assert!(!ci_mode_from(None, Some("false")).unwrap());
+        // An explicit value wins over the ambient one, both ways.
+        assert!(!ci_mode_from(Some("0"), Some("true")).unwrap());
+        assert!(ci_mode_from(Some("1"), Some("false")).unwrap());
+    }
+
+    #[test]
+    fn percentile_is_nearest_rank() {
+        let mut samples: Vec<f64> = (1..=100).map(f64::from).collect();
+        samples.sort_by(|a, b| a.total_cmp(b));
+        assert!((percentile(&samples, 50.0) - 50.0).abs() < 1e-9);
+        assert!((percentile(&samples, 95.0) - 95.0).abs() < 1e-9);
+        assert!((percentile(&samples, 99.0) - 99.0).abs() < 1e-9);
+        assert!((percentile(&samples, 100.0) - 100.0).abs() < 1e-9);
+        assert!((percentile(&samples, 0.1) - 1.0).abs() < 1e-9);
+        let mut two: Vec<f64> = vec![10.0, 20.0];
+        two.sort_by(|a, b| a.total_cmp(b));
+        assert!((percentile(&two, 50.0) - 10.0).abs() < 1e-9); // ceil(1) → idx 0
+    }
+
+    #[test]
+    fn median_picks_the_middle_and_averages_even_counts() {
+        let three = vec![1.0, 5.0, 9.0];
+        assert!((median(&three) - 5.0).abs() < 1e-9);
+        let four = vec![1.0, 5.0, 7.0, 9.0];
+        assert!((median(&four) - 6.0).abs() < 1e-9);
+        assert!(median(&[]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_reports_p50_p95_p99_and_max() {
+        // 198 ones + 1500 + 1600 → nearest-rank p99 = 1500, max = 1600.
+        let stats = kind_with_p99("probe", 1500.0, 200);
+        assert_eq!(stats.name, "probe");
+        assert_eq!(stats.samples, 200);
+        assert!((stats.p99 - 1500.0).abs() < 1e-9);
+        assert!((stats.max - 1600.0).abs() < 1e-9);
+        assert!((stats.p50 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_running_count_fails_closed() {
+        // A zero running count must never divide to a fake pass: the
+        // normalization yields +inf, which fails every steady-state gate.
+        let figures = SteadyFigures::new(0.0, 0.0, 0, 0);
+        assert!(figures.cpu_per_instance_pct.is_infinite());
+        let gates = evaluate_gates(5.0, &figures, 1.0);
+        assert!(!gates.passed, "zero running instances must fail closed");
+    }
+}

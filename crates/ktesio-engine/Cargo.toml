@@ -85,6 +85,14 @@ tempfile = { workspace = true }
 # trip the AD-2 boundary gate (which excludes dev-deps). The shipping engine
 # resolves `--kind mock` via its own internal builtin, not this crate.
 ktesio-conformance = { path = "../ktesio-conformance", version = "0.1.0" }
+# Story 7-5 perf harness ONLY (`examples/perf-budgets.rs`): samples the ENGINE
+# process's CPU% + RSS for the NFR-4 steady-state supervision-overhead budget.
+# DEV-ONLY and benchmark-gated — the example is compiled by `--all-targets` but
+# RUN only when invoked explicitly (`cargo run --example perf-budgets`), so it
+# never enters a shipping artifact and NFR-8's runtime-lean policy is
+# untouched: `cargo tree -p ktesio -e normal,build` is unchanged by this edge
+# (the spec record names sysinfo as the sanctioned measurement dev-dep).
+sysinfo = { workspace = true }
 
 [lints]
 workspace = true
