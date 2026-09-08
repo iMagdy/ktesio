@@ -54,7 +54,15 @@ STALE_PATTERNS = [
     # Deliberately narrow: "(tokens only)" alone also appears in legitimate
     # token-total prose.
     "timestamp; tokens only",
-    "own[s] their memory entirely",
+    # Regression guard for the THIRD fixed stale text (epic-6 retro
+    # remediation, PR #172): the hermes native-memory sentence claimed adapters
+    # "own their memory entirely" — replaced by the delegation wording. NOTE:
+    # STALE_PATTERNS are literal substrings, not regexes — the original entry
+    # "own[s] their memory entirely" could therefore never match anything
+    # (dead guard). The literal below is the verified historical stale text
+    # (pickaxe: docs/commands.md at 613d4ec..4119db3 — no "owns" variant ever
+    # existed), so the guard is live again.
+    "own their memory entirely",
 ]
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")

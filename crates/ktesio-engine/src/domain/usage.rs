@@ -101,8 +101,8 @@ impl std::fmt::Display for RunId {
 /// (AD-8; those are later Epic-3 stories).
 ///
 /// `Serialize`/`Deserialize` (snake_case) so it rides the AD-14
-/// [`UsageUpdateEvent`] wire and can round-trip through `kt --json` / the future
-/// 7-2 Host stream without a second dialect.
+/// [`UsageUpdateEvent`] wire and can round-trip through `kt --json` / the 7-2
+/// Host event bus without a second dialect.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// The Agent Instance this measurement belongs to (its unique name).
@@ -188,16 +188,17 @@ impl RecordOutcome {
 }
 
 /// A committed-usage event on the AD-14 event surface — the versioned wire struct
-/// `kt --json` and the future 7-2 Host subscription share ("one event schema, two
+/// `kt --json` and the 7-2 Host event bus share ("one event schema, two
 /// consumers").
 ///
 /// AD-14 names "usage updates" among the versioned engine event structs. 3-1
-/// FREEZES the wire shape now — a [`USAGE_SCHEMA_VERSION`]-stamped struct carrying
+/// FREEZES the wire shape — a [`USAGE_SCHEMA_VERSION`]-stamped struct carrying
 /// the committed [`UsageEvent`] — and EMITS it from the ledger-commit choke point,
-/// so `kt --json` and the Host stream cannot drift into two dialects. Full
-/// subscription DELIVERY is deferred to story 7-2 (this story records the event
-/// and returns it for observation, exactly as `TransitionEvent` seeds its own
-/// delivery). TOKENS ONLY — no dollars in the payload (3-3).
+/// so `kt --json` and the Host stream cannot drift into two dialects. Subscription
+/// DELIVERY shipped in story 7-2: the choke point publishes this struct onto the
+/// event bus right after the row commits (story 3-1's original return-it-for-
+/// observation seam stands unchanged). TOKENS ONLY — no dollars in the payload
+/// (3-3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageUpdateEvent {
     /// The usage-event schema version ([`USAGE_SCHEMA_VERSION`]).

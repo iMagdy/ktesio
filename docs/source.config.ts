@@ -8,6 +8,7 @@ const files = [
   'commands.md',
   'manifest.md',
   'adapter-contract.md',
+  'embedding.md',
   'lockfile.md',
   'architecture.md',
   'design/metering-agents-you-dont-control.md',

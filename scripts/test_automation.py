@@ -409,17 +409,34 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
         # In-repo baseline guard (#160, epic-6 retro A1): the frozen
         # ktesio-adapter-api v1 surface is diffed against the contract-v1
-        # freeze commit on EVERY run — the crates.io gate below it stays
-        # dormant (404 -> notice) until story 7-4, so this run is the active
-        # guard against an unannounced public-item removal/rename. The
-        # baseline rev must be the full freeze-commit SHA; `--baseline-rev`
-        # is a stable cargo-semver-checks flag (verified locally: green vs
-        # 4119db3, `function_missing` failure on a removed pub item).
+        # freeze commit on EVERY run — the crates.io gates below it stay
+        # dormant (404 -> notice) until the HELD publish executes
+        # (docs/release-process.md), so this run is the active guard against
+        # an unannounced public-item removal/rename. The baseline rev must be
+        # the full freeze-commit SHA; `--baseline-rev` is a stable
+        # cargo-semver-checks flag (verified locally: green vs 4119db3,
+        # `function_missing` failure on a removed pub item).
         self.assertIn(
             "cargo +stable semver-checks check-release -p ktesio-adapter-api "
             "--baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e",
             ci,
         )
+        # Story 7-4 arms the SAME mechanism for ktesio-engine, against a
+        # DIFFERENT honest freeze point: the embedding-surface freeze
+        # 8a8b328 (story 7-3), NOT the contract freeze 4119db3 — the engine's
+        # unpublished surface legitimately grew after the contract froze (the
+        # freeze itself added `LaunchResolveError::ContractIncompatible`, and
+        # a 4119db3 baseline fails two major lints on that honest history),
+        # so the engine's embedding surface freezes at 7-3's commit. Both
+        # baseline revs get the cat-file resolvability check so a history
+        # rewrite is a CLEAR infra error. Maintenance: bump all four pins
+        # (two here, two in ci.yml) together at the next deliberate freeze.
+        self.assertIn(
+            "cargo +stable semver-checks check-release -p ktesio-engine "
+            "--baseline-rev 8a8b3285bffc8b814d5effbd807f3236e53d0b99",
+            ci,
+        )
+        self.assertIn("git cat-file -e 8a8b3285bffc8b814d5effbd807f3236e53d0b99^{commit}", ci)
         # The baseline lookup needs full history: the semver job's checkout
         # must override the default shallow clone. Scoped to the SEMVER JOB
         # BLOCK ONLY (up to the next job heading): a `fetch-depth: 0` in some
@@ -441,17 +458,160 @@ class ReleaseDocsTests(unittest.TestCase):
             "git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit}", ci
         )
 
+    def test_ci_builds_and_runs_the_embedding_quickstart(self) -> None:
+        # Story 7-4: the embedding quickstart (the publish capstone's host
+        # example) is exercised by the CI `build` job — compiled in release
+        # next to the shipping binary, then RUN hermetically (its only
+        # subprocess is a re-exec of itself idling under a hard cap, on a
+        # temp-dir root; every leg asserts). Guard both steps so a facade
+        # regression can never silently drop out of the ordinary build gate,
+        # and guard the example file itself so the steps cannot outlive it.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        example = (
+            release_docs.ROOT
+            / "crates"
+            / "ktesio-engine"
+            / "examples"
+            / "embedding-quickstart.rs"
+        )
+
+        build_start = ci.index("- name: Build release binary")
+        # The next JOB heading bounds the build job's own script text; a
+        # missing match (job LAST in the file) slices to end-of-file instead.
+        import re as _re
+
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[build_start + 1 :])
+        build_end = build_start + 1 + next_job.start() if next_job else len(ci)
+        build_job = ci[build_start:build_end]
+        self.assertIn(
+            "cargo +stable build --release --example embedding-quickstart -p ktesio-engine",
+            build_job,
+        )
+        # The RUN step is guarded: a step-level timeout independent of the
+        # agent's own idle cap, and an existence assert with a clear error so
+        # a build-step regression fails loudly instead of "file not found".
+        self.assertIn("timeout-minutes: 5", build_job)
+        self.assertIn("test -x target/release/examples/embedding-quickstart", build_job)
+        self.assertIn("target/release/examples/embedding-quickstart", build_job)
+        self.assertTrue(example.is_file(), "the quickstart example must exist")
+
+    def test_ci_perf_budgets_job_runs_the_harness_blocking(self) -> None:
+        # Story 7-5 (NFR-4): the designated perf job runs the perf-budgets
+        # harness on every PR and GATES the measured budgets — reads p99 and
+        # RSS/instance gate hard; CPU/instance carries the harness's
+        # documented shared-runner tolerance over a median-of-3 window in CI.
+        # Guard the whole shape so the gate cannot silently drop out: the job
+        # exists, builds the release example, carries the stale-helper rm +
+        # rebuild guard (the harness SPAWNS fake_agent, so the test/coverage
+        # -job rule "any job that spawns agents carries it" applies), runs
+        # the binary BLOCKING (the run block's last line IS the bare binary
+        # invocation, and the block contains no failure-swallowing idiom),
+        # uploads the JSON report artifact, and the harness example file
+        # itself exists.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        example = (
+            release_docs.ROOT
+            / "crates"
+            / "ktesio-engine"
+            / "examples"
+            / "perf-budgets.rs"
+        )
+        job_start = ci.index("  perf-budgets:")
+        import re as _re
+
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[job_start + 1 :])
+        # The perf job may be LAST in the file — slice to end-of-file then.
+        job_end = job_start + 1 + next_job.start() if next_job else len(ci)
+        perf_job = ci[job_start:job_end]
+        self.assertIn("name: perf-budgets", perf_job)
+        self.assertIn("runs-on: ubuntu-latest", perf_job)
+        self.assertIn(
+            "cargo +stable build --release -p ktesio-engine --example perf-budgets",
+            perf_job,
+        )
+        # The stale-helper guard: rm + explicit rebuild for the fake_agent
+        # this harness spawns (same defect class the test job hit twice).
+        self.assertIn(
+            "rm -f target/release/fake_agent target/release/fake_agent.exe", perf_job
+        )
+        self.assertIn(
+            "cargo +stable build --release -p ktesio-conformance --bin fake_agent",
+            perf_job,
+        )
+        # Blocking, pinned structurally beyond substrings: the RUN step's
+        # block must END on the bare binary invocation (optional leading
+        # whitespace) — a tee/pipe/&& suffix could swallow the harness's
+        # nonzero exit — and must contain no failure-swallowing idiom.
+        run_step = perf_job.index("- name: Run the perf harness")
+        run_text = perf_job[perf_job.index("run: |", run_step) :]
+        next_step = _re.search(r"\n      - name:", run_text[1:])
+        run_block = (
+            run_text[: 1 + next_step.start()] if next_step else run_text
+        )
+        last_line = next(
+            line for line in reversed(run_block.splitlines()) if line.strip()
+        )
+        self.assertRegex(
+            last_line, r"^\s*target/release/examples/perf-budgets\s*$"
+        )
+        self.assertNotIn("|| true", run_block)
+        self.assertNotIn("exit 0", run_block)
+        # The measured record is also uploaded as the job's artifact (even on
+        # a red run): the harness writes it via the env var, the upload step
+        # publishes it, and the upload is not skipped on failure.
+        self.assertIn("PERF_BUDGETS_REPORT_PATH: perf-budgets-report.json", perf_job)
+        self.assertIn("actions/upload-artifact@", perf_job)
+        upload = perf_job[perf_job.index("- name: Upload the measured report") :]
+        self.assertIn("if: always()", upload)
+        self.assertIn("actions/upload-artifact@", upload)
+        self.assertIn("perf-budgets-report.json", upload)
+        self.assertTrue(example.is_file(), "the perf-budgets harness example must exist")
+
+    def test_publish_hold_pinned_in_all_four_internal_manifests(self) -> None:
+        # Story 7-4's non-negotiable, PINNED like any other invariant: the
+        # crates.io publish is HELD pending Islam's explicit go (no
+        # deployments, no releases, nothing that costs money), so all FOUR
+        # internal crate manifests must still carry `publish = false`. An
+        # accidental or premature flip fails here exactly like any other
+        # pinned invariant. The flip itself belongs ONLY to step 0 of the
+        # held runbook (docs/release-process.md, "Publishing the Engine
+        # Crates (ON HOLD)") — on publish day this test fails first, which is
+        # the loud, intended signal that the go protocol must have been
+        # followed; the flip lands as step 0 in the same change.
+        for crate in (
+            "ktesio-engine",
+            "ktesio-adapter-api",
+            "ktesio-adapters-hermes",
+            "ktesio-conformance",
+        ):
+            manifest = (
+                release_docs.ROOT / "crates" / crate / "Cargo.toml"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                "publish = false",
+                manifest,
+                f"{crate} lost its publish hold — publication is HELD pending "
+                "Islam's explicit go (docs/release-process.md)",
+            )
+
     def test_ci_enforces_msrv_floor(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
 
         # MSRV job installs the pinned floor toolchain explicitly and checks the
-        # whole workspace against it. Keep the version in lockstep with
-        # rust-version in the root Cargo.toml [workspace.package].
+        # whole workspace against it — --all-targets, so the DEV-dependencies
+        # (notably the story-7-5 perf harness's sysinfo) compile on the floor
+        # too and a future sysinfo MSRV bump past 1.96.1 reds the msrv job.
+        # Keep the version in lockstep with rust-version in the root
+        # Cargo.toml [workspace.package].
         self.assertIn("name: msrv", ci)
         self.assertIn("rustup toolchain install 1.96.1 --profile minimal", ci)
-        self.assertIn("cargo +1.96.1 check --workspace", ci)
+        self.assertIn("cargo +1.96.1 check --workspace --all-targets", ci)
 
         cargo_toml = (release_docs.ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('rust-version = "1.96.1"', cargo_toml)

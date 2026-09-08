@@ -23,6 +23,7 @@ By *agent* these pages mean a third-party program you run for yourself that call
 - [Adapter Contract](adapter-contract.md)
 - [Adapter manifest (`adapter.toml`)](manifest.md)
 - [Supported agents](agents.md)
+- [Embedding the engine](embedding.md)
 - [Architecture](architecture.md)
 
 ## Design

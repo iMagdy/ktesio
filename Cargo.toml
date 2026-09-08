@@ -77,3 +77,18 @@ sha2 = "0.11"
 tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 tempfile = "3"
+# Story 7-5 perf harness: the process-metrics crate behind the NFR-4
+# steady-state measurement (the ENGINE process's CPU% + RSS). DEV-DEPENDENCY
+# ONLY — consumed solely by ktesio-engine's `[dev-dependencies]` for the
+# benchmark-gated `perf-budgets` example (it never enters any shipping
+# artifact, so NFR-8's runtime-lean policy is untouched and the AD-2
+# `cargo tree -p ktesio -e normal,build` gate is unchanged). Renamed here so
+# the workspace stays the single source of truth for versions. Justification
+# over hand-rolled /proc parsing (spec 7-5 design note): cross-platform by
+# contract (Windows needs the crate anyway), and sysinfo's two-refresh CPU
+# delta is the standard, maintained implementation. `default-features = false`
+# with ONLY the required `system` handle feature (the `System` type itself is
+# feature-gated even though process metrics are core) — the component/disk/
+# network/user probe features (and their windows/objc2 stacks) stay out of
+# the dev build.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }

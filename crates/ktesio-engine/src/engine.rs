@@ -23,6 +23,22 @@
 //! and owns its runtime; it never assumes an ambient runtime elsewhere and holds
 //! no thread-locals or globals. This is what keeps the facade sound.
 
+//! ## The event subscription (story 7-2, FR-33 / AD-14)
+//!
+//! A Host OBSERVES the engine through [`Engine::subscribe`], which hands out a
+//! [`broadcast::Receiver`](crate::broadcast::Receiver) over the bounded event
+//! bus (capacity [`EVENT_BUS_CAPACITY`](crate::EVENT_BUS_CAPACITY)). The bus is
+//! fed at the SAME commit points where the event logs are appended — a
+//! subscriber sees exactly the committed truth, in commit order, per-instance
+//! FIFO — and the payload is the [`EngineEvent`](crate::EngineEvent) wrapper
+//! over the EXISTING versioned AD-14 structs verbatim (no new schema family).
+//! Slow subscribers are policy, not failure: `send` is non-blocking, so a
+//! stalled receiver can never stall supervision; past the capacity it observes
+//! `Lagged` and resyncs at the tail (see the `domain::bus` module docs for the
+//! full contract). Sync consumers get [`Blocking::subscribe`], whose
+//! [`EventSubscription`] owns a blocking `recv` bridged through the engine
+//! runtime exactly like every other facade method.
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,9 +49,10 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, EffectiveConfig, EngineError,
-    FleetEntry, InstanceName, LifecycleState, LogLine, Registry, RegistryError, RemoveDisposition,
-    RestartPolicy, Supervisor, TransitionCause, TransitionEvent,
+    broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, EffectiveConfig,
+    EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState, LogLine,
+    Registry, RegistryError, RemoveDisposition, RestartPolicy, Supervisor, TransitionCause,
+    TransitionEvent,
 };
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
@@ -130,6 +147,10 @@ impl Drop for Engine {
 struct EngineInner {
     registry: Mutex<Registry>,
     supervisor: Mutex<Supervisor>,
+    /// The supervisor's event bus clone (story 7-2): held OUTSIDE the mutex so
+    /// [`Engine::subscribe`] hands out receivers without ever contending on
+    /// the supervisor lock. Both clones share one broadcast channel.
+    events: EventBus,
 }
 
 impl Engine {
@@ -152,14 +173,19 @@ impl Engine {
             path: "<tokio-runtime>".to_string(),
             source: e,
         })?;
+        // Story 3-4: thread the engine runtime handle into the supervisor so an
+        // `engine-observed` start can spawn its loopback forward listener's
+        // accept loop on this runtime (the sync start path runs on the blocking
+        // pool, where `Handle::current` is unavailable). A `Handle` spawns onto
+        // its runtime from any thread, so this is sound. Story 7-2: keep a bus
+        // clone OUTSIDE the supervisor mutex so `subscribe()` is lock-free (see
+        // EngineInner::events).
+        let supervisor = Supervisor::with_runtime(rt.handle().clone());
+        let events = supervisor.event_bus();
         let inner = Arc::new(EngineInner {
             registry: Mutex::new(registry),
-            // Story 3-4: thread the engine runtime handle into the supervisor so an
-            // `engine-observed` start can spawn its loopback forward listener's
-            // accept loop on this runtime (the sync start path runs on the blocking
-            // pool, where `Handle::current` is unavailable). A `Handle` spawns onto
-            // its runtime from any thread, so this is sound.
-            supervisor: Mutex::new(Supervisor::with_runtime(rt.handle().clone())),
+            supervisor: Mutex::new(supervisor),
+            events,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -243,6 +269,31 @@ impl Engine {
     /// module docs for why `kt` uses this instead of becoming an async binary.
     pub fn blocking(&self) -> Blocking<'_> {
         Blocking { engine: self }
+    }
+
+    /// Subscribe to the engine's committed-event stream (story 7-2, FR-33).
+    ///
+    /// Returns a fresh [`broadcast::Receiver`](crate::broadcast::Receiver) over
+    /// the [`EngineEvent`] wrapper (the versioned AD-14 payloads verbatim); it
+    /// observes only events committed AFTER this call, in commit order —
+    /// per-instance FIFO, exactly what the durable logs record. The full
+    /// contract (committed-truth guarantee,
+    /// [`EVENT_BUS_CAPACITY`](crate::EVENT_BUS_CAPACITY) bound, the
+    /// `Lagged` slow-subscriber policy, publish-cannot-fail-supervision) is
+    /// documented on the `domain::bus` module.
+    ///
+    /// This is deliberately a SYNC method: the bus handle lives outside the
+    /// supervisor mutex, so handing out a receiver takes no lock and no
+    /// blocking-pool trip — it is safe from any context, async or sync, at any
+    /// point in the engine's life. There is NO await-related correctness rule
+    /// here; the ONLY ordering requirement is to subscribe BEFORE the events
+    /// you care about are committed (a receiver sees only later commits —
+    /// earlier ones are readable via the query APIs). An async Host drives
+    /// `rx.recv().await` on its own tasks; sync consumers use
+    /// [`Blocking::subscribe`] instead (its [`EventSubscription`] owns a
+    /// blocking `recv` bridged through the engine runtime).
+    pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
+        self.inner.events.subscribe()
     }
 
     /// The engine-computed Agent Home path for `name` (display helper).
@@ -1100,6 +1151,18 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.send_input(name, text))
     }
 
+    /// Blocking [`Engine::subscribe`] (story 7-2, FR-33): returns an
+    /// [`EventSubscription`] whose `recv` bridges the async receiver through
+    /// the engine runtime — the same facade pattern as every other method
+    /// here. Async consumers can call [`Engine::subscribe`] directly and use
+    /// the raw receiver instead.
+    pub fn subscribe(&self) -> EventSubscription {
+        EventSubscription {
+            rx: self.engine.subscribe(),
+            rt: Arc::clone(&self.engine.rt),
+        }
+    }
+
     /// Blocking [`Engine::transition_events`].
     pub fn transition_events(&self, name: &str) -> Result<Vec<TransitionEvent>, EngineError> {
         self.engine.rt.block_on(self.engine.transition_events(name))
@@ -1196,6 +1259,69 @@ impl Blocking<'_> {
         name: &str,
     ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
         self.engine.rt.block_on(self.engine.memory_status(name))
+    }
+}
+
+/// A live, sync-side subscription to the engine's event bus (story 7-2).
+///
+/// Obtained via [`Blocking::subscribe`]. Wraps the broadcast receiver plus the
+/// engine runtime handle so a synchronous Host can consume events without an
+/// async context — the same bridge every [`Blocking`] method uses, applied to
+/// `recv`.
+///
+/// ## The do-not-call-from-a-worker contract
+///
+/// `recv` (and only `recv`) runs `runtime.block_on`, so it MUST NOT be called
+/// from a thread that is itself driving the engine's runtime — a tokio worker
+/// or a `spawn_blocking` closure inside an async context (e.g. from a task
+/// that awaited another `Engine` method). `Runtime::block_on` panics there
+/// ("cannot block the calling thread"/"cannot start a runtime from within a
+/// runtime"), by tokio's rules — the same contract the rest of the facade
+/// carries. Consume the subscription on your OWN thread (`std::thread::spawn`
+/// or the host's executor), or take [`Engine::subscribe`]'s raw receiver and
+/// `await` it inside the runtime instead.
+///
+/// ## The runtime-keepalive contract (a Host must DROP its subscriptions)
+///
+/// This struct holds an `Arc` to the engine's runtime — deliberately a STRONG
+/// handle, not a `Weak`. The consequence is a runtime-lifetime contract a
+/// host must know: **while any [`EventSubscription`] is alive, the engine's
+/// async runtime stays alive**, even after the `Engine` (and every facade
+/// view of it) has been dropped. This is what makes a subscription usable for
+/// the natural drain-at-shutdown pattern (drop the engine, then keep reading
+/// the already-published events to the tail); it cannot deadlock or dangle —
+/// `recv` simply keeps serving buffered events, and returns
+/// `RecvError::Closed` once the buffer is drained and the engine's sender
+/// side is gone. The flip side: a host that leaks a subscription leaks the
+/// runtime's threads with it. **To release the runtime, drop every
+/// [`EventSubscription`] (and then the engine).** A `Weak` handle was
+/// considered and rejected: a runtime that could vanish under a live
+/// subscription would turn `recv` into a surprise-panic surface, which is
+/// worse for an embedder than an explicit drop obligation.
+pub struct EventSubscription {
+    rx: broadcast::Receiver<EngineEvent>,
+    rt: Arc<Runtime>,
+}
+
+impl EventSubscription {
+    /// Block the calling thread until the next committed event arrives.
+    ///
+    /// Errors with `RecvError::Closed` when the engine (and every other
+    /// receiver's sender side) is gone, or with `RecvError::Lagged(n)` after
+    /// this receiver fell more than
+    /// [`EVENT_BUS_CAPACITY`](crate::EVENT_BUS_CAPACITY) events behind — the
+    /// documented slow-subscriber policy: supervision was NEVER stalled by the
+    /// stall here, the `n` dropped events stay readable in the durable logs
+    /// (the query APIs), and the receiver resyncs at the current tail and
+    /// keeps working.
+    pub fn recv(&mut self) -> Result<EngineEvent, broadcast::error::RecvError> {
+        self.rt.block_on(self.rx.recv())
+    }
+
+    /// Non-blocking variant: the next buffered event, `TryRecvError::Empty`
+    /// when the tail is reached, `Lagged`/`Closed` per [`Self::recv`].
+    pub fn try_recv(&mut self) -> Result<EngineEvent, broadcast::error::TryRecvError> {
+        self.rx.try_recv()
     }
 }
 

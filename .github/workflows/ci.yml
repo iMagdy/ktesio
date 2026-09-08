@@ -201,6 +201,133 @@ jobs:
         # Explicit +stable (see fmt job): CI build sanity on latest stable; the
         # root pin governs only local bare cargo.
         run: cargo +stable build --release
+      - name: Build the embedding quickstart example (story 7-4)
+        # The publish capstone's compile-level proof: the quickstart is HOST
+        # code — it links only ktesio-engine's public facade (no kt, no
+        # ktesio-conformance) — so building it in CI proves the embedding
+        # surface compiles from outside the engine crate, exactly what a
+        # crates.io host will do once the HELD publish runs
+        # (docs/release-process.md). Keeping the build in this job means a
+        # facade regression reds the ordinary build gate before any host ever
+        # sees it. Explicit +stable (see fmt job).
+        run: cargo +stable build --release --example embedding-quickstart -p ktesio-engine
+      - name: Run the embedding quickstart (hermetic)
+        # Ubuntu-scoped BY JOB DESIGN: this whole `build` job runs on
+        # ubuntu-latest only (the build matrix is the `test` job's), so the
+        # run step needs no `runner.os == 'Linux'` guard — the binary path
+        # (`target/release/examples/embedding-quickstart`, no .exe suffix)
+        # can never meet a Windows/macOS runner here. The example itself is
+        # still COMPILED on all three OS legs (see the embed-clean/build
+        # surfaces that run in the 3-OS `test` matrix); only the hermetic
+        # run is ubuntu-scoped.
+        # The example is also RUNNABLE hermetically, so this gate is "works",
+        # not just "compiles": its only subprocess is a re-exec of itself
+        # idling under a hard 120 s cap (see the example's header), everything
+        # runs on a per-process temp-dir root, and every leg (register →
+        # configure → subscribe → start → observe → stop) ASSERTS instead of
+        # printing — the configure read-back, the at-least-one-event drain,
+        # the running state, and the Fleet budget row — so a failure exits
+        # nonzero and reds this job. One short-lived process spawn, no
+        # external service, no network, no fixture crates. The step-level
+        # timeout is independent of (and far tighter than) the agent's own
+        # 120 s idle cap, and the binary is asserted present first so a
+        # build-step regression fails with a CLEAR message, not a confusing
+        # "file not found".
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/embedding-quickstart || {
+            echo "::error::embedding-quickstart binary not found at target/release/examples/embedding-quickstart — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/embedding-quickstart
+
+  perf-budgets:
+    name: perf-budgets
+    # Story 7-5 (NFR-4): the DESIGNATED performance job. NFR-4's budgets
+    # (reads < 1s on a 25-instance Fleet; supervision overhead <= 2% CPU and
+    # <= 50MB RSS per running instance) are benchmarked here on every PR —
+    # measured, not assumed — and a regression FAILS this job (blocking; the
+    # run step is never allowed to fail). Gate policy (the harness prints it,
+    # with all measured numbers, as a JSON report in this job's log — the
+    # measured record of record, also uploaded as this job's artifact): reads
+    # p99 and RSS/instance gate hard at budget; CPU/instance gates strict
+    # (x1.0) locally and carries the harness's DOCUMENTED shared-runner
+    # tolerance (x1.5, named in the report) over the MEDIAN OF THREE windows
+    # here, because a hosted runner's co-tenant noise is uncontrollable.
+    # Gated separately from the standard test matrix (a dedicated ubuntu job,
+    # not a matrix leg) so the measurement is comparable run-to-run and
+    # perf-noise flakiness can never spill into the ordinary test gates.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build the perf harness (release profile)
+        # Release profile: the measurement must not pay dev-profile build
+        # noise. Explicit +stable (see fmt job): the root rust-toolchain.toml
+        # pins only local bare cargo; MSRV floor: the `msrv` job.
+        run: cargo +stable build --release -p ktesio-engine --example perf-budgets
+      - name: Rebuild the fake_agent helper (stale-helper guard)
+        # The SAME stale-helper guard the test + coverage jobs carry (and
+        # scripts/test_automation.py enforces for any job that spawns
+        # agents): this job's target/ cache key is Cargo.lock-derived, so a
+        # helper-only change cannot bust it and a frozen binary would
+        # silently ignore newer flags (unknown args are `_ => {}`). The
+        # harness resolves the helper at target/release/fake_agent; rm +
+        # explicit rebuild makes that deterministic instead of racing the
+        # lib's on-demand build fallback (the build-dir lock contention
+        # flake). hermes_shim is NOT needed here — the harness spawns only
+        # fake_agent.
+        shell: bash
+        run: |
+          rm -f target/release/fake_agent target/release/fake_agent.exe
+          cargo +stable build --release -p ktesio-conformance --bin fake_agent
+      - name: Run the perf harness (NFR-4 budgets; regressions fail this job)
+        # Blocking by design: a budget regression (reads p99 over 1s, RSS
+        # over 50 MiB/instance or its 2x spike guard, CPU over its applicable
+        # budget) exits nonzero and reds this job, per the AC "regressions
+        # fail the perf job". The runner's ambient CI=true env switches the
+        # harness into its documented CI mode (median-of-3 windows + the
+        # tolerance, and the reads gate's one 30s-cool-down retry). The env
+        # var also makes the harness write the JSON report to a file, which
+        # the step below uploads as the job's artifact — the run line itself
+        # stays the bare binary invocation so the step cannot silently
+        # swallow a nonzero exit.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets
+      - name: Upload the measured report (artifact)
+        # The measured record of record also lives in this job's log; the
+        # artifact makes it downloadable for trend inspection. `if: always()`
+        # so a red (regression) run's numbers are preserved too — that is
+        # exactly when the record matters most.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-budgets-report
+          path: perf-budgets-report.json
+          if-no-files-found: warn
 
   docs:
     name: docs
@@ -375,10 +502,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # The armed in-repo baseline guard (#160, epic-6 retro A1) diffs the
-          # frozen adapter-api surface against the contract-v1 freeze commit
-          # 4119db3. The default shallow clone cannot resolve a historical
-          # rev, so this job fetches full history for the baseline lookup.
+          # The armed in-repo baseline guard (#160, epic-6 retro A1; engine arm
+          # in story 7-4) diffs TWO frozen surfaces against their freeze
+          # commits: ktesio-adapter-api against the contract-v1 freeze commit
+          # 4119db3, and ktesio-engine against the embedding-surface freeze
+          # commit 8a8b328 (see the baseline comment below for why the two
+          # SHAs differ). The default shallow clone cannot resolve a
+          # historical rev, so this job fetches full history for the baseline
+          # lookups.
           fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
@@ -428,11 +559,12 @@ jobs:
           set -euo pipefail
           version="${{ steps.semver_version.outputs.version }}"
           user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
-          # Install the binary UP FRONT: the armed in-repo baseline guard below
-          # runs on EVERY push, so the old "lazy install inside the armed
-          # branch" dormancy no longer applies — the adapter-api surface is
-          # guarded in-repo even while the crates.io baseline stays dormant
-          # until story 7-4. Same +stable + --locked + version-pin +
+          # Install the binary UP FRONT: the armed in-repo baseline guards below
+          # run on EVERY push, so the old "lazy install inside the armed
+          # branch" dormancy no longer applies — the adapter-api and engine
+          # surfaces are guarded in-repo even while the crates.io baselines
+          # stay dormant until the held publish executes
+          # (docs/release-process.md). Same +stable + --locked + version-pin +
           # unknown-degrade idiom as before (AI-3).
           if [ "$version" = "unknown" ]; then
             if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -465,38 +597,58 @@ jobs:
               echo "installed=true" >> "$GITHUB_OUTPUT"
             fi
           fi
-          # ARMED in-repo baseline guard (#160, epic-6 retro A1): diff the
-          # frozen adapter-contract v1 Rust surface of ktesio-adapter-api
-          # against the freeze commit 4119db3. The guard fires on ANY breaking
-          # surface change vs the baseline (removal, rename, signature) —
-          # whether or not it was announced; announcement enforcement is
-          # review discipline until 7-4 gives the crates.io flow a real
-          # baseline to diff release-to-release.
+          # ARMED in-repo baseline guards (#160, epic-6 retro A1; ktesio-engine
+          # armed in story 7-4): diff the FROZEN public surfaces against their
+          # freeze commits. The guard fires on ANY breaking surface change vs
+          # the baseline (removal, rename, signature) — whether or not it was
+          # announced; announcement enforcement is review discipline until the
+          # crates.io flow gives each crate a real release-to-release baseline
+          # (the dormant per-crate crates.io loop below arms at first publish).
           #
-          # Maintenance: at the NEXT contract major (a deliberate, announced
-          # v2 freeze), update this SHA — and its copy in
-          # scripts/test_automation.py — to the new freeze commit. The baseline
-          # build resolves the freeze commit's OWN dependencies; if one is ever
-          # yanked/deleted upstream, the guard reds on infra — bump the SHA to
-          # a known-good commit rather than debugging the gate. The cat-file
-          # check below keeps a history-rewrite/GC failure a CLEAR error
-          # instead of a confusing semver-checks resolution abort.
+          # TWO baselines, two honest freeze points:
+          # * ktesio-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
+          #   contract surface has been frozen since story 6-6.
+          # * ktesio-engine @ 8a8b328 — the EMBEDDING-surface freeze (stories
+          #   7-1/7-2/7-3 landed; story 7-4 arms the guard). Deliberately NOT
+          #   4119db3: the engine's surface was legitimately still growing when
+          #   the contract froze (the freeze itself added the
+          #   `LaunchResolveError::ContractIncompatible` variant to an engine
+          #   error enum, and the lifecycle/events stories reshaped more) — the
+          #   engine was `publish = false` throughout, so those were allowed
+          #   evolution, and a 4119db3 baseline would red CI on that honest
+          #   history. The embedding surface the hosts see freezes at 7-3's
+          #   commit instead. Same mechanism, same pins, same bump procedure.
+          #
+          # Maintenance: at the next deliberate freeze (a contract-v2 freeze
+          # for adapter-api, or an announced engine major), update the SHAs
+          # here — and their copies in scripts/test_automation.py — together.
+          # The baseline builds resolve the freeze commit's OWN dependencies;
+          # if one is ever yanked/deleted upstream, the guard reds on infra —
+          # bump the SHA to a known-good commit rather than debugging the
+          # gate. The cat-file checks below keep a history-rewrite/GC failure
+          # a CLEAR error instead of a confusing semver-checks resolution
+          # abort.
           git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit} || {
             echo "::error::semver baseline rev 4119db37… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
             exit 1
           }
           cargo +stable semver-checks check-release -p ktesio-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
+          git cat-file -e 8a8b3285bffc8b814d5effbd807f3236e53d0b99^{commit} || {
+            echo "::error::semver baseline rev 8a8b328… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
+            exit 1
+          }
+          cargo +stable semver-checks check-release -p ktesio-engine --baseline-rev 8a8b3285bffc8b814d5effbd807f3236e53d0b99
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
               200)
                 # The binary was ensured above; the crates.io baseline (once
-                # story 7-4 publishes) is the authoritative release-to-release
-                # gate — no version re-probe happens here.
+                # the held publish runs) is the authoritative
+                # release-to-release gate — no version re-probe happens here.
                 cargo +stable semver-checks check-release -p "$crate"
                 ;;
               404)
-                echo "::notice::${crate} has no published baseline on crates.io yet; the semver gate arms at first publish (story 7-4)."
+                echo "::notice::${crate} has no published baseline on crates.io yet; the crates.io release-to-release gate arms at first publish (the HELD publish runbook, docs/release-process.md)."
                 ;;
               000|429|5[0-9][0-9])
                 echo "::notice::crates.io returned transient status ${status} for ${crate}; skipping the semver check this run."
@@ -540,7 +692,12 @@ jobs:
             target/
           restore-keys: ${{ runner.os }}-cargo-msrv-
       - name: Check workspace builds on the MSRV
-        run: cargo +1.96.1 check --workspace
+        # --all-targets (not just the lib graph) so the DEV-dependencies
+        # compile on the pinned floor too: the story-7-5 perf harness carries
+        # `sysinfo` as a benchmark-gated dev-dep, and a future sysinfo MSRV
+        # bump past 1.96.1 must red HERE (on a lockfile refresh), not in a
+        # contributor's local build.
+        run: cargo +1.96.1 check --workspace --all-targets
 
   coverage:
     name: coverage

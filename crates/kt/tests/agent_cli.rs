@@ -10,6 +10,8 @@ mod helpers;
 use std::path::Path;
 
 use helpers::{run_kt_agent, run_kt_agent_with_env, TestContext};
+use ktesio_conformance::uj3;
+use ktesio_engine::{Engine, FleetEntry, LifecycleState, UsageView};
 
 /// Path to the SQLite state DB the engine creates under a state base.
 fn state_db(state_dir: &Path) -> std::path::PathBuf {
@@ -2158,6 +2160,340 @@ fn uj1_governance_journey_through_documented_cli_commands() {
         "no dollar figure anywhere without a Rate: stdout={}",
         ufree.stdout
     );
+}
+
+// ---- Story 7-1: the UJ-3 journey through documented kt commands ----
+
+/// The re-exec entry for the UJ-3 journey's breach leg (mirrors
+/// `agent_cli_start_helper_subprocess` above). It runs ONLY when BOTH env
+/// vars are set — `KTESIO_CLI_UJ3_BREACH_HELPER` (the instance name) AND the
+/// `KTESIO_CLI_UJ3_REEXEC_ARMED` arm flag the PARENT sets immediately before
+/// the re-exec — so the helper can never open an engine over an arbitrary
+/// state dir when its env var is set out of harness context. When armed, it
+/// opens an engine over `KTESIO_STATE_DIR`, STARTS the named instance, waits —
+/// in THIS engine session, where the background reaper lives — for the
+/// committed `paused` state the breach produces (via the SHARED
+/// `ktesio_conformance::uj3` poller), reads the LIVE Fleet row and asserts the
+/// shared paused-entry shape (the same assertion the host test feeds from its
+/// own facade read — the paused-entry leg is proven on BOTH paths), and only
+/// then exits WITHOUT dropping the engine (crash semantics): the suspended
+/// `fake_agent` survives, re-parents to init, and stays adoptable by the next
+/// documented `kt agent stop`.
+#[test]
+fn agent_cli_uj3_breach_helper_subprocess() {
+    let Ok(name) = std::env::var("KTESIO_CLI_UJ3_BREACH_HELPER") else {
+        return;
+    };
+    // The arming guard: an env var alone is not consent — the parent must
+    // have armed this re-exec deliberately.
+    if std::env::var("KTESIO_CLI_UJ3_REEXEC_ARMED").as_deref() != Ok("1") {
+        return;
+    }
+    let state = std::path::PathBuf::from(std::env::var("KTESIO_STATE_DIR").unwrap());
+    let engine = Engine::open(Some(state.clone())).expect("uj3 breach helper engine open");
+    engine
+        .blocking()
+        .start(&name)
+        .expect("uj3 breach helper start");
+    uj3::wait_for_state(
+        &state,
+        &name,
+        LifecycleState::Paused,
+        uj3::STATE_POLL_BUDGET,
+    );
+    // The paused-entry shape, from the CLI side: the engine session that owns
+    // the Run reads its own LIVE Fleet row (so current-Run == cumulative
+    // holds) and feeds the SAME shared assertion the host test uses.
+    let entry = engine
+        .blocking()
+        .fleet()
+        .expect("uj3 breach helper fleet read")
+        .into_iter()
+        .find(|e| e.name.as_str() == name)
+        .expect("the flow's instance is in the Fleet");
+    uj3::assert_paused_entry(&entry);
+    // Exit WITHOUT dropping `engine` (no handle Drop → no kill): the breach-
+    // paused process survives exactly as after an engine crash (story 1-6).
+    std::process::exit(0);
+}
+
+/// Re-exec this test binary into [`agent_cli_uj3_breach_helper_subprocess`]
+/// with the uj3 helper env armed — BOTH the name env and the explicit arm
+/// flag (the helper refuses to run un-armed) — the file's established
+/// cross-lifetime harness, specialized to the breach leg.
+fn start_via_uj3_breach_helper(state_dir: &Path, name: &str) {
+    let exe = std::env::current_exe().expect("test exe");
+    let status = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "agent_cli_uj3_breach_helper_subprocess",
+            "--nocapture",
+        ])
+        .env("KTESIO_CLI_UJ3_BREACH_HELPER", name)
+        .env("KTESIO_CLI_UJ3_REEXEC_ARMED", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .status()
+        .expect("run uj3 breach helper subprocess");
+    assert!(
+        status.success(),
+        "uj3 breach helper subprocess failed: {status}"
+    );
+}
+
+/// Best-effort orphan guard for the journey's breach leg: between the helper's
+/// crash-style exit and the stop leg, ANY failure would leak the SIGSTOP'd
+/// `fake_agent` (a 10-minute linger) as a real orphan. Drop runs the
+/// documented `kt agent stop <name> --timeout 0` unless disarmed — best-effort,
+/// never panicking in Drop (a guard stop on an already-dead instance is a
+/// harmless error, and a Drop panic would mask the test's own failure). The
+/// guard lives in the PARENT test process, so it fires even if the helper
+/// subprocess itself is SIGKILLed: the parent's asserts fail, the unwind runs
+/// this Drop.
+struct StopOrphanOnDrop<'a> {
+    name: &'a str,
+    working_dir: &'a Path,
+    state_dir: &'a Path,
+    /// The `--timeout` argument, built from the SHARED `uj3::STOP_WINDOW` (a
+    /// suspended process cannot act on a graceful signal).
+    timeout_arg: String,
+    armed: bool,
+}
+
+impl StopOrphanOnDrop<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StopOrphanOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = run_kt_agent(
+                &["agent", "stop", self.name, "--timeout", &self.timeout_arg],
+                self.working_dir,
+                self.state_dir,
+            );
+        }
+    }
+}
+
+#[test]
+fn uj3_governance_journey_through_documented_cli_commands_unix() {
+    // Story 7-1 (FR-31), the behavioral-identity half: the SAME UJ-3 flow the
+    // library host test (`crates/ktesio-engine/tests/uj3_library_host.rs`)
+    // drives through the engine's `Blocking` facade is driven here through
+    // DOCUMENTED `kt` commands only — register --manifest, config set,
+    // config get, show --json / usage --json, stop — and EVERY assertion comes
+    // from the SHARED `ktesio_conformance::uj3` module (the expectations are
+    // pinned once; neither suite re-states them). The two suites drive
+    // DIFFERENT roots (this one: the `KTESIO_STATE_DIR`-pinned kt harness home;
+    // the host: its own temp engine root); the shared module asserts on
+    // OBSERVED reads, never on paths.
+    //
+    // Reachability inventory (§4.x, mirroring the host test's module docs):
+    // §4.1 (register --manifest / show / usage reads), §4.2 (start, the
+    // breach-pause, stop), §4.3 (config set + config get provenance), and
+    // §4.5 (budget/rate/cap + the recorded breaches) are exercised by this
+    // flow; §4.4 (memory) and §4.6 (interaction) are facade-reachability-
+    // proven by the engine's hermes e2e (tests/hermes.rs phases) and cited
+    // there, not re-tested; §4.7 is the manifest contract itself; §4.9 and
+    // §4.10 are out of scope (epic 8/9).
+    //
+    // SINGLE-LIFETIME CLI BOUNDARY (the documented `kt agent start` contract):
+    // a standalone `kt agent start` kills the process on the command's clean
+    // engine drop, and ANY intervening `kt` command that adopts a live process
+    // kills it on ITS clean drop too — so a live agent cannot be read across
+    // separate CLI invocations by construction. The flow therefore reads the
+    // instance at the safe points — before the start (no process), from the
+    // helper's own LIVE engine session (the shared paused-entry assertion),
+    // and after the terminal stop (record cleared) — and drives the breach leg
+    // through the file's established surviving-engine harness (the helper
+    // above), whose engine session runs the reaper that ingests the fixture's
+    // usage and commits the breach pause. `agent stop` then ADOPTS the live
+    // paused process (story 1-6 AI-7) and lands the terminal state cleanly. A
+    // `StopOrphanOnDrop` guard covers the window where that stop hasn't run
+    // yet, so a mid-flow failure cannot leak the suspended agent.
+    //
+    // WINDOWS POSTURE (the `_unix` convention, and why not `#[ignore]`):
+    // Windows cannot simulate cross-lifetime survival at all
+    // (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills the child when the helper
+    // exits), so the breach leg is structurally impossible there and this
+    // test runtime-returns. A conditional-ignore attribute would be the
+    // louder signal, but OS-conditional code is FORBIDDEN in this file by
+    // the CI gate (only the engine backends and engine tests are
+    // allowlisted — the gate matches the attribute text itself, even in a
+    // comment) — so
+    // the file's documented convention stands: the data-driven runtime return
+    // plus the `_unix` SUFFIX that keeps the limitation visible in the test
+    // list on every OS, while the OS-INDEPENDENT shared assertions (every one
+    // this test feeds) are proven on all three OSes by the host test, which
+    // runs the identical flow through the same shared module.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let name = uj3::FLOW_INSTANCE;
+
+    // (1) §4.1/§4.7 register through the SHARED fixture manifest (contract v1,
+    // per-OS declaration, self-reported metering, the `model` → env mapping).
+    let manifest_dir = uj3::write_flow_manifest(&ctx.project_dir.join("uj3-flow"));
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            name,
+            "--manifest",
+            manifest_dir.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "register --manifest: stderr={}", reg.stderr);
+
+    // (2) §4.3/§4.5 configure: the SHARED key/value pairs (the same writes the
+    // host test performs through `Blocking::set_config`).
+    for (key, value) in uj3::flow_config_pairs() {
+        let set = run_kt_agent(
+            &["agent", "config", "set", name, key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+        assert!(
+            set.success,
+            "config set {key}={value}: stderr={}",
+            set.stderr
+        );
+    }
+
+    // (3) §4.3 read back with provenance: the configured `model` leaf resolves
+    // at the pinned layer. The SAME shared assertion the host test feeds from
+    // `effective_config`.
+    let cfg = run_kt_agent(
+        &["agent", "config", "get", name, uj3::MODEL_KEY, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(cfg.success, "config get --json: stderr={}", cfg.stderr);
+    let cfg_doc: serde_json::Value = serde_json::from_str(&cfg.stdout)
+        .unwrap_or_else(|e| panic!("config get --json not JSON: {e}\n{}", cfg.stdout));
+    let leaf = &cfg_doc["entries"][0];
+    assert_eq!(leaf["key"], serde_json::json!(uj3::MODEL_KEY), "{cfg_doc}");
+    uj3::assert_model_leaf(
+        leaf["value"].as_str().expect("a string value"),
+        leaf["source"].as_str().expect("a string source"),
+    );
+
+    // (4) §4.1 pre-start `show --json`: the seeded budget + honest zero usage,
+    // parsed into the SAME `FleetEntry` shape the host test's facade read
+    // returns — one shared assertion, two surfaces.
+    let entry: FleetEntry = show_entry(&ctx, state_dir, name);
+    uj3::assert_pre_start_entry(&entry);
+
+    // (5) pre-start `usage --json`: the focused surface over the SAME data.
+    let view: UsageView = usage_view(&ctx, state_dir, name);
+    uj3::assert_pre_start_usage(&view);
+
+    // (6) §4.2 start + breach: the helper's engine session starts the instance,
+    // waits for the COMMITTED paused state (usage event → BudgetEvaluator →
+    // the breach-pause), asserts the shared paused-entry shape from its LIVE
+    // Fleet row, then exits crash-style so the suspended process survives. The
+    // orphan guard is armed FIRST: from here until the stop leg lands, any
+    // failure (a killed helper included) must not leak the suspended agent.
+    let timeout_arg = uj3::STOP_WINDOW.as_secs().to_string();
+    let mut orphan_guard = StopOrphanOnDrop {
+        name,
+        working_dir: ctx.project_dir.as_path(),
+        state_dir,
+        timeout_arg,
+        armed: true,
+    };
+    start_via_uj3_breach_helper(state_dir, name);
+
+    // (7) §4.2 stop: the documented command ADOPTS the live paused process and
+    // lands the terminal state. The SHARED zero window (a SIGSTOP'd process
+    // cannot act on SIGTERM — the graceful window would always fully elapse),
+    // the same value the host facade passes.
+    let stop = run_kt_agent(
+        &[
+            "agent",
+            "stop",
+            name,
+            "--timeout",
+            &orphan_guard.timeout_arg,
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(stop.success, "stop: stderr={}", stop.stderr);
+    assert!(stop.stdout.contains("stopped"), "stdout={}", stop.stdout);
+    // The stop leg landed: no orphan possible anymore.
+    orphan_guard.disarm();
+
+    // (8) Post-stop reads (safe now: terminal state, spawn record cleared):
+    // the frozen ledger — honestly a RANGE (the suspension races the emitter;
+    // see `uj3::assert_stopped_usage`) — and every surface reports honestly:
+    // the SAME shared assertions the host test feeds after ITS stop leg.
+    let entry: FleetEntry = show_entry(&ctx, state_dir, name);
+    uj3::assert_stopped_entry(&entry);
+    let view: UsageView = usage_view(&ctx, state_dir, name);
+    uj3::assert_stopped_usage(&view);
+
+    // (9) The enforcement chain's records, from the SAME committed logs the
+    // facade reads — exactly one breach per dimension (the token breach won
+    // the pause) and a `→ paused` transition carrying the TOKEN
+    // `BudgetExceeded` cause. The CLI has no breach-events command (and none
+    // may be added here), so the shared committed-log readers are the
+    // behavioral-identity path for these records.
+    uj3::assert_flow_breaches(&uj3::read_breach_events(state_dir, name));
+    uj3::assert_paused_transition_budget_exceeded(&uj3::read_transition_events(state_dir, name));
+}
+
+/// Run the documented `kt agent show <name> --json` and parse the instance row
+/// back into the engine's `FleetEntry` — the SAME serde shape the host test's
+/// facade read returns. The document's `schema_version` is asserted against
+/// the engine's pinned Fleet constant (AD-14: "one schema, two consumers" is
+/// PINNED here, not merely serde-tolerated).
+fn show_entry(ctx: &TestContext, state_dir: &Path, name: &str) -> FleetEntry {
+    let show = run_kt_agent(
+        &["agent", "show", name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(show.success, "show --json: stderr={}", show.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&show.stdout)
+        .unwrap_or_else(|e| panic!("show --json not JSON: {e}\n{}", show.stdout));
+    assert_eq!(
+        doc["schema_version"],
+        serde_json::json!(ktesio_engine::FLEET_SCHEMA_VERSION),
+        "the show document negotiates on the pinned Fleet schema version: {doc}"
+    );
+    serde_json::from_value(doc["instance"].clone())
+        .unwrap_or_else(|e| panic!("show --json instance is not a FleetEntry: {e}\n{doc}"))
+}
+
+/// Run the documented `kt agent usage <name> --json` and parse the usage
+/// object back into the engine's `UsageView`. The named usage document
+/// carries the SAME Fleet `schema_version` as `list`/`show` (it serializes
+/// the same fleet domain types) — asserted against the engine's pinned
+/// constant, never a local literal.
+fn usage_view(ctx: &TestContext, state_dir: &Path, name: &str) -> UsageView {
+    let usage = run_kt_agent(
+        &["agent", "usage", name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(usage.success, "usage --json: stderr={}", usage.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&usage.stdout)
+        .unwrap_or_else(|e| panic!("usage --json not JSON: {e}\n{}", usage.stdout));
+    assert_eq!(
+        doc["schema_version"],
+        serde_json::json!(ktesio_engine::FLEET_SCHEMA_VERSION),
+        "the usage document carries the pinned Fleet schema version: {doc}"
+    );
+    serde_json::from_value(doc["usage"].clone())
+        .unwrap_or_else(|e| panic!("usage --json usage is not a UsageView: {e}\n{doc}"))
 }
 
 // ---- Story 3-3: dollar cost + Cost Cap rendering (AC-B/AC10 — AD-8) ----

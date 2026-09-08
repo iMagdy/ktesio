@@ -36,8 +36,11 @@
 //! ## What "an event" is here (AD-14 seed)
 //!
 //! Each transition RECORDS a [`TransitionEvent`] to the per-instance log and
-//! returns it (observable to tests / embedders). This is NOT the 7-2 bounded
-//! subscription bus — only the seed struct + its recording.
+//! returns it (observable to tests / embedders). Since story 7-2 the supervisor
+//! ALSO PUBLISHES each committed event onto the bounded event bus (the
+//! `domain::bus` module, FR-33) — at the SAME commit points where the logs
+//! append, so bus order == durable append order. The bus is additive to the
+//! log/query surface, which stays the machine-authoritative record.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,6 +59,7 @@ use crate::ports::{
 use crate::time::now_rfc3339;
 
 use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
+use super::bus::{EngineEvent, EventBus};
 use super::config::{self, ConfigLayer};
 use super::cost::{CostEvaluator, EstimateLabel, Micros};
 use super::error::EngineError;
@@ -424,6 +428,12 @@ pub struct Supervisor {
     running: HashMap<InstanceName, Supervised>,
     usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
+    /// The event bus (story 7-2, FR-33): publishes at the three commit points
+    /// (transition append, breach append, usage-ingestion commit) so a
+    /// subscriber observes exactly the committed truth in commit order. The
+    /// engine holds its own clone ([`Supervisor::event_bus`]) so
+    /// `subscribe()` never takes the supervisor lock.
+    events: EventBus,
     /// The engine's tokio runtime handle (story 3-4), used to SPAWN the loopback
     /// forward listener's accept loop for an `engine-observed` instance. The
     /// supervisor's sync start path runs on the blocking pool, so it cannot use
@@ -450,6 +460,7 @@ impl Supervisor {
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
+            events: EventBus::new(),
             runtime: None,
         }
     }
@@ -466,6 +477,7 @@ impl Supervisor {
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
+            events: EventBus::new(),
             runtime: Some(runtime),
         }
     }
@@ -482,8 +494,31 @@ impl Supervisor {
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff,
+            events: EventBus::new(),
             runtime: None,
         }
+    }
+
+    /// A clone of this supervisor's event bus (story 7-2) — the engine holds it
+    /// so [`Engine::subscribe`](crate::Engine::subscribe) hands out receivers
+    /// WITHOUT taking the supervisor lock. `broadcast::Sender::clone` shares
+    /// the same channel, so publishes through either clone reach every
+    /// receiver.
+    pub(crate) fn event_bus(&self) -> EventBus {
+        self.events.clone()
+    }
+
+    /// Publish one committed event onto the bus (story 7-2).
+    ///
+    /// Called EXCLUSIVELY from the three commit points, immediately AFTER the
+    /// durable append/commit succeeded. Every caller runs while the supervisor
+    /// lock is held — a CALLER-ENFORCED obligation (the bus itself does not
+    /// serialize; see the `domain::bus` module's ordering invariant) — so
+    /// publishes are serialized in durable-append order: the per-instance FIFO
+    /// guarantee. Publishing cannot fail supervision: a send with no receivers
+    /// (or any send error) is swallowed by the bus.
+    fn publish(&self, event: EngineEvent) {
+        self.events.publish(event);
     }
 
     /// Start a registered / previously stopped / FAILED Agent Instance
@@ -2188,6 +2223,13 @@ impl Supervisor {
                 detail,
             }
         })?;
+        // Story 7-2: the append COMMITTED — publish onto the event bus. After
+        // the durable append (never before: a subscriber never sees an
+        // uncommitted event), before the best-effort text mirror below, so the
+        // bus order is exactly the durable-log order. Ordering obligation:
+        // this runs under the supervisor lock (see the `domain::bus`
+        // caller-enforced invariant).
+        self.publish(EngineEvent::Transition(event.clone()));
         if let Some(capture) = log_capture {
             let text = engine_transition_line_text(&event);
             capture.send_engine_line(LogLine::new(
@@ -2538,8 +2580,9 @@ impl Supervisor {
     /// transaction via `record_usage_event` (AD-6: one transaction per event). A
     /// re-delivered batch is classified [`RecordOutcome::DuplicateReplay`] by the
     /// DB `UNIQUE` index and is a no-op (AC-A no-double-count). On a fresh insert it
-    /// builds the AD-14 [`UsageUpdateEvent`] (the wire shape frozen now; Host
-    /// delivery is story 7-2). A store error is a best-effort diagnostic — usage
+    /// builds the AD-14 [`UsageUpdateEvent`] (the wire shape frozen in 3-1;
+    /// delivered on the event bus since story 7-2). A store error is a
+    /// best-effort diagnostic — usage
     /// ingestion must never crash the supervisor or a lifecycle op (the ledger is
     /// advisory to the RUN, not gating it this story).
     ///
@@ -2586,12 +2629,22 @@ impl Supervisor {
             .ok()
             .and_then(|eff| config::resolve_cost(&eff).0);
         match registry.record_usage_event(&event, rate) {
-            // A fresh row: build the AD-14 usage-update wire struct (frozen now; 7-2
-            // delivers it), THEN run the AD-7 enforcement stage on the just-committed
-            // totals — synchronously, in this same commit path.
+            // A fresh row: build the AD-14 usage-update wire struct (frozen in 3-1;
+            // published on the event bus since 7-2), THEN run the AD-7 enforcement
+            // stage on the just-committed totals — synchronously, in this same
+            // commit path.
             Ok(RecordOutcome::Inserted) => {
+                let update = UsageUpdateEvent::new(event);
+                // Story 7-2: the ledger row COMMITTED — publish onto the event
+                // bus BEFORE the enforcement stage runs, preserving commit
+                // order (the usage row precedes any breach/transition the
+                // enforcement commits, so the bus shows exactly the durable
+                // sequence: usage → token breach → pause → dollar breach).
+                // Ordering obligation: this runs under the supervisor lock
+                // (see the `domain::bus` caller-enforced invariant).
+                self.publish(EngineEvent::UsageUpdate(update.clone()));
                 self.enforce_budget(registry, name, run_id, metering_source);
-                Some(UsageUpdateEvent::new(event))
+                Some(update)
             }
             // A recognized replay — no double-count, no event emitted (nothing new
             // was committed). This is the AC-A guarantee in action; the evaluator is
@@ -2946,16 +2999,26 @@ impl Supervisor {
         // Surface (do NOT swallow) an append failure: the breach record is the FR-21
         // mandated durable artifact; a lost record with no diagnostic is the bug. Log
         // and move on — enforcement still acts.
-        if let Err(e) = append_breach_event(&path, event) {
-            self.log_enforcement_diagnostic(
-                registry,
-                name,
-                &format!(
-                    "could not record the budget breach event to {}: {e} — the mandated \
-                     breach record was NOT written",
-                    path.display()
-                ),
-            );
+        match append_breach_event(&path, event) {
+            Ok(()) => {
+                // Story 7-2: the append COMMITTED — publish onto the event bus
+                // (after the durable record exists, never before; a failed
+                // append publishes nothing). Ordering obligation: this runs
+                // under the supervisor lock (see the `domain::bus`
+                // caller-enforced invariant).
+                self.publish(EngineEvent::BudgetBreach(event.clone()));
+            }
+            Err(e) => {
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!(
+                        "could not record the budget breach event to {}: {e} — the mandated \
+                         breach record was NOT written",
+                        path.display()
+                    ),
+                );
+            }
         }
     }
 

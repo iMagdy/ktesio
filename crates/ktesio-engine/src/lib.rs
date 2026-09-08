@@ -34,12 +34,17 @@
 //! `pub` so the *port trait* is nameable by future in-workspace collaborators,
 //! but the concrete store is not re-exported.
 //!
-//! ## Synchronous this story
+//! ## Observing the engine: the event subscription (story 7-2, FR-33/AD-14)
 //!
-//! The engine API is synchronous here; the async-first tokio internals and the
-//! `blocking()` facade (AD-13) arrive in story 1.4. The registry API is
-//! facade-friendly by construction: it takes its state-dir base explicitly and
-//! holds no global state.
+//! A Host subscribes via [`Engine::subscribe`] (async consumers, raw
+//! [`broadcast::Receiver`]) or [`Blocking::subscribe`] (sync consumers, an
+//! [`EventSubscription`] with a blocking `recv`). The bounded bus
+//! ([`EVENT_BUS_CAPACITY`]) is fed at the same commit points where the event
+//! logs append, so subscribers observe exactly the committed truth in commit
+//! order; payloads are the [`EngineEvent`] wrapper over the existing versioned
+//! AD-14 structs verbatim. The full contract — commit-point guarantee,
+//! per-instance FIFO, the `Lagged` slow-subscriber policy — is documented on
+//! the `domain::bus` module.
 //!
 //! ## Dependency law (AD-2)
 //!
@@ -69,16 +74,17 @@ mod time;
 // collaborators + tests but is no longer what `kt` uses directly.
 pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
-    is_pass_through, render_dollars, render_dollars_bare, resolve, AgentInstance, BreachAction,
-    BreachDimension, BreachScope, BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap,
-    EffectiveConfig, EngineError, EstimateLabel, FleetEntry, FleetListing, FleetTotals,
-    InstanceName, LifecycleCommand, LifecycleError, LifecycleState, LogLine, LogStream, Micros,
-    NameError, Rate, Registry, RegistryError, RemoveDisposition, ResolvedValue, RestartPolicy,
-    RunId, SourceLayer, TokenBudget, TransitionCause, TransitionEvent, UsageEvent, UsageTotals,
-    UsageUpdateEvent, UsageView, BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
-    LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
+    broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AgentInstance,
+    BreachAction, BreachDimension, BreachScope, BudgetBreachEvent, BudgetView, ConfigError,
+    ConfigLayer, CostCap, EffectiveConfig, EngineError, EngineEvent, EstimateLabel, FleetEntry,
+    FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
+    LogLine, LogStream, Micros, NameError, Rate, Registry, RegistryError, RemoveDisposition,
+    ResolvedValue, RestartPolicy, RunId, SourceLayer, TokenBudget, TransitionCause,
+    TransitionEvent, UsageEvent, UsageTotals, UsageUpdateEvent, UsageView, BUDGET_SCHEMA_VERSION,
+    EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION,
+    MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
 };
-pub use engine::{Blocking, Engine, InstanceStatus};
+pub use engine::{Blocking, Engine, EventSubscription, InstanceStatus};
 // Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary
 // `kt` parses `--kind` against and the status shape the public read returns.
 pub use ports::{GuaranteeLevel, MemoryBackingKind, MemoryBackingStatus};

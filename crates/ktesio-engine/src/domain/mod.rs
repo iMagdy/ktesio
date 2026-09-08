@@ -10,6 +10,7 @@
 //! backend. Budgets and config resolution arrive with their stories.
 
 mod budget;
+mod bus;
 mod config;
 mod cost;
 mod error;
@@ -28,6 +29,8 @@ mod usage;
 pub use budget::{
     BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,
 };
+pub(crate) use bus::EventBus;
+pub use bus::{broadcast, EngineEvent, EVENT_BUS_CAPACITY};
 pub use config::{
     is_pass_through, is_secret_ref, pass_through_tail, resolve, resolve_cost, resolve_token_budget,
     resolve_upstream_base_url, secret_name, ConfigError, ConfigLayer, EffectiveConfig,
