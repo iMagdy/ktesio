@@ -447,6 +447,40 @@ pub fn usage_from_payload(event: &UsageUpdateEvent) -> CommittedUsage {
     }
 }
 
+/// A teardown `stop` that survives transient process-control failures.
+/// Shared CI runners intermittently deny a process-group signal with
+/// `EPERM: Operation not permitted` (observed on macOS runners, 2026-09-09:
+/// `interleaved_instances_keep_per_instance_fifo` died in teardown while the
+/// SAME stop succeeded everywhere else). Retry with a short backoff before
+/// giving up — a teardown that flakes is a red PR for no code reason. Panics
+/// with every accumulated error if all attempts fail.
+pub fn stop_resilient(facade: &::ktesio_engine::Blocking<'_>, name: &str, window: Duration) {
+    let mut errors = Vec::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        match facade.stop(name, Some(window)) {
+            Ok(_) => return,
+            Err(e) => errors.push(format!("attempt {}: {e}", attempt + 1)),
+        }
+    }
+    panic!("stop {name} failed after 3 attempts: {}", errors.join("; "));
+}
+
+/// Multi-instance [`stop_resilient`]: stops each named instance, retrying on
+/// transient failures; one instance's persistent failure is noted to stderr
+/// and the loop CONTINUES so the remaining instances still attempt to stop.
+pub fn stop_all_resilient(
+    facade: &::ktesio_engine::Blocking<'_>,
+    names: &[&str],
+    window: Duration,
+) {
+    for name in names {
+        stop_resilient(facade, name, window);
+    }
+}
+
 /// Drain a RAW `Engine::subscribe()` receiver to its current tail with
 /// `try_recv` (the story-7-2 helper for the async subscription surface).
 /// Exact, never racy: callers invoke this only AFTER every publishing call
