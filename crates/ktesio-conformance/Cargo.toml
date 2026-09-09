@@ -7,9 +7,9 @@ description = "Ktesio adapter conformance test kit (TCK) and mock adapter"
 license-file.workspace = true
 homepage.workspace = true
 repository.workspace = true
-# PUBLISHED STATE (v0.7.0 release, 2026-09-09): this dev/test kit KEEPS
-# `publish = false` — it is the dev/test kit, nothing published depends on
-# it, and publishing it is a separate, undecided step
+# UNPUBLISHED by decision (v0.7.0 release, 2026-09-09): this dev/test kit
+# KEEPS `publish = false` — it is the dev/test kit, nothing published
+# depends on it, and publishing it is a separate, undecided step
 # (docs/release-process.md decision log).
 publish = false
 

@@ -58,7 +58,7 @@ Configure this repository secret before publishing a tag:
 
 The workflow verifies that `Cargo.toml` version matches the tag without the leading `v`. If the crate version is already published, the workflow skips the publish step so release reruns stay safe.
 
-## Publishing the Engine Crates (ON HOLD)
+## Publishing the Engine Crates
 
 Story 7-4 prepared everything needed to publish the embedding crates
 (`ktesio-engine` + `ktesio-adapter-api`, plus the engine's builtin-adapter

@@ -19,7 +19,7 @@ to an exact revision:
 
 ```toml
 [dependencies]
-ktesio-engine = { git = "https://github.com/iMagdy/ktesio", rev = "<full-commit-sha>" }
+ktesio-engine = "0.1"
 ```
 
 Pin a **full-length commit SHA**, never a branch: a pinned `rev` makes your
@@ -38,7 +38,7 @@ git rev-parse origin/main
 ```
 
 (paste the full 40-character output as your `rev`). After the publish executes
-(see [the release runbook](release-process.md#publishing-the-engine-crates-on-hold)),
+(see [the release runbook](release-process.md#publishing-the-engine-crates)),
 switch to the versioned crates.io form — the facade you compile against does
 not change:
 
@@ -166,7 +166,11 @@ does. Four instruments keep that statement honest:
 
 ## Availability
 
-The crates are **prepared for publication and currently held**: the manifests
-still carry `publish = false`, and the exact ordered publish commands live in
-[the release runbook](release-process.md#publishing-the-engine-crates-on-hold).
-Until that go, pin the git dependency as shown above.
+**Published**: `ktesio-engine` 0.1, `ktesio-adapter-api` 0.1, and
+`ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
+release v0.7.0, 2026-09-09). Depend on `ktesio-engine = "0.1"` — no git
+dependency needed. The crates are source-available (noncommercial free;
+commercial use requires the author's written approval — see the license).
+
+The publish runbook's historical HELD state is retained in
+[the release process](release-process.md) decision log.
