@@ -7,11 +7,10 @@ description = "Ktesio adapter conformance test kit (TCK) and mock adapter"
 license-file.workspace = true
 homepage.workspace = true
 repository.workspace = true
-# PUBLISH HELD (story 7-4): every publication action is HELD — requires
-# Islam's explicit go. UNLIKE the other internal crates, this kit KEEPS
-# `publish = false` even on publish day: it is the dev/test kit, nothing
-# published depends on it, and publishing it is a separate, undecided step
-# (docs/release-process.md, "Publishing the Engine Crates (ON HOLD)", step 0).
+# PUBLISHED STATE (v0.7.0 release, 2026-09-09): this dev/test kit KEEPS
+# `publish = false` — it is the dev/test kit, nothing published depends on
+# it, and publishing it is a separate, undecided step
+# (docs/release-process.md decision log).
 publish = false
 
 [dependencies]

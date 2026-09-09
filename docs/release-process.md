@@ -220,8 +220,12 @@ widen a gate or an allowlist to make a baseline pass.
 
 ### Decision log
 
-- **Publish go:** none yet — the hold stands. Link Islam's explicit go
-  statement (the release-tracking issue/PR) here when it comes.
+- **Publish go:** GRANTED 2026-09-09 — Islam's explicit go recorded on the release-tracking issue
+  [#176](https://github.com/iMagdy/ktesio/issues/176) ("GO — execute steps 0–7 now", libs 0.1.0 +
+  kt/tag v0.7.0, #168 dispositions ratified in the same decision round). Steps 0–7 executed by the
+  orchestrator same day. The one-time name check returned 200 for all three names — reconciled as
+  Islam's OWN v0.0.1 placeholder reservations (created 2026-07-03, owners verified = iMagdy), so
+  the publishes supersede his own placeholders.
 - **Semver-baseline retire-or-keep:** open by default — KEEP until revisited
   at the second published release, per the flip note above.
 

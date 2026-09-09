@@ -571,32 +571,25 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("perf-budgets-report.json", upload)
         self.assertTrue(example.is_file(), "the perf-budgets harness example must exist")
 
-    def test_publish_hold_pinned_in_all_four_internal_manifests(self) -> None:
-        # Story 7-4's non-negotiable, PINNED like any other invariant: the
-        # crates.io publish is HELD pending Islam's explicit go (no
-        # deployments, no releases, nothing that costs money), so all FOUR
-        # internal crate manifests must still carry `publish = false`. An
-        # accidental or premature flip fails here exactly like any other
-        # pinned invariant. The flip itself belongs ONLY to step 0 of the
-        # held runbook (docs/release-process.md, "Publishing the Engine
-        # Crates (ON HOLD)") — on publish day this test fails first, which is
-        # the loud, intended signal that the go protocol must have been
-        # followed; the flip lands as step 0 in the same change.
-        for crate in (
-            "ktesio-engine",
-            "ktesio-adapter-api",
-            "ktesio-adapters-hermes",
-            "ktesio-conformance",
-        ):
-            manifest = (
-                release_docs.ROOT / "crates" / crate / "Cargo.toml"
-            ).read_text(encoding="utf-8")
-            self.assertIn(
-                "publish = false",
-                manifest,
-                f"{crate} lost its publish hold — publication is HELD pending "
-                "Islam's explicit go (docs/release-process.md)",
+    def test_publish_flags_match_the_post_v070_release_state(self) -> None:
+        """Publish-day state (go recorded 2026-09-09, release issue #176):
+        the three library crates are PUBLISHED (no publish=false) and
+        ktesio-conformance KEEPS its flag (dev/test kit, separate decision).
+        This pin now catches an accidental re-add of publish=false to the
+        published crates, or a flip of conformance's flag."""
+        for crate in ("ktesio-adapter-api", "ktesio-adapters-hermes", "ktesio-engine"):
+            manifest = (release_docs.ROOT / "crates" / crate / "Cargo.toml").read_text(
+                encoding="utf-8"
             )
+            self.assertNotIn("publish = false", manifest, crate)
+            self.assertNotIn("publish.workspace", manifest, crate)
+        conformance = (release_docs.ROOT / "crates" / "ktesio-conformance" / "Cargo.toml").read_text(
+            encoding="utf-8"
+        )
+        # The dev/test kit KEEPS its flag — publishing it is a separate,
+        # undecided decision (docs/release-process.md decision log).
+        self.assertIn("publish = false", conformance, "ktesio-conformance")
+
 
     def test_ci_enforces_msrv_floor(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(

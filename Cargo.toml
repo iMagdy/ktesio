@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # Minimum supported Rust version. Floor is set by the bundled-SQLite build:
 # rusqlite 0.40.1 → libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in
