@@ -44,7 +44,7 @@ rusqlite = { workspace = true }
 # `kt agent start` restarts a `failed` instance to `running`. Dev-only — excluded
 # from the boundary gate (`cargo tree -e normal,build`), so the shipping `kt`
 # graph still never depends on it (same rationale as the engine's dev-dep).
-ktesio-conformance = { path = "../ktesio-conformance", version = "0.1.0" }
+ktesio-conformance = { path = "../ktesio-conformance" }
 
 [lints]
 workspace = true

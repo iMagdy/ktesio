@@ -83,7 +83,7 @@ tempfile = { workspace = true }
 # is a DEV dependency ONLY — a normal edge would be transitive into `kt` and
 # trip the AD-2 boundary gate (which excludes dev-deps). The shipping engine
 # resolves `--kind mock` via its own internal builtin, not this crate.
-ktesio-conformance = { path = "../ktesio-conformance", version = "0.1.0" }
+ktesio-conformance = { path = "../ktesio-conformance" }
 # Story 7-5 perf harness ONLY (`examples/perf-budgets.rs`): samples the ENGINE
 # process's CPU% + RSS for the NFR-4 steady-state supervision-overhead budget.
 # DEV-ONLY and benchmark-gated — the example is compiled by `--all-targets` but
