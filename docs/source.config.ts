@@ -11,6 +11,7 @@ const files = [
   'embedding.md',
   'lockfile.md',
   'architecture.md',
+  'agents.md',
   'design/metering-agents-you-dont-control.md',
   'testing.md',
   'contributing.md',
