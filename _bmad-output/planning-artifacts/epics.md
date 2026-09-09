@@ -172,6 +172,9 @@ A Host embeds the engine library, drives every capability without a TTY, subscri
 **FRs covered:** FR-31..FR-34
 
 ### Epic 8: Provision Skills and Migrate Legacy Users
+
+> **(2026-09-09 — CLOSED AS SUPERSEDED by Islam's decision, option A):** the skills-provisioning premise was overtaken by the project pivot. Epic 9 removed the legacy skills-manager surface and repositioned Ktesio as an agent runner, so skills provisioning is no longer a Ktesio capability. The stories below are RETIRED WITHOUT DEVELOPMENT (8-4 was already self-marked superseded; 8-5's install-channel concern is carried by the release process and `scripts/public` installers). Definitions retained for the record. GitHub issues #95-99 closed 2026-09-09.
+
 An Operator provisions commit-locked Skills to a managed agent, built fresh in `ktesio-engine::skills` under the hexagonal boundary (Epic 9 removed the legacy machinery this was originally planned to relocate). Existing v0.5.0 users already received the pivot's removal notice via the 0.6.0 release notes (Epic 9); this epic's remaining migration-continuity work is confirming every install channel still yields a working `kt` after the upgrade.
 **FRs covered:** FR-35..FR-39
 > **Correction 2026-07-13 (see `sprint-change-proposal-2026-07-13.md` + Epic 9):** the "retire the legacy CLI now" course-correction **supersedes** Story 8-4 (deprecate-in-place) and **changes the premise of Story 8-1 / AD-16** (the skills machinery it planned to relocate-and-reuse is being deleted, so 8-2/8-3 must build agent skill-provisioning in `engine::skills` fresh). FR-37/FR-38 amendments are flagged for Islam in the proposal. Final re-scope is Story 9-3 (architect-owned) — do not treat this Epic 8 summary as current until that lands.
