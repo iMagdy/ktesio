@@ -39,6 +39,19 @@
 //! [`EventSubscription`] owns a blocking `recv` bridged through the engine
 //! runtime exactly like every other facade method.
 
+//! ## The diagnostic sink (story 10-2)
+//!
+//! The engine writes TWO operational diagnostics (the DC-10 memory-delivery
+//! notice and the enforcement breadcrumb). By default they go to stderr,
+//! exactly as they always have. A host that owns its stderr installs a
+//! [`DiagnosticSink`](crate::DiagnosticSink) — any `std::io::Write` — at open
+//! ([`Engine::open_with_diagnostics`]) or any time later
+//! ([`Engine::with_diagnostics`] / [`Blocking::with_diagnostics`]); the
+//! diagnostics then route to the sink, receiving the exact bytes (same
+//! `[ktesio] `-prefixed text, one line each) stderr would have received. The
+//! sink is engine-embedder ergonomics — it never touches the adapter-api
+//! contract.
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,10 +62,10 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, EffectiveConfig,
-    EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState, LogLine,
-    Registry, RegistryError, RemoveDisposition, RestartPolicy, Supervisor, TransitionCause,
-    TransitionEvent,
+    broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, DiagnosticSink,
+    EffectiveConfig, EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState,
+    LogLine, Registry, RegistryError, RemoveDisposition, RestartPolicy, Supervisor,
+    TransitionCause, TransitionEvent,
 };
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
@@ -167,6 +180,39 @@ impl Engine {
     ///    task that periodically runs [`Supervisor::poll_once`] via
     ///    `spawn_blocking` and times the Restart Policy backoffs.
     pub fn open(base: Option<PathBuf>) -> Result<Self, RegistryError> {
+        Self::open_inner(base, None)
+    }
+
+    /// Open an engine with a host-provided diagnostic sink INSTALLED FROM THE
+    /// FIRST MOMENT (story 10-2).
+    ///
+    /// Behaviorally [`Engine::open`] in every respect except one: the sink is
+    /// installed BEFORE orphan adoption runs and BEFORE the crash-detection
+    /// reaper starts, so even a diagnostic fired by the reaper for an adopted
+    /// instance (an enforcement breadcrumb for a budget breach committed right
+    /// after open) routes to the sink — no stderr write can slip through
+    /// between open and a later install. Hosts that can pass the sink at open
+    /// should; [`Engine::with_diagnostics`] exists for installing or rotating
+    /// a sink later in the engine's life.
+    ///
+    /// See [`DiagnosticSink`](crate::DiagnosticSink) for the sink contract
+    /// (what it receives, thread-safety, the no-re-entry rule) and
+    /// docs/embedding.md for the host-facing guide.
+    pub fn open_with_diagnostics(
+        base: Option<PathBuf>,
+        sink: DiagnosticSink,
+    ) -> Result<Self, RegistryError> {
+        Self::open_inner(base, Some(sink))
+    }
+
+    /// The shared open path (story 10-2): `open` passes no sink (the
+    /// diagnostics keep their default stderr behavior, byte-identical to the
+    /// pre-sink engine), `open_with_diagnostics` installs the host's writer
+    /// before any supervision work starts.
+    fn open_inner(
+        base: Option<PathBuf>,
+        diagnostics: Option<DiagnosticSink>,
+    ) -> Result<Self, RegistryError> {
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
             name: "<engine-runtime>".to_string(),
@@ -179,8 +225,13 @@ impl Engine {
         // pool, where `Handle::current` is unavailable). A `Handle` spawns onto
         // its runtime from any thread, so this is sound. Story 7-2: keep a bus
         // clone OUTSIDE the supervisor mutex so `subscribe()` is lock-free (see
-        // EngineInner::events).
-        let supervisor = Supervisor::with_runtime(rt.handle().clone());
+        // EngineInner::events). Story 10-2: install the host's diagnostic sink
+        // (when given) BEFORE adoption + the reaper spawn, so no diagnostic can
+        // fire before the sink is in place.
+        let mut supervisor = Supervisor::with_runtime(rt.handle().clone());
+        if let Some(sink) = diagnostics {
+            supervisor.install_diagnostics(sink);
+        }
         let events = supervisor.event_bus();
         let inner = Arc::new(EngineInner {
             registry: Mutex::new(registry),
@@ -269,6 +320,33 @@ impl Engine {
     /// module docs for why `kt` uses this instead of becoming an async binary.
     pub fn blocking(&self) -> Blocking<'_> {
         Blocking { engine: self }
+    }
+
+    /// Install (or replace) the host-provided diagnostic sink (story 10-2) on
+    /// an already-open engine.
+    ///
+    /// The engine's two operational diagnostics — the DC-10 memory-delivery
+    /// notice and the enforcement breadcrumb — then route to `sink` instead of
+    /// stderr, receiving the exact bytes (same `[ktesio] `-prefixed text, one
+    /// `\n`-terminated line per diagnostic) stderr would have received. With
+    /// no sink installed (the [`Engine::open`] default) the diagnostics keep
+    /// their historical stderr behavior, byte-identical. See
+    /// [`DiagnosticSink`](crate::DiagnosticSink) for the full contract.
+    ///
+    /// This is deliberately a SYNC method like [`Engine::subscribe`]: it takes
+    /// the supervisor lock briefly (the sink is one field swap behind that
+    /// mutex) and needs no blocking-pool trip — safe from any context.
+    /// Installing replaces any earlier sink, so a host can rotate its writer
+    /// mid-flight; the change takes effect for every later diagnostic. For a
+    /// sink that must also catch reaper-fired diagnostics for adopted
+    /// instances in the open-to-install window, prefer
+    /// [`Engine::open_with_diagnostics`].
+    pub fn with_diagnostics(&self, sink: DiagnosticSink) {
+        self.inner
+            .supervisor
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .install_diagnostics(sink);
     }
 
     /// Subscribe to the engine's committed-event stream (story 7-2, FR-33).
@@ -1161,6 +1239,17 @@ impl Blocking<'_> {
             rx: self.engine.subscribe(),
             rt: Arc::clone(&self.engine.rt),
         }
+    }
+
+    /// Blocking install (or replace) of the story-10-2 diagnostic sink — the
+    /// sync-surface form of [`Engine::with_diagnostics`]. Like `subscribe`,
+    /// this is a DIRECT sync call, not a `block_on` bridge: it takes the
+    /// supervisor lock for one field swap and returns. The engine's two
+    /// operational diagnostics then route to `sink` (exact stderr bytes, one
+    /// line each) instead of stderr; the no-sink default is unchanged. See
+    /// [`DiagnosticSink`](crate::DiagnosticSink) for the contract.
+    pub fn with_diagnostics(&self, sink: DiagnosticSink) {
+        self.engine.with_diagnostics(sink);
     }
 
     /// Blocking [`Engine::transition_events`].

@@ -46,6 +46,20 @@
 //! per-instance FIFO, the `Lagged` slow-subscriber policy — is documented on
 //! the `domain::bus` module.
 //!
+//! ## Routing engine diagnostics: the host-provided sink (story 10-2)
+//!
+//! The engine writes TWO operational diagnostics — the DC-10 memory-delivery
+//! notice and the enforcement breadcrumb. With no sink installed they go to
+//! stderr, byte-identical to every pre-sink release. A host that owns its
+//! stderr installs a [`DiagnosticSink`] (any `std::io::Write`, thread-safely
+//! wrapped) via [`Engine::open_with_diagnostics`] (in place before any
+//! supervision work) or [`Engine::with_diagnostics`] /
+//! [`Blocking::with_diagnostics`] (install or rotate later); the diagnostics
+//! then route to the sink, receiving the exact bytes — same `[ktesio] `
+//! prefixed text, one newline-terminated line each — stderr would have
+//! received. The sink is engine-embedder ergonomics only: the adapter-api
+//! contract is untouched.
+//!
 //! ## Dependency law (AD-2)
 //!
 //! The `kt` binary depends only on this crate's public API (plus
@@ -76,13 +90,13 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AgentInstance,
     BreachAction, BreachDimension, BreachScope, BudgetBreachEvent, BudgetView, ConfigError,
-    ConfigLayer, CostCap, EffectiveConfig, EngineError, EngineEvent, EstimateLabel, FleetEntry,
-    FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
-    LogLine, LogStream, Micros, NameError, Rate, Registry, RegistryError, RemoveDisposition,
-    ResolvedValue, RestartPolicy, RunId, SourceLayer, TokenBudget, TransitionCause,
-    TransitionEvent, UsageEvent, UsageTotals, UsageUpdateEvent, UsageView, BUDGET_SCHEMA_VERSION,
-    EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION,
-    MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
+    ConfigLayer, CostCap, DiagnosticSink, EffectiveConfig, EngineError, EngineEvent, EstimateLabel,
+    FleetEntry, FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError,
+    LifecycleState, LogLine, LogStream, Micros, NameError, Rate, Registry, RegistryError,
+    RemoveDisposition, ResolvedValue, RestartPolicy, RunId, SourceLayer, TokenBudget,
+    TransitionCause, TransitionEvent, UsageEvent, UsageTotals, UsageUpdateEvent, UsageView,
+    BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
+    LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, EventSubscription, InstanceStatus};
 // Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary

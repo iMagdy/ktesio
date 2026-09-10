@@ -72,6 +72,7 @@ surface `kt` uses. The capabilities you will reach for first:
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
 | `subscribe` / `Blocking::subscribe` | Receive the event stream (below). |
+| `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `kt agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
 | `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. |
@@ -101,6 +102,50 @@ Four rules cover the whole contract:
    ledger reads) are the recourse: they always return the committed truth
    regardless of any crash. Treat the stream as a live notification surface,
    never as your only copy.
+
+## The diagnostic sink
+
+The engine writes exactly two operational diagnostics — a DC-10 notice when an
+attached filesystem memory backing cannot be delivered to the agent, and an
+enforcement breadcrumb when a budget-breach action (pause/stop) could not be
+honored. With no sink installed they go to **stderr**, byte-for-byte as they
+always have; nothing is written to stdout, ever. A host that owns its stderr
+(for a daemon, a GUI, a log pipeline) can route both into its own writer:
+
+```rust
+use ktesio_engine::{DiagnosticSink, Engine};
+use std::sync::{Arc, Mutex};
+
+// Any std::io::Write works — a file, a channel, an in-memory buffer.
+let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(std::io::sink())));
+
+// Either install at open (the airtight form — in place before any
+// supervision work, including orphan adoption and the crash reaper):
+let engine = Engine::open_with_diagnostics(Some(state_dir), sink.clone())?;
+
+// …or install/rotate on an already-open engine:
+engine.blocking().with_diagnostics(sink);
+```
+
+The contract, in five rules:
+
+1. **Exact texts.** Each diagnostic arrives as one full line — the same
+   `[ktesio] `-prefixed text stderr would have received, `\n`-terminated. A
+   sink that mirrors its input reproduces the default output byte-for-byte.
+2. **Opt-in, additive.** Installing nothing changes nothing; the default path
+   is pinned by CI as byte-identical to the historical engine.
+3. **Thread-safe by construction.** The sink is an `Arc<Mutex<Box<dyn Write +
+   Send>>>`, so the engine can emit from any supervision thread and you can
+   clone the `Arc` to share one sink across engines. Diagnostics are rare —
+   the lock is never a hot path.
+4. **Never re-enter the engine from the writer.** Emissions happen while the
+   engine's supervisor lock is held; a `write` that calls back into the engine
+   would deadlock. Forwarding the line to your own channel or lock is fine.
+5. **Best-effort, like the diagnostics themselves.** A write error is
+   swallowed (supervision never fails or blocks on a broken sink), and no
+   diagnostic is ever the durable record of anything — the transition, breach,
+   and usage logs remain the authoritative copies, readable via the query
+   APIs.
 
 ## The quickstart example
 
