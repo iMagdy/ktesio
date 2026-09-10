@@ -1315,6 +1315,13 @@ impl Registry {
         &self.paths
     }
 
+    /// The engine STATE DB path — the `usage_events` ledger's home. Names the
+    /// ledger family's record location in errors that need it (the story-10-3
+    /// resync helper's truncation guard).
+    pub(crate) fn state_db_path(&self) -> std::path::PathBuf {
+        self.paths.state_db()
+    }
+
     // ---- Memory Backing collaboration surface (story 5-1; crate-internal) ----
 
     /// The attached [`MemoryBacking`] for an instance, or `None` — read by the

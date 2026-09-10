@@ -10,9 +10,16 @@
 //! same three helpers — a manifest builder, a `try_recv` drain, a
 //! `fake_agent` resolver — so a schema or convention change had to be
 //! replicated by hand in every copy (the exact failure mode #164 predicted).
-//! This module is the consolidation: a fixture shape is stated ONCE here, and
-//! every suite (`ktesio-engine`'s `tests/`, the `perf-budgets` example,
-//! `kt`'s `agent_cli.rs` journey) consumes it. A test imports these helpers
+//! This module is the consolidation: a fixture shape is stated ONCE here,
+//! and the suites story 10-1 enumerated consume it — `uj3::
+//! write_flow_manifest`'s callers (the 7-1/7-3 suites), the
+//! event-subscription suite's lingering/crash-once/replay fixtures, the
+//! perf-budgets heartbeat fixture, and `kt`'s `agent_cli.rs` fake_agent
+//! shapes; since stories 10-2/10-3 the diagnostic-sink and resync suites do
+//! too. NOT every suite consumes it: the lifecycle/metering/budget-family
+//! engine suites keep their own private builders, deliberately outside the
+//! consolidation's enumerated scope — docs/testing.md's consumer inventory
+//! is the accurate statement. A test imports these helpers
 //! to BUILD fixtures and OBSERVE streams; the driving happens exclusively
 //! through each suite's own sanctioned surface (the engine's public
 //! `Blocking` facade, documented `kt` commands). This module is deliberately
@@ -115,6 +122,10 @@ impl ManifestFixture {
     /// all three OSes so the default pause Breach Action lands `paused`
     /// deterministically everywhere, self-reported metering, and the
     /// `[config.model]` env mapping that makes the configure leg meaningful).
+    /// The metering source comes from `uj3::METERING_SOURCE` — the constant
+    /// is THE fixture's declaration (not this builder's default), so the
+    /// constant and the wire cannot drift apart silently (the cross-check
+    /// test below pins the two homes equal too).
     pub fn uj3_flow() -> Self {
         Self::new(
             crate::uj3::MANIFEST_KIND,
@@ -127,6 +138,7 @@ impl ManifestFixture {
         )
         .guaranteed_on_all_oses("interaction")
         .guaranteed_on_all_oses("pause")
+        .metering(crate::uj3::METERING_SOURCE)
         .config_env(crate::uj3::MODEL_KEY, crate::uj3::MODEL_ENV_VAR)
     }
 
@@ -615,12 +627,21 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_the_frozen_adapter_contract_agreeing_with_uj3() {
-        // The builder stamps the adapter-api frozen const; uj3's pinned copy
-        // must never drift from it (both name contract v1).
+    fn frozen_constants_agree_between_the_builder_and_uj3() {
+        // The builder's shared defaults and uj3's pinned copies must never
+        // drift: both name contract v1, and the uj3_flow preset's metering
+        // source is uj3::METERING_SOURCE (not the builder default), which
+        // must equal the builder default's wire string — two homes, one
+        // pinned equality each way.
         assert_eq!(
             ktesio_adapter_api::CONTRACT_VERSION,
             crate::uj3::CONTRACT_VERSION
+        );
+        assert_eq!(
+            MeteringSource::SelfReported.as_str(),
+            crate::uj3::METERING_SOURCE,
+            "the builder-default metering source and uj3::METERING_SOURCE are the same wire \
+             string (the uj3_flow preset takes the constant explicitly)"
         );
     }
 
@@ -689,7 +710,17 @@ mod tests {
                     "args = [\"--crash-after-ms\", \"1500\", \"--crash-times\", \"1\", \
                      \"--crash-state\","
                         .into(),
-                    format!("\"{}\"", crash_state.to_string_lossy()),
+                    // The crash-state FILENAME only, never the quoted path:
+                    // the args are TOML Debug-quoted, so a Windows path's
+                    // backslashes are escaped (`C:\\…`) and a full-path
+                    // comparison against the raw lossy string would hold on
+                    // Unix and fail on Windows. The filename carries no
+                    // separators, so it appears verbatim on every OS.
+                    crash_state
+                        .file_name()
+                        .expect("the crash state has a file name")
+                        .to_string_lossy()
+                        .into_owned(),
                 ],
                 vec!["[capabilities.pause]"],
             ),

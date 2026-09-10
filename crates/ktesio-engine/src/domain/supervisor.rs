@@ -433,18 +433,29 @@ struct Supervised {
 /// receiving a diagnostic receives the exact bytes the default stderr path
 /// would have emitted. Write failures are swallowed (the diagnostics are
 /// best-effort by contract, AD-12 — a broken or closed host writer must never
-/// fail or crash supervision). The writer is invoked while the SUPERVISOR
-/// lock is held (both emission sites are supervisor paths), so a sink's
-/// `Write` impl must not re-enter the engine — a call that took the
-/// supervisor lock would deadlock; routing the line onward inside the
-/// writer's own lock is fine.
+/// fail or crash supervision), and a write PANIC in the host's `Write` impl
+/// is caught and swallowed the same way — a host bug must never unwind
+/// through the engine's supervisor critical section (that would poison the
+/// supervisor mutex on its way out); the same sink keeps receiving later
+/// diagnostics. The writer is invoked while the SUPERVISOR lock is held
+/// (both emission sites are supervisor paths), so a sink's `Write` impl must
+/// not re-enter the engine — a call that took the supervisor lock would
+/// deadlock; routing the line onward inside the writer's own lock is fine.
+///
+/// Installing is ONE-WAY: `install_diagnostics` (reached via
+/// [`Engine::with_diagnostics`] / [`Blocking::with_diagnostics`]) REPLACES
+/// the current sink — it never removes one, so there is no uninstall back to
+/// the stderr default. A host that wants the default back re-opens the
+/// engine ([`Engine::open`](crate::Engine::open)), or installs its own writer
+/// that emits to the process's stderr.
 ///
 /// Install via [`Engine::open_with_diagnostics`](crate::Engine::open_with_diagnostics)
 /// (airtight — the sink is in place before orphan adoption and before the
 /// crash-detection reaper starts) or post-open via
 /// [`Engine::with_diagnostics`](crate::Engine::with_diagnostics) /
 /// [`Blocking::with_diagnostics`](crate::Blocking::with_diagnostics)
-/// (install or rotate at any later point).
+/// (install or rotate at any later point; rotation flushes the outgoing
+/// writer before the swap so buffered bytes are not silently lost).
 pub type DiagnosticSink = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// The lifecycle supervisor: owns running process handles + drives transitions.
@@ -571,8 +582,25 @@ impl Supervisor {
     /// Installing replaces any earlier sink (a host rotating a log file
     /// installs the new writer over the old one); the change takes effect for
     /// every later diagnostic. Serialized with emissions by the supervisor
-    /// mutex.
+    /// mutex. Installing is ONE-WAY — this replaces, never removes; there is
+    /// no uninstall back to the stderr default (see the
+    /// [`DiagnosticSink`] docs).
+    ///
+    /// Rotation flushes the OUTGOING writer before the swap: a buffering
+    /// host writer must not silently lose its already-emitted diagnostics
+    /// because its bytes never made it out of the host's buffer. The flush
+    /// is best-effort (an error or a panic in the outgoing writer's flush is
+    /// swallowed, exactly like an emission write — never fails or crashes
+    /// the rotation).
     pub(crate) fn install_diagnostics(&mut self, sink: DiagnosticSink) {
+        if let Some(previous) = self.diagnostics.take() {
+            let mut writer = previous
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = writer.flush();
+            }));
+        }
         self.diagnostics = Some(sink);
     }
 
@@ -590,14 +618,30 @@ impl Supervisor {
     /// Best-effort by contract: a sink/stderr write failure is swallowed — a
     /// broken or closed host writer must never fail, block, or crash
     /// supervision (no diagnostic is the durable record of anything; the
-    /// records live in the logs/ledger). A poisoned sink mutex (the host
-    /// writer panicked while held) is recovered via `into_inner` rather than
-    /// propagated — a host bug must not become an engine panic on a LATER
-    /// diagnostic.
+    /// records live in the logs/ledger). A host writer's write/flush PANIC
+    /// is caught with `catch_unwind` and swallowed the same way: an uncaught
+    /// panic here would unwind through this supervisor-lock critical section
+    /// and POISON the supervisor mutex, turning every later engine call into
+    /// a panic. Because the panic never escapes this scope, the sink's own
+    /// mutex never poisons either, and the same sink receives the next
+    /// diagnostic. (The panic message itself still prints via the process's
+    /// panic hook — the host's own bug surfacing on its own stderr is honest;
+    /// silencing it would require installing a process-global hook, which
+    /// the embed-clean audit forbids.)
     ///
-    /// CALLED UNDER THE SUPERVISOR LOCK (both emission sites are supervisor
-    /// paths): the sink's `Write` impl must not re-enter the engine — a call
-    /// that took the supervisor lock would deadlock.
+    /// MUST be called while the SUPERVISOR lock is held — and that is
+    /// load-bearing beyond the no-re-entry rule below: the `self.diagnostics`
+    /// field read here is an ORDINARY, non-atomic read, and
+    /// [`Supervisor::install_diagnostics`] swaps that field under the SAME
+    /// supervisor mutex. Holding the lock across the read+write is what
+    /// makes an install/rotation serialize with an emission (a diagnostic is
+    /// never torn across two sinks, never races a rotation mid-write); a
+    /// caller that read the field without the supervisor lock would race a
+    /// concurrent `with_diagnostics`. Both emission sites are supervisor
+    /// paths, so the precondition holds by construction — keep it that way.
+    ///
+    /// The sink's `Write` impl must not re-enter the engine — a call that
+    /// took the supervisor lock would deadlock.
     fn emit_diagnostic(&self, message: &str) {
         let mut line = String::with_capacity(message.len() + 10);
         line.push_str("[ktesio] ");
@@ -608,7 +652,14 @@ impl Supervisor {
                 let mut writer = sink
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = writer.write_all(line.as_bytes());
+                let bytes = line.as_bytes();
+                // Swallow BOTH failure modes (io error, panic) and FLUSH:
+                // a buffering host writer must not silently lose the line
+                // inside its own buffer after a successful `write_all`.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = writer.write_all(bytes);
+                    let _ = writer.flush();
+                }));
             }
             None => {
                 let _ = std::io::stderr().write_all(line.as_bytes());

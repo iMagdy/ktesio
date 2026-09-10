@@ -22,16 +22,23 @@
 //!    `backfilled ++ received` equals the committed record EXACTLY — the
 //!    backfill is precisely the prefix, the live stream precisely the
 //!    suffix, so the union window has no duplicate and no gap (the
-//!    documented "resync FIRST, then subscribe" contract, held end to end).
+//!    resync-first ordering — one of the two documented orders, the gap-free
+//!    one only across a quiescent agent — held end to end).
 //! 3. **Cursor continuation** — a resync consumed mid-stream, the cursor
 //!    passed back after MORE commits, returns exactly the new events: the
 //!    incremental heal a lagging/crashed host needs, never a re-delivery of
-//!    the consumed prefix (and a cursor past a family's end clamps instead
-//!    of erroring).
+//!    the consumed prefix. A cursor past a family's committed count (a
+//!    truncated/rotated log) is a TYPED ERROR naming the family and both
+//!    counts — never a silent clamp, which would re-deliver or silently skip.
 //! 4. **Honest edges** — an unregistered name fails `NotFound` (a mistyped
 //!    name must not read as a silent empty backfill), a malformed name fails
 //!    `InvalidName`, and a torn trailing append (the very crash this helper
-//!    heals) is skipped: the good prefix returns, never a failed recovery.
+//!    heals) is skipped WITH the skip surfaced (`torn_tail_skipped`): the
+//!    good prefix returns, and the host knows a record may be missing.
+//! 5. **Wire pins** — `ResyncCursor`/`ResyncBatch` serialize as snake_case
+//!    and round-trip (the documented host-persistence contract), with
+//!    `torn_tail_skipped` additive (`#[serde(default)]`: an archived batch
+//!    without it still loads).
 //!
 //! ## Determinism posture (the house style, shared with `events_subscription.rs`)
 //!
@@ -48,8 +55,8 @@ use std::time::Duration;
 use ktesio_conformance::test_support::{self, ManifestFixture};
 use ktesio_conformance::uj3;
 use ktesio_engine::{
-    AdapterRef, BudgetBreachEvent, Engine, EngineError, EngineEvent, LifecycleState,
-    TransitionEvent, UsageUpdateEvent, BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION,
+    AdapterRef, BudgetBreachEvent, Engine, EngineError, EngineEvent, LifecycleState, ResyncBatch,
+    ResyncCursor, TransitionEvent, UsageUpdateEvent, BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION,
     USAGE_SCHEMA_VERSION,
 };
 use tempfile::TempDir;
@@ -197,6 +204,10 @@ fn resync_returns_exactly_the_committed_logs_after_the_crash_window() {
     for event in &batch.events {
         assert_payload_validates(event);
     }
+    assert!(
+        !batch.torn_tail_skipped,
+        "a clean flow's backfill surfaces no torn-tail skip"
+    );
     // The breach family carries the SHARED uj3 shape assertions (both
     // dimensions, pinned numbers) — the backfill is the real committed truth.
     uj3::assert_flow_breaches(&breaches_of(&batch.events));
@@ -215,7 +226,9 @@ fn resync_returns_exactly_the_committed_logs_after_the_crash_window() {
 }
 
 // ---------------------------------------------------------------------------
-// Family (2): backfill FIRST, subscribe SECOND — no duplicates, no gaps
+// Family (2): backfill FIRST, subscribe SECOND (the resync-first ordering,
+// gap-free here because the agent is quiescent across the seam) — no
+// duplicates, no gaps
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -250,7 +263,8 @@ fn backfill_then_subscribe_delivers_the_committed_window_with_no_duplicates_and_
         .expect("the window backfill");
     assert!(!backfill.events.is_empty(), "the missed window backfills");
 
-    // …THEN subscribes live (the documented contract order).
+    // …THEN subscribes live (the resync-first ordering — clean continuity
+    // here because the flow is quiescent across the seam).
     let mut sub = facade.subscribe();
 
     // ---- Phase 2 (the live window): resume + stop commit and deliver. ----
@@ -370,17 +384,21 @@ fn a_resync_cursor_continues_from_where_the_host_left_off() {
         "the incremental batch is the new tail, in commit order"
     );
 
-    // A cursor past a family's end CLAMPS (graceful degradation): a
-    // recreated/truncated log degrades to "whatever is there", never an
-    // error, never a negative skip.
+    // A cursor past a family's committed count is a TYPED ERROR, never a
+    // silent clamp: a count below the cursor means the log was truncated or
+    // rotated away, and clamping would either re-deliver from zero or
+    // silently skip records — both violate the never-re-deliver contract.
+    // The error names the family and BOTH counts, so resetting the cursor
+    // (deliberately, to ResyncCursor::START) is a conscious host decision.
     let mut overrun = first.cursor;
     overrun.transitions += 1_000;
-    let clamped = facade
+    let err = facade
         .resync_events("resync-cursor", overrun)
-        .expect("an overrun cursor clamps instead of failing");
+        .expect_err("a cursor past a family's committed count fails, never clamps");
     assert!(
-        clamped.events.is_empty(),
-        "everything is past the cursor: {clamped:?}"
+        matches!(&err, EngineError::Log { detail, .. }
+            if detail.contains("transition") && detail.contains("(1002)") && detail.contains("(4)")),
+        "the error names the family and both counts: {err:?}"
     );
 
     uj3::stop_resilient(&facade, "resync-cursor", Duration::from_secs(5));
@@ -458,6 +476,11 @@ fn resync_surfaces_the_expected_error_arms_and_tolerates_a_torn_tail() {
         committed,
         "exactly the good prefix backfills"
     );
+    assert!(
+        batch.torn_tail_skipped,
+        "the torn-tail skip is SURFACED on the batch — the engine's next append fuses onto the \
+         torn fragment, so the host must know a record may be missing"
+    );
 
     // The tolerance is bounded: a malformed INTERIOR line (a bad line with a
     // good line AFTER it — not a trailing race) is the wrong file or a
@@ -490,4 +513,62 @@ fn resync_surfaces_the_expected_error_arms_and_tolerates_a_torn_tail() {
         .resync_events("resync-edges", ktesio_engine::ResyncCursor::START)
         .unwrap_err();
     assert!(matches!(err, EngineError::Log { .. }), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Family (5): the wire pins — the host-persistence contract, literally
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resync_wire_structs_round_trip_snake_case_beside_the_payload_validator() {
+    // The documented host-persistence contract: `ResyncCursor`/`ResyncBatch`
+    // are serde-derived snake_case so a host can persist its cursor across
+    // its own restarts. Pinned LITERALLY (the exact wire bytes a host's
+    // saved file carries) AND by round-trip equality, beside
+    // `assert_payload_validates` (the payload-shape validator above).
+    let cursor = ResyncCursor {
+        transitions: 3,
+        breaches: 1,
+        usage: 7,
+    };
+    let json = serde_json::to_string(&cursor).expect("the cursor serializes");
+    assert_eq!(
+        json, r#"{"transitions":3,"breaches":1,"usage":7}"#,
+        "the cursor wire shape is snake_case, field-complete, in declaration order"
+    );
+    let back: ResyncCursor = serde_json::from_str(&json).expect("the cursor round-trips");
+    assert_eq!(back, cursor);
+
+    // The batch: `torn_tail_skipped` is ADDITIVE on the wire
+    // (`#[serde(default)]`, the report family's policy) — a current batch
+    // round-trips carrying the flag, and an ARCHIVED batch without the
+    // field still deserializes (as `false`).
+    let batch = ResyncBatch {
+        events: Vec::new(),
+        cursor,
+        torn_tail_skipped: true,
+    };
+    let json = serde_json::to_string(&batch).expect("the batch serializes");
+    assert!(
+        json.contains(r#""torn_tail_skipped":true"#),
+        "the additive field rides the wire when set: {json}"
+    );
+    assert!(
+        json.contains(r#""events":[]"#) && json.contains(r#""cursor""#),
+        "the batch carries events + cursor snake_case keys: {json}"
+    );
+    let back: ResyncBatch = serde_json::from_str(&json).expect("the batch round-trips");
+    assert_eq!(back, batch);
+
+    let legacy = r#"{"events":[],"cursor":{"transitions":3,"breaches":1,"usage":7}}"#;
+    let back: ResyncBatch = serde_json::from_str(legacy).expect("an archived batch still loads");
+    assert_eq!(
+        back,
+        ResyncBatch {
+            events: Vec::new(),
+            cursor,
+            torn_tail_skipped: false,
+        },
+        "a batch produced before the additive field deserializes with the serde default"
+    );
 }

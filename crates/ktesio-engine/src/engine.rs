@@ -48,9 +48,11 @@
 //! ([`Engine::open_with_diagnostics`]) or any time later
 //! ([`Engine::with_diagnostics`] / [`Blocking::with_diagnostics`]); the
 //! diagnostics then route to the sink, receiving the exact bytes (same
-//! `[ktesio] `-prefixed text, one line each) stderr would have received. The
-//! sink is engine-embedder ergonomics — it never touches the adapter-api
-//! contract.
+//! `[ktesio] `-prefixed text, one line each) stderr would have received.
+//! Installing REPLACES any earlier sink (rotation) and is one-way — there is
+//! no uninstall back to the stderr default; a host that wants the default
+//! back re-opens the engine. The sink is engine-embedder ergonomics — it
+//! never touches the adapter-api contract.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -196,8 +198,8 @@ impl Engine {
     /// a sink later in the engine's life.
     ///
     /// See [`DiagnosticSink`](crate::DiagnosticSink) for the sink contract
-    /// (what it receives, thread-safety, the no-re-entry rule) and
-    /// docs/embedding.md for the host-facing guide.
+    /// (what it receives, thread-safety, the no-re-entry rule, the one-way
+    /// install) and docs/embedding.md for the host-facing guide.
     pub fn open_with_diagnostics(
         base: Option<PathBuf>,
         sink: DiagnosticSink,
@@ -337,10 +339,21 @@ impl Engine {
     /// the supervisor lock briefly (the sink is one field swap behind that
     /// mutex) and needs no blocking-pool trip — safe from any context.
     /// Installing replaces any earlier sink, so a host can rotate its writer
-    /// mid-flight; the change takes effect for every later diagnostic. For a
-    /// sink that must also catch reaper-fired diagnostics for adopted
-    /// instances in the open-to-install window, prefer
-    /// [`Engine::open_with_diagnostics`].
+    /// mid-flight; the change takes effect for every later diagnostic (the
+    /// outgoing writer is flushed before the swap, so a buffering writer does
+    /// not silently lose its bytes across the rotation).
+    ///
+    /// ## Installing is ONE-WAY
+    ///
+    /// There is no uninstall back to the stderr default: this method (and
+    /// every install path) REPLACES the current sink and never removes one.
+    /// A host that wants the default stderr behavior back re-opens the
+    /// engine ([`Engine::open`]), or installs its own writer that emits to
+    /// the process's stderr — deliberately so: a host that installed a sink
+    /// almost certainly does not own its stderr, and a silent revert to
+    /// stderr would be the wrong fallback. For a sink that must also catch
+    /// reaper-fired diagnostics for adopted instances in the open-to-install
+    /// window, prefer [`Engine::open_with_diagnostics`].
     pub fn with_diagnostics(&self, sink: DiagnosticSink) {
         self.inner
             .supervisor
@@ -1098,18 +1111,32 @@ impl Engine {
     /// to the NEXT call, so re-running a resync never re-delivers what a host
     /// already consumed.
     ///
-    /// ## Ordering (the documented contract: backfill FIRST, then subscribe)
+    /// ## Ordering: both orders work; pick by the gap/duplicate tradeoff
     ///
     /// Within each family the batch is exact commit order (log line order /
     /// ledger `rowid` order — the same orders the durable record keeps);
     /// across families the batch is family-major (transitions, then breaches,
     /// then usage), because the durable record carries no global cross-family
-    /// sequence. That is precisely why the contract is **call
-    /// `resync_events` FIRST, subscribe (`Engine::subscribe`) SECOND**: that
-    /// order yields clean continuity — the backfilled prefix plus the live
-    /// suffix, no gap and no duplicate. Subscribing first is not corrupting,
-    /// only overlapping (duplicates, never gaps — the host's own window, its
-    /// own dedup). See `domain::resync` for the full contract.
+    /// sequence. How to combine the backfill with the live stream is the
+    /// host's ordering choice:
+    ///
+    /// * **Subscribe FIRST, then resync** — RECOMMENDED for gap-sensitive
+    ///   hosts. Gap-free by construction (every commit after the subscribe
+    ///   is delivered live), at the cost of overlap with the backfill, which
+    ///   the host dedups per family against its own cursor position
+    ///   (duplicates, never gaps).
+    /// * **Resync first, then subscribe** — no seam duplicates (the backfill
+    ///   is precisely the prefix, the live stream precisely the suffix), but
+    ///   NOT gap-free: a commit+publish landing between `resync_events`
+    ///   returning and `subscribe()` is delivered by NEITHER. Use it across
+    ///   a quiescent agent (stopped/paused, no traffic) or accept the
+    ///   window.
+    ///
+    /// The backfill is also NOT a cross-family point-in-time snapshot: the
+    /// three family reads are sequential, so a commit landing between them
+    /// skews the families relative to each other (per-family slices stay
+    /// exact and cursor-lossless). See `domain::resync` for the full
+    /// contract, including both honesty notes.
     ///
     /// This is a READ-side helper: the bus, its publish points, and the
     /// subscribe semantics are untouched. Runs on the blocking pool (registry
@@ -1118,9 +1145,13 @@ impl Engine {
     /// [`EngineError::InvalidName`] (the `read_agent_log` precedent — a
     /// mistyped name must not read as a silent empty backfill). The reads are
     /// torn-tail tolerant (ONE unparseable trailing line per log is skipped —
-    /// this helper is called most often right after the crash it heals, and
-    /// that crash can tear the trailing append); a malformed INTERIOR line is
-    /// a typed [`EngineError::Log`]. Sync consumers use
+    /// and only when it carries the torn-append signature, the file not
+    /// ending with a newline — with the skip SURFACED on the batch's
+    /// `torn_tail_skipped`, because the engine's next append fuses onto the
+    /// torn fragment and the skipped line may be carrying a good record);
+    /// every other malformed line is a typed [`EngineError::Log`], as is a
+    /// cursor position past a family's committed count (a truncated/rotated
+    /// log — never silently clamped into a re-delivery). Sync consumers use
     /// [`Blocking::resync_events`].
     pub async fn resync_events(
         &self,
@@ -1304,8 +1335,11 @@ impl Blocking<'_> {
     /// this is a DIRECT sync call, not a `block_on` bridge: it takes the
     /// supervisor lock for one field swap and returns. The engine's two
     /// operational diagnostics then route to `sink` (exact stderr bytes, one
-    /// line each) instead of stderr; the no-sink default is unchanged. See
-    /// [`DiagnosticSink`](crate::DiagnosticSink) for the contract.
+    /// line each) instead of stderr; the no-sink default is unchanged.
+    /// Installing REPLACES (never removes) — there is no uninstall back to
+    /// the stderr default; see [`Engine::with_diagnostics`] for the one-way
+    /// install note. See [`DiagnosticSink`](crate::DiagnosticSink) for the
+    /// contract.
     pub fn with_diagnostics(&self, sink: DiagnosticSink) {
         self.engine.with_diagnostics(sink);
     }
@@ -1324,8 +1358,9 @@ impl Blocking<'_> {
 
     /// Blocking [`Engine::resync_events`] (story 10-3) — the crash-window
     /// backfill: committed events past `after` as bus payloads, plus the
-    /// cursor for the next call. See the async method for the ordering
-    /// contract (resync FIRST, subscribe SECOND).
+    /// cursor for the next call. See the async method for the full contract
+    /// (both orderings and their tradeoffs, the surfaced torn-tail skip, and
+    /// the truncation guard).
     pub fn resync_events(
         &self,
         name: &str,

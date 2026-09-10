@@ -114,17 +114,15 @@ returns them as the exact event payloads the live bus delivers:
 ```rust
 use ktesio_engine::{Blocking, ResyncCursor};
 
-// 1. Backfill everything committed so far …
-let batch = facade.resync_events("my-agent", ResyncCursor::START)?;
-for event in &batch.events {
-    // transition / budget breach / usage update — the same shapes the
-    // live stream carries.
-}
-
-// 2. …THEN subscribe live. That order is the contract: the backfill is
-//    precisely the prefix and the live stream precisely the suffix, so the
-//    combined window has no gap and no duplicate.
+// 1. Subscribe live FIRST — the gap-free order. Every commit from this
+//    moment reaches the stream, whatever the backfill does afterwards.
 let mut events = facade.subscribe();
+
+// 2. …then backfill everything committed before it. The backfill overlaps
+//    the live stream, so drop the overlap yourself: skip each family's
+//    first `cursor.<family>` backfilled records against your own position
+//    bookkeeping (or key on the records' own identity fields).
+let batch = facade.resync_events("my-agent", ResyncCursor::START)?;
 ```
 
 The contract, in five rules:
@@ -132,27 +130,53 @@ The contract, in five rules:
 1. **Committed truth only.** A read-side helper over the same durable records
    the query APIs return — the bus is untouched. An event whose append failed
    never appears in a backfill either.
-2. **Ordering is exact per family.** Transitions come in `instance.log` order,
-   breaches in `breaches.log` order, usage updates in ledger commit order —
-   the same orders the stream guarantees. Across families the batch is
-   family-major (transitions, then breaches, then usage): the durable record
-   carries no global cross-family sequence, and the engine does not fabricate
-   one. This is exactly why rule 2 of the usage pattern above is "subscribe
-   after backfill" — that order needs no cross-family ordering inside the
-   backfill. Subscribing first is not corrupting, only overlapping
-   (duplicates, never gaps — your window, your dedup).
+2. **Ordering is exact per family; the combined order is your choice, with
+   named tradeoffs.** Transitions come in `instance.log` order, breaches in
+   `breaches.log` order, usage updates in ledger commit order — the same
+   orders the stream guarantees. Across families the batch is family-major
+   (transitions, then breaches, then usage): the durable record carries no
+   global cross-family sequence, and the engine does not fabricate one.
+   * **Subscribe first, then resync** is the *gap-free* order: every commit
+     after the subscribe reaches the live stream by construction, and the
+     backfill merely overlaps it — you see duplicates, never gaps, and you
+     dedup the overlap per family with your own cursor bookkeeping (the
+     sample above). **Gap-sensitive hosts should use this order.**
+   * **Resync first, then subscribe** has no seam duplicates — the backfill
+     is precisely the prefix and the live stream precisely the suffix — but
+     it is NOT gap-free: a commit landing between the `resync_events` call
+     returning and your `subscribe()` is delivered by *neither*. Use it only
+     across a quiescent agent (stopped/paused, no traffic) or accept the
+     window consciously.
 3. **Cursor-based and idempotent.** The returned batch carries a
    `ResyncCursor`; pass it to the next call and the already-consumed prefix is
    skipped, so re-running a resync never re-delivers. Persist the cursor
-   across your own restarts if you like (it serializes).
-4. **Crash-recovery read posture.** The helper is called most often right
-   after the crash it heals — and that crash can tear the log's trailing
-   append. One unparseable trailing line per log is skipped (that record is
-   absent from the durable truth too); a malformed interior line is a typed
-   error worth investigating.
-5. **Per-instance.** `name` scopes the read; a Fleet-wide backfill is your
-   loop over instances. An unregistered name fails `NotFound` rather than
-   reading as a silent empty backfill.
+   across your own restarts if you like (it serializes snake_case). A cursor
+   below a family's committed count backfills the suffix; a cursor ABOVE one
+   (the log was truncated or the ledger rotated away) is a typed error naming
+   the family and both counts — never a silent clamp, which would re-deliver
+   from zero or silently skip records. Resetting to `ResyncCursor::START` is
+   your deliberate choice.
+4. **Crash-recovery read posture, with the skip surfaced.** The helper is
+   called most often right after the crash it heals — and that crash can tear
+   the log's trailing append. One unparseable trailing line per log is
+   skipped — and only when it carries the torn-append signature (the file
+   does not end with a newline, the mark of a write cut mid-append) — and the
+   skip is never silent: the batch's `torn_tail_skipped` flag is set,
+   because the engine's next append fuses onto the torn fragment and the
+   skipped line may be carrying a good post-crash record you did not
+   receive. Every other malformed line is a typed error worth investigating:
+   an interior line, a newline-terminated trailing line (corruption, or
+   exactly that fused line), or a trailing line that is valid JSON of the
+   wrong shape (the wrong file).
+5. **Per-instance — and per-family honest.** `name` scopes the read; a
+   Fleet-wide backfill is your loop over instances. An unregistered name
+   fails `NotFound` rather than reading as a silent empty backfill. And the
+   batch is per-family exact, not a cross-family snapshot: the three family
+   reads (transitions, breaches, ledger) are sequential, so a commit landing
+   between them skews the families relative to each other. Each family's
+   slice stays exact and cursor-lossless — the next call picks up exactly the
+   stragglers — but if you need one coherent point-in-time view, make the
+   agent quiescent (stop/pause) across the read.
 
 ## The diagnostic sink
 
@@ -183,8 +207,13 @@ The contract, in five rules:
 1. **Exact texts.** Each diagnostic arrives as one full line — the same
    `[ktesio] `-prefixed text stderr would have received, `\n`-terminated. A
    sink that mirrors its input reproduces the default output byte-for-byte.
-2. **Opt-in, additive.** Installing nothing changes nothing; the default path
-   is pinned by CI as byte-identical to the historical engine.
+2. **Opt-in, additive — and one-way.** Installing nothing changes nothing;
+   the default path is pinned by CI as byte-identical to the historical
+   engine. Installing REPLACES whatever sink is installed (that is how you
+   rotate writers mid-flight; the outgoing writer is flushed before the swap
+   so its buffered bytes are not lost), but there is **no uninstall** back to
+   the stderr default — a host that wants the default back re-opens the
+   engine, or installs its own writer that emits to the process's stderr.
 3. **Thread-safe by construction.** The sink is an `Arc<Mutex<Box<dyn Write +
    Send>>>`, so the engine can emit from any supervision thread and you can
    clone the `Arc` to share one sink across engines. Diagnostics are rare —
@@ -193,10 +222,12 @@ The contract, in five rules:
    engine's supervisor lock is held; a `write` that calls back into the engine
    would deadlock. Forwarding the line to your own channel or lock is fine.
 5. **Best-effort, like the diagnostics themselves.** A write error is
-   swallowed (supervision never fails or blocks on a broken sink), and no
-   diagnostic is ever the durable record of anything — the transition, breach,
-   and usage logs remain the authoritative copies, readable via the query
-   APIs.
+   swallowed — and so is a PANIC in your writer's `write`/`flush` (the engine
+   catches it: a host bug must never unwind through supervision, and the same
+   sink keeps receiving later diagnostics) — so supervision never fails or
+   blocks on a broken sink. No diagnostic is ever the durable record of
+   anything — the transition, breach, and usage logs remain the authoritative
+   copies, readable via the query APIs.
 
 ## The quickstart example
 

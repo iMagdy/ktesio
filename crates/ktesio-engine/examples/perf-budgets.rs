@@ -46,9 +46,12 @@
 //!    noise). The ratified numbers come from the observed measurements
 //!    recorded in docs/testing.md (2026-09-10 local run: a −0.015 pct-point
 //!    CPU delta, +0.01 MiB RSS delta, +0.7 ms read-p99 delta — fan-out cost
-//!    for one subscriber is effectively zero, so the budgets sit two orders
-//!    of magnitude above observed, sized for measurement noise rather than
-//!    headroom erosion). The addendum still runs AFTER the gated phases so
+//!    for one subscriber is effectively zero, so the budgets carry large
+//!    headroom: ~16× the observed CPU-delta magnitude and two orders of
+//!    magnitude on RSS (~200×) and read p99 (~143×) — sized for measurement
+//!    noise rather than headroom erosion). The budgets were ratified on a
+//!    macOS local (strict) run and are enforced on ubuntu CI with the same
+//!    factor shape (docs/testing.md). The addendum still runs AFTER the gated phases so
 //!    the zero-subscriber figures cannot be contaminated, and the startup
 //!    liveness check counts its window against the fixture's orphan bound.
 //!
@@ -228,13 +231,16 @@ const RSS_SPIKE_TOLERANCE: f64 = 2.0;
 /// the observed measurements (the 2026-09-10 local release run recorded in
 /// docs/testing.md: CPU delta −0.015 pct-points, RSS delta +0.01 MiB,
 /// read-p99 delta +0.7 ms — one subscriber's fan-out cost is effectively
-/// zero), sized two orders of magnitude above observed so the gate absorbs
-/// single-window measurement noise (the addendum runs ONE window even on CI;
-/// the shared-runner tolerance below is its other noise absorber) while any
-/// REAL fan-out regression (a per-publish broadcast storm, a per-event host
-/// callback) trips it. A change to any of these numbers is a budget
-/// re-ratification — it must consciously update docs/testing.md's budget
-/// table with the new observations, never a silent gate tweak.
+/// zero), sized far above observed — ~16× the CPU-delta magnitude and two
+/// orders of magnitude (~200× / ~143×) on the RSS / read-p99 deltas — so the
+/// gate absorbs single-window measurement noise (the addendum runs ONE
+/// window even on CI; the shared-runner tolerance below is its other noise
+/// absorber) while any REAL fan-out regression (a per-publish broadcast
+/// storm, a per-event host callback) trips it. Ratified on a macOS local
+/// (strict) run; enforced on ubuntu CI with the same factor shape. A change
+/// to any of these numbers is a budget re-ratification — it must consciously
+/// update docs/testing.md's budget table with the new observations, never a
+/// silent gate tweak.
 const BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS: f64 = 0.25;
 /// See [`BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS`] (per-instance MiB, mean
 /// over the addendum window vs the baseline's median window mean).

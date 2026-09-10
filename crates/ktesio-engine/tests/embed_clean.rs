@@ -70,7 +70,13 @@
 //!    recognized as test gates only when they actually select test builds
 //!    (`not(test)` keeps production code scanned), and an unreadable source
 //!    file or directory PANICS with its path instead of silently meaning
-//!    "unscanned".
+//!    "unscanned". The story-10-2 stdio accounting is widened against the
+//!    imported-path bypass: the single-stdio-reach count pin matches
+//!    fully-qualified calls, BARE imported-path calls
+//!    (`use std::io::stdout;` + `stdout()`), brace-group stdio imports, and
+//!    hand-written `_print` internals — so shortening a stdio path to an
+//!    imported name cannot sneak a second writer past either the zero-print
+//!    scan or the count pin.
 //! 3. **The blocking-coverage inventory audit** — every `pub async fn` in
 //!    the WHOLE production crate (not just `engine.rs` — an
 //!    `impl Engine { pub async fn … }` in another module cannot escape the
@@ -753,6 +759,26 @@ fn scan(root: &Path, pattern: &dyn Fn(&str) -> bool) -> Vec<Finding> {
     findings
 }
 
+/// True when `line` calls `name(…)` as a FREE function: every occurrence of
+/// `name(` whose immediately preceding character is not a `.` — a `.name(`
+/// is a METHOD call (e.g. the backends' `command.stdout(Stdio::…)` setter,
+/// which aims the CHILD's stdio and is a sanctioned, different shape), while
+/// `std::io::stderr(` and a bare imported `stdout(` are the process-stdio
+/// free calls this audit counts.
+fn free_call(line: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(&needle) {
+        let start = from + rel;
+        if start == 0 || bytes[start - 1] != b'.' {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 #[test]
 fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -804,18 +830,27 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // (`Supervisor::emit_diagnostic` — stderr survives only as the no-sink
     // DEFAULT, which the `diagnostic_sink.rs` suite proves byte-identical).
     // The print-site allowlist is therefore EMPTY: any NEW raw print in
-    // production sources fails here outright. TEETH beyond the zero-scan: the
-    // sink plumbing is positively pinned below, so the choke point cannot
-    // silently disappear or lose a diagnostic. ----
+    // production sources fails here outright. Hardened (Epic-10 review)
+    // against the imported-path bypass: a hand-written `_print` (the
+    // println!-family's expansion internals) fails outright, and the
+    // write-target check matches BARE call forms (`stdout(`/`stderr(`), not
+    // just the fully-qualified ones — `use std::io::stdout;` + a bare
+    // `stdout().write_all(...)` cannot evade by shortening the path. The
+    // zero-scan's blind spot left (a write! into a locally-bound handle
+    // variable) is covered by the count pin below, which matches the
+    // IMPORTS too. TEETH beyond the zero-scan: the sink plumbing is
+    // positively pinned below, so the choke point cannot silently disappear
+    // or lose a diagnostic. ----
     let prompts = scan(&src, &|line| {
         ["println!", "eprintln!", "print!", "dbg!"]
             .iter()
             .any(|p| line.contains(p))
+            || line.contains("_print")
             || ((line.contains("writeln!(") || line.contains("write!("))
                 && (line.contains("io::stderr")
                     || line.contains("io::stdout")
-                    || line.contains("stderr()")
-                    || line.contains("stdout()")))
+                    || line.contains("stderr(")
+                    || line.contains("stdout(")))
     });
     assert!(
         prompts.is_empty(),
@@ -883,18 +918,34 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         );
     }
     // The stderr default arm is the ONLY place the engine touches stdio at
-    // all — a second `io::stderr()`/`io::stdout()` reach anywhere in the
-    // production sources is exactly the uninvited-write class story 10-2
-    // closed. (Run crate-wide, not per-file: the pin above keeps the
-    // sanctioned site honest, this keeps the COUNT honest.)
+    // all — a second stdio reach anywhere in the production sources is
+    // exactly the uninvited-write class story 10-2 closed. (Run crate-wide,
+    // not per-file: the pin above keeps the sanctioned site honest, this
+    // keeps the COUNT honest.) Widened (Epic-10 review) so a stdio write via
+    // an IMPORTED path cannot evade the count the fully-qualified forms
+    // satisfy: the classes are the call forms — fully qualified
+    // (`std::io::stderr()`) AND bare (`use std::io::stdout;` then
+    // `stdout().write_all(...)`; the zero-arg handle constructor always
+    // carries the `()`) — the import forms (`use std::io::stdout;` or a
+    // brace-group `use std::io::{stdout, …}`), and a hand-written `_print`
+    // (println!/print!'s expansion internals). The backends' CHILD-stdio
+    // setters (`command.stdout(Stdio::…)`) are DOT-prefixed METHOD calls —
+    // a different, sanctioned shape ([`free_call`] excludes them) aiming the
+    // spawned child's stdio, never the host process's.
     let stdio_reaches = scan(&src, &|line| {
-        line.contains("io::stderr()") || line.contains("io::stdout()")
+        free_call(line, "stdout")
+            || free_call(line, "stderr")
+            || (line.contains("use std::io")
+                && (line.contains("stdout") || line.contains("stderr")))
+            || line.contains("_print")
     });
     assert_eq!(
         stdio_reaches.len(),
         1,
         "the engine must reach stdio in EXACTLY ONE place (the diagnostic \
-         sink's stderr default arm in domain/supervisor.rs): {}",
+         sink's stderr default arm in domain/supervisor.rs) — counted across \
+         fully-qualified calls, bare imported-path calls, stdio imports, and \
+         hand-written _print internals: {}",
         stdio_reaches
             .iter()
             .map(Finding::describe)
@@ -904,6 +955,11 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     assert_eq!(
         stdio_reaches[0].file, "domain/supervisor.rs",
         "the one stdio reach must be the sink's stderr default arm"
+    );
+    assert!(
+        stdio_reaches[0].text.contains("stderr"),
+        "the one stdio reach must be the STDERR default arm, not stdout: {}",
+        stdio_reaches[0].describe()
     );
 
     // ---- No env MUTATION: the engine reads `KTESIO_STATE_DIR` etc. (fine);

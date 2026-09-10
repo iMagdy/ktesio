@@ -30,6 +30,16 @@
 //!   drives the same flow with the sink installed; the parent asserts the
 //!   child's stderr contains no `[ktesio]` line at all while the sink's
 //!   captured bytes (relayed via a file) equal the expected pair exactly.
+//! * **The contract corners the docs promise** (the Epic-10 hardening):
+//!   mid-flight ROTATION splits the diagnostics across the two sinks (sink A
+//!   holds exactly the first line, sink B exactly the second — installing
+//!   REPLACES, which an `if diagnostics.is_none()`-shaped install would
+//!   silently break); a best-effort write (an always-failing writer is
+//!   swallowed and supervision continues); panic recovery (a writer that
+//!   panics on its FIRST write is caught — the supervisor mutex never
+//!   poisons — and the same sink receives the next diagnostic); and the
+//!   shared-Arc shape (one sink `Arc` across TWO engines, both diagnostics
+//!   landing in the one capture in call order).
 //!
 //! Determinism posture (the house style): every wait polls COMMITTED state
 //! (the shared `uj3` bounded poller) or the sink's own captured bytes — never
@@ -43,7 +53,9 @@ use std::time::{Duration, Instant};
 
 use ktesio_conformance::test_support::ManifestFixture;
 use ktesio_conformance::uj3;
-use ktesio_engine::{AdapterRef, DiagnosticSink, Engine, LifecycleState, MemoryBackingKind};
+use ktesio_engine::{
+    AdapterRef, DiagnosticSink, Engine, EngineError, LifecycleState, MemoryBackingKind,
+};
 use tempfile::TempDir;
 
 /// The instance that fires the DC-10 memory-delivery notice (an unmapped
@@ -107,6 +119,25 @@ fn write_unmapped_manifest(dir: &Path) -> PathBuf {
     ManifestFixture::fake_agent(NOTICE_INSTANCE, &["--linger-ms", "600000"]).write(dir)
 }
 
+/// The exact expected DC-10 notice LINE for an engine-reported managed dir
+/// (the choke point emits `[ktesio] ` + this text + a terminating '\n').
+/// Shared by the byte-exact suites and the rotation/Arc-sharing suites.
+fn expected_notice_line(dir: &Path) -> String {
+    format!(
+        "[ktesio] {NOTICE_INSTANCE}: a 'filesystem' Memory Backing is attached (managed \
+         directory: {}), but this adapter declares no config mapping for the reserved key \
+         'memory.dir', so the agent will NOT receive the path. Add [config.\"memory.dir\"] \
+         env = \"...\" to its manifest to deliver it.",
+        dir.display()
+    )
+}
+
+/// The exact expected enforcement-breadcrumb LINE for the transition-gate
+/// error the enforcement path received (same emission shape as above).
+fn expected_breadcrumb_line(pause_err: &EngineError) -> String {
+    format!("[ktesio] {BREADCRUMB_INSTANCE}: budget breach pause could not be honored: {pause_err}")
+}
+
 /// Drive BOTH diagnostics through their real production paths on ONE engine
 /// and return `(notice_line, breadcrumb_line, breadcrumb_needle)` — the exact
 /// expected diagnostic LINES (without the trailing newlines the emitter
@@ -144,16 +175,7 @@ fn drive_both_diagnostics(
         .start(NOTICE_INSTANCE)
         .expect("the unmapped start STILL succeeds");
     assert_eq!(started.state, LifecycleState::Running);
-
-    // The exact expected line: the choke point emits `[ktesio] ` + the notice
-    // text (byte-pinned here, including the engine-reported managed dir) + '\n'.
-    let notice_line = format!(
-        "[ktesio] {NOTICE_INSTANCE}: a 'filesystem' Memory Backing is attached (managed \
-         directory: {}), but this adapter declares no config mapping for the reserved key \
-         'memory.dir', so the agent will NOT receive the path. Add [config.\"memory.dir\"] \
-         env = \"...\" to its manifest to deliver it.",
-        dir.display()
-    );
+    let notice_line = expected_notice_line(&dir);
 
     // ---- (2) The enforcement breadcrumb. ----
     facade
@@ -194,9 +216,7 @@ fn drive_both_diagnostics(
     let pause_err = facade
         .pause(BREADCRUMB_INSTANCE)
         .expect_err("pausing an already-paused instance is a gate rejection");
-    let breadcrumb_line = format!(
-        "[ktesio] {BREADCRUMB_INSTANCE}: budget breach pause could not be honored: {pause_err}"
-    );
+    let breadcrumb_line = expected_breadcrumb_line(&pause_err);
 
     // Teardown (never mask the assertions): the flow instance is SIGSTOP'd
     // (Unix), so its stop takes the shared zero window.
@@ -277,6 +297,308 @@ fn a_facade_installed_sink_receives_both_diagnostics_exact_texts() {
         bytes,
         format!("{notice_line}\n{breadcrumb_line}\n").into_bytes(),
         "the facade-installed sink must receive EXACTLY the two diagnostic lines"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The contract corners the docs promise: rotation, best-effort writes,
+// panic recovery, and the shared-Arc shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mid_flight_rotation_splits_the_diagnostics_between_the_two_sinks() {
+    // The documented rotation contract — installing REPLACES, and the change
+    // takes effect for every later diagnostic: sink A is in place for the
+    // FIRST diagnostic, sink B replaces it mid-flight, the SECOND diagnostic
+    // routes to B. A must hold exactly the first line (nothing after the
+    // rotation) and B exactly the second. (This is the contract an
+    // `if self.diagnostics.is_none()`-shaped install would silently break:
+    // the second install would be a no-op and BOTH lines would land on A.)
+    let state = TempDir::new().expect("state root");
+    let unmapped_dir = TempDir::new().expect("unmapped manifest dir");
+    let flow_dir = TempDir::new().expect("flow manifest dir");
+    let unmapped = write_unmapped_manifest(unmapped_dir.path());
+    let flow = uj3::write_flow_manifest(flow_dir.path());
+
+    let captured_a = Arc::new(Mutex::new(Vec::new()));
+    let captured_b = Arc::new(Mutex::new(Vec::new()));
+    let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
+    let facade = engine.blocking();
+
+    // Sink A in place BEFORE any supervision work; the FIRST diagnostic
+    // (the DC-10 notice) is emitted synchronously inside `start`.
+    facade.with_diagnostics(make_sink(&captured_a));
+    facade
+        .register_with_adapter(
+            NOTICE_INSTANCE,
+            &AdapterRef::Manifest(unmapped.to_path_buf()),
+        )
+        .expect("register the unmapped manifest instance");
+    let dir = facade
+        .attach_memory(NOTICE_INSTANCE, MemoryBackingKind::Filesystem)
+        .expect("attach the filesystem backing");
+    let started = facade
+        .start(NOTICE_INSTANCE)
+        .expect("the unmapped start STILL succeeds");
+    assert_eq!(started.state, LifecycleState::Running);
+    let notice_line = expected_notice_line(&dir);
+
+    // ROTATE mid-flight: sink B replaces A before the SECOND diagnostic.
+    facade.with_diagnostics(make_sink(&captured_b));
+
+    // The SECOND diagnostic rides the same production path as the byte-exact
+    // suites above. The `pause` call is the determinism barrier (it takes the
+    // supervisor lock the ingestion pass holds through the emission).
+    facade
+        .register_with_adapter(
+            BREADCRUMB_INSTANCE,
+            &AdapterRef::Manifest(flow.to_path_buf()),
+        )
+        .expect("register the flow instance");
+    for (key, value) in uj3::flow_config_pairs() {
+        facade
+            .set_config(BREADCRUMB_INSTANCE, key, value)
+            .unwrap_or_else(|e| panic!("set_config {key}={value} failed: {e}"));
+    }
+    facade
+        .start(BREADCRUMB_INSTANCE)
+        .expect("start the flow instance");
+    uj3::wait_for_state(
+        state.path(),
+        BREADCRUMB_INSTANCE,
+        LifecycleState::Paused,
+        POLL_BUDGET,
+    );
+    let pause_err = facade
+        .pause(BREADCRUMB_INSTANCE)
+        .expect_err("pausing an already-paused instance is a gate rejection");
+    let breadcrumb_line = expected_breadcrumb_line(&pause_err);
+
+    // B holds EXACTLY the post-rotation diagnostic…
+    let bytes_b = wait_for_capture(&captured_b, "budget breach pause could not be honored:");
+    assert_eq!(
+        bytes_b,
+        format!("{breadcrumb_line}\n").into_bytes(),
+        "the post-rotation sink holds exactly the second diagnostic"
+    );
+    // …and A holds ONLY the first (nothing leaked past the rotation).
+    assert_eq!(
+        *captured_a.lock().unwrap(),
+        format!("{notice_line}\n").into_bytes(),
+        "the pre-rotation sink holds exactly the first diagnostic and nothing after"
+    );
+
+    // Teardown (never mask the assertions).
+    let _ = facade.stop(NOTICE_INSTANCE, Some(Duration::from_secs(5)));
+    let _ = facade.stop(BREADCRUMB_INSTANCE, Some(uj3::STOP_WINDOW));
+}
+
+/// A sink writer whose EVERY write fails (the closed/broken host writer the
+/// best-effort contract names). `Send` so it boxes into a [`DiagnosticSink`].
+struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("the host sink is closed"))
+    }
+
+    fn write_all(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("the host sink is closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("the host sink is closed"))
+    }
+}
+
+#[test]
+fn a_failing_sink_write_is_swallowed_and_supervision_continues() {
+    // Best-effort by contract: a broken or closed host writer must never
+    // fail, block, or crash supervision. With an always-failing sink
+    // installed FROM OPEN, the diagnostic-emitting start still SUCCEEDS, the
+    // instance reaches its committed state, and the engine keeps working
+    // (a later stop succeeds) — the swallowed write is invisible to
+    // supervision.
+    let state = TempDir::new().expect("state root");
+    let unmapped_dir = TempDir::new().expect("unmapped manifest dir");
+    let unmapped = write_unmapped_manifest(unmapped_dir.path());
+
+    let engine = Engine::open_with_diagnostics(
+        Some(state.path().to_path_buf()),
+        Arc::new(Mutex::new(Box::new(FailingWriter))),
+    )
+    .expect("open engine with a failing sink");
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            NOTICE_INSTANCE,
+            &AdapterRef::Manifest(unmapped.to_path_buf()),
+        )
+        .expect("register the unmapped manifest instance");
+    facade
+        .attach_memory(NOTICE_INSTANCE, MemoryBackingKind::Filesystem)
+        .expect("attach the filesystem backing");
+    let started = facade
+        .start(NOTICE_INSTANCE)
+        .expect("the diagnostic write failure is swallowed — start succeeds");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // The engine keeps supervising after the swallowed failure.
+    let stopped = facade
+        .stop(NOTICE_INSTANCE, Some(Duration::from_secs(5)))
+        .expect("supervision continues after the swallowed write failure");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}
+
+/// A sink writer that PANICS on its FIRST write and works afterwards — the
+/// panic-recovery corner: `emit_diagnostic` catches the panic (a host bug
+/// must never unwind through the supervisor's critical section — that would
+/// poison the supervisor mutex — nor poison the sink's own mutex), and the
+/// SAME sink keeps receiving later diagnostics.
+struct PanicOnceWriter {
+    panicked: bool,
+    captured: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PanicOnceWriter {
+    fn write_once(&mut self, buf: &[u8]) {
+        if !self.panicked {
+            self.panicked = true;
+            panic!("the host writer panicked mid-write");
+        }
+        self.captured.lock().unwrap().extend_from_slice(buf);
+    }
+}
+
+impl Write for PanicOnceWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_once(buf);
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.write_once(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_panicking_sink_write_is_caught_and_the_same_sink_keeps_receiving() {
+    // The first write PANICS inside the engine's emission — caught and
+    // swallowed (`catch_unwind` keeps it from unwinding through the
+    // supervisor-lock critical section, so neither the supervisor mutex nor
+    // the sink's own mutex poisons). The SECOND diagnostic then lands on the
+    // SAME sink, proving recovery is real and not a poisoned-mutex-only
+    // `into_inner` salvage.
+    let state = TempDir::new().expect("state root");
+    let unmapped_dir = TempDir::new().expect("unmapped manifest dir");
+    let flow_dir = TempDir::new().expect("flow manifest dir");
+    let unmapped = write_unmapped_manifest(unmapped_dir.path());
+    let flow = uj3::write_flow_manifest(flow_dir.path());
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let engine = Engine::open_with_diagnostics(
+        Some(state.path().to_path_buf()),
+        Arc::new(Mutex::new(Box::new(PanicOnceWriter {
+            panicked: false,
+            captured: Arc::clone(&captured),
+        }))),
+    )
+    .expect("open engine with a panic-once sink");
+
+    let (notice_line, breadcrumb_line, needle) =
+        drive_both_diagnostics(&engine, state.path(), &unmapped, &flow);
+    let bytes = wait_for_capture(&captured, &needle);
+    assert_eq!(
+        bytes,
+        format!("{breadcrumb_line}\n").into_bytes(),
+        "the panicking FIRST write is swallowed (the notice is lost, best-effort) and the \
+         SECOND diagnostic lands on the same sink: capture must be exactly the breadcrumb"
+    );
+    assert!(
+        !bytes
+            .windows(notice_line.len())
+            .any(|w| w == notice_line.as_bytes()),
+        "the notice whose write panicked never partially reached the sink"
+    );
+}
+
+#[test]
+fn one_shared_sink_arc_serves_two_engines_in_one_process() {
+    // The `DiagnosticSink` name is `Arc<Mutex<Box<dyn Write + Send>>>` so a
+    // host can clone the Arc and share ONE sink across engines (the type's
+    // documented shape): two engines over DIFFERENT hermetic roots, the same
+    // Arc — each engine's diagnostic lands in the one shared capture, in
+    // call order (each emission is synchronous with its facade call and
+    // serialized by the sink's mutex).
+    let state_a = TempDir::new().expect("engine-A state root");
+    let state_b = TempDir::new().expect("engine-B state root");
+    let unmapped_dir_a = TempDir::new().expect("engine-A manifest dir");
+    let unmapped_dir_b = TempDir::new().expect("engine-B manifest dir");
+    let unmapped_a = write_unmapped_manifest(unmapped_dir_a.path());
+    let unmapped_b = write_unmapped_manifest(unmapped_dir_b.path());
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let shared = make_sink(&captured);
+    let engine_a = Engine::open_with_diagnostics(
+        Some(state_a.path().to_path_buf()),
+        std::sync::Arc::clone(&shared),
+    )
+    .expect("open engine A with the shared sink");
+    let engine_b = Engine::open_with_diagnostics(
+        Some(state_b.path().to_path_buf()),
+        std::sync::Arc::clone(&shared),
+    )
+    .expect("open engine B with the SAME sink Arc");
+
+    // Fire the notice on each engine; both land in the shared capture.
+    let notice_line_a;
+    let notice_line_b;
+    let needle_b;
+    {
+        let facade = engine_a.blocking();
+        facade
+            .register_with_adapter(
+                NOTICE_INSTANCE,
+                &AdapterRef::Manifest(unmapped_a.to_path_buf()),
+            )
+            .expect("register the unmapped manifest instance on engine A");
+        let dir = facade
+            .attach_memory(NOTICE_INSTANCE, MemoryBackingKind::Filesystem)
+            .expect("attach the filesystem backing on engine A");
+        let started = facade.start(NOTICE_INSTANCE).expect("start on engine A");
+        assert_eq!(started.state, LifecycleState::Running);
+        notice_line_a = expected_notice_line(&dir);
+        let _ = facade.stop(NOTICE_INSTANCE, Some(Duration::from_secs(5)));
+    }
+    {
+        let facade = engine_b.blocking();
+        facade
+            .register_with_adapter(
+                NOTICE_INSTANCE,
+                &AdapterRef::Manifest(unmapped_b.to_path_buf()),
+            )
+            .expect("register the unmapped manifest instance on engine B");
+        let dir = facade
+            .attach_memory(NOTICE_INSTANCE, MemoryBackingKind::Filesystem)
+            .expect("attach the filesystem backing on engine B");
+        needle_b = dir.display().to_string();
+        let started = facade.start(NOTICE_INSTANCE).expect("start on engine B");
+        assert_eq!(started.state, LifecycleState::Running);
+        notice_line_b = expected_notice_line(&dir);
+        let _ = facade.stop(NOTICE_INSTANCE, Some(Duration::from_secs(5)));
+    }
+
+    // The SHARED capture holds BOTH engines' diagnostics, in call order.
+    let bytes = wait_for_capture(&captured, &needle_b);
+    assert_eq!(
+        bytes,
+        format!("{notice_line_a}\n{notice_line_b}\n").into_bytes(),
+        "one shared sink Arc receives both engines' diagnostics, in call order"
     );
 }
 
