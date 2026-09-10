@@ -226,6 +226,12 @@ widen a gate or an allowlist to make a baseline pass.
   orchestrator same day. The one-time name check returned 200 for all three names — reconciled as
   Islam's OWN v0.0.1 placeholder reservations (created 2026-07-03, owners verified = iMagdy), so
   the publishes supersede his own placeholders.
+- **Step 7 tap push — MANUAL (2026-09-09):** the workflow's tap checkout failed on auth (the
+  `HOMEBREW_TAP_TOKEN` secret no longer fetches `iMagdy/homebrew-tap` — expired/rotated token;
+  renew the secret before the next release). Executed the documented fallback: formula rendered
+  locally from the v0.7.0 checksums and pushed manually to `iMagdy/homebrew-tap` (53dadf0).
+  Everything else in steps 0–7 ran clean; `ktesio` 0.7.0 and the three library crates are live on
+  crates.io; release v0.7.0 is published with all platform binaries.
 - **Semver-baseline retire-or-keep:** open by default — KEEP until revisited
   at the second published release, per the flip note above.
 
