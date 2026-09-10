@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 09-09-2026 21:30
+last_updated: 09-10-2026 01:53
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -101,6 +101,10 @@ development_status:
   7-5-benchmark-the-performance-budgets: done  # 🎉 MERGED as 12f3aab (PR #173). NFR-4 measured: reads p99 ~6ms (<1s), CPU/inst ~0.7% (2%), RSS/inst ~1MiB (50MiB) — budgets validate generously. Blocking CI perf job.  # 2026-09-09: NFR-4 MEASURED (not asserted): 25-instance fleet harness (examples/perf-budgets.rs) — reads p99 ~6ms vs <1s budget, CPU/instance ~0.7% vs 2%, RSS/instance ~1MiB vs 50MiB — all budgets pass with huge headroom, no PRD update needed. Gate math under test (12 unit tests — the fail-path was unexecuted code before), CI perf-budgets job blocking + artifact upload + median-of-3 CI tolerance (1.5x, documented), sysinfo dev-dep (NFR-8-compatible). 3 lenses + 17 patches. Lands in the epic-7 PR.
   epic-7-retrospective: optional
   epic-8: done  # CLOSED AS SUPERSEDED 2026-09-09 by Islam's decision (option A): the skills-provisioning premise was overtaken by the pivot — epic 9 removed the legacy skills-manager surface and repositioned Ktesio as an agent runner, so "provision skills to agents" is no longer a Ktesio capability. Stories RETIRED WITHOUT DEVELOPMENT: 8-1 (skills-provisioning foundation), 8-2 (provision skills), 8-3 (skill-set management), 8-4 (already self-marked superseded), 8-5 (install channels — carried instead by the release process + scripts/public installers). Full definitions remain in planning-artifacts/epics.md Epic 8. GitHub issues #95-99 closed 2026-09-09.
+  epic-10: in-progress  # opened 2026-09-10 by sprint change proposal (_bmad-output/planning-artifacts/sprint-change-proposal-2026-09-10.md, Islam-approved): Consolidate & Harden the Embedding Surface
+  10-1-embedding-test-support-consolidation: backlog  # one test-support home for the manifest builders + drains (issue #164)
+  10-2-host-provided-diagnostic-sink: backlog  # additive public API; removes the 2 audit allowlist entries
+  10-3-event-bus-resync-and-subscriber-budget: backlog  # subscribe-with-backfill helper + ratified subscriber-active budget
   epic-8-retrospective: optional
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
@@ -964,7 +968,7 @@ action_items:
     epic: 4
     owner: "Islam / Winston (architect); execution naturally Epic 7 or a dedicated
       resilience story"
-    status: in-progress  # Part (a) SWEEP DONE 2026-07-21 → ai-63-lock-sweep-2026-07-21.md (findings independently spot-verified by the orchestrator against source). Results: the retro's "single Mutex<Supervisor>" was imprecise — EngineInner holds TWO coarse mutexes (Registry + Supervisor) together for the whole op. The count is ~17 genuinely-unbounded FS operation sites under the lock (NOT 2) + fork/exec + a LATENT-unbounded bare child.wait() in the handle Drop (unix:580 — the 4-2 bug's exact shape, never bounded by the 4-2 fix) + the rusqlite class (fsync-at-commit only; SQLite contention is NOT an unbounded block — no busy_timeout, returns SQLITE_BUSY immediately). SEVEREST LIVE finding: drain_usage_for (supervisor.rs:2177) does std::fs::read of the ENTIRE, UNROTATED, monotonically-growing agent.log every 250ms per running instance on the crash-reaper hot path under both locks — degrades the whole fleet silently as uptime grows (exactly the long-running away-mode scenario), inverting the intuition that one-shot operator commands are the risk. Amplifier: poll_once→enforce_stop lets a single stop-action budget breach freeze the fleet lock ~35s automatically. Part (b) — the architectural fix decision (per-call bounds / per-instance write locks / actor-per-process) — is now with Islam+Winston; the severe drain_usage_for+rotation instance may warrant a tactical fix ahead of the broader redesign (Islam deciding). UPDATE 2026-08-23: TACTICAL FIX LANDED — PR #126 squash-merged to main 2026-08-12 as bbed9a7: incremental usage-drain read (new read_usage_tail helper reads only [cursor, len), plan_drain's decision logic byte-identical per adversarial billing-integrity review, UTF-8-at-cursor boundary safe) + post-stop RESCUE Terminal drain after backend.stop confirms death and before handle removal (closes the stat→read window under-count race the adversarial pass found; disjoint by cursor so no double-count; skipped on StopUnconfirmed; net improvement over Epic 3's ship). 924 tests. The broader ~17-site locking-model decision remains OPEN as part (b) with Islam+Winston — status stays in-progress. || 2026-08-26 AD-17 GATE CORRECTION (PR #145). Two records had drifted apart and this entry is routinely quoted for the wrong gate. (i) THIS item recommends doing part (a), THE SWEEP, before Epic 5 — and (a) is DONE. (ii) ARCHITECTURE-SPINE.md AD-17 ("Coarse global locking is a recorded decision, with a bounded-work rule") was written later, is the authoritative record, and scopes (b) explicitly: the replacement model "MUST be decided BEFORE Epic 7's daemon/embedding work begins", because a long-lived daemon removes the short-lived CLI-invocation lifetime that currently masks the cost. AD-17 is referenced nowhere else in this entry, which is why an Epic-5 framing persisted. What actually governed Epic 5 was AD-17's BOUNDED-WORK RULE, and story 5-1 complied with it by construction (bounded single-directory create_dir_all only; contents-copy and detach-time remove_dir_all refused by design; the residual `remove --delete` remove_dir_all at sweep site 17 recorded as an AI-63(b) input it could not fix). SUPERSEDED SCHEDULING NOTE: on 2026-08-13 Islam elected to decide (b) before story 5-1 started; 5-1 has since SHIPPED (PR #138, ff1f669) and 5-2 with it, so that sequencing choice is MOOT — it was always a scheduling preference, never a dependency. THE REAL GATE IS NOW IMMINENT: Epic 6 is in progress (6-1 done, 6-2 in progress) and Epic 7 is next, so per AD-17 part (b) must be decided before Epic 7 opens. Owner remains Islam + Winston (architect).
+    status: done         # Part (a) SWEEP DONE 2026-07-21 → ai-63-lock-sweep-2026-07-21.md (findings independently spot-verified by the orchestrator against source). Results: the retro's "single Mutex<Supervisor>" was imprecise — EngineInner holds TWO coarse mutexes (Registry + Supervisor) together for the whole op. The count is ~17 genuinely-unbounded FS operation sites under the lock (NOT 2) + fork/exec + a LATENT-unbounded bare child.wait() in the handle Drop (unix:580 — the 4-2 bug's exact shape, never bounded by the 4-2 fix) + the rusqlite class (fsync-at-commit only; SQLite contention is NOT an unbounded block — no busy_timeout, returns SQLITE_BUSY immediately). SEVEREST LIVE finding: drain_usage_for (supervisor.rs:2177) does std::fs::read of the ENTIRE, UNROTATED, monotonically-growing agent.log every 250ms per running instance on the crash-reaper hot path under both locks — degrades the whole fleet silently as uptime grows (exactly the long-running away-mode scenario), inverting the intuition that one-shot operator commands are the risk. Amplifier: poll_once→enforce_stop lets a single stop-action budget breach freeze the fleet lock ~35s automatically. Part (b) — the architectural fix decision (per-call bounds / per-instance write locks / actor-per-process) — is now with Islam+Winston; the severe drain_usage_for+rotation instance may warrant a tactical fix ahead of the broader redesign (Islam deciding). UPDATE 2026-08-23: TACTICAL FIX LANDED — PR #126 squash-merged to main 2026-08-12 as bbed9a7: incremental usage-drain read (new read_usage_tail helper reads only [cursor, len), plan_drain's decision logic byte-identical per adversarial billing-integrity review, UTF-8-at-cursor boundary safe) + post-stop RESCUE Terminal drain after backend.stop confirms death and before handle removal (closes the stat→read window under-count race the adversarial pass found; disjoint by cursor so no double-count; skipped on StopUnconfirmed; net improvement over Epic 3's ship). 924 tests. The broader ~17-site locking-model decision remains OPEN as part (b) with Islam+Winston — status stays in-progress. || 2026-08-26 AD-17 GATE CORRECTION (PR #145). Two records had drifted apart and this entry is routinely quoted for the wrong gate. (i) THIS item recommends doing part (a), THE SWEEP, before Epic 5 — and (a) is DONE. (ii) ARCHITECTURE-SPINE.md AD-17 ("Coarse global locking is a recorded decision, with a bounded-work rule") was written later, is the authoritative record, and scopes (b) explicitly: the replacement model "MUST be decided BEFORE Epic 7's daemon/embedding work begins", because a long-lived daemon removes the short-lived CLI-invocation lifetime that currently masks the cost. AD-17 is referenced nowhere else in this entry, which is why an Epic-5 framing persisted. What actually governed Epic 5 was AD-17's BOUNDED-WORK RULE, and story 5-1 complied with it by construction (bounded single-directory create_dir_all only; contents-copy and detach-time remove_dir_all refused by design; the residual `remove --delete` remove_dir_all at sweep site 17 recorded as an AI-63(b) input it could not fix). SUPERSEDED SCHEDULING NOTE: on 2026-08-13 Islam elected to decide (b) before story 5-1 started; 5-1 has since SHIPPED (PR #138, ff1f669) and 5-2 with it, so that sequencing choice is MOOT — it was always a scheduling preference, never a dependency. THE REAL GATE IS NOW IMMINENT: Epic 6 is in progress (6-1 done, 6-2 in progress) and Epic 7 is next, so per AD-17 part (b) must be decided before Epic 7 opens. Owner remains Islam + Winston (architect).
     severity: high
     action: "Close the 'unbounded operation under the single global Mutex<Supervisor>'
       bug class ARCHITECTURALLY, not per-call. Two independent CRITICALs in one epic
@@ -1026,7 +1030,7 @@ action_items:
   - id: AI-65
     epic: 4
     owner: "Islam / whoever owns the review-mandate defaults"
-    status: open
+    status: done
     severity: medium
     action: "Scope fix-pass review by whether the fix changes a VALUE or a MECHANISM.
       Story 4-2's crash-safety fix (21af762) was correct, thoroughly tested, and closed
@@ -1050,7 +1054,7 @@ action_items:
   - id: AI-66
     epic: 4
     owner: "Dev / QA; scope as a dedicated hardening story"
-    status: open
+    status: done
     severity: medium
     action: "Sweep the existing test suite for the FIVE named blind-spot patterns,
       starting with the one instance still open in main. Story 4-3's adversarial pass
@@ -1146,7 +1150,7 @@ action_items:
   - id: AI-69
     epic: 4
     owner: "Dev / QA; Islam to ratify if the answer is 'the mapper pin is permanent'"
-    status: open
+    status: done
     severity: low
     action: "Decide exit code 6's permanent gate: build a deterministic stuck-agent
       harness, or ratify the mapper pin as sufficient. Exit code 6 (InteractionTimedOut)

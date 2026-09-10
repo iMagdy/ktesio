@@ -850,3 +850,28 @@ So that I am told the tool became an agent runner and where to migrate, instead 
 ## Tracking
 
 Synced to GitHub 2026-07-02: Project [Ktesio #5](https://github.com/users/iMagdy/projects/5) (linked to iMagdy/ktesio) · epics = issues #55–#62 · stories = issues #63–#99 (issue titles carry the BMAD keys; bodies mirror this file and are BMAD-managed — edit here, re-run the sync script). Full key→issue map: `_bmad-output/implementation-artifacts/github-sync-map.json`. Sync tool: `_bmad-output/implementation-artifacts/github_sync.py` (idempotent).
+
+
+## Epic 10: Consolidate & Harden the Embedding Surface
+
+The post-release hardening pass: pay down the deferrals the epic-7 suites accumulated, give hosts
+a first-class diagnostic surface, and turn the event bus's documented crash-window limitation into
+a one-call remedy. Opened 2026-09-10 by sprint change proposal
+(sprint-change-proposal-2026-09-10.md, Islam-approved).
+
+### Story 10.1: One test-support home for the embedding suites
+Consolidate the manifest builders and drain helpers scattered across the epic-7 suites into a
+single parameterized test-support module in ktesio-conformance (the embedding quickstart stays
+deliberately standalone). AC: no duplicate builder/drain logic outside the support module; all
+suites green; boundary graph unchanged. (Issue #164.)
+
+### Story 10.2: Host-provided diagnostic sink
+Engine gains an optional diagnostic sink — the two AD-12 diagnostics (DC-10 memory-delivery
+notice, enforcement breadcrumb) route to the sink when a host provides one, defaulting to stderr
+otherwise. Removes both embed_clean audit allowlist entries. Additive public API, documented.
+
+### Story 10.3: Event-bus resync helper + ratified subscriber-active budget
+(a) Subscribe-with-backfill: on subscribe, backfill from the committed logs before live events —
+the crash-window at-most-once limitation becomes a one-call remedy, tested with a
+crash-window simulation. (b) Measure subscriber-active overhead in the perf harness and ratify a
+subscriber-active budget from the measurement.
