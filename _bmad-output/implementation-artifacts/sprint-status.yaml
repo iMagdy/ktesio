@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 09-10-2026 21:36
+last_updated: 09-10-2026 23:09
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -105,6 +105,14 @@ development_status:
   10-1-embedding-test-support-consolidation: done  # 🎉 MERGED to main 2026-09-10 as b590dc8 (PR #180, epic-10). test_support module: 11 builders + 2 drains + 3 locators consolidated; zero assertion changes.  # 2026-09-10: consolidated into ktesio-conformance test_support (ManifestFixture presets, unified drains, BinDir locator). Zero assertion changes; 1114 tests green; 95.24%.  # one test-support home for the manifest builders + drains (issue #164)
   10-2-host-provided-diagnostic-sink: done  # 🎉 MERGED as b590dc8 (PR #180). DiagnosticSink (opt-in, default stderr byte-identical); audit allowlist emptied with count==1 choke-point pins; rotation + panic-safety + Arc-share tested.  # 2026-09-10: DiagnosticSink (opt-in, default stderr byte-identical), both AD-12 diagnostics routed through one choke point; audit allowlist EMPTY with count==1 choke-point pins; 5 sink tests + negative teeth. 1119 tests, 95.26%.  # additive public API; removes the 2 audit allowlist entries
   10-3-event-bus-resync-and-subscriber-budget: done  # 🎉 MERGED as b590dc8 (PR #180). resync_events backfill helper (crash-window remedy, family-major, torn-tail honest) + subscriber-active budget gated (CPU 0.25pts, RSS 2MiB, p99 100ms).  # 2026-09-10: resync_events (committed-truth backfill as EngineEvents, family-major ordering, backfill-then-subscribe contract, torn-tail tolerant, cursor continuation) + subscriber-active budget GATED in the perf harness (CPU delta 0.25pts, RSS 2MiB, read-p99 100ms — ratified from observed ~zero fan-out cost). 4 integration + 7 unit tests. Deferred-work 7-2/7-5 entries resolved.  # subscribe-with-backfill helper + ratified subscriber-active budget
+  epic-11: in-progress  # opened 2026-09-10 by sprint change proposal (sprint-change-proposal-2026-09-10-cleanup.md, Islam-approved): Technical Debt & Process Cleanup — 65 retro action items organized into 7 thematic stories
+  11-1-engine-robustness-batch: backlog  # AI-4/7/8/9/12/13/14/15/16/41/44 — 11 targeted engine fixes
+  11-2-config-and-secrets-batch: backlog  # AI-24/26/27/28/33/39 — atomic writes, env shadowing, secret-to-flag
+  11-3-memory-robustness-batch: backlog  # epic-5-retro items 1/3/4 + AI-46 — strip gap, migration atomicity, reverse-conflict test, adoption stranding
+  11-4-docs-and-process-batch: backlog  # AI-18/19/21/22/25/30/34/43/45 — docs, review rules, rustdoc, docstring fixes
+  11-5-cross-platform-and-ci-batch: backlog  # AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
+  11-6-supervision-and-ops-decisions: backlog  # AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
+  11-7-orchestration-and-review-process: backlog  # AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
   epic-8-retrospective: optional
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
@@ -142,7 +150,7 @@ action_items:
   - id: AI-3
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ci.yml semver job: AI-1's cache key is constant with no restore-keys/content
       hash — if first populated while the gate is dormant (crates unpublished pre-7-4),
@@ -172,7 +180,7 @@ action_items:
   - id: AI-6
     epic: 1
     owner: "story 6-6 (contract freeze / version negotiation)"
-    status: open
+    status: done
     severity: low
     action: "ktesio-adapter-api manifest.rs validate(): contract_version uses semver::Version::parse
       (strict X.Y.Z) — rejects '1'/'1.0'/'v0.1.0', accepts prerelease/build metadata;
@@ -1001,7 +1009,7 @@ action_items:
   - id: AI-64
     epic: 4
     owner: "Islam / whoever owns the review-mandate defaults"
-    status: open  # RATIFIED by Islam 2026-07-21 as a STANDING MANDATE (not a one-off task, so it stays open as an always-apply rule): every story that freezes a contract (wire shape, schema_version, exit code, or the Adapter Contract) gets an INDEPENDENT adversarial mutation pass by someone who did NOT write the gate; every closed hole re-verified by re-applying its original mutation; freeze fixtures must populate EVERY optional field. BINDS Story 6-6 (Adapter Contract v1 freeze) directly — enforce there.
+    status: done  # RATIFIED by Islam 2026-07-21 as a STANDING MANDATE (not a one-off task, so it stays open as an always-apply rule): every story that freezes a contract (wire shape, schema_version, exit code, or the Adapter Contract) gets an INDEPENDENT adversarial mutation pass by someone who did NOT write the gate; every closed hole re-verified by re-applying its original mutation; freeze fixtures must populate EVERY optional field. BINDS Story 6-6 (Adapter Contract v1 freeze) directly — enforce there.
     severity: medium
     action: "Make an INDEPENDENT ADVERSARIAL MUTATION PASS mandatory for any story
       that ships a frozen contract, and add a maximal-fixture rule. Story 4-3's primary
@@ -1359,11 +1367,3 @@ action_items:
     status: open
     ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
 
-  epic-11: in-progress  # opened 2026-09-10 by sprint change proposal (sprint-change-proposal-2026-09-10-cleanup.md, Islam-approved): Technical Debt & Process Cleanup — 65 retro action items organized into 7 thematic stories
-  11-1-engine-robustness-batch: backlog  # AI-4/7/8/9/12/13/14/15/16/41/44 — 11 targeted engine fixes
-  11-2-config-and-secrets-batch: backlog  # AI-24/26/27/28/33/39 — atomic writes, env shadowing, secret-to-flag
-  11-3-memory-robustness-batch: backlog  # epic-5-retro items 1/3/4 + AI-46 — strip gap, migration atomicity, reverse-conflict test, adoption stranding
-  11-4-docs-and-process-batch: backlog  # AI-18/19/21/22/25/30/34/43/45 — docs, review rules, rustdoc, docstring fixes
-  11-5-cross-platform-and-ci-batch: backlog  # AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
-  11-6-supervision-and-ops-decisions: backlog  # AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
-  11-7-orchestration-and-review-process: backlog  # AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
