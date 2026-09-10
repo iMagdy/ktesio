@@ -875,3 +875,35 @@ otherwise. Removes both embed_clean audit allowlist entries. Additive public API
 the crash-window at-most-once limitation becomes a one-call remedy, tested with a
 crash-window simulation. (b) Measure subscriber-active overhead in the perf harness and ratify a
 subscriber-active budget from the measurement.
+
+
+## Epic 11: Technical Debt & Process Cleanup
+
+The post-release hardening sprint: 65 open retro action items from epics 1-7 organized into 7
+thematic stories, each sized for one focused session. Opened 2026-09-10 by sprint change proposal
+(sprint-change-proposal-2026-09-10-cleanup.md, Islam-approved).
+
+### Story 11.1: Engine robustness batch
+11 targeted engine fixes from retro items AI-4/7/8/9/12/13/14/15/16/41/44: error-message precision,
+pause/resume ordering, poll-error surfacing, adoption budget re-evaluation, N+1 read elimination.
+
+### Story 11.2: Config & secrets batch
+Atomic config writes, env-shadowing warn, secret-to-flag warn, leading-dash accept.
+
+### Story 11.3: Memory robustness batch
+memory.dir strip gap, migration crash-atomicity, registry reverse-conflict test, adoption
+stranding fix.
+
+### Story 11.4: Docs, docs-gate & process batch
+Honest-state pattern doc, review rules, away-mode drill, MSRV contributor docs, table-prefix
+naming, docstring fixes, metering/label fixes, rustdoc failure.
+
+### Story 11.5: Cross-platform & CI batch
+Survival test parity, _live cross-OS robustness, 3-OS matrix timing, docs probe, coverage gate.
+
+### Story 11.6: Supervision & operations decisions
+PRODUCT DECISIONS needed from Islam: daemon/detach, HTTPS upstream, Dependabot triage, tracing
+exposure documentation.
+
+### Story 11.7: Orchestration & review process batch
+test_automation pins, review rules adoption, sprint-status sync, playbook patterns.
