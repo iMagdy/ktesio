@@ -102,7 +102,7 @@ development_status:
   epic-7-retrospective: optional
   epic-8: done  # CLOSED AS SUPERSEDED 2026-09-09 by Islam's decision (option A): the skills-provisioning premise was overtaken by the pivot — epic 9 removed the legacy skills-manager surface and repositioned Ktesio as an agent runner, so "provision skills to agents" is no longer a Ktesio capability. Stories RETIRED WITHOUT DEVELOPMENT: 8-1 (skills-provisioning foundation), 8-2 (provision skills), 8-3 (skill-set management), 8-4 (already self-marked superseded), 8-5 (install channels — carried instead by the release process + scripts/public installers). Full definitions remain in planning-artifacts/epics.md Epic 8. GitHub issues #95-99 closed 2026-09-09.
   epic-10: in-progress  # opened 2026-09-10 by sprint change proposal (_bmad-output/planning-artifacts/sprint-change-proposal-2026-09-10.md, Islam-approved): Consolidate & Harden the Embedding Surface
-  10-1-embedding-test-support-consolidation: backlog  # one test-support home for the manifest builders + drains (issue #164)
+  10-1-embedding-test-support-consolidation: in-progress  # one test-support home for the manifest builders + drains (issue #164)
   10-2-host-provided-diagnostic-sink: backlog  # additive public API; removes the 2 audit allowlist entries
   10-3-event-bus-resync-and-subscriber-budget: backlog  # subscribe-with-backfill helper + ratified subscriber-active budget
   epic-8-retrospective: optional

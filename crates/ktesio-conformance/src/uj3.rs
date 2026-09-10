@@ -25,10 +25,11 @@
 //!   library `Engine::open` root and a `kt` state dir),
 //! * the usage-ledger reader + received-stream projection + the raw-receiver
 //!   drain ([`committed_usage_rows`], [`usage_from_payload`],
-//!   [`drain_receiver`]) — the ONE comparison shape for story 7-2's "the
-//!   received usage stream equals the committed ledger rows exactly"
-//!   guarantee, consumed by both the 7-2 acceptance suite and the 7-3
-//!   collision test, and
+//!   [`drain_receiver`] — the drain now delegating to the shared
+//!   `test_support` implementation) — the ONE comparison shape for story
+//!   7-2's "the received usage stream equals the committed ledger rows
+//!   exactly" guarantee, consumed by both the 7-2 acceptance suite and the
+//!   7-3 collision test, and
 //! * assertion helpers over OBSERVED reads (state, breach/transition events,
 //!   [`FleetEntry`]/[`UsageView`] rows) — each expectation stated ONCE here,
 //!   never re-stated inline by either suite.
@@ -189,9 +190,10 @@ pub fn flow_config_pairs() -> Vec<(&'static str, &'static str)> {
 
 /// Write the flow's fixture manifest (`adapter.toml`) into `dir` and return the
 /// directory path (both `AdapterRef::Manifest` and `kt agent register
-/// --manifest` accept a directory). Built from scratch in the proven
-/// `budget.rs`/`tck.rs` shape (deferral #164 stands — this does NOT refactor
-/// the other fixture builders):
+/// --manifest` accept a directory). Since story 10-1 (issue #164 resolved for
+/// the embedding suites) this is a THIN preset call: the body is built by
+/// [`crate::test_support::ManifestFixture::uj3_flow`] — the ONE parameterized
+/// fixture builder — with this shape:
 ///
 /// * `contract_version = "1.0.0"` — the negotiated contract major,
 /// * `pause` + `interaction` **guaranteed on all three OSes** so the default
@@ -211,59 +213,7 @@ pub fn flow_config_pairs() -> Vec<(&'static str, &'static str)> {
 ///   [`MODEL_ENV_VAR`] env var — what makes the configure leg's set + read
 ///   meaningful for THIS adapter (a mapping exists to deliver through).
 pub fn write_flow_manifest(dir: &Path) -> PathBuf {
-    std::fs::create_dir_all(dir).unwrap_or_else(|e| {
-        panic!(
-            "could not create the uj3 fixture manifest dir {}: {e}",
-            dir.display()
-        )
-    });
-    let bin = crate::fake_agent_bin();
-    // A non-UTF8 exec path would be silently munged by to_string_lossy into
-    // a launch that never resolves (the TOML wire is UTF-8 regardless) —
-    // fail loudly instead (the perf-budgets harness precedent).
-    let bin = bin.to_str().unwrap_or_else(|| {
-        panic!(
-            "the fake_agent path {} is not valid UTF-8; the TOML manifest requires a UTF-8 path",
-            bin.display()
-        )
-    });
-    let body = format!(
-        r#"
-contract_version = "{contract_version}"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = ["--emit-usage", "{emit}", "--linger-ms", "600000"]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "{metering}"
-
-[config.model]
-env = "{model_env}"
-"#,
-        contract_version = CONTRACT_VERSION,
-        kind = MANIFEST_KIND,
-        exec = bin,
-        emit = EMIT_EVENTS,
-        metering = METERING_SOURCE,
-        model_env = MODEL_ENV_VAR,
-    );
-    let path = dir.join("adapter.toml");
-    std::fs::write(&path, body).expect("write the uj3 flow manifest");
-    dir.to_path_buf()
+    crate::test_support::ManifestFixture::uj3_flow().write(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,29 +433,21 @@ pub fn stop_all_resilient(
 
 /// Drain a RAW `Engine::subscribe()` receiver to its current tail with
 /// `try_recv` (the story-7-2 helper for the async subscription surface).
-/// Exact, never racy: callers invoke this only AFTER every publishing call
-/// has returned (each publish completes under the supervisor lock before its
-/// facade call returns — after a committed-state wait plus ONE
-/// supervisor-lock-taking read as the barrier, everything published is
+/// Delegates to the ONE lag-accumulating drain in
+/// [`crate::test_support::drain_raw_receiver`] (story 10-1): the Lagged math
+/// is shared with the `EventSubscription`-typed form — the only difference
+/// there is its `Closed` policy (panic, since a subscription holds its
+/// engine's runtime). Exact, never racy: callers invoke this only AFTER every
+/// publishing call has returned (each publish completes under the supervisor
+/// lock before its facade call returns — after a committed-state wait plus
+/// ONE supervisor-lock-taking read as the barrier, everything published is
 /// already buffered). Returns the received events plus the TOTAL dropped
 /// count if the receiver lagged past the bus capacity (`Lagged` is not an
 /// event; counts ACCUMULATE with saturating adds).
 pub fn drain_receiver(
     sub: &mut broadcast::Receiver<EngineEvent>,
 ) -> (Vec<EngineEvent>, Option<u64>) {
-    let mut events = Vec::new();
-    let mut lagged: Option<u64> = None;
-    loop {
-        match sub.try_recv() {
-            Ok(event) => events.push(event),
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                lagged = Some(lagged.unwrap_or(0).saturating_add(n));
-            }
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
-                return (events, lagged);
-            }
-        }
-    }
+    crate::test_support::drain_raw_receiver(sub)
 }
 
 // ---------------------------------------------------------------------------

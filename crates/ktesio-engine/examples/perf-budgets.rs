@@ -86,8 +86,10 @@
 //! cargo run --release --example perf-budgets -p ktesio-engine
 //! ```
 //!
-//! (From the workspace root, so the on-demand `fake_agent` build below lands
-//! in the same `target/`.) The CI perf-budgets job builds the release example
+//! (From the workspace root, so the fixture's `fake_agent` exec resolves into
+//! the same `target/` — the shared locator's examples/ hop plus its
+//! on-demand-build fallback (story 10-1) pin the helper to this binary's
+//! target root either way.) The CI perf-budgets job builds the release example
 //! + helper explicitly and runs the binary — its regressions FAIL that job.
 //!
 //! ## Measurement honesty
@@ -124,9 +126,9 @@
 //!   on macOS; Windows is measured-and-reported (sysinfo's `memory()` is the
 //!   working-set-size analog there) — NEVER a gate platform.
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ktesio_conformance::test_support::{fake_agent_bin_in, BinDir, ManifestFixture};
 use ktesio_engine::{AdapterRef, Blocking, ConfigLayer, Engine, FleetEntry, LifecycleState};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -622,8 +624,21 @@ fn main() {
     // removed at teardown (TempDir drops delete the whole tree). ----
     let state = tempfile::TempDir::new().expect("create the hermetic state root");
     let manifest_tmp = tempfile::TempDir::new().expect("create the manifest dir");
-    let fake_agent = locate_fake_agent();
-    let manifest_dir = write_heartbeat_manifest(manifest_tmp.path(), &fake_agent);
+    // The fixture exec resolves via the SHARED locator's `examples/` hop
+    // (story 10-1): an example's `current_exe` lands in
+    // `target/<profile>/examples/`, so the test-deps (`deps/`) default would
+    // look one directory too deep — the parameterized
+    // `fake_agent_bin_in(BinDir::Examples)` is the same resolution + the same
+    // on-demand-build fallback, with the profile-matching (--release) and
+    // --target-dir pinning the test-deps default lacked.
+    let fake_agent = fake_agent_bin_in(BinDir::Examples);
+    // The heartbeat fixture: the SHARED heartbeat preset (story 10-1) —
+    // contract v1, pause + interaction guaranteed ×3, self-reported metering,
+    // the `[config.model]` env mapping, and the heartbeat-only args (the
+    // steady-state window measures supervision, not metering ingestion).
+    let manifest_dir = ManifestFixture::heartbeat(MANIFEST_KIND, HEARTBEAT_MS, AGENT_LINGER_MS)
+        .exec(fake_agent)
+        .write(manifest_tmp.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open the engine");
     let facade = engine.blocking();
@@ -1303,106 +1318,6 @@ fn host_logical_cores() -> usize {
     let mut sys = System::new();
     sys.refresh_cpu_all();
     sys.cpus().len()
-}
-
-// ---------------------------------------------------------------------------
-// The fixture (the uj3 `write_flow_manifest` shape, heartbeat legs)
-// ---------------------------------------------------------------------------
-
-/// Locate the conformance `fake_agent` helper from THIS example's binary.
-///
-/// `ktesio_conformance::fake_agent_bin()` cannot be reused here: it resolves
-/// relative to a TEST binary's `deps/` directory, and an example runs from
-/// `target/<profile>/examples/` — so the same resolution is replicated with
-/// the `examples` hop, plus an identical on-demand-build fallback that passes
-/// an explicit `--target-dir` (derived from this binary's own path, which
-/// already respects `CARGO_TARGET_DIR`) so the helper lands exactly where the
-/// candidate lives regardless of the invoking shell's cwd.
-fn locate_fake_agent() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("resolve the running example binary");
-    dir.pop(); // drop the example binary name → .../examples
-    if dir.ends_with("examples") {
-        dir.pop(); // → .../target/<profile>
-    }
-    let candidate = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
-    if candidate.exists() {
-        return candidate;
-    }
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut build = std::process::Command::new(&cargo);
-    build
-        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
-        .env_remove("RUSTC_WRAPPER");
-    if dir.ends_with("release") {
-        build.arg("--release");
-    }
-    if let Some(target_root) = dir.parent() {
-        build.arg("--target-dir").arg(target_root);
-    }
-    let status = build
-        .status()
-        .expect("spawn cargo to build the fake_agent helper");
-    if !(status.success() && candidate.exists()) {
-        panic!(
-            "fake_agent helper not found at {} and the on-demand build did not produce it \
-             (status: {status:?}). Run `cargo build -p ktesio-conformance --bin fake_agent` \
-             from the workspace root, then re-run the harness.",
-            candidate.display()
-        );
-    }
-    candidate
-}
-
-/// Write the fixture manifest (`adapter.toml`): the established
-/// `uj3::write_flow_manifest` shape — contract v1, per-OS capability
-/// declaration, self-reported metering, a `[config.model]` env mapping —
-/// with HEARTBEAT legs instead of usage emission: the running subset idles
-/// (`--heartbeat-ms` only) so the steady-state window measures supervision,
-/// not metering ingestion, and a 60 s self-exit bounds any orphan. All
-/// FLEET_SIZE instances register under this ONE manifest (the same adapter
-/// kind repeated — exactly like registering N `mock` instances; instance
-/// NAMES are what must be fleet-unique).
-fn write_heartbeat_manifest(dir: &Path, exec: &Path) -> PathBuf {
-    std::fs::create_dir_all(dir).expect("create the manifest dir");
-    // A non-UTF8 exec path would be silently munged by to_string_lossy into a
-    // launch that never resolves — fail loudly instead.
-    let exec = exec.to_str().unwrap_or_else(|| {
-        panic!(
-            "the fake_agent path {} is not valid UTF-8; the TOML manifest requires a UTF-8 path",
-            exec.display()
-        )
-    });
-    let exec = exec.replace('\\', "/");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{MANIFEST_KIND}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = ["--heartbeat-ms", "{HEARTBEAT_MS}", "--linger-ms", "{AGENT_LINGER_MS}"]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-
-[config.model]
-env = "MODEL"
-"#
-    );
-    std::fs::write(dir.join("adapter.toml"), body).expect("write adapter.toml");
-    dir.to_path_buf()
 }
 
 // ---------------------------------------------------------------------------

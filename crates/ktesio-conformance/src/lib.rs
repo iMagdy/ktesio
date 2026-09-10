@@ -17,6 +17,13 @@
 //!   (`crates/kt/tests/agent_cli.rs`) BOTH consume, so the two paths are
 //!   provably behaviorally identical. Test infrastructure — never a driving
 //!   surface (its own module docs carry the boundary).
+//! * [`test_support`] — the ONE test-support home for the embedding suites
+//!   (story 10-1, issue #164): the parameterized manifest-TOML builder with
+//!   named presets (the uj3 flow fixture is its primary preset), the ONE
+//!   lag-accumulating subscription drain for BOTH receiver forms, and the
+//!   [`fake_agent_bin`] locator parameterized over the cargo target
+//!   subdirectory (`test_support::BinDir`). Test infrastructure — never a
+//!   driving surface (its own module docs carry the boundary).
 //!
 //! ## Dependency boundary (CRITICAL — why this is a DEV fixture downstream)
 //!
@@ -48,12 +55,18 @@ use ktesio_adapter_api::{
 };
 
 pub mod tck;
+pub mod test_support;
 pub mod uj3;
 
 pub use tck::{
     run_conformance, run_mock_conformance, section_ids, ConformanceReport, SectionReport,
     SectionResult, TckAdapter,
 };
+
+// The `fake_agent` locator lives in `test_support` (the shared test-support
+// home, parameterized over the cargo target subdir hop — story 10-1); the
+// crate-root path every suite already imports stays stable.
+pub use test_support::fake_agent_bin;
 
 /// The kind string the mock adapter registers under.
 pub const MOCK_KIND: &str = "mock";
@@ -228,85 +241,6 @@ pub fn probe_inert_start(adapter: &MockAdapter) -> AdapterError {
     adapter
         .start()
         .expect_err("mock start must be inert (the trait's unavailable default body)")
-}
-
-/// Locate the `fake_agent` test helper binary (story 1.4, AD-3).
-///
-/// The engine's start/stop integration tests point a manifest adapter's
-/// `[lifecycle.start]` `exec` at this binary so the supervisor spawns a REAL
-/// process. `CARGO_BIN_EXE_fake_agent` is only set for THIS crate's own targets,
-/// so a cross-crate test resolves the path from the running test executable's
-/// location instead: `fake_agent` sits next to the test-deps directory, in the
-/// same `debug`/`release` profile dir.
-///
-/// If the binary is not present (e.g. under `cargo tarpaulin`, which builds test
-/// targets but not sibling `[[bin]]` targets), it is BUILT on demand via
-/// `cargo build -p ktesio-conformance --bin fake_agent` so the process-spawning
-/// tests run under every harness. Panics with a clear message only if the build
-/// itself fails.
-///
-/// # EXISTENCE IS NOT FRESHNESS — the caller's job, and CI's
-///
-/// This function returns the candidate the moment the file EXISTS. It does not
-/// check whether that file was built from the current source, and deliberately
-/// so: the on-demand build below is a LAST RESORT, not a routine path. Under
-/// `cargo nextest` every test runs in its own process, so a check that decided
-/// "stale, rebuild" would fire in many processes at once and serialise them all
-/// on cargo's build-directory lock — an observed, reproducible flake (it is why
-/// the CI `test` job builds the helper explicitly instead of letting the tests
-/// race here).
-///
-/// The consequence is a trap worth naming, because it has bitten this repo
-/// TWICE: a `target/` directory restored from an actions/cache whose key is
-/// derived from `Cargo.lock` can hand back a `fake_agent` built before a flag
-/// was added. `parse()` in the helper ignores unknown args (`_ => {}`), so a
-/// stale binary does not fail — it silently does LESS, and the tests waiting on
-/// the output that flag was supposed to produce burn their deadlines and report
-/// a timing-shaped failure that has nothing to do with timing.
-///
-/// The guard therefore lives in `.github/workflows/ci.yml`, in BOTH jobs that
-/// run these tests (`test` and `coverage`): `rm -f target/debug/fake_agent*`
-/// followed by an explicit `cargo build -p ktesio-conformance --bin fake_agent`
-/// before the suite. `scripts/test_automation.py` asserts both jobs still carry
-/// it. Any NEW job that spawns agents must carry it too.
-///
-/// Kept a plain runtime path computation — no OS-conditional compilation (the
-/// executable suffix comes from [`std::env::consts::EXE_SUFFIX`], a runtime
-/// constant, so the OS-cfg gate stays green).
-pub fn fake_agent_bin() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("locate the running test executable");
-    // .../target/<profile>/deps/<test-bin>  → go up to .../target/<profile>/
-    let mut dir = exe;
-    dir.pop(); // drop the test-bin file name
-    if dir.ends_with("deps") {
-        dir.pop(); // drop `deps`
-    }
-    let candidate = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
-    if candidate.exists() {
-        return candidate;
-    }
-    // Not built by this harness — build it on demand. EXCLUDED from coverage
-    // (the fake_agent bin's own `#[cfg(not(tarpaulin_include))]` precedent):
-    // a coverage harness can never honestly execute this arm — the coverage
-    // CI job builds the helper explicitly BEFORE the suite, so under
-    // tarpaulin the arm is dead by contract, and instrumenting it would only
-    // tax the gate with unexecutable lines.
-    #[cfg(not(tarpaulin_include))]
-    {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let status = std::process::Command::new(cargo)
-            .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
-            .env_remove("RUSTC_WRAPPER") // a shimmed PATH must not break the build
-            .status();
-        if !matches!(status, Ok(s) if s.success() && candidate.exists()) {
-            panic!(
-                "fake_agent binary not found at {} and an on-demand build did not produce it \
-                 (build status: {status:?}). Build `ktesio-conformance` first.",
-                candidate.display()
-            );
-        }
-    }
-    candidate
 }
 
 #[cfg(test)]

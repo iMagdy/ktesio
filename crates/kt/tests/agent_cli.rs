@@ -10,6 +10,7 @@ mod helpers;
 use std::path::Path;
 
 use helpers::{run_kt_agent, run_kt_agent_with_env, TestContext};
+use ktesio_conformance::test_support::{current_os_key, ManifestFixture};
 use ktesio_conformance::uj3;
 use ktesio_engine::{Engine, FleetEntry, LifecycleState, UsageView};
 
@@ -379,6 +380,16 @@ source = "self-reported"
 "#;
 
 /// Write an `adapter.toml` into a fresh subdirectory of `dir` and return it.
+///
+/// Deliberately NOT consolidated onto the shared
+/// `ktesio_conformance::test_support::ManifestFixture` (story 10-1): this
+/// writer takes a RAW TOML body, which is the point — the register/show
+/// failure-path tests feed it INTENTIONALLY INVALID or bespoke manifests
+/// (a missing `[metering]`, a nonexistent `exec`, hand-picked per-OS pause
+/// levels the shared presets do not model). A builder that cannot produce
+/// broken TOML is exactly what those tests need to stay honest; the shared
+/// fixture builder serves the VALID fake_agent shapes (its presets), which
+/// this file's `fake_agent_manifest*` wrappers consume.
 fn manifest_dir(dir: &Path, body: &str) -> std::path::PathBuf {
     let m = dir.join("manifest-adapter");
     std::fs::create_dir_all(&m).unwrap();
@@ -537,63 +548,20 @@ fn show_unknown_instance_exits_nonzero() {
 
 // ---- Story 1.4: `kt agent start` / `kt agent stop` ----
 
-/// Locate the `fake_agent` helper binary: a sibling of the `kt` test binary in
-/// the same `target/<profile>/` dir (both are workspace bins built by
-/// `--all-targets`). Cross-crate `CARGO_BIN_EXE_*` is unavailable, so resolve by
-/// sibling path from `CARGO_BIN_EXE_kt`. If it is not present (e.g. under
-/// tarpaulin, which does not build sibling bins), build it on demand.
-fn fake_agent_bin() -> std::path::PathBuf {
-    let kt = std::path::PathBuf::from(env!("CARGO_BIN_EXE_kt"));
-    let dir = kt.parent().expect("kt bin has a parent dir");
-    let bin = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
-    if bin.exists() {
-        return bin;
-    }
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = std::process::Command::new(cargo)
-        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
-        .status();
-    assert!(
-        matches!(status, Ok(s) if s.success()) && bin.exists(),
-        "fake_agent not found at {} and on-demand build failed ({status:?})",
-        bin.display()
-    );
-    bin
-}
-
-/// Write a manifest whose `[lifecycle.start]` exec points at `fake_agent`.
+/// Write a manifest whose `[lifecycle.start]` exec points at `fake_agent`,
+/// interaction `guaranteed` on all three OSes. The TOML body is the SHARED
+/// builder's `fake_agent` preset (story 10-1 —
+/// `ktesio_conformance::test_support` states the manifest shape ONCE); this
+/// wrapper only keeps the fixture's `fake-agent-adapter` subdirectory name.
+/// The locator behind it is the SHARED `ktesio_conformance::fake_agent_bin`:
+/// the running kt integration-test binary resolves its own
+/// `target/<profile>/deps/` sibling — the same profile dir the old local
+/// `CARGO_BIN_EXE_kt`-anchored copy named — so that copy was duplication,
+/// not a distinct seam (the `CARGO_BIN_EXE_kt` seam for RUNNING kt is
+/// separate and stays).
 fn fake_agent_manifest(dir: &Path, args: &[&str]) -> std::path::PathBuf {
     let m = dir.join("fake-agent-adapter");
-    std::fs::create_dir_all(&m).unwrap();
-    let bin = fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "fake"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-    );
-    std::fs::write(m.join("adapter.toml"), body).unwrap();
-    m
+    ManifestFixture::fake_agent("fake", args).write(&m)
 }
 
 #[test]
@@ -800,58 +768,20 @@ fn stop_accepts_timeout_flag() {
 
 // ---- Story 1.5: `kt agent pause` / `kt agent resume` (AC6) ----
 
-/// The wire key for the current OS's `[capabilities.pause]` entry. Runtime data
-/// (matches the engine's `OsId::current()` mapping), not conditional compilation.
-fn current_os_pause_key() -> &'static str {
-    match std::env::consts::OS {
-        "linux" => "linux",
-        "macos" => "macos",
-        "windows" => "windows",
-        _ => "other",
-    }
-}
-
-/// Write a `fake_agent` manifest whose CURRENT-OS pause level is `pause_level`.
+/// Write a `fake_agent` manifest whose CURRENT-OS pause level is `pause_level`
+/// (interaction `guaranteed` on all three OSes). The TOML body is the SHARED
+/// builder's single-OS capability entry + the cross-OS interaction guarantee
+/// (story 10-1); this wrapper keeps the fixture's `pause-adapter` subdir name.
 fn fake_agent_manifest_with_pause(
     dir: &Path,
     args: &[&str],
     pause_level: &str,
 ) -> std::path::PathBuf {
     let m = dir.join("pause-adapter");
-    std::fs::create_dir_all(&m).unwrap();
-    let bin = fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "fake"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.pause]
-{os} = "{pause_level}"
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-        os = current_os_pause_key(),
-    );
-    std::fs::write(m.join("adapter.toml"), body).unwrap();
-    m
+    ManifestFixture::new("fake", args)
+        .capability_on_os("pause", current_os_key(), pause_level)
+        .guaranteed_on_all_oses("interaction")
+        .write(&m)
 }
 
 #[test]
@@ -1005,29 +935,12 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
         "windows"
     };
     let m = fake_agent_manifest_with_pause(&ctx.project_dir, &["--linger-ms", "600000"], "ignored");
-    // Overwrite the manifest so pause is declared ONLY for the other OS.
-    let bin = fake_agent_bin();
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-[adapter]
-kind = "fake"
-[lifecycle.start]
-exec = {exec:?}
-args = ["--linger-ms", "600000"]
-[capabilities.pause]
-{other} = "guaranteed"
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-        other = other,
-    );
-    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    // Overwrite the manifest so pause is declared ONLY for the other OS
+    // (the SHARED builder's single-OS capability entry, story 10-1).
+    ManifestFixture::new("fake", &["--linger-ms", "600000"])
+        .capability_on_os("pause", other, "guaranteed")
+        .guaranteed_on_all_oses("interaction")
+        .write(&m);
 
     run_kt_agent(
         &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
@@ -1106,42 +1019,18 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
 // ---- Story 4-1: `kt agent send <name> <text>` (AC-A, AC-B, AC-C) ----
 
 /// Write a `fake_agent` manifest whose CURRENT-OS interaction level is
-/// `interaction_level` (mirrors `fake_agent_manifest_with_pause`).
+/// `interaction_level` (mirrors `fake_agent_manifest_with_pause`; NO pause
+/// declaration). The TOML body is the SHARED builder's single-OS capability
+/// entry (story 10-1); this wrapper keeps the fixture's `send-adapter` name.
 fn fake_agent_manifest_with_interaction(
     dir: &Path,
     args: &[&str],
     interaction_level: &str,
 ) -> std::path::PathBuf {
     let m = dir.join("send-adapter");
-    std::fs::create_dir_all(&m).unwrap();
-    let bin = fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "fake"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.interaction]
-{os} = "{interaction_level}"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-        os = current_os_pause_key(),
-    );
-    std::fs::write(m.join("adapter.toml"), body).unwrap();
-    m
+    ManifestFixture::new("fake", args)
+        .capability_on_os("interaction", current_os_key(), interaction_level)
+        .write(&m)
 }
 
 /// The agent.log path inside an instance's Agent Home.
@@ -1310,25 +1199,11 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
         &["--echo-stdin", "--linger-ms", "600000"],
         "ignored",
     );
-    // Overwrite the manifest so interaction is declared ONLY for the other OS.
-    let bin = fake_agent_bin();
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-[adapter]
-kind = "fake"
-[lifecycle.start]
-exec = {exec:?}
-args = ["--echo-stdin", "--linger-ms", "600000"]
-[capabilities.interaction]
-{other} = "guaranteed"
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-        other = other,
-    );
-    std::fs::write(m.join("adapter.toml"), body).unwrap();
+    // Overwrite the manifest so interaction is declared ONLY for the other
+    // OS (the SHARED builder's single-OS capability entry, story 10-1).
+    ManifestFixture::new("fake", &["--echo-stdin", "--linger-ms", "600000"])
+        .capability_on_os("interaction", other, "guaranteed")
+        .write(&m);
 
     run_kt_agent(
         &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
@@ -3658,41 +3533,24 @@ fn run_kt_agent_env(
 }
 
 /// Write a `fake_agent` manifest that (a) dumps its received argv + env to
-/// `dump_path` at startup (`--dump`, the config-mapping observation point) and (b)
-/// maps the unified `model` key into the native env var `MODEL` (`[config.model]
-/// env = "MODEL"`). So a `model = "secret:NAME"` leaf, once resolved, lands in the
+/// `dump_path` at startup (`--dump`, the config-mapping observation point) and
+/// (b) maps the unified `model` key into the native env var `MODEL`
+/// (`[config.model] env = "MODEL"`, the SHARED builder's config-env chain —
+/// story 10-1). So a `model = "secret:NAME"` leaf, once resolved, lands in the
 /// child's `MODEL` env — captured in the dump as `env=MODEL=<cleartext>`.
 fn fake_agent_manifest_secret_env(dir: &Path, dump_path: &Path) -> std::path::PathBuf {
     let m = dir.join("fake-agent-secret-adapter");
-    std::fs::create_dir_all(&m).unwrap();
-    let bin = fake_agent_bin();
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "fake"
-
-[lifecycle.start]
-exec = {exec:?}
-args = ["--linger-ms", "600000", "--dump", {dump:?}]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-
-[config.model]
-env = "MODEL"
-"#,
-        exec = bin.to_string_lossy(),
-        dump = dump_path.to_string_lossy(),
-    );
-    std::fs::write(m.join("adapter.toml"), body).unwrap();
-    m
+    ManifestFixture::fake_agent(
+        "fake",
+        &[
+            "--linger-ms",
+            "600000",
+            "--dump",
+            &*dump_path.to_string_lossy(),
+        ],
+    )
+    .config_env("model", "MODEL")
+    .write(&m)
 }
 
 /// Recursively collect the text of every file under `dir` into one string (for the
