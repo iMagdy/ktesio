@@ -64,8 +64,8 @@ use crate::adapter::AdapterRef;
 use crate::domain::{
     broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, DiagnosticSink,
     EffectiveConfig, EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState,
-    LogLine, Registry, RegistryError, RemoveDisposition, RestartPolicy, Supervisor,
-    TransitionCause, TransitionEvent,
+    LogLine, Registry, RegistryError, RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor,
+    Supervisor, TransitionCause, TransitionEvent,
 };
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
@@ -1085,6 +1085,64 @@ impl Engine {
         .await
     }
 
+    /// Backfill an instance's COMMITTED events as bus payloads (story 10-3) —
+    /// the one-call remedy for the event bus's documented crash-window
+    /// at-most-once delivery.
+    ///
+    /// Reads the same committed truth the query APIs serve (the instance's
+    /// `instance.log` transitions, `breaches.log` breach records, and
+    /// `usage_events` ledger rows — COMMITTED records only: a failed append
+    /// never appears here either) and converts every record past `after` into
+    /// the exact [`EngineEvent`] wrapper the live bus delivers. The returned
+    /// [`ResyncBatch`] carries those events plus the [`ResyncCursor`] to pass
+    /// to the NEXT call, so re-running a resync never re-delivers what a host
+    /// already consumed.
+    ///
+    /// ## Ordering (the documented contract: backfill FIRST, then subscribe)
+    ///
+    /// Within each family the batch is exact commit order (log line order /
+    /// ledger `rowid` order — the same orders the durable record keeps);
+    /// across families the batch is family-major (transitions, then breaches,
+    /// then usage), because the durable record carries no global cross-family
+    /// sequence. That is precisely why the contract is **call
+    /// `resync_events` FIRST, subscribe (`Engine::subscribe`) SECOND**: that
+    /// order yields clean continuity — the backfilled prefix plus the live
+    /// suffix, no gap and no duplicate. Subscribing first is not corrupting,
+    /// only overlapping (duplicates, never gaps — the host's own window, its
+    /// own dedup). See `domain::resync` for the full contract.
+    ///
+    /// This is a READ-side helper: the bus, its publish points, and the
+    /// subscribe semantics are untouched. Runs on the blocking pool (registry
+    /// lock + file/DB reads), like the other reads. An unregistered name fails
+    /// [`EngineError::NotFound`] and a malformed name
+    /// [`EngineError::InvalidName`] (the `read_agent_log` precedent — a
+    /// mistyped name must not read as a silent empty backfill). The reads are
+    /// torn-tail tolerant (ONE unparseable trailing line per log is skipped —
+    /// this helper is called most often right after the crash it heals, and
+    /// that crash can tear the trailing append); a malformed INTERIOR line is
+    /// a typed [`EngineError::Log`]. Sync consumers use
+    /// [`Blocking::resync_events`].
+    pub async fn resync_events(
+        &self,
+        name: &str,
+        after: ResyncCursor,
+    ) -> Result<ResyncBatch, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            registry
+                .lookup(&iname)
+                .map_err(crate::domain::registry_error_to_engine)?;
+            crate::domain::read_committed(&registry, &iname, &after)
+        })
+        .await
+    }
+
     /// Read the retained ATTRIBUTED output log for an instance (story 4-2,
     /// AC-A) — a ONE-SHOT full read of whatever is currently retained (the
     /// current generation plus any rotated predecessors), in on-disk append
@@ -1262,6 +1320,20 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.budget_breach_events(name))
+    }
+
+    /// Blocking [`Engine::resync_events`] (story 10-3) — the crash-window
+    /// backfill: committed events past `after` as bus payloads, plus the
+    /// cursor for the next call. See the async method for the ordering
+    /// contract (resync FIRST, subscribe SECOND).
+    pub fn resync_events(
+        &self,
+        name: &str,
+        after: ResyncCursor,
+    ) -> Result<ResyncBatch, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.resync_events(name, after))
     }
 
     /// Blocking [`Engine::read_agent_log`] (story 4-2, AC-A).

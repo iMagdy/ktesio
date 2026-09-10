@@ -72,6 +72,7 @@ surface `kt` uses. The capabilities you will reach for first:
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
 | `subscribe` / `Blocking::subscribe` | Receive the event stream (below). |
+| `resync_events` / `Blocking::resync_events` | Backfill the committed events a subscriber missed (below). |
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `kt agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
@@ -95,13 +96,63 @@ Four rules cover the whole contract:
    fall more than its capacity behind, your next receive observes `Lagged` and
    resynchronizes at the tail — the dropped events stay readable in the
    durable logs. Drain promptly or poll `try_recv` on your own cadence.
-4. **Delivery is at-most-once in the crash window.** Events are appended to
-   the durable record first, then published; a process crash between the two
-   loses that one event from the *stream* — the durable record stays complete,
-   and the query APIs (`transition_events`, `budget_breach_events`, the usage
-   ledger reads) are the recourse: they always return the committed truth
-   regardless of any crash. Treat the stream as a live notification surface,
-   never as your only copy.
+4. **Delivery is at-most-once in the crash window — and recoverable.** Events
+   are appended to the durable record first, then published; a process crash
+   between the two loses that one event from the *stream*. The durable record
+   stays complete, and `resync_events` (below) heals the window in one call.
+   Treat the stream as a live notification surface, with the resync as your
+   gap remedy.
+
+## Healing the crash window: `resync_events`
+
+Rule 4 above leaves a gap: events committed while nobody was subscribed (or
+while your subscriber's process was down) never reach the stream. The engine
+ships the remedy — one call reads the instance's COMMITTED event records (the
+same truth the query APIs serve: transitions, breaches, ledger rows) and
+returns them as the exact event payloads the live bus delivers:
+
+```rust
+use ktesio_engine::{Blocking, ResyncCursor};
+
+// 1. Backfill everything committed so far …
+let batch = facade.resync_events("my-agent", ResyncCursor::START)?;
+for event in &batch.events {
+    // transition / budget breach / usage update — the same shapes the
+    // live stream carries.
+}
+
+// 2. …THEN subscribe live. That order is the contract: the backfill is
+//    precisely the prefix and the live stream precisely the suffix, so the
+//    combined window has no gap and no duplicate.
+let mut events = facade.subscribe();
+```
+
+The contract, in five rules:
+
+1. **Committed truth only.** A read-side helper over the same durable records
+   the query APIs return — the bus is untouched. An event whose append failed
+   never appears in a backfill either.
+2. **Ordering is exact per family.** Transitions come in `instance.log` order,
+   breaches in `breaches.log` order, usage updates in ledger commit order —
+   the same orders the stream guarantees. Across families the batch is
+   family-major (transitions, then breaches, then usage): the durable record
+   carries no global cross-family sequence, and the engine does not fabricate
+   one. This is exactly why rule 2 of the usage pattern above is "subscribe
+   after backfill" — that order needs no cross-family ordering inside the
+   backfill. Subscribing first is not corrupting, only overlapping
+   (duplicates, never gaps — your window, your dedup).
+3. **Cursor-based and idempotent.** The returned batch carries a
+   `ResyncCursor`; pass it to the next call and the already-consumed prefix is
+   skipped, so re-running a resync never re-delivers. Persist the cursor
+   across your own restarts if you like (it serializes).
+4. **Crash-recovery read posture.** The helper is called most often right
+   after the crash it heals — and that crash can tear the log's trailing
+   append. One unparseable trailing line per log is skipped (that record is
+   absent from the durable truth too); a malformed interior line is a typed
+   error worth investigating.
+5. **Per-instance.** `name` scopes the read; a Fleet-wide backfill is your
+   loop over instances. An unregistered name fails `NotFound` rather than
+   reading as a silent empty backfill.
 
 ## The diagnostic sink
 

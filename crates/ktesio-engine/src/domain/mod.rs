@@ -21,6 +21,7 @@ mod lifecycle;
 mod name;
 mod registry;
 mod restart;
+mod resync;
 mod secret;
 mod supervisor;
 mod transition;
@@ -53,7 +54,11 @@ pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};
 pub use registry::{Registry, RemoveDisposition};
+pub use resync::{ResyncBatch, ResyncCursor};
+// The resync core is engine-internal glue the facade calls (the story-10-3
+// helper); only the cursor/batch TYPES are public surface.
 pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
+pub(crate) use resync::read_committed;
 pub use secret::{SecretString, REDACTED};
 pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
 pub use supervisor::{DiagnosticSink, RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};

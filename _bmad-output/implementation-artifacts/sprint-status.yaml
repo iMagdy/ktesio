@@ -104,7 +104,7 @@ development_status:
   epic-10: in-progress  # opened 2026-09-10 by sprint change proposal (_bmad-output/planning-artifacts/sprint-change-proposal-2026-09-10.md, Islam-approved): Consolidate & Harden the Embedding Surface
   10-1-embedding-test-support-consolidation: review  # 2026-09-10: consolidated into ktesio-conformance test_support (ManifestFixture presets, unified drains, BinDir locator). Zero assertion changes; 1114 tests green; 95.24%.  # one test-support home for the manifest builders + drains (issue #164)
   10-2-host-provided-diagnostic-sink: review  # 2026-09-10: DiagnosticSink (opt-in, default stderr byte-identical), both AD-12 diagnostics routed through one choke point; audit allowlist EMPTY with count==1 choke-point pins; 5 sink tests + negative teeth. 1119 tests, 95.26%.  # additive public API; removes the 2 audit allowlist entries
-  10-3-event-bus-resync-and-subscriber-budget: in-progress  # subscribe-with-backfill helper + ratified subscriber-active budget
+  10-3-event-bus-resync-and-subscriber-budget: review  # 2026-09-10: resync_events (committed-truth backfill as EngineEvents, family-major ordering, backfill-then-subscribe contract, torn-tail tolerant, cursor continuation) + subscriber-active budget GATED in the perf harness (CPU delta 0.25pts, RSS 2MiB, read-p99 100ms — ratified from observed ~zero fan-out cost). 4 integration + 7 unit tests. Deferred-work 7-2/7-5 entries resolved.  # subscribe-with-backfill helper + ratified subscriber-active budget
   epic-8-retrospective: optional
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified

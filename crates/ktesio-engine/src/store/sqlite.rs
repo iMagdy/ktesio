@@ -234,6 +234,61 @@ impl SqliteStore {
             .expect("install delete-blocking trigger");
     }
 
+    /// The committed [`UsageEvent`] ROWS for an instance, in COMMIT ORDER
+    /// (story 10-3: the resync helper's ledger read) — one struct per
+    /// `usage_events` row, ordered by the rows' insertion order (`rowid`), the
+    /// same order the commit choke point appended them in and therefore the
+    /// same order the 7-2 bus published them. An absent instance (or one with
+    /// no rows) reads as an empty vec. Read-only — never mutates the ledger.
+    ///
+    /// Deliberately an INHERENT method, not a [`StateStore`] trait method: the
+    /// trait is the published port surface (frozen since the v0.7.0 freeze —
+    /// adding a required method would be a semver break for its implementors),
+    /// and this read has exactly one caller, the engine-internal registry
+    /// (which holds the concrete store).
+    pub(crate) fn usage_events(&self, name: &InstanceName) -> Result<Vec<UsageEvent>, StoreError> {
+        // An absent instance has no rows (mirrors count_usage_events).
+        let Some(id) = self.instance_id(name)? else {
+            return Ok(Vec::new());
+        };
+        // COMMIT ORDER is the rows' insertion order (`rowid` — SQLite assigns
+        // monotonically on INSERT and the ledger is append-only: rows are never
+        // updated or deleted in the shipping engine), i.e. the exact order the
+        // commit choke point inserted them and the bus published them.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT run_id, input_tokens, output_tokens, metering_source, sequence, \
+                 occurred_at FROM usage_events WHERE instance_id = ?1 ORDER BY rowid",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([id], |row| {
+                Ok(UsageEvent {
+                    // The instance name round-trips from the lookup (the
+                    // column itself is the FK's `agent_instances.id`, not a
+                    // string).
+                    instance: name.as_str().to_string(),
+                    run_id: RunId::from_wire(row.get::<_, String>(0)?),
+                    // The store clamps on WRITE (saturating into the signed
+                    // column), so a stored count is always a faithful u64 —
+                    // mirror the `.max(0)` read discipline the totals use
+                    // against any pre-clamping (pre-v3) row.
+                    input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    metering_source: row.get::<_, String>(3)?,
+                    sequence: row.get::<_, i64>(4)?.max(0) as u64,
+                    occurred_at: row.get::<_, String>(5)?,
+                })
+            })
+            .map_err(backend)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(backend)?);
+        }
+        Ok(events)
+    }
+
     /// Test-only fault injection: DROP the `agent_instances` table so every
     /// subsequent read/write of it fails with a SQL error. Used to exercise the
     /// config surface's store-error arms (`require_instance`'s

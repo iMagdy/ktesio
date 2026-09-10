@@ -52,13 +52,20 @@
 //! The durable append and the bus publish are two separate steps, in that
 //! order. A process crash in the window between them loses that ONE event
 //! from the bus — delivery is at-most-once in the crash window. The durable
-//! logs stay COMPLETE either way, so the recourse is the query APIs
+//! logs stay COMPLETE either way, and since story 10-3 the remedy is ONE
+//! call: [`Engine::resync_events`](crate::Engine::resync_events) /
+//! [`Blocking::resync_events`](crate::Blocking::resync_events) backfill the
+//! committed records as [`EngineEvent`]s past a
+//! [`ResyncCursor`](super::resync::ResyncCursor) (the contract: resync
+//! FIRST, then subscribe — see the `domain::resync` module for the ordering
+//! and torn-tail tolerance details). The query APIs
 //! ([`TransitionEvent`]s via `Engine::transition_events`,
-//! [`BudgetBreachEvent`]s via `Engine::budget_breach_events`, ledger reads):
-//! they return the committed truth regardless of any crash. A resync /
-//! gap-detection helper over the bus is explicitly DEFERRED work (recorded in
-//! `_bmad-output/implementation-artifacts/deferred-work.md`, from the EC1-3
-//! crash-window review findings) — do not hand-roll a per-host substitute.
+//! [`BudgetBreachEvent`]s via `Engine::budget_breach_events`, ledger reads)
+//! remain the narrower per-family reads underneath. The at-most-once WINDOW
+//! itself is the documented policy, not a failure mode: closing it in-band
+//! would need publish-before-append (violating the committed-truth
+//! guarantee) or a durable per-subscriber cursor (a persistence surface the
+//! 7-2 review explicitly rejected).
 //!
 //! ## Boundary (what this is NOT)
 //!
