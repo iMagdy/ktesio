@@ -34,8 +34,8 @@
 //!    handler (signal hooks, panic hooks, console control/exception hooks,
 //!    `tokio::signal`), never builds a lazy/global runtime or static cell
 //!    outside the per-engine runtime `Engine::open` owns, and holds exactly
-//!    THREE named allowlist entries the audit honestly earned — ONE global
-//!    static plus TWO pinned best-effort stderr print sites:
+//!    ONE named allowlist entry the audit honestly earned — ONE global
+//!    static:
 //!    * `static RUN_NONCE: AtomicU64` (`domain/usage.rs`) — the RunId
 //!      uniqueness tie-breaker: a monotonic counter consulted only to keep
 //!      two same-nanosecond Run ids DISTINCT, never read for behavior. It
@@ -44,18 +44,21 @@
 //!      (separate roots keep separate ledgers; conflation would only matter
 //!      for merged ledgers, which Ktesio does not do). The collision test's
 //!      disjoint-run-id assertion proves this per-process property.
-//!    * TWO best-effort stderr diagnostics (`domain/supervisor.rs`, both
-//!      citing spine AD-12 "enforcement diagnostics ride the engine log /
-//!      stderr, NEVER `kt` stdout"): the DC-10 memory-delivery notice and the
-//!      enforcement breadcrumb. Not prompts and not control surfaces (they
-//!      never read input, block, or gate behavior; stderr only, so a Host's
-//!      stdout is never polluted) — allowlisted rather than closed, because
-//!      routing them through a Host-provided diagnostic sink is a public-API
-//!      design change beyond this story's additive scope. Each site is
-//!      pinned by a fragment UNIQUE to its own emission, and each pin must
-//!      match EXACTLY ONE line — a duplicate or a rewording fails the audit,
-//!      and any OTHER print site (including `writeln!`/`write!` aimed at
-//!      stdio) fails it too.
+//!
+//!    The audit's TWO historical print-site allowlist entries — the best-effort
+//!    stderr diagnostics in `domain/supervisor.rs` (the DC-10 memory-delivery
+//!    notice and the enforcement breadcrumb, both citing spine AD-12) — were
+//!    CLOSED by story 10-2, not allowlisted forever: both diagnostics now
+//!    route through the host-provided diagnostic sink (`Supervisor::
+//!    emit_diagnostic`; stderr survives only as the no-sink DEFAULT, which the
+//!    `diagnostic_sink.rs` suite proves byte-identical). The print-site
+//!    allowlist is therefore EMPTY — any new raw print in production sources
+//!    fails the audit outright — and the sink plumbing itself carries positive
+//!    pins with the same count==1 discipline the old entries had: the
+//!    `emit_diagnostic` choke point, BOTH diagnostic routes into it, and the
+//!    stderr default arm must each match EXACTLY ONE site, so a diagnostic
+//!    cannot silently disappear, be reworded, or grow a second direct stderr
+//!    writer.
 //!
 //!    The scanner itself is hardened against bypass classes: string-literal
 //!    contents are blanked before token matching (a log message containing
@@ -67,7 +70,13 @@
 //!    recognized as test gates only when they actually select test builds
 //!    (`not(test)` keeps production code scanned), and an unreadable source
 //!    file or directory PANICS with its path instead of silently meaning
-//!    "unscanned".
+//!    "unscanned". The story-10-2 stdio accounting is widened against the
+//!    imported-path bypass: the single-stdio-reach count pin matches
+//!    fully-qualified calls, BARE imported-path calls
+//!    (`use std::io::stdout;` + `stdout()`), brace-group stdio imports, and
+//!    hand-written `_print` internals — so shortening a stdio path to an
+//!    imported name cannot sneak a second writer past either the zero-print
+//!    scan or the count pin.
 //! 3. **The blocking-coverage inventory audit** — every `pub async fn` in
 //!    the WHOLE production crate (not just `engine.rs` — an
 //!    `impl Engine { pub async fn … }` in another module cannot escape the
@@ -750,6 +759,26 @@ fn scan(root: &Path, pattern: &dyn Fn(&str) -> bool) -> Vec<Finding> {
     findings
 }
 
+/// True when `line` calls `name(…)` as a FREE function: every occurrence of
+/// `name(` whose immediately preceding character is not a `.` — a `.name(`
+/// is a METHOD call (e.g. the backends' `command.stdout(Stdio::…)` setter,
+/// which aims the CHILD's stdio and is a sanctioned, different shape), while
+/// `std::io::stderr(` and a bare imported `stdout(` are the process-stdio
+/// free calls this audit counts.
+fn free_call(line: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(&needle) {
+        let start = from + rel;
+        if start == 0 || bytes[start - 1] != b'.' {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 #[test]
 fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -794,52 +823,87 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     );
 
     // ---- No interactive prompts: no `println!`/`eprintln!`/`print!`/`dbg!`,
-    // and no `writeln!`/`write!` aimed at stdio, in production sources
-    // BEYOND the narrow named allowlist below. THE HONEST FINDING this audit
-    // recorded: exactly TWO production print sites exist, both documented
-    // best-effort stderr DIAGNOSTICS in `domain/supervisor.rs` citing spine
-    // AD-12 ("enforcement diagnostics ride the engine log / stderr, NEVER
-    // `kt` stdout") — not prompts, not control surfaces (they never read
-    // input, block, or gate behavior), and on stderr only, so a Host's stdout
-    // is never polluted. They are allowlisted, not closed: routing them
-    // through a Host-provided diagnostic sink is a public-API design change
-    // beyond this story's additive scope. TEETH: each entry is pinned by a
-    // fragment UNIQUE to its own emission (the pins do NOT overlap — an
-    // earlier shared-prefix pin made entry 2 self-satisfying and auto-accepted
-    // any new `[ktesio]` print), each pin must match EXACTLY ONE site (a
-    // duplicate or a rewording both fail), and any OTHER print site fails the
-    // audit. Matching runs on string-cleaned lines, so a token inside a log
-    // MESSAGE cannot match; the allowlist pins read the ORIGINAL line because
-    // the distinguishing content IS the emission text. ----
+    // and no `writeln!`/`write!` aimed at stdio, ANYWHERE in production
+    // sources. Story 10-2 CLOSED the audit's two historical findings: the
+    // DC-10 memory-delivery notice and the enforcement breadcrumb (both
+    // citing spine AD-12) now route through the host-provided diagnostic sink
+    // (`Supervisor::emit_diagnostic` — stderr survives only as the no-sink
+    // DEFAULT, which the `diagnostic_sink.rs` suite proves byte-identical).
+    // The print-site allowlist is therefore EMPTY: any NEW raw print in
+    // production sources fails here outright. Hardened (Epic-10 review)
+    // against the imported-path bypass: a hand-written `_print` (the
+    // println!-family's expansion internals) fails outright, and the
+    // write-target check matches BARE call forms (`stdout(`/`stderr(`), not
+    // just the fully-qualified ones — `use std::io::stdout;` + a bare
+    // `stdout().write_all(...)` cannot evade by shortening the path. The
+    // zero-scan's blind spot left (a write! into a locally-bound handle
+    // variable) is covered by the count pin below, which matches the
+    // IMPORTS too. TEETH beyond the zero-scan: the sink plumbing is
+    // positively pinned below, so the choke point cannot silently disappear
+    // or lose a diagnostic. ----
     let prompts = scan(&src, &|line| {
         ["println!", "eprintln!", "print!", "dbg!"]
             .iter()
             .any(|p| line.contains(p))
+            || line.contains("_print")
             || ((line.contains("writeln!(") || line.contains("write!("))
                 && (line.contains("io::stderr")
                     || line.contains("io::stdout")
-                    || line.contains("stderr()")
-                    || line.contains("stdout()")))
+                    || line.contains("stderr(")
+                    || line.contains("stdout(")))
     });
-    let allowed: [(&str, &str); 2] = [
-        // (1) The DC-10 memory-delivery notice (story 5-1/2-2 Decision 6): a
-        // `filesystem` backing attached but the adapter maps no target for
-        // the reserved key — the operator took an explicit attach action and
-        // is owed the truth about its effect; the start still succeeds.
-        // Pinned by its unique `{notice}` emission shape.
-        ("domain/supervisor.rs", r#"eprintln!("[ktesio] {notice}")"#),
-        // (2) The enforcement breadcrumb (`log_enforcement_diagnostic`): a
-        // breach action (pause/stop) that could not be honored, or a breach
-        // record that failed to append — the breach itself is already durably
-        // recorded, so this is an operator breadcrumb, never the record.
-        // Pinned by its unique `{}: {detail}` formatting.
+    assert!(
+        prompts.is_empty(),
+        "a raw print site appeared in production sources — the engine's ONLY \
+         diagnostic emission is the story-10-2 diagnostic sink \
+         (`Supervisor::emit_diagnostic` in domain/supervisor.rs; stderr is its \
+         no-sink default). A print is a control surface: route it through the \
+         sink or re-review the sink contract: {}",
+        prompts
+            .iter()
+            .map(Finding::describe)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+
+    // ---- Positive story-10-2 sink pins (the retired allowlist's teeth, kept
+    // in the new shape): each fragment must match EXACTLY ONE site, so a
+    // removed or reworded diagnostic route — or a second direct stderr writer
+    // sneaking past the print scan above — fails here. ----
+    let sink_pins: [(&str, &str, &str); 4] = [
+        // The ONE diagnostic emission choke point (both diagnostics route
+        // through it; the `[ktesio] ` prefix + terminating newline live here).
         (
             "domain/supervisor.rs",
-            r#"eprintln!("[ktesio] {}: {detail}""#,
+            "fn emit_diagnostic(&self",
+            "the diagnostic-sink choke point",
+        ),
+        // The DC-10 memory-delivery notice's route into the sink (story
+        // 5-1/2-2 Decision 6 — the operator attach action is owed the truth).
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&notice)",
+            "the DC-10 memory-delivery notice's route into the sink",
+        ),
+        // The enforcement breadcrumb's route into the sink (a breach action
+        // that could not be honored, or a breach record that failed to append
+        // — an operator breadcrumb, never the record).
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&format!(",
+            "the enforcement breadcrumb's route into the sink",
+        ),
+        // The stderr DEFAULT arm: with no sink installed the diagnostics go
+        // to stderr byte-identically to the pre-sink engine (pinned
+        // end-to-end by the `diagnostic_sink.rs` subprocess suite).
+        (
+            "domain/supervisor.rs",
+            "std::io::stderr().write_all(",
+            "the sink's stderr default arm",
         ),
     ];
-    for (file, marker) in allowed {
-        let hits: Vec<String> = prompts
+    for (file, marker, what) in sink_pins {
+        let hits: Vec<String> = scan(&src, &|line| line.contains(marker))
             .iter()
             .filter(|f| f.file == file && f.text.contains(marker))
             .map(Finding::describe)
@@ -847,26 +911,55 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         assert_eq!(
             hits.len(),
             1,
-            "allowlist entry ({file}, {marker}) must match EXACTLY ONE site — 0 means \
-             the diagnostic disappeared or was reworded, >1 means a duplicate appeared; \
-             both require re-review: {hits:?}"
+            "the story-10-2 sink pin for {what} ({file}, {marker}) must match \
+             EXACTLY ONE site — 0 means the diagnostic disappeared or its \
+             route was reworded, >1 means a duplicate appeared; both require \
+             re-reviewing the sink contract: {hits:?}"
         );
     }
-    let unexpected: Vec<String> = prompts
-        .iter()
-        .filter(|f| {
-            !allowed
-                .iter()
-                .any(|(file, marker)| f.file == *file && f.text.contains(marker))
-        })
-        .map(Finding::describe)
-        .collect();
+    // The stderr default arm is the ONLY place the engine touches stdio at
+    // all — a second stdio reach anywhere in the production sources is
+    // exactly the uninvited-write class story 10-2 closed. (Run crate-wide,
+    // not per-file: the pin above keeps the sanctioned site honest, this
+    // keeps the COUNT honest.) Widened (Epic-10 review) so a stdio write via
+    // an IMPORTED path cannot evade the count the fully-qualified forms
+    // satisfy: the classes are the call forms — fully qualified
+    // (`std::io::stderr()`) AND bare (`use std::io::stdout;` then
+    // `stdout().write_all(...)`; the zero-arg handle constructor always
+    // carries the `()`) — the import forms (`use std::io::stdout;` or a
+    // brace-group `use std::io::{stdout, …}`), and a hand-written `_print`
+    // (println!/print!'s expansion internals). The backends' CHILD-stdio
+    // setters (`command.stdout(Stdio::…)`) are DOT-prefixed METHOD calls —
+    // a different, sanctioned shape ([`free_call`] excludes them) aiming the
+    // spawned child's stdio, never the host process's.
+    let stdio_reaches = scan(&src, &|line| {
+        free_call(line, "stdout")
+            || free_call(line, "stderr")
+            || (line.contains("use std::io")
+                && (line.contains("stdout") || line.contains("stderr")))
+            || line.contains("_print")
+    });
+    assert_eq!(
+        stdio_reaches.len(),
+        1,
+        "the engine must reach stdio in EXACTLY ONE place (the diagnostic \
+         sink's stderr default arm in domain/supervisor.rs) — counted across \
+         fully-qualified calls, bare imported-path calls, stdio imports, and \
+         hand-written _print internals: {}",
+        stdio_reaches
+            .iter()
+            .map(Finding::describe)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    assert_eq!(
+        stdio_reaches[0].file, "domain/supervisor.rs",
+        "the one stdio reach must be the sink's stderr default arm"
+    );
     assert!(
-        unexpected.is_empty(),
-        "a print site outside the two named AD-12 diagnostic allowlist entries \
-         (prompts are a control surface; close it or allowlist it with \
-         justification): {}",
-        unexpected.join("; ")
+        stdio_reaches[0].text.contains("stderr"),
+        "the one stdio reach must be the STDERR default arm, not stdout: {}",
+        stdio_reaches[0].describe()
     );
 
     // ---- No env MUTATION: the engine reads `KTESIO_STATE_DIR` etc. (fine);
@@ -1166,17 +1259,21 @@ fn every_public_async_engine_entry_point_has_a_blocking_facade_counterpart() {
          sync surface loses them): {missing:?}"
     );
 
-    // The facade's only intentional EXTRA is the bridged `subscribe` (the
-    // sync EventSubscription over the sync Engine::subscribe) — anything else
-    // means the two surfaces drifted and must be reviewed.
+    // The facade's only intentional EXTRAS are the two sync-side methods —
+    // the bridged `subscribe` (the sync EventSubscription over the sync
+    // Engine::subscribe) and the story-10-2 sink installer `with_diagnostics`
+    // (a lock-and-field-swap over Engine::with_diagnostics; neither has — or
+    // needs — an async form). Anything else means the two surfaces drifted
+    // and must be reviewed.
     let extras: Vec<&String> = facade
         .keys()
         .filter(|n| !crate_async.contains_key(*n))
         .collect();
     assert_eq!(
         extras,
-        ["subscribe"],
-        "the facade's only extra must be the bridged subscribe: {extras:?}"
+        ["subscribe", "with_diagnostics"],
+        "the facade's only extras must be the bridged subscribe and the \
+         story-10-2 sink installer with_diagnostics: {extras:?}"
     );
 
     // Name AND signature: each counterpart's parameter list must equal the
@@ -1196,10 +1293,11 @@ fn every_public_async_engine_entry_point_has_a_blocking_facade_counterpart() {
     // Each counterpart really bridges through the engine runtime
     // (`block_on`) — not a reimplementation (parsed over the CLEANED region,
     // the same hygiene as the inventory). `subscribe` constructs the bridged
-    // EventSubscription instead (covered by the extra assertion above).
+    // EventSubscription instead, and `with_diagnostics` is the story-10-2
+    // sync sink installer (both covered by the extras assertion above).
     for chunk in facade_region.split("pub fn ").skip(1) {
         let name = chunk.split('(').next().unwrap_or("").trim();
-        if name == "subscribe" || name.is_empty() {
+        if name == "subscribe" || name == "with_diagnostics" || name.is_empty() {
             continue;
         }
         assert!(

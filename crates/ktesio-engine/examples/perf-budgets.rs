@@ -32,29 +32,46 @@
 //!    after a 30 s cool-down and gates on the second run (the house flake
 //!    policy: a co-tenant stall must not red an ordinary PR; local runs are
 //!    single-shot).
-//! 3. **Subscriber-active overhead (reported, NOT gated)** — NFR-4's gated
-//!    figures above are measured with ZERO subscribers; the epic ships a
-//!    subscription surface, so after the gated measurements the harness
+//! 3. **Subscriber-active overhead (GATED at the ratified budgets, story
+//!    10-3)** — NFR-4's gated figures above are measured with ZERO
+//!    subscribers; a host using the subscription surface needs a budget
+//!    covering fan-out cost, so after the gated measurements the harness
 //!    attaches ONE active subscriber and re-measures a single steady-state
-//!    window plus the same read kinds, REPORTING those figures and their
-//!    deltas vs the unsubscribed baseline (the report's
-//!    `subscriber_overhead` block). Measured-and-reported only: no
-//!    ratified subscriber-active budget exists (proposed deferred work), so
-//!    these numbers never gate and cannot fail the run. The addendum runs
-//!    AFTER the gated phases so it cannot contaminate them, and the startup
+//!    window plus the same read kinds, and the DELTAS vs the unsubscribed
+//!    baseline (CPU percentage points, RSS MiB, read p99 ms per instance)
+//!    gate against the RATIFIED subscriber-active budgets — the same policy
+//!    shape as the CPU gate (strict ×1.0 locally; the documented
+//!    shared-runner tolerance ×1.5 in CI, since the addendum runs ONE window
+//!    even on CI and the tolerance is what absorbs that single-window
+//!    noise). The ratified numbers come from the observed measurements
+//!    recorded in docs/testing.md (2026-09-10 local run: a −0.015 pct-point
+//!    CPU delta, +0.01 MiB RSS delta, +0.7 ms read-p99 delta — fan-out cost
+//!    for one subscriber is effectively zero, so the budgets carry large
+//!    headroom: ~16× the observed CPU-delta magnitude and two orders of
+//!    magnitude on RSS (~200×) and read p99 (~143×) — sized for measurement
+//!    noise rather than headroom erosion). The budgets were ratified on a
+//!    macOS local (strict) run and are enforced on ubuntu CI with the same
+//!    factor shape (docs/testing.md). The addendum still runs AFTER the gated phases so
+//!    the zero-subscriber figures cannot be contaminated, and the startup
 //!    liveness check counts its window against the fixture's orphan bound.
 //!
 //! It prints a machine-readable JSON report to stdout (the measured record —
 //! the CI perf-budgets job log is its canonical home, and the job uploads the
 //! JSON as a workflow artifact via `PERF_BUDGETS_REPORT_PATH`) and GATES:
 //!
-//! | gate                        | local + CI | budget                          |
-//! |-----------------------------|------------|---------------------------------|
-//! | read p99                    | hard       | < 1000 ms                       |
-//! | RSS mean / instance         | hard       | ≤ 50 MiB                        |
-//! | RSS max spike / instance    | hard       | ≤ 2 × 50 MiB (leak guard)       |
-//! | CPU / instance              | hard       | ≤ 2% strict (local)             |
-//! | CPU / instance              | hard       | ≤ 2% × `shared_runner_tolerance` (CI) |
+//! | gate                              | local + CI | budget                          |
+//! |-----------------------------------|------------|---------------------------------|
+//! | read p99                          | hard       | < 1000 ms                       |
+//! | RSS mean / instance               | hard       | ≤ 50 MiB                        |
+//! | RSS max spike / instance          | hard       | ≤ 2 × 50 MiB (leak guard)       |
+//! | CPU / instance                    | hard       | ≤ 2% strict (local)             |
+//! | CPU / instance                    | hard       | ≤ 2% × `shared_runner_tolerance` (CI) |
+//! | subscriber CPU Δ / instance       | hard       | ≤ 0.25 pct-pts strict (local)   |
+//! | subscriber CPU Δ / instance       | hard       | ≤ 0.25 × tolerance (CI)         |
+//! | subscriber RSS Δ / instance       | hard       | ≤ 2 MiB strict (local)          |
+//! | subscriber RSS Δ / instance       | hard       | ≤ 2 × tolerance (CI)            |
+//! | subscriber read-p99 Δ             | hard       | ≤ 100 ms strict (local)         |
+//! | subscriber read-p99 Δ             | hard       | ≤ 100 × tolerance (CI)          |
 //!
 //! ## The CI tolerance policy (named, not hidden)
 //!
@@ -69,6 +86,13 @@
 //! reads and RSS gate at budget on every gate platform (ubuntu CI; strict
 //! local macOS), and every report carries both the
 //! strict-budget margin and the applied tolerance.
+//!
+//! Story 10-3 applies the SAME factor shape to the ratified subscriber-active
+//! delta gates (CPU Δ / RSS Δ / read-p99 Δ): strict ×1.0 locally, ×1.5 in
+//! CI — deliberately WITHOUT the median-of-three mechanism, because the
+//! addendum measures ONE window even on CI (the deltas are differences taken
+//! seconds apart in one process), so the tolerance is the sole noise
+//! absorber there and the budgets are sized for it (docs/testing.md).
 //!
 //! ## Why an example (explicit gating, not `#[ignore]` sprawl)
 //!
@@ -86,8 +110,10 @@
 //! cargo run --release --example perf-budgets -p ktesio-engine
 //! ```
 //!
-//! (From the workspace root, so the on-demand `fake_agent` build below lands
-//! in the same `target/`.) The CI perf-budgets job builds the release example
+//! (From the workspace root, so the fixture's `fake_agent` exec resolves into
+//! the same `target/` — the shared locator's examples/ hop plus its
+//! on-demand-build fallback (story 10-1) pin the helper to this binary's
+//! target root either way.) The CI perf-budgets job builds the release example
 //! + helper explicitly and runs the binary — its regressions FAIL that job.
 //!
 //! ## Measurement honesty
@@ -124,9 +150,9 @@
 //!   on macOS; Windows is measured-and-reported (sysinfo's `memory()` is the
 //!   working-set-size analog there) — NEVER a gate platform.
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ktesio_conformance::test_support::{fake_agent_bin_in, BinDir, ManifestFixture};
 use ktesio_engine::{AdapterRef, Blocking, ConfigLayer, Engine, FleetEntry, LifecycleState};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -199,6 +225,29 @@ const BUDGET_RSS_PER_INSTANCE_MIB: f64 = 50.0;
 /// The RSS spike/leak guard: a single window sample exceeding twice the
 /// per-instance budget fails the run even when the mean is fine.
 const RSS_SPIKE_TOLERANCE: f64 = 2.0;
+
+/// The RATIFIED subscriber-active budgets (story 10-3) — ceilings on the
+/// ONE-active-subscriber DELTAS vs the unsubscribed baseline. Ratified from
+/// the observed measurements (the 2026-09-10 local release run recorded in
+/// docs/testing.md: CPU delta −0.015 pct-points, RSS delta +0.01 MiB,
+/// read-p99 delta +0.7 ms — one subscriber's fan-out cost is effectively
+/// zero), sized far above observed — ~16× the CPU-delta magnitude and two
+/// orders of magnitude (~200× / ~143×) on the RSS / read-p99 deltas — so the
+/// gate absorbs single-window measurement noise (the addendum runs ONE
+/// window even on CI; the shared-runner tolerance below is its other noise
+/// absorber) while any REAL fan-out regression (a per-publish broadcast
+/// storm, a per-event host callback) trips it. Ratified on a macOS local
+/// (strict) run; enforced on ubuntu CI with the same factor shape. A change
+/// to any of these numbers is a budget re-ratification — it must consciously
+/// update docs/testing.md's budget table with the new observations, never a
+/// silent gate tweak.
+const BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS: f64 = 0.25;
+/// See [`BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS`] (per-instance MiB, mean
+/// over the addendum window vs the baseline's median window mean).
+const BUDGET_SUBSCRIBER_RSS_DELTA_MIB: f64 = 2.0;
+/// See [`BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS`] (overall worst-kind read
+/// p99, ms, with-subscriber pass vs the baseline pass).
+const BUDGET_SUBSCRIBER_READ_P99_DELTA_MS: f64 = 100.0;
 
 /// The DOCUMENTED shared-runner tolerance factor for the CPU gate in CI only
 /// (see the module docs). Named here and in every report — never hidden.
@@ -447,9 +496,9 @@ impl SteadyFigures {
 /// The subscriber-overhead addendum figures: the SAME per-instance steady
 /// figures and overall read p99 measured with ONE active subscriber
 /// attached, plus the deltas vs the unsubscribed baseline. Pure delta math,
-/// pinned by tests. MEASURED-AND-REPORTED ONLY — no ratified
-/// subscriber-active budget exists (the deferred-work entry proposes one),
-/// so these figures never gate.
+/// pinned by tests. The deltas GATE against the ratified subscriber-active
+/// budgets (story 10-3) — strict locally, at the shared-runner tolerance on
+/// CI (see `evaluate_gates`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SubscriberOverhead {
     cpu_per_instance_pct: f64,
@@ -538,9 +587,18 @@ struct GateReport {
 /// CPU gates strict (×1.0)
 /// locally and at the named shared-runner tolerance (×1.5) on CI. The read
 /// gate uses the STRICT `<` bound (the budget is "< 1 s" — exactly-at
-/// fails); the RSS/CPU ceilings use `≤`.
-fn evaluate_gates(overall_p99_ms: f64, steady: &SteadyFigures, tolerance: f64) -> GateReport {
-    let verdicts = vec![
+/// fails); the RSS/CPU ceilings use `≤`. The subscriber-active DELTAS
+/// (story 10-3) gate against the ratified budgets with the CPU gate's
+/// tolerance shape — `≤` bounds, strict locally, tolerated on CI — and a
+/// negative delta (the subscriber pass measured cheaper) passes trivially:
+/// the budget ceilings the OVERHEAD, never a measurement sign.
+fn evaluate_gates(
+    overall_p99_ms: f64,
+    steady: &SteadyFigures,
+    subscriber: &SubscriberOverhead,
+    tolerance: f64,
+) -> GateReport {
+    let mut verdicts = vec![
         gate(
             "read_p99_lt_1s",
             overall_p99_ms,
@@ -570,8 +628,40 @@ fn evaluate_gates(overall_p99_ms: f64, steady: &SteadyFigures, tolerance: f64) -
             GateBound::Le,
         ),
     ];
+    verdicts.extend(subscriber_gates(subscriber, tolerance));
     let passed = verdicts.iter().all(|v| v.passed);
     GateReport { verdicts, passed }
+}
+
+/// The three story-10-3 subscriber-active delta gates (appended AFTER the
+/// four zero-subscriber gates, so verdict indices 0–3 keep their meaning):
+/// CPU Δ pct-points, RSS Δ MiB, read-p99 Δ ms — each `≤` its ratified budget
+/// × tolerance (strict ×1.0 locally; the shared-runner ×1.5 on CI, the same
+/// policy shape as the CPU gate).
+fn subscriber_gates(subscriber: &SubscriberOverhead, tolerance: f64) -> Vec<GateVerdict> {
+    vec![
+        gate(
+            "subscriber_cpu_delta_le_budget",
+            subscriber.cpu_delta_pct_points,
+            BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS,
+            tolerance,
+            GateBound::Le,
+        ),
+        gate(
+            "subscriber_rss_delta_le_budget",
+            subscriber.rss_delta_mib,
+            BUDGET_SUBSCRIBER_RSS_DELTA_MIB,
+            tolerance,
+            GateBound::Le,
+        ),
+        gate(
+            "subscriber_read_p99_delta_le_budget",
+            subscriber.read_p99_delta_ms,
+            BUDGET_SUBSCRIBER_READ_P99_DELTA_MS,
+            tolerance,
+            GateBound::Le,
+        ),
+    ]
 }
 
 /// One gate: `measured` against `budget × tolerance` in the gate's own bound
@@ -614,7 +704,7 @@ fn main() {
         "ktesio perf-budgets harness (story 7-5 / NFR-4): fleet={FLEET_SIZE} \
          running={RUNNING_COUNT} read_iterations={} window={:?} settle={:?} \
          windows={} ci={} (plus a one-window subscriber-overhead addendum, \
-         measured-and-reported, not gated)",
+         gated at the story-10-3 ratified delta budgets)",
         config.read_iterations, config.window, config.settle, config.windows, config.ci,
     ));
 
@@ -622,8 +712,21 @@ fn main() {
     // removed at teardown (TempDir drops delete the whole tree). ----
     let state = tempfile::TempDir::new().expect("create the hermetic state root");
     let manifest_tmp = tempfile::TempDir::new().expect("create the manifest dir");
-    let fake_agent = locate_fake_agent();
-    let manifest_dir = write_heartbeat_manifest(manifest_tmp.path(), &fake_agent);
+    // The fixture exec resolves via the SHARED locator's `examples/` hop
+    // (story 10-1): an example's `current_exe` lands in
+    // `target/<profile>/examples/`, so the test-deps (`deps/`) default would
+    // look one directory too deep — the parameterized
+    // `fake_agent_bin_in(BinDir::Examples)` is the same resolution + the same
+    // on-demand-build fallback, with the profile-matching (--release) and
+    // --target-dir pinning the test-deps default lacked.
+    let fake_agent = fake_agent_bin_in(BinDir::Examples);
+    // The heartbeat fixture: the SHARED heartbeat preset (story 10-1) —
+    // contract v1, pause + interaction guaranteed ×3, self-reported metering,
+    // the `[config.model]` env mapping, and the heartbeat-only args (the
+    // steady-state window measures supervision, not metering ingestion).
+    let manifest_dir = ManifestFixture::heartbeat(MANIFEST_KIND, HEARTBEAT_MS, AGENT_LINGER_MS)
+        .exec(fake_agent)
+        .write(manifest_tmp.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open the engine");
     let facade = engine.blocking();
@@ -706,17 +809,17 @@ fn main() {
     }
     note("read-latency measurement complete");
 
-    // ---- Measure (3): subscriber-active overhead — MEASURED-AND-REPORTED,
-    // never gated. NFR-4's gated figures above are ZERO-subscriber figures
-    // by design; the epic ships a subscription surface, so the harness also
-    // measures the SAME per-instance figures and read p99 with ONE active
-    // subscriber attached and reports the delta vs the unsubscribed baseline.
-    // It runs AFTER the gated measurements (so it cannot contaminate them),
-    // uses ONE steady-state window even in CI mode (context, not gates), and
-    // the heartbeat idlers must still be alive — which is why the startup
-    // liveness check counts this window too. A ratified subscriber-active
-    // budget is proposed deferred work; until one exists these numbers only
-    // inform.
+    // ---- Measure (3): subscriber-active overhead — GATED at the story-10-3
+    // ratified delta budgets. NFR-4's gated figures above are ZERO-subscriber
+    // figures by design; a host using the subscription surface needs a budget
+    // covering fan-out cost, so the harness measures the SAME per-instance
+    // figures and read p99 with ONE active subscriber attached and the DELTAS
+    // vs the unsubscribed baseline gate (strict locally; the shared-runner
+    // tolerance on CI — see `subscriber_gates`). It still runs AFTER the
+    // gated measurements (so it cannot contaminate them), uses ONE
+    // steady-state window even in CI mode (the tolerance is the noise
+    // absorber there), and the heartbeat idlers must still be alive — which
+    // is why the startup liveness check counts this window too.
     note("subscriber-overhead addendum: attaching ONE active subscriber");
     let subscription = facade.subscribe();
     let sub_steady = measure_steady_windows(&config, 1);
@@ -747,7 +850,7 @@ fn main() {
     } else {
         1.0
     };
-    let gates = evaluate_gates(p99, &figures, tolerance);
+    let gates = evaluate_gates(p99, &figures, &subscriber_overhead, tolerance);
     let report = build_report(
         &config,
         &reads,
@@ -1146,10 +1249,10 @@ fn build_report(
         "read_latency_ms": per_kind,
         "read_p99_overall_ms": overall_p99_ms,
         "subscriber_overhead": {
-            "policy": "measured-and-REPORTED, never gated — no ratified subscriber-active budget exists yet (proposed deferred work); the gated figures in this report are ZERO-subscriber figures by design",
+            "policy": "GATED at the story-10-3 ratified subscriber-active delta budgets (strict locally; the shared-runner tolerance on CI, one window even on CI — the deltas gate, the absolutes are context); the gated zero-subscriber figures above were measured BEFORE the subscriber attached, by design",
             "subscriber_count": 1,
             "window_count": 1,
-            "window_note": "one steady-state window even in CI mode — these figures are context, not gates",
+            "window_note": "one steady-state window even in CI mode — the ratified delta budgets are sized for single-window noise (docs/testing.md)",
             "cpu_percent_per_instance": subscriber_overhead.cpu_per_instance_pct,
             "cpu_delta_vs_unsubscribed_pct_points": subscriber_overhead.cpu_delta_pct_points,
             "rss_mib_per_instance_mean": subscriber_overhead.rss_per_instance_mib_mean,
@@ -1180,21 +1283,25 @@ fn build_report(
             "cpu_per_instance_pct": BUDGET_CPU_PER_INSTANCE_PCT,
             "rss_per_instance_mib": BUDGET_RSS_PER_INSTANCE_MIB,
             "rss_spike_factor": RSS_SPIKE_TOLERANCE,
+            "subscriber_cpu_delta_pct_points": BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS,
+            "subscriber_rss_delta_mib": BUDGET_SUBSCRIBER_RSS_DELTA_MIB,
+            "subscriber_read_p99_delta_ms": BUDGET_SUBSCRIBER_READ_P99_DELTA_MS,
+            "subscriber_budget_source": "story 10-3 ratification over the observed 2026-09-10 runs (docs/testing.md)",
         },
         "ci_tolerance": {
             "name": "shared_runner_tolerance",
             "factor": CI_CPU_TOLERANCE_FACTOR,
-            "applies_to": "cpu_per_instance gate only, CI mode only",
+            "applies_to": "cpu_per_instance gate AND the story-10-3 subscriber-active delta gates, CI mode only",
             "applied": tolerance != 1.0,
             "effective_cpu_budget_pct": BUDGET_CPU_PER_INSTANCE_PCT * tolerance,
-            "policy": "reads and RSS gate at budget on every gate platform (ubuntu CI; strict local macOS — Windows is measured-and-reported, never a gate platform); CPU gates strict (x1.0) locally and at the named shared-runner tolerance (x1.5) on CI — over the median of three windows — where co-tenant noise is uncontrollable",
+            "policy": "reads and RSS gate at budget on every gate platform (ubuntu CI; strict local macOS — Windows is measured-and-reported, never a gate platform); CPU gates strict (x1.0) locally and at the named shared-runner tolerance (x1.5) on CI — over the median of three windows — where co-tenant noise is uncontrollable; the subscriber delta gates use the same factor shape but stay single-window (the factor is their noise absorber, and their budgets are sized for it)",
         },
         "gates": verdicts,
         "notes": [
             "units: the gate is 50 MiB/instance (derived from raw bytes); this reconciles with NFR-4's '50MB' prose intent — documented in docs/testing.md",
             "platform scope: gates are enforced on ubuntu CI; strict local gating on macOS; Windows figures are measured-and-reported (sysinfo's memory() is the working-set-size analog there), never a gate platform",
             "the per-instance budgets mean MARGINAL supervision overhead: the fixed engine cost amortizes over the running count (see the consts' budget-assumption docs)",
-            "subscriber overhead is measured separately (the subscriber_overhead block, ONE active subscriber) and REPORTED, not gated — the gated figures are zero-subscriber by design; a ratified subscriber-active budget is proposed deferred work",
+            "subscriber overhead is measured separately (the subscriber_overhead block, ONE active subscriber, after the gated phases) and its DELTAS gate at the story-10-3 ratified budgets (strict locally; shared-runner tolerance on CI) — a negative delta passes trivially: the budget ceilings the overhead, never the measurement's sign",
         ],
         "status": if gates.passed { "pass" } else { "fail" },
     })
@@ -1226,16 +1333,18 @@ fn print_report(report: &serde_json::Value, gates: &GateReport) {
     }
     if let Some(sub) = report["subscriber_overhead"].as_object() {
         println!(
-            "PERF BUDGETS — with ONE active subscriber (measured-and-REPORTED, not gated): \
-             CPU {:.4}%/instance ({:+.4} pts vs unsubscribed); RSS mean {:.2} MiB/instance \
-             ({:+.2} MiB); reads p99 {:.3} ms ({:+.3} ms vs unsubscribed). \
-             No ratified subscriber-active budget exists yet.",
+            "PERF BUDGETS — with ONE active subscriber (deltas GATED at the ratified budgets): \
+             CPU {:.4}%/instance ({:+.4} pts vs unsubscribed, gate <= {}); RSS mean {:.2} MiB/instance \
+             ({:+.2} MiB, gate <= {}); reads p99 {:.3} ms ({:+.3} ms vs unsubscribed, gate <= {}).",
             sub["cpu_percent_per_instance"],
             sub["cpu_delta_vs_unsubscribed_pct_points"],
+            BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS,
             sub["rss_mib_per_instance_mean"],
             sub["rss_delta_vs_unsubscribed_mib"],
+            BUDGET_SUBSCRIBER_RSS_DELTA_MIB,
             sub["read_p99_overall_ms"],
             sub["read_p99_delta_vs_unsubscribed_ms"],
+            BUDGET_SUBSCRIBER_READ_P99_DELTA_MS,
         );
     }
     let tolerance_applied = report["ci_tolerance"]["applied"].as_bool().unwrap_or(false);
@@ -1306,106 +1415,6 @@ fn host_logical_cores() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// The fixture (the uj3 `write_flow_manifest` shape, heartbeat legs)
-// ---------------------------------------------------------------------------
-
-/// Locate the conformance `fake_agent` helper from THIS example's binary.
-///
-/// `ktesio_conformance::fake_agent_bin()` cannot be reused here: it resolves
-/// relative to a TEST binary's `deps/` directory, and an example runs from
-/// `target/<profile>/examples/` — so the same resolution is replicated with
-/// the `examples` hop, plus an identical on-demand-build fallback that passes
-/// an explicit `--target-dir` (derived from this binary's own path, which
-/// already respects `CARGO_TARGET_DIR`) so the helper lands exactly where the
-/// candidate lives regardless of the invoking shell's cwd.
-fn locate_fake_agent() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("resolve the running example binary");
-    dir.pop(); // drop the example binary name → .../examples
-    if dir.ends_with("examples") {
-        dir.pop(); // → .../target/<profile>
-    }
-    let candidate = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
-    if candidate.exists() {
-        return candidate;
-    }
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut build = std::process::Command::new(&cargo);
-    build
-        .args(["build", "-p", "ktesio-conformance", "--bin", "fake_agent"])
-        .env_remove("RUSTC_WRAPPER");
-    if dir.ends_with("release") {
-        build.arg("--release");
-    }
-    if let Some(target_root) = dir.parent() {
-        build.arg("--target-dir").arg(target_root);
-    }
-    let status = build
-        .status()
-        .expect("spawn cargo to build the fake_agent helper");
-    if !(status.success() && candidate.exists()) {
-        panic!(
-            "fake_agent helper not found at {} and the on-demand build did not produce it \
-             (status: {status:?}). Run `cargo build -p ktesio-conformance --bin fake_agent` \
-             from the workspace root, then re-run the harness.",
-            candidate.display()
-        );
-    }
-    candidate
-}
-
-/// Write the fixture manifest (`adapter.toml`): the established
-/// `uj3::write_flow_manifest` shape — contract v1, per-OS capability
-/// declaration, self-reported metering, a `[config.model]` env mapping —
-/// with HEARTBEAT legs instead of usage emission: the running subset idles
-/// (`--heartbeat-ms` only) so the steady-state window measures supervision,
-/// not metering ingestion, and a 60 s self-exit bounds any orphan. All
-/// FLEET_SIZE instances register under this ONE manifest (the same adapter
-/// kind repeated — exactly like registering N `mock` instances; instance
-/// NAMES are what must be fleet-unique).
-fn write_heartbeat_manifest(dir: &Path, exec: &Path) -> PathBuf {
-    std::fs::create_dir_all(dir).expect("create the manifest dir");
-    // A non-UTF8 exec path would be silently munged by to_string_lossy into a
-    // launch that never resolves — fail loudly instead.
-    let exec = exec.to_str().unwrap_or_else(|| {
-        panic!(
-            "the fake_agent path {} is not valid UTF-8; the TOML manifest requires a UTF-8 path",
-            exec.display()
-        )
-    });
-    let exec = exec.replace('\\', "/");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{MANIFEST_KIND}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = ["--heartbeat-ms", "{HEARTBEAT_MS}", "--linger-ms", "{AGENT_LINGER_MS}"]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-
-[config.model]
-env = "MODEL"
-"#
-    );
-    std::fs::write(dir.join("adapter.toml"), body).expect("write adapter.toml");
-    dir.to_path_buf()
-}
-
-// ---------------------------------------------------------------------------
 // Gate-math tests (run by `cargo test --all-targets` — NOT the harness)
 // ---------------------------------------------------------------------------
 
@@ -1441,9 +1450,22 @@ mod tests {
         SteadyFigures::new(10.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10)
     }
 
+    /// A subscriber pass with ZERO deltas (identical figures both passes) —
+    /// the default for tests that exercise the four zero-subscriber gates
+    /// and must not trip the story-10-3 subscriber gates appended after
+    /// them.
+    fn quiet_subscriber() -> SubscriberOverhead {
+        SubscriberOverhead::new(&healthy_steady(), 5.0, &healthy_steady(), 5.0)
+    }
+
     #[test]
     fn all_fast_reads_and_healthy_steady_pass() {
-        let gates = evaluate_gates(overall_read_p99(&fast_reads()), &healthy_steady(), 1.0);
+        let gates = evaluate_gates(
+            overall_read_p99(&fast_reads()),
+            &healthy_steady(),
+            &quiet_subscriber(),
+            1.0,
+        );
         assert!(gates.passed, "every gate must pass: {gates:?}");
     }
 
@@ -1456,7 +1478,7 @@ mod tests {
             (overall - 1500.0).abs() < 1e-9,
             "the overall p99 must be the worst kind's 1500ms tail: {overall}"
         );
-        let gates = evaluate_gates(overall, &healthy_steady(), 1.0);
+        let gates = evaluate_gates(overall, &healthy_steady(), &quiet_subscriber(), 1.0);
         assert!(!gates.passed, "a 1500ms p99 kind must fail the read gate");
         assert!(!gates.verdicts[0].passed);
         assert!(
@@ -1469,7 +1491,7 @@ mod tests {
     fn rss_mean_over_budget_fails() {
         // 600 MiB aggregate over 10 running = 60 MiB/instance > 50.
         let steady = SteadyFigures::new(10.0, 600.0 * 1024.0 * 1024.0, 600_000_000, 10);
-        let gates = evaluate_gates(5.0, &steady, 1.0);
+        let gates = evaluate_gates(5.0, &steady, &quiet_subscriber(), 1.0);
         assert!(
             !gates.verdicts[1].passed,
             "60 MiB/instance must fail: {gates:?}"
@@ -1485,12 +1507,12 @@ mod tests {
         // gate consumes the divided figure, never the aggregate).
         let steady = SteadyFigures::new(10.0, 400.0 * 1024.0 * 1024.0, 400_000_000, 10);
         assert!((steady.rss_per_instance_mib - 40.0).abs() < 1e-9);
-        let gates = evaluate_gates(5.0, &steady, 1.0);
+        let gates = evaluate_gates(5.0, &steady, &quiet_subscriber(), 1.0);
         assert!(gates.verdicts[1].passed);
         // The SAME aggregate over TWO running instances = 200 MiB/instance —
         // both the mean gate and the spike guard must fail.
         let few = SteadyFigures::new(10.0, 400.0 * 1024.0 * 1024.0, 400_000_000, 2);
-        let gates = evaluate_gates(5.0, &few, 1.0);
+        let gates = evaluate_gates(5.0, &few, &quiet_subscriber(), 1.0);
         assert!(!gates.verdicts[1].passed);
         assert!(!gates.verdicts[2].passed);
     }
@@ -1501,7 +1523,7 @@ mod tests {
         // 120 MiB/instance > 2 × 50 — the leak guard must fail the run.
         let steady = SteadyFigures::new(10.0, 400.0 * 1024.0 * 1024.0, 1200 * 1024 * 1024, 10);
         assert!((steady.rss_per_instance_mib - 40.0).abs() < 1e-9);
-        let gates = evaluate_gates(5.0, &steady, 1.0);
+        let gates = evaluate_gates(5.0, &steady, &quiet_subscriber(), 1.0);
         assert!(
             !gates.verdicts[2].passed,
             "a 120 MiB/instance spike must fail"
@@ -1513,10 +1535,10 @@ mod tests {
     fn cpu_gate_is_strict_locally_and_tolerant_on_ci() {
         // 2.5%/instance: over the strict 2% budget, under the CI 2% × 1.5 = 3%.
         let steady = SteadyFigures::new(25.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
-        let local = evaluate_gates(5.0, &steady, 1.0);
+        let local = evaluate_gates(5.0, &steady, &quiet_subscriber(), 1.0);
         assert!(!local.verdicts[3].passed, "2.5%/instance must fail strict");
         assert!(!local.passed);
-        let ci = evaluate_gates(5.0, &steady, CI_CPU_TOLERANCE_FACTOR);
+        let ci = evaluate_gates(5.0, &steady, &quiet_subscriber(), CI_CPU_TOLERANCE_FACTOR);
         assert!(ci.verdicts[3].passed, "2.5%/instance must pass at x1.5");
         assert!((ci.verdicts[3].effective_budget - 3.0).abs() < 1e-9);
         assert!((ci.verdicts[3].tolerance - 1.5).abs() < 1e-9);
@@ -1531,9 +1553,9 @@ mod tests {
         // budget (the gate is <=, so this passes); the same aggregate over
         // 5 running = 4%/instance fails it.
         let at_budget = SteadyFigures::new(20.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
-        assert!(evaluate_gates(5.0, &at_budget, 1.0).verdicts[3].passed);
+        assert!(evaluate_gates(5.0, &at_budget, &quiet_subscriber(), 1.0).verdicts[3].passed);
         let over = SteadyFigures::new(20.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 5);
-        assert!(!evaluate_gates(5.0, &over, 1.0).verdicts[3].passed);
+        assert!(!evaluate_gates(5.0, &over, &quiet_subscriber(), 1.0).verdicts[3].passed);
     }
 
     #[test]
@@ -1593,7 +1615,7 @@ mod tests {
         // normalization yields +inf, which fails every steady-state gate.
         let figures = SteadyFigures::new(0.0, 0.0, 0, 0);
         assert!(figures.cpu_per_instance_pct.is_infinite());
-        let gates = evaluate_gates(5.0, &figures, 1.0);
+        let gates = evaluate_gates(5.0, &figures, &quiet_subscriber(), 1.0);
         assert!(!gates.passed, "zero running instances must fail closed");
     }
 
@@ -1615,7 +1637,7 @@ mod tests {
         // excludes); just under it passes. The RSS/CPU ceilings keep their
         // `≤` bounds (exactly-at-budget passes there — pinned by
         // cpu_normalization_uses_the_running_count).
-        let at = evaluate_gates(1000.0, &healthy_steady(), 1.0);
+        let at = evaluate_gates(1000.0, &healthy_steady(), &quiet_subscriber(), 1.0);
         assert!(
             !at.verdicts[0].passed,
             "a p99 exactly at the 1000 ms budget must FAIL the strict < read gate: {at:?}"
@@ -1623,7 +1645,7 @@ mod tests {
         assert_eq!(at.verdicts[0].bound, GateBound::Lt);
         assert_eq!(at.verdicts[1].bound, GateBound::Le);
         assert_eq!(at.verdicts[3].bound, GateBound::Le);
-        let under = evaluate_gates(999.999, &healthy_steady(), 1.0);
+        let under = evaluate_gates(999.999, &healthy_steady(), &quiet_subscriber(), 1.0);
         assert!(under.verdicts[0].passed, "just under the budget passes");
     }
 
@@ -1685,5 +1707,104 @@ mod tests {
         // the sign is information, never abs()-ed away.
         let cheaper = SubscriberOverhead::new(&baseline, 5.0, &baseline, 4.0);
         assert!(cheaper.read_p99_delta_ms < 0.0);
+    }
+
+    #[test]
+    fn the_ratified_subscriber_budgets_are_pinned() {
+        // The story-10-3 ratification, pinned like the NFR-4 premise: a
+        // budget change must consciously edit these assertions (and update
+        // docs/testing.md's budget table with the new observations), never
+        // silently tweak a gate.
+        assert_eq!(BUDGET_SUBSCRIBER_CPU_DELTA_PCT_POINTS, 0.25);
+        assert_eq!(BUDGET_SUBSCRIBER_RSS_DELTA_MIB, 2.0);
+        assert_eq!(BUDGET_SUBSCRIBER_READ_P99_DELTA_MS, 100.0);
+    }
+
+    #[test]
+    fn subscriber_deltas_within_budget_pass_and_negative_deltas_pass_trivially() {
+        // Zero deltas (a quiet addendum) leave the whole report green — the
+        // three subscriber gates ride indices 4-6, appended after the four
+        // zero-subscriber gates whose meaning never moves.
+        let gates = evaluate_gates(5.0, &healthy_steady(), &quiet_subscriber(), 1.0);
+        assert!(gates.passed, "zero deltas must pass: {gates:?}");
+        assert_eq!(
+            gates.verdicts.len(),
+            7,
+            "four NFR-4 gates + three subscriber gates"
+        );
+        assert_eq!(gates.verdicts[4].name, "subscriber_cpu_delta_le_budget");
+        assert_eq!(gates.verdicts[5].name, "subscriber_rss_delta_le_budget");
+        assert_eq!(
+            gates.verdicts[6].name,
+            "subscriber_read_p99_delta_le_budget"
+        );
+        // A NEGATIVE delta (the subscriber pass measured cheaper — pure
+        // noise) passes trivially: the budget ceilings the OVERHEAD, never
+        // the measurement's sign.
+        let negative = SubscriberOverhead::new(&healthy_steady(), 5.0, &healthy_steady(), 4.0);
+        assert!(negative.read_p99_delta_ms < 0.0);
+        let gates = evaluate_gates(5.0, &healthy_steady(), &negative, 1.0);
+        assert!(
+            gates.passed,
+            "a cheaper subscriber pass must pass: {gates:?}"
+        );
+    }
+
+    #[test]
+    fn subscriber_deltas_over_the_ratified_budgets_fail() {
+        // Each delta driven far over its strict budget fails ITS gate — and
+        // the whole run — with every other figure healthy. Budgets: 0.25
+        // pct-points CPU Δ, 2 MiB RSS Δ, 100 ms read-p99 Δ.
+        let cpu = SteadyFigures::new(1_010.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let subscriber = SubscriberOverhead::new(&healthy_steady(), 5.0, &cpu, 5.0);
+        let gates = evaluate_gates(5.0, &healthy_steady(), &subscriber, 1.0);
+        assert!(!gates.passed, "a huge CPU delta must fail the run");
+        assert!(!gates.verdicts[4].passed, "the CPU delta gate: {gates:?}");
+
+        let rss = SteadyFigures::new(10.0, 2_100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let subscriber = SubscriberOverhead::new(&healthy_steady(), 5.0, &rss, 5.0);
+        let gates = evaluate_gates(5.0, &healthy_steady(), &subscriber, 1.0);
+        assert!(!gates.passed, "a huge RSS delta must fail the run");
+        assert!(!gates.verdicts[5].passed, "the RSS delta gate: {gates:?}");
+
+        let subscriber =
+            SubscriberOverhead::new(&healthy_steady(), 5.0, &healthy_steady(), 5_000.0);
+        let gates = evaluate_gates(5.0, &healthy_steady(), &subscriber, 1.0);
+        assert!(!gates.passed, "a huge read-p99 delta must fail the run");
+        assert!(
+            !gates.verdicts[6].passed,
+            "the read-p99 delta gate: {gates:?}"
+        );
+    }
+
+    #[test]
+    fn subscriber_gates_take_the_ci_tolerance_like_the_cpu_gate() {
+        // The policy shape: strict ×1.0 locally, ×1.5 on CI — a delta between
+        // the strict budget and the tolerated budget fails locally and passes
+        // on CI. CPU Δ 0.3 pct-points: over the strict 0.25, under 0.25 × 1.5
+        // = 0.375.
+        let with_cpu = SteadyFigures::new(13.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let subscriber = SubscriberOverhead::new(&healthy_steady(), 5.0, &with_cpu, 5.0);
+        assert!((subscriber.cpu_delta_pct_points - 0.3).abs() < 1e-9);
+        let local = evaluate_gates(5.0, &healthy_steady(), &subscriber, 1.0);
+        assert!(
+            !local.verdicts[4].passed,
+            "0.3 pct-points must fail the strict 0.25 budget: {:?}",
+            local.verdicts[4]
+        );
+        assert!(!local.passed, "the strict failure fails the whole run");
+        let ci = evaluate_gates(5.0, &healthy_steady(), &subscriber, CI_CPU_TOLERANCE_FACTOR);
+        assert!(
+            ci.verdicts[4].passed,
+            "0.3 pct-points must pass at x1.5 (0.375): {:?}",
+            ci.verdicts[4]
+        );
+        assert!((ci.verdicts[4].effective_budget - 0.375).abs() < 1e-9);
+        assert!((ci.verdicts[5].effective_budget - 3.0).abs() < 1e-9);
+        assert!((ci.verdicts[6].effective_budget - 150.0).abs() < 1e-9);
+        // The tolerance widens ONLY the CPU + subscriber delta gates — reads
+        // and RSS keep gating at strict budget.
+        assert!((ci.verdicts[0].effective_budget - BUDGET_READ_P99_MS).abs() < 1e-9);
+        assert!((ci.verdicts[1].effective_budget - BUDGET_RSS_PER_INSTANCE_MIB).abs() < 1e-9);
     }
 }

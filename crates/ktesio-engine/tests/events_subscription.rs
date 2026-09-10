@@ -58,6 +58,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ktesio_conformance::test_support::{self, ManifestFixture};
 use ktesio_conformance::uj3::{self, committed_usage_rows, usage_from_payload, CommittedUsage};
 use ktesio_engine::{
     broadcast, AdapterRef, BreachDimension, Engine, EngineEvent, RestartPolicy, TransitionCause,
@@ -67,114 +68,15 @@ use ktesio_engine::{
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Fixture manifests + shared drain/wait helpers
+// Shared drain/wait helpers
+//
+// The fixture manifests are the SHARED `ktesio_conformance::test_support`
+// presets (story 10-1): `ManifestFixture::lingering` for the cross-OS pause
+// families, `crash_once` for the crash/restart leg, `replay_batch` for the
+// VG2 leg — no local manifest-TOML builder lives here anymore. The drains
+// are the shared `test_support::drain_subscription` (ONE lag-accumulating
+// implementation for both receiver forms).
 // ---------------------------------------------------------------------------
-
-/// Write a manifest whose `[lifecycle.start]` exec is `fake_agent` + `args`
-/// (the `crash.rs`/`metering.rs` generic shape; interaction guaranteed so the
-/// readiness line is standard).
-fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
-    let bin = ktesio_conformance::fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-    );
-    std::fs::write(dir.join("adapter.toml"), body).expect("write the fake-agent manifest");
-}
-
-/// Write a manifest for a LINGERING agent (no usage emission) with pause +
-/// interaction `guaranteed` on all three OSes — the cross-OS pause the
-/// slow-subscriber and FIFO families hammer.
-fn write_lingering_manifest(dir: &Path, kind: &str) {
-    let bin = ktesio_conformance::fake_agent_bin();
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = ["--linger-ms", "600000"]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-    );
-    std::fs::write(dir.join("adapter.toml"), body).expect("write the lingering manifest");
-}
-
-/// Write a manifest whose agent crashes ONCE after its first launch, then
-/// lingers — the proven `tests/crash.rs` `--crash-times` pattern, with the
-/// cross-restart counter in `dir`.
-///
-/// The crash delay must COMFORTABLY EXCEED the engine's readiness window
-/// (READINESS_WINDOW = 300ms — the same rule supervisor.rs's own tests state)
-/// or the crash can land inside `watch_startup`, which records a
-/// starting→failed LAUNCH failure — a path that never consults the restart
-/// policy — and the start would error instead of later crash-detecting.
-/// 1500ms is 5× the window: past it on a cold, loaded first run.
-fn write_crash_once_manifest(dir: &Path, kind: &str) {
-    let bin = ktesio_conformance::fake_agent_bin();
-    let crash_state = dir.join("crash-count");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = ["--crash-after-ms", "1500", "--crash-times", "1", "--crash-state", {crash_state:?}]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-        crash_state = crash_state.to_string_lossy(),
-    );
-    std::fs::write(dir.join("adapter.toml"), body).expect("write the crash-once manifest");
-}
 
 /// Poll `instance_status` until `pred(state)` holds, bounded (the `crash.rs`
 /// helper, shared shape).
@@ -202,31 +104,10 @@ fn wait_until_state(
     }
 }
 
-/// Drain the subscription to its current tail with `try_recv`.
-///
-/// Exact, never racy: callers invoke this only AFTER every publishing call has
-/// returned (each publish completes under the supervisor lock before its
-/// facade call returns), so everything published is already buffered. Returns
-/// the received events plus the TOTAL dropped count if the receiver lagged
-/// past the capacity (the `Lagged` marker is not an event; counts ACCUMULATE
-/// with saturating adds — a drain can pass through more than one lag burst if
-/// publishes race the drain, and overwriting would undercount).
-fn drain(sub: &mut ktesio_engine::EventSubscription) -> (Vec<EngineEvent>, Option<u64>) {
-    let mut events = Vec::new();
-    let mut lagged: Option<u64> = None;
-    loop {
-        match sub.try_recv() {
-            Ok(event) => events.push(event),
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                lagged = Some(lagged.map_or(n, |acc| acc.saturating_add(n)));
-            }
-            Err(broadcast::error::TryRecvError::Empty) => return (events, lagged),
-            Err(broadcast::error::TryRecvError::Closed) => {
-                panic!("the subscription closed while the engine is alive")
-            }
-        }
-    }
-}
+// The subscription drain is the SHARED `test_support::drain_subscription`
+// (story 10-1) — ONE lag-accumulating `try_recv` implementation for both
+// receiver forms; its `Closed` arm is the invariant panic (a subscription
+// holds its engine's runtime, so a closed bus mid-test is a violation).
 
 /// The supervisor-lock barrier: a fleet read takes the supervisor mutex, so
 /// once it returns, any concurrently-running publisher (the reaper's poll /
@@ -389,7 +270,7 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     );
     // Barrier (see `barrier`): the reaper's breaching pass is done publishing.
     barrier(&facade);
-    let (phase1, lagged1) = drain(&mut sub);
+    let (phase1, lagged1) = test_support::drain_subscription(&mut sub);
     assert!(
         lagged1.is_none(),
         "a dozen events never exceed the capacity"
@@ -398,7 +279,7 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     facade
         .stop(uj3::FLOW_INSTANCE, Some(uj3::STOP_WINDOW))
         .expect("stop");
-    let (phase2, lagged2) = drain(&mut sub);
+    let (phase2, lagged2) = test_support::drain_subscription(&mut sub);
     assert!(lagged2.is_none());
 
     let events: Vec<EngineEvent> = phase1.iter().cloned().chain(phase2).collect();
@@ -531,7 +412,10 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
 fn subscriber_sees_the_crashed_and_restarted_transitions() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_crash_once_manifest(manifest.path(), "sub-crashy");
+    // The crash/restart fixture: the SHARED crash-once preset (story 10-1;
+    // the readiness-safe 1500ms delay rationale lives on the preset).
+    ManifestFixture::crash_once("sub-crashy", &manifest.path().join("crash-count"))
+        .write(manifest.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -567,7 +451,7 @@ fn subscriber_sees_the_crashed_and_restarted_transitions() {
     }
     barrier(&facade);
 
-    let (events, lagged) = drain(&mut sub);
+    let (events, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     let received = transitions_of(&events);
     let committed = committed_transitions(&facade, "sub-crashy");
@@ -613,7 +497,7 @@ fn subscriber_sees_the_crashed_and_restarted_transitions() {
 fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_lingering_manifest(manifest.path(), "sub-slow");
+    ManifestFixture::lingering("sub-slow").write(manifest.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -679,7 +563,7 @@ fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
     // Now the stalled receiver catches up: first the Lagged marker naming the
     // dropped prefix, then the retained window — which corresponds EXACTLY to
     // the durable log's tail (nothing committed is ever mis-delivered).
-    let (events, lagged) = drain(&mut sub);
+    let (events, lagged) = test_support::drain_subscription(&mut sub);
     let lagged = lagged.expect("a stalled receiver past the capacity observes Lagged");
     assert_eq!(
         lagged,
@@ -743,7 +627,7 @@ fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
 fn two_subscribers_fan_out_independently() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_lingering_manifest(manifest.path(), "sub-fanout");
+    ManifestFixture::lingering("sub-fanout").write(manifest.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -773,8 +657,8 @@ fn two_subscribers_fan_out_independently() {
         .unwrap();
     barrier(&facade);
 
-    let (events_a, lag_a) = drain(&mut sub_a);
-    let (events_b, lag_b) = drain(&mut sub_b);
+    let (events_a, lag_a) = test_support::drain_subscription(&mut sub_a);
+    let (events_b, lag_b) = test_support::drain_subscription(&mut sub_b);
     assert!(lag_a.is_none() && lag_b.is_none());
     assert!(!events_a.is_empty(), "the sequence is non-empty");
     assert_eq!(
@@ -805,7 +689,7 @@ fn two_subscribers_fan_out_independently() {
 fn interleaved_instances_keep_per_instance_fifo() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_lingering_manifest(manifest.path(), "sub-fifo");
+    ManifestFixture::lingering("sub-fifo").write(manifest.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -838,7 +722,7 @@ fn interleaved_instances_keep_per_instance_fifo() {
     facade.resume("fifo-b").unwrap();
     barrier(&facade);
 
-    let (events, lagged) = drain(&mut sub);
+    let (events, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
 
     // The exact expected global sequence: A's start edges, B's start edges,
@@ -956,7 +840,7 @@ fn interleaved_instances_keep_per_instance_fifo() {
     uj3::stop_all_resilient(&facade, &["fifo-usage-a", "fifo-usage-b"], uj3::STOP_WINDOW);
     barrier(&facade);
 
-    let (events, lagged) = drain(&mut sub);
+    let (events, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     for name in ["fifo-usage-a", "fifo-usage-b"] {
         let mine: Vec<EngineEvent> = events
@@ -993,7 +877,7 @@ fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
     // every OS (opening a directory for append is an error, no OS cfg here).
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_lingering_manifest(manifest.path(), "sub-silent");
+    ManifestFixture::lingering("sub-silent").write(manifest.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -1014,7 +898,7 @@ fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
         "the instance to start",
     );
     barrier(&facade);
-    let (baseline, lagged) = drain(&mut sub);
+    let (baseline, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     assert_eq!(
         transitions_of(&baseline).len(),
@@ -1037,7 +921,7 @@ fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
         facade.pause("sub-silent").is_err(),
         "the obstructed append must fail the transition"
     );
-    let (quiet, lagged) = drain(&mut sub);
+    let (quiet, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     assert!(
         quiet.is_empty(),
@@ -1048,7 +932,7 @@ fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
     std::fs::remove_dir(&log).expect("clear the obstruction");
     facade.resume("sub-silent").expect("resume after clearing");
     barrier(&facade);
-    let (after, lagged) = drain(&mut sub);
+    let (after, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     let resumed = transitions_of(&after);
     assert_eq!(
@@ -1134,7 +1018,7 @@ fn a_failed_breach_append_still_enforces_but_publishes_no_breach() {
         uj3::STATE_POLL_BUDGET,
     );
     barrier(&facade);
-    let (events, lagged) = drain(&mut sub);
+    let (events, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
 
     assert!(
@@ -1177,17 +1061,8 @@ fn a_replayed_batch_publishes_no_duplicate_usage_event() {
     // Inserted/DuplicateReplay match would double-deliver here.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_fake_manifest(
-        manifest.path(),
-        "sub-replay",
-        &[
-            "--emit-usage",
-            "3",
-            "--replay-usage",
-            "--linger-ms",
-            "600000",
-        ],
-    );
+    // The replay fixture: the SHARED replay-batch preset (story 10-1).
+    ManifestFixture::replay_batch("sub-replay", 3).write(manifest.path());
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -1209,7 +1084,7 @@ fn a_replayed_batch_publishes_no_duplicate_usage_event() {
     std::thread::sleep(Duration::from_millis(800));
     barrier(&facade);
 
-    let (events, lagged) = drain(&mut sub);
+    let (events, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     let usage = usage_of(&events);
     let rows = committed_usage_rows(state.path(), "sub-replay");
@@ -1237,7 +1112,7 @@ fn a_replayed_batch_publishes_no_duplicate_usage_event() {
 async fn an_async_consumer_receives_the_flow_over_the_raw_receiver() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    write_lingering_manifest(manifest.path(), "sub-async");
+    ManifestFixture::lingering("sub-async").write(manifest.path());
     let state_path = state.path().to_path_buf();
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");

@@ -39,6 +39,21 @@
 //! [`EventSubscription`] owns a blocking `recv` bridged through the engine
 //! runtime exactly like every other facade method.
 
+//! ## The diagnostic sink (story 10-2)
+//!
+//! The engine writes TWO operational diagnostics (the DC-10 memory-delivery
+//! notice and the enforcement breadcrumb). By default they go to stderr,
+//! exactly as they always have. A host that owns its stderr installs a
+//! [`DiagnosticSink`](crate::DiagnosticSink) — any `std::io::Write` — at open
+//! ([`Engine::open_with_diagnostics`]) or any time later
+//! ([`Engine::with_diagnostics`] / [`Blocking::with_diagnostics`]); the
+//! diagnostics then route to the sink, receiving the exact bytes (same
+//! `[ktesio] `-prefixed text, one line each) stderr would have received.
+//! Installing REPLACES any earlier sink (rotation) and is one-way — there is
+//! no uninstall back to the stderr default; a host that wants the default
+//! back re-opens the engine. The sink is engine-embedder ergonomics — it
+//! never touches the adapter-api contract.
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,10 +64,10 @@ use ktesio_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, EffectiveConfig,
-    EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState, LogLine,
-    Registry, RegistryError, RemoveDisposition, RestartPolicy, Supervisor, TransitionCause,
-    TransitionEvent,
+    broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, DiagnosticSink,
+    EffectiveConfig, EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState,
+    LogLine, Registry, RegistryError, RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor,
+    Supervisor, TransitionCause, TransitionEvent,
 };
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
@@ -167,6 +182,39 @@ impl Engine {
     ///    task that periodically runs [`Supervisor::poll_once`] via
     ///    `spawn_blocking` and times the Restart Policy backoffs.
     pub fn open(base: Option<PathBuf>) -> Result<Self, RegistryError> {
+        Self::open_inner(base, None)
+    }
+
+    /// Open an engine with a host-provided diagnostic sink INSTALLED FROM THE
+    /// FIRST MOMENT (story 10-2).
+    ///
+    /// Behaviorally [`Engine::open`] in every respect except one: the sink is
+    /// installed BEFORE orphan adoption runs and BEFORE the crash-detection
+    /// reaper starts, so even a diagnostic fired by the reaper for an adopted
+    /// instance (an enforcement breadcrumb for a budget breach committed right
+    /// after open) routes to the sink — no stderr write can slip through
+    /// between open and a later install. Hosts that can pass the sink at open
+    /// should; [`Engine::with_diagnostics`] exists for installing or rotating
+    /// a sink later in the engine's life.
+    ///
+    /// See [`DiagnosticSink`](crate::DiagnosticSink) for the sink contract
+    /// (what it receives, thread-safety, the no-re-entry rule, the one-way
+    /// install) and docs/embedding.md for the host-facing guide.
+    pub fn open_with_diagnostics(
+        base: Option<PathBuf>,
+        sink: DiagnosticSink,
+    ) -> Result<Self, RegistryError> {
+        Self::open_inner(base, Some(sink))
+    }
+
+    /// The shared open path (story 10-2): `open` passes no sink (the
+    /// diagnostics keep their default stderr behavior, byte-identical to the
+    /// pre-sink engine), `open_with_diagnostics` installs the host's writer
+    /// before any supervision work starts.
+    fn open_inner(
+        base: Option<PathBuf>,
+        diagnostics: Option<DiagnosticSink>,
+    ) -> Result<Self, RegistryError> {
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
             name: "<engine-runtime>".to_string(),
@@ -179,8 +227,13 @@ impl Engine {
         // pool, where `Handle::current` is unavailable). A `Handle` spawns onto
         // its runtime from any thread, so this is sound. Story 7-2: keep a bus
         // clone OUTSIDE the supervisor mutex so `subscribe()` is lock-free (see
-        // EngineInner::events).
-        let supervisor = Supervisor::with_runtime(rt.handle().clone());
+        // EngineInner::events). Story 10-2: install the host's diagnostic sink
+        // (when given) BEFORE adoption + the reaper spawn, so no diagnostic can
+        // fire before the sink is in place.
+        let mut supervisor = Supervisor::with_runtime(rt.handle().clone());
+        if let Some(sink) = diagnostics {
+            supervisor.install_diagnostics(sink);
+        }
         let events = supervisor.event_bus();
         let inner = Arc::new(EngineInner {
             registry: Mutex::new(registry),
@@ -269,6 +322,44 @@ impl Engine {
     /// module docs for why `kt` uses this instead of becoming an async binary.
     pub fn blocking(&self) -> Blocking<'_> {
         Blocking { engine: self }
+    }
+
+    /// Install (or replace) the host-provided diagnostic sink (story 10-2) on
+    /// an already-open engine.
+    ///
+    /// The engine's two operational diagnostics — the DC-10 memory-delivery
+    /// notice and the enforcement breadcrumb — then route to `sink` instead of
+    /// stderr, receiving the exact bytes (same `[ktesio] `-prefixed text, one
+    /// `\n`-terminated line per diagnostic) stderr would have received. With
+    /// no sink installed (the [`Engine::open`] default) the diagnostics keep
+    /// their historical stderr behavior, byte-identical. See
+    /// [`DiagnosticSink`](crate::DiagnosticSink) for the full contract.
+    ///
+    /// This is deliberately a SYNC method like [`Engine::subscribe`]: it takes
+    /// the supervisor lock briefly (the sink is one field swap behind that
+    /// mutex) and needs no blocking-pool trip — safe from any context.
+    /// Installing replaces any earlier sink, so a host can rotate its writer
+    /// mid-flight; the change takes effect for every later diagnostic (the
+    /// outgoing writer is flushed before the swap, so a buffering writer does
+    /// not silently lose its bytes across the rotation).
+    ///
+    /// ## Installing is ONE-WAY
+    ///
+    /// There is no uninstall back to the stderr default: this method (and
+    /// every install path) REPLACES the current sink and never removes one.
+    /// A host that wants the default stderr behavior back re-opens the
+    /// engine ([`Engine::open`]), or installs its own writer that emits to
+    /// the process's stderr — deliberately so: a host that installed a sink
+    /// almost certainly does not own its stderr, and a silent revert to
+    /// stderr would be the wrong fallback. For a sink that must also catch
+    /// reaper-fired diagnostics for adopted instances in the open-to-install
+    /// window, prefer [`Engine::open_with_diagnostics`].
+    pub fn with_diagnostics(&self, sink: DiagnosticSink) {
+        self.inner
+            .supervisor
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .install_diagnostics(sink);
     }
 
     /// Subscribe to the engine's committed-event stream (story 7-2, FR-33).
@@ -1007,6 +1098,82 @@ impl Engine {
         .await
     }
 
+    /// Backfill an instance's COMMITTED events as bus payloads (story 10-3) —
+    /// the one-call remedy for the event bus's documented crash-window
+    /// at-most-once delivery.
+    ///
+    /// Reads the same committed truth the query APIs serve (the instance's
+    /// `instance.log` transitions, `breaches.log` breach records, and
+    /// `usage_events` ledger rows — COMMITTED records only: a failed append
+    /// never appears here either) and converts every record past `after` into
+    /// the exact [`EngineEvent`] wrapper the live bus delivers. The returned
+    /// [`ResyncBatch`] carries those events plus the [`ResyncCursor`] to pass
+    /// to the NEXT call, so re-running a resync never re-delivers what a host
+    /// already consumed.
+    ///
+    /// ## Ordering: both orders work; pick by the gap/duplicate tradeoff
+    ///
+    /// Within each family the batch is exact commit order (log line order /
+    /// ledger `rowid` order — the same orders the durable record keeps);
+    /// across families the batch is family-major (transitions, then breaches,
+    /// then usage), because the durable record carries no global cross-family
+    /// sequence. How to combine the backfill with the live stream is the
+    /// host's ordering choice:
+    ///
+    /// * **Subscribe FIRST, then resync** — RECOMMENDED for gap-sensitive
+    ///   hosts. Gap-free by construction (every commit after the subscribe
+    ///   is delivered live), at the cost of overlap with the backfill, which
+    ///   the host dedups per family against its own cursor position
+    ///   (duplicates, never gaps).
+    /// * **Resync first, then subscribe** — no seam duplicates (the backfill
+    ///   is precisely the prefix, the live stream precisely the suffix), but
+    ///   NOT gap-free: a commit+publish landing between `resync_events`
+    ///   returning and `subscribe()` is delivered by NEITHER. Use it across
+    ///   a quiescent agent (stopped/paused, no traffic) or accept the
+    ///   window.
+    ///
+    /// The backfill is also NOT a cross-family point-in-time snapshot: the
+    /// three family reads are sequential, so a commit landing between them
+    /// skews the families relative to each other (per-family slices stay
+    /// exact and cursor-lossless). See `domain::resync` for the full
+    /// contract, including both honesty notes.
+    ///
+    /// This is a READ-side helper: the bus, its publish points, and the
+    /// subscribe semantics are untouched. Runs on the blocking pool (registry
+    /// lock + file/DB reads), like the other reads. An unregistered name fails
+    /// [`EngineError::NotFound`] and a malformed name
+    /// [`EngineError::InvalidName`] (the `read_agent_log` precedent — a
+    /// mistyped name must not read as a silent empty backfill). The reads are
+    /// torn-tail tolerant (ONE unparseable trailing line per log is skipped —
+    /// and only when it carries the torn-append signature, the file not
+    /// ending with a newline — with the skip SURFACED on the batch's
+    /// `torn_tail_skipped`, because the engine's next append fuses onto the
+    /// torn fragment and the skipped line may be carrying a good record);
+    /// every other malformed line is a typed [`EngineError::Log`], as is a
+    /// cursor position past a family's committed count (a truncated/rotated
+    /// log — never silently clamped into a re-delivery). Sync consumers use
+    /// [`Blocking::resync_events`].
+    pub async fn resync_events(
+        &self,
+        name: &str,
+        after: ResyncCursor,
+    ) -> Result<ResyncBatch, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            registry
+                .lookup(&iname)
+                .map_err(crate::domain::registry_error_to_engine)?;
+            crate::domain::read_committed(&registry, &iname, &after)
+        })
+        .await
+    }
+
     /// Read the retained ATTRIBUTED output log for an instance (story 4-2,
     /// AC-A) — a ONE-SHOT full read of whatever is currently retained (the
     /// current generation plus any rotated predecessors), in on-disk append
@@ -1163,6 +1330,20 @@ impl Blocking<'_> {
         }
     }
 
+    /// Blocking install (or replace) of the story-10-2 diagnostic sink — the
+    /// sync-surface form of [`Engine::with_diagnostics`]. Like `subscribe`,
+    /// this is a DIRECT sync call, not a `block_on` bridge: it takes the
+    /// supervisor lock for one field swap and returns. The engine's two
+    /// operational diagnostics then route to `sink` (exact stderr bytes, one
+    /// line each) instead of stderr; the no-sink default is unchanged.
+    /// Installing REPLACES (never removes) — there is no uninstall back to
+    /// the stderr default; see [`Engine::with_diagnostics`] for the one-way
+    /// install note. See [`DiagnosticSink`](crate::DiagnosticSink) for the
+    /// contract.
+    pub fn with_diagnostics(&self, sink: DiagnosticSink) {
+        self.engine.with_diagnostics(sink);
+    }
+
     /// Blocking [`Engine::transition_events`].
     pub fn transition_events(&self, name: &str) -> Result<Vec<TransitionEvent>, EngineError> {
         self.engine.rt.block_on(self.engine.transition_events(name))
@@ -1173,6 +1354,21 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.budget_breach_events(name))
+    }
+
+    /// Blocking [`Engine::resync_events`] (story 10-3) — the crash-window
+    /// backfill: committed events past `after` as bus payloads, plus the
+    /// cursor for the next call. See the async method for the full contract
+    /// (both orderings and their tradeoffs, the surfaced torn-tail skip, and
+    /// the truncation guard).
+    pub fn resync_events(
+        &self,
+        name: &str,
+        after: ResyncCursor,
+    ) -> Result<ResyncBatch, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.resync_events(name, after))
     }
 
     /// Blocking [`Engine::read_agent_log`] (story 4-2, AC-A).

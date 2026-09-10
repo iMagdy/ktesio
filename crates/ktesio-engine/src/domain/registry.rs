@@ -1250,6 +1250,17 @@ impl Registry {
         Ok(self.store.record_usage_event(event, rate)?)
     }
 
+    /// The committed [`UsageEvent`] ROWS for an instance in commit order
+    /// (story 10-3: the resync helper's ledger read) — one struct per
+    /// `usage_events` row, `rowid`-ordered (insertion order). An absent
+    /// instance / empty ledger reads as an empty vec.
+    pub(crate) fn usage_rows(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Vec<crate::domain::UsageEvent>, RegistryError> {
+        Ok(self.store.usage_events(name)?)
+    }
+
     /// The CUMULATIVE token totals for an instance (sum over all its Runs) — the
     /// Fleet-detail `usage` read (AC-C/AC11). An absent instance totals zero.
     pub(crate) fn usage_totals(
@@ -1302,6 +1313,13 @@ impl Registry {
     #[cfg(test)]
     pub(crate) fn paths(&self) -> &EnginePaths {
         &self.paths
+    }
+
+    /// The engine STATE DB path — the `usage_events` ledger's home. Names the
+    /// ledger family's record location in errors that need it (the story-10-3
+    /// resync helper's truncation guard).
+    pub(crate) fn state_db_path(&self) -> std::path::PathBuf {
+        self.paths.state_db()
     }
 
     // ---- Memory Backing collaboration surface (story 5-1; crate-internal) ----

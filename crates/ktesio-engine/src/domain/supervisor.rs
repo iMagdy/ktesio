@@ -43,7 +43,9 @@
 //! log/query surface, which stays the machine-authoritative record.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ktesio_adapter_api::{Capability, ConfigMapping, OsId, SupportLevel};
@@ -415,6 +417,47 @@ struct Supervised {
     stop_unconfirmed: bool,
 }
 
+/// A host-provided diagnostic sink (story 10-2): the writer every engine
+/// diagnostic routes to when one is installed, instead of the default stderr.
+///
+/// The engine names the WIDE, thread-safe shape — `Arc<Mutex<Box<dyn Write +
+/// Send>>>` — so a host can clone the `Arc` and share ONE sink across several
+/// engines (or engine + non-engine components) in one process. The engine's
+/// two AD-12 diagnostics (the DC-10 memory-delivery notice and the
+/// enforcement breadcrumb) emit through it when one is installed; with no
+/// sink the diagnostics go to stderr exactly as they always have (the default
+/// path is byte-identical to the pre-sink behavior).
+///
+/// Each diagnostic arrives as ONE full line — the message text as it appears
+/// on stderr today, `[ktesio] ` prefixed, `\n` terminated — so a sink
+/// receiving a diagnostic receives the exact bytes the default stderr path
+/// would have emitted. Write failures are swallowed (the diagnostics are
+/// best-effort by contract, AD-12 — a broken or closed host writer must never
+/// fail or crash supervision), and a write PANIC in the host's `Write` impl
+/// is caught and swallowed the same way — a host bug must never unwind
+/// through the engine's supervisor critical section (that would poison the
+/// supervisor mutex on its way out); the same sink keeps receiving later
+/// diagnostics. The writer is invoked while the SUPERVISOR lock is held
+/// (both emission sites are supervisor paths), so a sink's `Write` impl must
+/// not re-enter the engine — a call that took the supervisor lock would
+/// deadlock; routing the line onward inside the writer's own lock is fine.
+///
+/// Installing is ONE-WAY: `install_diagnostics` (reached via
+/// [`Engine::with_diagnostics`] / [`Blocking::with_diagnostics`]) REPLACES
+/// the current sink — it never removes one, so there is no uninstall back to
+/// the stderr default. A host that wants the default back re-opens the
+/// engine ([`Engine::open`](crate::Engine::open)), or installs its own writer
+/// that emits to the process's stderr.
+///
+/// Install via [`Engine::open_with_diagnostics`](crate::Engine::open_with_diagnostics)
+/// (airtight — the sink is in place before orphan adoption and before the
+/// crash-detection reaper starts) or post-open via
+/// [`Engine::with_diagnostics`](crate::Engine::with_diagnostics) /
+/// [`Blocking::with_diagnostics`](crate::Blocking::with_diagnostics)
+/// (install or rotate at any later point; rotation flushes the outgoing
+/// writer before the swap so buffered bytes are not silently lost).
+pub type DiagnosticSink = Arc<Mutex<Box<dyn Write + Send>>>;
+
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
@@ -444,6 +487,13 @@ pub struct Supervisor {
     /// (only the sync unit tests, which never start an observed instance, use the
     /// handle-less constructors).
     runtime: Option<tokio::runtime::Handle>,
+    /// The host-provided diagnostic sink (story 10-2), when one is installed.
+    /// `None` (every constructor's default) keeps the historical behavior: the
+    /// two AD-12 diagnostics go to stderr. Both emission sites run while the
+    /// supervisor lock is held (the start / enforcement paths), so the sink's
+    /// own `Mutex` is contended only by the rare diagnostics — never a hot
+    /// path — and installs/rotations serialize with emissions correctly.
+    diagnostics: Option<DiagnosticSink>,
 }
 
 impl Supervisor {
@@ -462,6 +512,7 @@ impl Supervisor {
             backoff: BackoffSchedule::production(),
             events: EventBus::new(),
             runtime: None,
+            diagnostics: None,
         }
     }
 
@@ -479,6 +530,7 @@ impl Supervisor {
             backoff: BackoffSchedule::production(),
             events: EventBus::new(),
             runtime: Some(runtime),
+            diagnostics: None,
         }
     }
 
@@ -496,6 +548,7 @@ impl Supervisor {
             backoff,
             events: EventBus::new(),
             runtime: None,
+            diagnostics: None,
         }
     }
 
@@ -519,6 +572,99 @@ impl Supervisor {
     /// (or any send error) is swallowed by the bus.
     fn publish(&self, event: EngineEvent) {
         self.events.publish(event);
+    }
+
+    /// Install (or replace) the host-provided diagnostic sink (story 10-2).
+    /// Crate-internal: hosts reach it through
+    /// [`Engine::open_with_diagnostics`](crate::Engine::open_with_diagnostics)
+    /// / [`Engine::with_diagnostics`](crate::Engine::with_diagnostics) /
+    /// [`Blocking::with_diagnostics`](crate::Blocking::with_diagnostics).
+    /// Installing replaces any earlier sink (a host rotating a log file
+    /// installs the new writer over the old one); the change takes effect for
+    /// every later diagnostic. Serialized with emissions by the supervisor
+    /// mutex. Installing is ONE-WAY — this replaces, never removes; there is
+    /// no uninstall back to the stderr default (see the
+    /// [`DiagnosticSink`] docs).
+    ///
+    /// Rotation flushes the OUTGOING writer before the swap: a buffering
+    /// host writer must not silently lose its already-emitted diagnostics
+    /// because its bytes never made it out of the host's buffer. The flush
+    /// is best-effort (an error or a panic in the outgoing writer's flush is
+    /// swallowed, exactly like an emission write — never fails or crashes
+    /// the rotation).
+    pub(crate) fn install_diagnostics(&mut self, sink: DiagnosticSink) {
+        if let Some(previous) = self.diagnostics.take() {
+            let mut writer = previous
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = writer.flush();
+            }));
+        }
+        self.diagnostics = Some(sink);
+    }
+
+    /// Emit ONE engine diagnostic (story 10-2) — the engine's ONLY diagnostic
+    /// emission choke point. With a sink installed the line goes to the sink;
+    /// with none it goes to STDERR, byte-identical to the pre-sink behavior
+    /// (same `[ktesio] `-prefixed wording, one line, AD-12's "diagnostics ride
+    /// the engine log / stderr, NEVER `kt` stdout").
+    ///
+    /// The `[ktesio] ` marker prefix and the terminating `\n` are added HERE,
+    /// in one place, so the sink receives the exact bytes the stderr default
+    /// would have emitted — same message text as today, one line per
+    /// diagnostic.
+    ///
+    /// Best-effort by contract: a sink/stderr write failure is swallowed — a
+    /// broken or closed host writer must never fail, block, or crash
+    /// supervision (no diagnostic is the durable record of anything; the
+    /// records live in the logs/ledger). A host writer's write/flush PANIC
+    /// is caught with `catch_unwind` and swallowed the same way: an uncaught
+    /// panic here would unwind through this supervisor-lock critical section
+    /// and POISON the supervisor mutex, turning every later engine call into
+    /// a panic. Because the panic never escapes this scope, the sink's own
+    /// mutex never poisons either, and the same sink receives the next
+    /// diagnostic. (The panic message itself still prints via the process's
+    /// panic hook — the host's own bug surfacing on its own stderr is honest;
+    /// silencing it would require installing a process-global hook, which
+    /// the embed-clean audit forbids.)
+    ///
+    /// MUST be called while the SUPERVISOR lock is held — and that is
+    /// load-bearing beyond the no-re-entry rule below: the `self.diagnostics`
+    /// field read here is an ORDINARY, non-atomic read, and
+    /// [`Supervisor::install_diagnostics`] swaps that field under the SAME
+    /// supervisor mutex. Holding the lock across the read+write is what
+    /// makes an install/rotation serialize with an emission (a diagnostic is
+    /// never torn across two sinks, never races a rotation mid-write); a
+    /// caller that read the field without the supervisor lock would race a
+    /// concurrent `with_diagnostics`. Both emission sites are supervisor
+    /// paths, so the precondition holds by construction — keep it that way.
+    ///
+    /// The sink's `Write` impl must not re-enter the engine — a call that
+    /// took the supervisor lock would deadlock.
+    fn emit_diagnostic(&self, message: &str) {
+        let mut line = String::with_capacity(message.len() + 10);
+        line.push_str("[ktesio] ");
+        line.push_str(message);
+        line.push('\n');
+        match &self.diagnostics {
+            Some(sink) => {
+                let mut writer = sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let bytes = line.as_bytes();
+                // Swallow BOTH failure modes (io error, panic) and FLUSH:
+                // a buffering host writer must not silently lose the line
+                // inside its own buffer after a successful `write_all`.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = writer.write_all(bytes);
+                    let _ = writer.flush();
+                }));
+            }
+            None => {
+                let _ = std::io::stderr().write_all(line.as_bytes());
+            }
+        }
     }
 
     /// Start a registered / previously stopped / FAILED Agent Instance
@@ -739,17 +885,19 @@ impl Supervisor {
 
         // (2b-memory-delivery) DC-10 honesty (AD-11 Delivery clause): when a
         // `filesystem` backing is attached but the resolved mapping declares NO
-        // target for the reserved key, say so ONCE on stderr (AD-12) — naming the
-        // instance, the managed path, and the fact that the agent will not receive
-        // it. The start still SUCCEEDS: the directory guarantee holds regardless,
-        // and refusing an otherwise-healthy agent because its adapter maps no
-        // memory key would be a regression. Deliberately NOT generalized to other
-        // unmapped keys (story 2-2 Decision 6 stands; memory is special only
-        // because the operator took an explicit attach action and is owed the
-        // truth about its effect). Pure decision fn (unit-tested); this eprintln
-        // is the only emission site.
+        // target for the reserved key, say so ONCE through the diagnostic
+        // emission (AD-12: stderr by default, the host's story-10-2 sink when
+        // installed) — naming the instance, the managed path, and the fact
+        // that the agent will not receive it. The start still SUCCEEDS: the
+        // directory guarantee holds regardless, and refusing an
+        // otherwise-healthy agent because its adapter maps no memory key would
+        // be a regression. Deliberately NOT generalized to other unmapped
+        // keys (story 2-2 Decision 6 stands; memory is special only because
+        // the operator took an explicit attach action and is owed the truth
+        // about its effect). Pure decision fn (unit-tested); this is the only
+        // emission site, routed through `emit_diagnostic` (story 10-2).
         if let Some(notice) = memory_delivery_notice(memory_dir.as_deref(), &mapping, &name) {
-            eprintln!("[ktesio] {notice}");
+            self.emit_diagnostic(&notice);
         }
 
         // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
@@ -3022,16 +3170,17 @@ impl Supervisor {
         }
     }
 
-    /// Surface one enforcement diagnostic on STDERR (AD-12: enforcement
-    /// diagnostics ride the engine log / stderr, NEVER `kt` stdout, NEVER a crash).
-    /// Used when a breach action (pause/stop) could not be honored — the breach
-    /// itself is already durably recorded in the breach log, so this is only an
-    /// operator breadcrumb, not the record of the breach. `registry` is unused (the
-    /// diagnostic is not persisted to a strict-parse log to avoid corrupting the
-    /// transition-event reader) but kept for signature symmetry with the other
-    /// enforcement helpers.
+    /// Surface one enforcement diagnostic through the engine's diagnostic
+    /// emission (AD-12: enforcement diagnostics ride the engine log / stderr —
+    /// or the host's story-10-2 sink when one is installed — NEVER `kt`
+    /// stdout, NEVER a crash). Used when a breach action (pause/stop) could
+    /// not be honored — the breach itself is already durably recorded in the
+    /// breach log, so this is only an operator breadcrumb, not the record of
+    /// the breach. `registry` is unused (the diagnostic is not persisted to a
+    /// strict-parse log to avoid corrupting the transition-event reader) but
+    /// kept for signature symmetry with the other enforcement helpers.
     fn log_enforcement_diagnostic(&self, _registry: &Registry, name: &InstanceName, detail: &str) {
-        eprintln!("[ktesio] {}: {detail}", name.as_str());
+        self.emit_diagnostic(&format!("{}: {detail}", name.as_str()));
     }
 
     /// Read back the recorded [`BudgetBreachEvent`]s for an instance from its
@@ -3112,7 +3261,8 @@ fn invocation_overrides(base_url: Option<&str>, memory_dir: Option<&Path>) -> Op
 /// adapter declares no target for the reserved key. `None` means nothing to say
 /// — either no filesystem backing is attached, or the mapping DOES target the
 /// key and delivery is genuinely declared. Pure + deterministic (unit-tested);
-/// the caller owns the stderr emission.
+/// the caller routes it through `emit_diagnostic` (story 10-2: stderr by
+/// default, the host's sink when installed).
 fn memory_delivery_notice(
     memory_dir: Option<&Path>,
     mapping: &ConfigMapping,
