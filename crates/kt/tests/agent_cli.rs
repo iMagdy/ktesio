@@ -1894,8 +1894,10 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
 #[test]
 fn human_list_shows_the_budget_column_and_real_usage_columns() {
     // Story 1-7 (AC4) + story 3-1/3-2 (AC-C/AC9): the human `list` renders a Budget
-    // (tokens) column — the honest `—` for an UN-budgeted instance — AND a real
-    // Usage (tokens) column; the metering note is on stderr.
+    // column — the honest `—` for an UN-budgeted instance — AND a real Usage
+    // column; the metering note is on stderr. AI-45 (story 11-4): the Usage header
+    // carries the "est. $" estimate qualifier like Budget's (the cells are narrow
+    // and truncatable, so the qualifier lives in the headers).
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1920,6 +1922,28 @@ fn human_list_shows_the_budget_column_and_real_usage_columns() {
     );
     // The metering note is on stderr (AD-12), never stdout.
     assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
+
+    // AI-45 (story 11-4): at a width where the headers render in full, the Usage
+    // header carries the SAME estimate qualifier ("est. $") the Budget header
+    // carries — both money-bearing columns label their dollars in the header, so
+    // truncation can never strip the label off a cell.
+    let wide = run_kt_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "140")],
+    );
+    assert!(wide.success, "list should exit 0; stderr={}", wide.stderr);
+    assert!(
+        wide.stdout.contains("Usage (tok, est. $)"),
+        "the Usage header must carry the estimate qualifier; stdout=\n{}",
+        wide.stdout
+    );
+    assert!(
+        wide.stdout.contains("Budget (tok, est. $)"),
+        "the Budget header must carry the estimate qualifier; stdout=\n{}",
+        wide.stdout
+    );
 }
 
 #[test]
@@ -2646,9 +2670,10 @@ fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
     );
 
     // Human table: the dollar cap cell rendered THROUGH the currency module shows a
-    // `$` figure. (The narrow `list` Budget column may TRUNCATE the trailing
-    // `(estimated)` label; the untruncated `show` surface asserts the label — see
-    // `show_of_a_rated_instance_surfaces_a_labeled_cost_row`.)
+    // `$` figure. (Since story 3-3's header treatment and story 11-4's Usage twin,
+    // the narrow `list` cells render dollars BARE — the `(estimated)` qualifier
+    // lives in the headers; the untruncated `show` surface asserts the inline
+    // label — see `show_of_a_rated_instance_surfaces_a_labeled_cost_row`.)
     let human = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(human.success, "list should exit 0; stderr={}", human.stderr);
     assert!(
@@ -2668,9 +2693,11 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
     // dollar value BARE (via render_dollars_bare), so there is no inline estimate
     // label in the cell to mangle, and the header carries the label instead.
     //
-    // COLUMNS=110 is chosen so the Budget header + cell BOTH render in full while the
-    // other columns (Usage / Agent Home) truncate — the truncation pressure is real,
-    // yet the Budget column is the one under test and is fully observable.
+    // COLUMNS=116 is chosen so the Budget header + cell AND the Usage header all
+    // render in full while the other columns (Agent Home) absorb the truncation
+    // pressure — the columns under test are fully observable. (AI-45 widened the
+    // Usage header to "Usage (tok, est. $)", which costs the table five columns of
+    // slack; 116 restores the room 110 used to give the Budget cell.)
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -2697,15 +2724,17 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
         &["agent", "list"],
         &ctx.project_dir,
         state_dir,
-        &[("COLUMNS", "110")],
+        &[("COLUMNS", "116")],
     );
     assert!(human.success, "list should exit 0; stderr={}", human.stderr);
 
     // (1) The estimate qualifier lives in the HEADER ("est. $") — the stable home of
-    // the dollar label on this truncatable surface (FR-23).
+    // the dollar label on this truncatable surface (FR-23). BOTH money-bearing
+    // headers carry it now: Budget (story 3-3) and Usage (AI-45, story 11-4).
     assert!(
-        human.stdout.contains("est. $"),
-        "the Budget header must carry the estimate qualifier 'est. $'; stdout=\n{}",
+        human.stdout.contains("Budget (tok, est. $)")
+            && human.stdout.contains("Usage (tok, est. $)"),
+        "the Budget + Usage headers must carry the estimate qualifier 'est. $'; stdout=\n{}",
         human.stdout
     );
     // (2) The header is NOT the stale "Budget (tokens)" mislabel — the column now
@@ -2726,6 +2755,27 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
          estimate label to truncate); stdout=\n{}",
         human.stdout
     );
+    // (3b) The Usage CELL is the AI-45 twin (story 11-4): the Rate'd dollar
+    // renders BARE — `in 0 / out 0 · $0.00` — with NO inline `(estimated)` (a
+    // regression to the inline form would truncate to a mangled `(es…` glued
+    // to a dollar in this narrow column, the exact FR-23 hazard). Asserted on
+    // the rendered row because the unit test pins the helper, not the call site.
+    assert!(
+        human.stdout.contains("in 0 / out 0 · $0.00"),
+        "the Usage cell must render the bare Rate'd dollar; stdout=\n{}",
+        human.stdout
+    );
+    {
+        let usage_row_line = human
+            .stdout
+            .lines()
+            .find(|l| l.contains("in 0 / out 0 · $0.00"))
+            .expect("the usage row exists");
+        assert!(
+            !usage_row_line.contains("(estimated)") && !usage_row_line.contains("(es"),
+            "the Usage row must carry NO inline estimate label fragment: {usage_row_line}"
+        );
+    }
 
     // (4) Belt-and-suspenders: the estimate qualifier is ALSO carried by the
     // always-present, never-truncated stderr metering note ("labeled estimates"),
@@ -3496,6 +3546,105 @@ fn config_get_unknown_instance_exits_nonzero() {
 }
 
 // ---- Story 2-2: the `agent.*`-unvalidated marker in `config get` (AC-B/AC7) ----
+
+#[test]
+fn config_get_table_prefix_exits_nonzero_and_names_the_child_leaves() {
+    // AI-25 (story 11-4): `budget` has no effective VALUE of its own but IS a
+    // prefix of effective leaves once one is set. The honest rejection stays
+    // (stderr + non-zero exit, stdout clean) but now NAMES the child leaves so the
+    // operator is steered to the right `get` in one step. The leaf path (a real
+    // value prints) and the plain unknown-key path (no children named) are pinned
+    // unchanged by the companion tests + the second half of this one.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.tokens.cumulative",
+            "500000",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // The table prefix: non-zero exit, nothing on stdout, children named on stderr.
+    let run = run_kt_agent(
+        &["agent", "config", "get", "demo", "budget"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "a table prefix must exit non-zero; stdout={}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("500000"),
+        "stdout must stay clean of a partial document; stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("budget.tokens.cumulative"),
+        "stderr must name the effective child leaf; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("table prefix"),
+        "stderr must say WHY (a config table prefix, not a plain unknown key); stderr={}",
+        run.stderr
+    );
+
+    // A key that is NEITHER a value NOR a prefix keeps the plain unknown-key
+    // diagnostic — no children named, because none exist.
+    let unknown = run_kt_agent(
+        &["agent", "config", "get", "demo", "cost"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !unknown.success,
+        "an unknown key must exit non-zero; stdout={}",
+        unknown.stdout
+    );
+    assert!(
+        unknown
+            .stderr
+            .contains("has no effective value for config key 'cost'"),
+        "the plain unknown-key diagnostic; stderr={}",
+        unknown.stderr
+    );
+    assert!(
+        !unknown.stderr.contains("table prefix"),
+        "a non-prefix key must NOT read as a table; stderr={}",
+        unknown.stderr
+    );
+
+    // The leaf path is unchanged: the exact key with a value still prints it.
+    let leaf = run_kt_agent(
+        &["agent", "config", "get", "demo", "budget.tokens.cumulative"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        leaf.success,
+        "a leaf get must exit 0; stderr={}",
+        leaf.stderr
+    );
+    assert!(
+        leaf.stdout.lines().any(|l| l.trim() == "500000"),
+        "leaf value on stdout; stdout={}",
+        leaf.stdout
+    );
+}
 
 #[test]
 fn config_get_marks_agent_pass_through_leaf_unvalidated_and_known_key_validated() {

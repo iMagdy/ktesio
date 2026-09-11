@@ -112,7 +112,7 @@ enum Commands {
 enum AgentCommands {
     /// Register a new Agent Instance under a unique name
     Register {
-        /// Fleet-unique instance name (^[a-z0-9][a-z0-9_-]*$)
+        /// Fleet-unique instance name (`^[a-z0-9][a-z0-9_-]*$`)
         name: String,
         /// Native adapter kind (e.g. mock). Mutually exclusive with --manifest.
         #[arg(
