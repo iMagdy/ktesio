@@ -19,6 +19,7 @@
 //!    byte-identical (AI-28).
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -36,6 +37,7 @@ fn temp_residue(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }

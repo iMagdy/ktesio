@@ -2747,8 +2747,17 @@ impl Supervisor {
                 CrashInput::Exited(Some(c)) => {
                     format!("process exited unexpectedly with code {c}")
                 }
-                // AI-13: an adopted process's exit code is unrecoverable (it is
-                // not this engine's child — only a parent gets an ExitStatus).
+                // AI-13: an adopted process's exit code is unrecoverable on
+                // UNIX (it is not this engine's child — only a parent gets an
+                // ExitStatus), so THIS arm is the Unix-shaped case: the cause
+                // says the code is unavailable and why, instead of asserting a
+                // signal termination it cannot prove. On WINDOWS this arm is
+                // reachable only when the code is GENUINELY unreadable: the
+                // adopted handle's poll (backends/windows reap_if_exited)
+                // reads the real exit code via GetExitCodeProcess, so a
+                // Windows adopted exit normally lands in the `Exited(Some)`
+                // arm above carrying its true code (the story-11-5 closure of
+                // the 11-1 Windows-half defer).
                 CrashInput::Exited(None) if adopted => "process exited unexpectedly (exit \
                  code unavailable — adopted process is not this engine's child)"
                     .to_string(),
@@ -2980,8 +2989,14 @@ impl Supervisor {
                             // An adopted instance's stop attempt has not
                             // happened yet in THIS engine session.
                             stop_unconfirmed: false,
-                            // AI-13: this handle was re-acquired, not spawned —
-                            // its exit code is unrecoverable.
+                            // AI-13: this handle was re-acquired, not spawned.
+                            // On UNIX its exit code is unrecoverable (the
+                            // adopted-exit crash cause says so); on WINDOWS
+                            // the adopted handle's poll still reads the real
+                            // exit code via GetExitCodeProcess
+                            // (backends/windows reap_if_exited), so only a
+                            // genuinely unreadable code falls to the
+                            // unavailable-code cause there.
                             adopted: true,
                         },
                     );
@@ -4503,10 +4518,34 @@ mod tests {
         (state, manifest, registry)
     }
 
+    /// Poll for the `fake_agent` readiness marker (`--marker <path>`, written
+    /// at startup right after the ready line and BEFORE the `--dump` file) —
+    /// the AI-35/38 readiness handshake (story 11-5): a `_live` test proceeds
+    /// as soon as the spawned agent is PROVABLY up, on every OS, instead of
+    /// being gated off macOS/Windows on an OS-fragile wall-clock assumption
+    /// about spawn latency. The generous bound absorbs loaded CI runners (and
+    /// the instrumented coverage run); the poll returns the moment the file
+    /// appears, so the happy path pays nothing.
+    fn wait_for_marker(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readiness marker never appeared at {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Poll for a `--dump` file to appear (the spawned `fake_agent` writes it at
-    /// startup) and return its contents, bounded — avoids racing the spawn.
+    /// startup, right after its readiness `--marker`) and return its contents,
+    /// bounded — avoids racing the spawn. Call [`Self::wait_for_marker`] first
+    /// for the readiness handshake.
     fn wait_for_dump(path: &Path) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if !text.is_empty() {
@@ -4853,15 +4892,16 @@ mod tests {
         // snapshot, so mutating the manifest's [lifecycle.start] args no longer
         // affects the started process. Register a fake_agent, REWRITE its manifest
         // with a decoy arg only a re-read would surface, then START — the spawned
-        // argv carries the ORIGINAL args and NOT the decoy. Linux-only spawn+observe,
-        // matching the sibling `_live` proofs (macOS/Windows CI spawn scaffolding is
-        // the very fragility this fix removes; the OS-agnostic seam test above +
-        // Epic 1 backend tests cover the rest).
-        if OsId::current() != OsId::Linux {
-            return;
-        }
+        // argv carries the ORIGINAL args and NOT the decoy. Runs on ALL three
+        // OSes (AI-35/38, story 11-5): the spawn+observe is a readiness
+        // HANDSHAKE — the manifest passes `--marker`, the test waits for the
+        // agent's marker file, then for its argv `--dump` — so no OS-fragile
+        // wall-clock assumption about spawn latency remains (see
+        // `wait_for_marker`).
         let dump = tempfile::tempdir().unwrap();
         let dump_path = dump.path().join("argv.txt");
+        let marker_path = dump.path().join("ready.marker");
+        let marker = marker_path.to_str().unwrap();
         let (_state, manifest, registry) = setup_fake(
             "del",
             &[
@@ -4869,6 +4909,8 @@ mod tests {
                 "600000",
                 "--dump",
                 dump_path.to_str().unwrap(),
+                "--marker",
+                marker,
             ],
         );
 
@@ -4883,6 +4925,8 @@ mod tests {
                 "600000",
                 "--dump",
                 dump_path.to_str().unwrap(),
+                "--marker",
+                marker,
                 "--decoy-from-reread",
             ],
         );
@@ -4894,6 +4938,7 @@ mod tests {
         // The spawned fake_agent dumped its argv: the ORIGINAL start args are there,
         // and the post-registration decoy is NOT — the launch came from the
         // registration snapshot, not a re-read of the mutated manifest.
+        wait_for_marker(&marker_path);
         let dumped = wait_for_dump(&dump_path);
         assert!(
             dumped.lines().any(|l| l == "arg=--linger-ms"),
@@ -4907,23 +4952,20 @@ mod tests {
 
     #[test]
     fn manifest_start_maps_model_to_the_declared_flag_target_live() {
-        // Linux-only (RUNTIME gate, not cfg): the delivery logic proven here —
+        // Cross-OS (AI-35/38, story 11-5): the delivery logic proven here —
         // unified config → native env/flag/file mapping — is OS-agnostic engine
-        // code, identical on every OS. Only the `_live` spawn+observe scaffolding
-        // (spawn the real `fake_agent`, poll its `--dump` file) is fragile on
-        // macOS/Windows CI (spawn latency, `.exe` naming). It is covered on Linux
-        // here, and Epic 1's process/backend tests already prove the OS-specific
-        // spawn works on all three OSes. Tarpaulin runs on Linux, so gating these
-        // to Linux leaves coverage unchanged.
-        if OsId::current() != OsId::Linux {
-            return;
-        }
+        // code, identical on every OS, and the `_live` spawn+observe is now a
+        // readiness HANDSHAKE (the manifest passes `--marker`; the test waits
+        // for the marker file, then the argv `--dump` — see `wait_for_marker`),
+        // so the old "fragile spawn on macOS/Windows CI" Linux-only gate is
+        // dropped and the proof runs on all three legs.
         // AC-A + AC8 (the MANIFEST proof, live). A `fake_agent` manifest declares
         // `[config.model]` → flag `--model`; set model, start the REAL process
         // with `--dump`, and assert the mapped flag landed in the spawned
         // process's argv (observed via the dump file — no stdout race).
         let dump = tempfile::tempdir().unwrap();
         let dump_path = dump.path().join("argv.txt");
+        let marker_path = dump.path().join("ready.marker");
         let (_state, _manifest, registry) = setup_fake_with_config(
             "flg",
             &[
@@ -4931,6 +4973,8 @@ mod tests {
                 "600000",
                 "--dump",
                 dump_path.to_str().unwrap(),
+                "--marker",
+                marker_path.to_str().unwrap(),
             ],
             "[config.model]\nflag = \"--model\"\n",
         );
@@ -4942,6 +4986,7 @@ mod tests {
         assert_eq!(state_of(&registry, "flg"), LifecycleState::Running);
 
         // The spawned fake_agent dumped its argv; the mapped flag + value are there.
+        wait_for_marker(&marker_path);
         let dumped = wait_for_dump(&dump_path);
         assert!(
             dumped.lines().any(|l| l == "arg=--model"),
@@ -4957,11 +5002,10 @@ mod tests {
 
     #[test]
     fn secret_leaf_delivers_cleartext_to_the_adapter_but_masks_snapshot_and_events() {
-        // Linux-only: see manifest_start_maps_model_to_the_declared_flag_target_live
-        // — OS-agnostic delivery, fragile _live spawn on macOS/Windows CI.
-        if OsId::current() != OsId::Linux {
-            return;
-        }
+        // Cross-OS (AI-35/38, story 11-5): see
+        // manifest_start_maps_model_to_the_declared_flag_target_live — the
+        // `_live` observe is a readiness handshake (`--marker` → `--dump`), so
+        // the Linux-only gate is dropped.
         // Story 2-4 (AC-A/AC9 delivery + AC-B no-leak, engine level). A
         // `model = secret:NAME` leaf resolves (env resolver) to a sentinel; the
         // spawned agent's argv carries the CLEARTEXT (usable), while the persisted
@@ -4974,6 +5018,7 @@ mod tests {
 
         let dump = tempfile::tempdir().unwrap();
         let dump_path = dump.path().join("argv.txt");
+        let marker_path = dump.path().join("ready.marker");
         let (_state, _manifest, registry) = setup_fake_with_config(
             "sekeng",
             &[
@@ -4981,6 +5026,8 @@ mod tests {
                 "600000",
                 "--dump",
                 dump_path.to_str().unwrap(),
+                "--marker",
+                marker_path.to_str().unwrap(),
             ],
             "[config.model]\nflag = \"--model\"\n",
         );
@@ -4994,6 +5041,7 @@ mod tests {
         assert_eq!(state_of(&registry, "sekeng"), LifecycleState::Running);
 
         // (POSITIVE) the spawned process argv carries the resolved CLEARTEXT.
+        wait_for_marker(&marker_path);
         let dumped = wait_for_dump(&dump_path);
         assert!(
             dumped.lines().any(|l| l == format!("arg={SENTINEL}")),
@@ -5097,17 +5145,17 @@ mod tests {
 
     #[test]
     fn manifest_start_delivers_agent_pass_through_verbatim_live() {
-        // Linux-only: see manifest_start_maps_model_to_the_declared_flag_target_live
-        // — OS-agnostic delivery, fragile _live spawn on macOS/Windows CI.
-        if OsId::current() != OsId::Linux {
-            return;
-        }
+        // Cross-OS (AI-35/38, story 11-5): see
+        // manifest_start_maps_model_to_the_declared_flag_target_live — the
+        // `_live` observe is a readiness handshake (`--marker` → `--dump`), so
+        // the Linux-only gate is dropped.
         // AC-B (the `agent.*` verbatim proof, live). Set an `agent.*` pass-through
         // key, start the REAL fake_agent with `--dump`, and assert the value was
         // delivered VERBATIM into the native mechanism (an env var named by the
         // verbatim key-tail) — no rewriting, no known-key mapping.
         let dump = tempfile::tempdir().unwrap();
         let dump_path = dump.path().join("env.txt");
+        let marker_path = dump.path().join("ready.marker");
         // No [config] mapping at all — pass-through does not need one (AC6).
         let (_state, _manifest, registry) = setup_fake_with_config(
             "pth",
@@ -5116,6 +5164,8 @@ mod tests {
                 "600000",
                 "--dump",
                 dump_path.to_str().unwrap(),
+                "--marker",
+                marker_path.to_str().unwrap(),
             ],
             "",
         );
@@ -5128,6 +5178,7 @@ mod tests {
         sup.start(&registry, "pth").unwrap();
         assert_eq!(state_of(&registry, "pth"), LifecycleState::Running);
 
+        wait_for_marker(&marker_path);
         let dumped = wait_for_dump(&dump_path);
         assert!(
             dumped.lines().any(|l| l == "env=CUSTOM_TOKEN=verbatim-xyz"),
@@ -7896,5 +7947,132 @@ mod tests {
         drop(conn);
         sup.stop(&registry, "tdrain", Some(Duration::from_millis(200)))
             .unwrap();
+    }
+
+    // ---- Story 11-5 (AI-71): the read/observation helpers' error surfaces ----
+    //
+    // These pin the documented contracts the read helpers promise but that no
+    // test exercised: a log that cannot be READ (not merely absent — absent is
+    // an honest empty) is a TYPED error naming the instance + path, never a
+    // silent empty vec; an invalid name is the typed InvalidName; and the
+    // blank-line/missing-generation tolerances are the only silent paths. A
+    // directory where the log file must be makes `read_to_string` fail on
+    // every OS (no OS-cfg — portable setup).
+
+    #[test]
+    fn read_events_rejects_an_invalid_name_with_the_typed_error() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_events(&registry, "Bad Name").unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidName { ref name, .. } if name == "Bad Name"),
+            "expected InvalidName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_events_surfaces_an_unreadable_instance_log_as_a_typed_log_error() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry.register("evt", "mock").unwrap();
+        let name = InstanceName::new("evt").unwrap();
+        let path = registry.instance_log_path(&name);
+        std::fs::create_dir_all(&path).unwrap();
+        let err = Supervisor::read_events(&registry, "evt").unwrap_err();
+        match &err {
+            EngineError::Log {
+                name: n,
+                path: p,
+                detail,
+            } => {
+                assert_eq!(n, "evt");
+                assert_eq!(p, &path.to_string_lossy().into_owned());
+                assert!(!detail.is_empty(), "the error must name the read failure");
+            }
+            other => panic!("expected EngineError::Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_breach_events_rejects_an_invalid_name_with_the_typed_error() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = Supervisor::read_breach_events(&registry, "Bad Name").unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidName { ref name, .. } if name == "Bad Name"),
+            "expected InvalidName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_breach_events_surfaces_an_unreadable_breach_log_as_a_typed_log_error() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry.register("brk", "mock").unwrap();
+        let name = InstanceName::new("brk").unwrap();
+        let path = registry.instance_breach_log_path(&name);
+        std::fs::create_dir_all(&path).unwrap();
+        let err = Supervisor::read_breach_events(&registry, "brk").unwrap_err();
+        match &err {
+            EngineError::Log {
+                name: n,
+                path: p,
+                detail,
+            } => {
+                assert_eq!(n, "brk");
+                assert_eq!(p, &path.to_string_lossy().into_owned());
+                assert!(!detail.is_empty(), "the error must name the read failure");
+            }
+            other => panic!("expected EngineError::Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_agent_log_since_surfaces_an_unreadable_attributed_log_as_a_typed_error() {
+        // The NOT-FOUND arm is the documented empty tail; every OTHER read
+        // failure is a typed EngineError::Log (the live-tail reader must
+        // distinguish "nothing yet" from "cannot read").
+        let state = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry.register("alr", "mock").unwrap();
+        let name = InstanceName::new("alr").unwrap();
+        let path = registry.attributed_output_log_path(&name);
+        std::fs::create_dir_all(&path).unwrap();
+        let expected_path = path.to_string_lossy().into_owned();
+        let err = Supervisor::read_agent_log_since(&registry, "alr", 0).unwrap_err();
+        assert!(
+            matches!(err, EngineError::Log { ref name, ref path, .. } if name == "alr"
+                && path == &expected_path),
+            "expected a Log error naming the instance + path, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn log_line_helpers_skip_blank_lines_and_surface_unreadable_generations() {
+        // parse_log_lines: blank lines are skipped (the documented AC-G
+        // convention) — an all-blank input is Ok with nothing parsed.
+        let mut out = Vec::new();
+        parse_log_lines("\n   \n", &mut out).expect("blank lines are skipped, not errors");
+        assert!(out.is_empty());
+        // read_log_lines_from: a missing generation is a silent no-op (the
+        // documented oldest-to-newest probe convention); an UNREADABLE one is
+        // an error, mirroring read_events_from.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gen-missing.log");
+        let mut out = Vec::new();
+        read_log_lines_from(&missing, &mut out).expect("missing generation is a no-op");
+        assert!(out.is_empty());
+        let obstructed = dir.path().join("gen-0.log");
+        std::fs::create_dir(&obstructed).unwrap();
+        let mut out = Vec::new();
+        let err = read_log_lines_from(&obstructed, &mut out).unwrap_err();
+        assert!(!err.is_empty(), "an unreadable generation must be an error");
+    }
+
+    #[test]
+    fn default_constructs_the_standard_supervisor() {
+        // Default delegates to new() (the standard schedule); trivially
+        // non-panicking, pinned so the impl block stays honest.
+        let _ = Supervisor::default();
     }
 }

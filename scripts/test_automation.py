@@ -272,6 +272,64 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("swapon /mnt/covswap", ci)
         self.assertIn("rm -rf /usr/share/dotnet", ci)
 
+    def test_ci_runs_on_feature_branch_pushes_and_a_nightly_schedule(self) -> None:
+        # Story 11-5 (AI-37/AI-54): the full CI — the 3-OS matrix + coverage
+        # included — runs on EVERY branch push (not only main, not only PRs)
+        # plus a nightly schedule and manual dispatch. The old
+        # `branches: [main]` push filter is what let a feature branch reach a
+        # PR with locally-verified-only commits (Epic 2's merge-pressure
+        # lesson); the `**` glob keeps main's push runs AND covers every
+        # feature branch. Pin the whole trigger block so a regression back to
+        # main-only pushes — or a dropped schedule/dispatch — fails here.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('branches:\n      - "**"', ci)
+        self.assertNotIn("branches: [main]", ci)
+        self.assertIn("pull_request:", ci)
+        self.assertIn('cron: "17 7 * * *"', ci)
+        self.assertIn("workflow_dispatch:", ci)
+        # The dedupe story stays true: a per-ref concurrency group collapses
+        # repeated pushes to the same branch (cancel-in-progress).
+        self.assertIn("group: ${{ github.workflow }}-${{ github.ref }}", ci)
+        self.assertIn("cancel-in-progress: true", ci)
+
+    def test_docs_probe_workflow_watches_every_registered_page(self) -> None:
+        # Story 11-5 (epic-7-retro-item-2): a scheduled probe watches the
+        # DEPLOYED docs site (Cloudflare Pages, outside repo CI) because a
+        # silent deploy death went unnoticed for two weeks (Aug 2026) while
+        # repo CI stayed green. Pin the shape: schedule + manual dispatch, no
+        # `needs:` coupling to CI, every docs/meta.json page probed for HTTP
+        # 200 with each failure NAMED (never fail-fast — one run must report
+        # the whole blast radius), and a content marker on the newest page so
+        # a 200-from-an-error-page cannot false-pass.
+        probe = (
+            release_docs.ROOT / ".github" / "workflows" / "docs-probe.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('cron: "3 6 * * *"', probe)
+        self.assertIn("workflow_dispatch:", probe)
+        # No `needs:` coupling to the CI job graph — checked per LINE so the
+        # prose in a comment cannot false-fail the pin.
+        self.assertFalse(
+            [line for line in probe.splitlines() if line.strip().startswith("needs:")],
+            "the docs probe must not declare job-level needs",
+        )
+        # The page list is read from the site's own registry at probe time.
+        self.assertIn("jq -r '.pages[] | select(startswith(\"---\") | not)' docs/meta.json", probe)
+        self.assertIn("https://docs.ktesio.dev", probe)
+        # Failures name the dead page via ::error:: and fail the job.
+        self.assertIn("docs.ktesio.dev page is DOWN", probe)
+        self.assertIn("expected 200", probe)
+        # The two special-case URL mappings mirror docs/lib/source.ts's
+        # slugs(): README is the site root, RELEASE_NOTES serves at
+        # /release-notes.
+        self.assertIn("README) url=\"$base/\"", probe)
+        self.assertIn('RELEASE_NOTES) url="$base/release-notes"', probe)
+        # The newest-page content marker (a bare 200 is not enough).
+        self.assertIn('marker="Release Notes"', probe)
+
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the
         # per-OS ProcessBackend supervision code — in particular the Windows

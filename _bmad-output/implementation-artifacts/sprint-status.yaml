@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 09-11-2026 15:30
+last_updated: 09-11-2026 18:10
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -110,7 +110,7 @@ development_status:
   11-2-config-and-secrets-batch: review  # AI-24/26/27/28/33/39 — atomic writes, env shadowing, secret-to-flag
   11-3-memory-robustness-batch: review  # epic-5-retro items 1/3/4 + AI-46 — strip gap, migration atomicity, reverse-conflict test, adoption stranding
   11-4-docs-and-process-batch: backlog  # AI-18/19/21/22/25/30/34/43/45 — docs, review rules, rustdoc, docstring fixes
-  11-5-cross-platform-and-ci-batch: backlog  # AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
+  11-5-cross-platform-and-ci-batch: review  # AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
   11-6-supervision-and-ops-decisions: backlog  # AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
   11-7-orchestration-and-review-process: backlog  # AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
   epic-8-retrospective: optional
@@ -447,7 +447,7 @@ action_items:
   - id: AI-29
     epic: 1
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): the Windows-POSITIVE tests the item asked for now run ON the windows-latest leg — tests/adoption.rs gains windows_engine_death_kills_the_child_and_reconciles_its_record_to_failed, windows_fleet_records_reconcile_after_engine_death_the_reboot_semantics, and windows_paused_row_reconciles_to_failed_when_the_job_close_killed_it (engine death → Job kill-on-close → records reconcile to `failed`), and agent_cli.rs gains pause_after_windows_engine_death_reconciles_and_fails_honestly_windows (plus per-OS honesty notes where a Windows equivalent is meaningless: guaranteed suspension, exit code 5). The Unix-shaped tests' runtime skips now carry pointer comments to the Windows siblings. NFR-1 is affirmatively validated per-OS, not merely gated.
     severity: medium
     action: "Epic 1's SURVIVAL-path NFR-1 proofs are Unix-tested ONLY: engine_kill_adopts_live_child
       (1-6), whole_fleet_survives_a_reboot (1-7), ai7_paused, + the 2 pause CLI tests
@@ -531,7 +531,7 @@ action_items:
   - id: AI-35
     epic: 2
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): the 4 supervisor `_live` tests + the CLI secret no-leak matrix lost their Linux-only gates and run on all three legs. The observation is now a readiness HANDSHAKE (fake_agent --marker file polled before the --dump, generous bounded deadlines) instead of a fragile wall-clock spawn assumption, and the CLI test routes its start through the surviving-engine harness (with the resolver env var inherited by the re-exec'd helper), so the Windows kill-on-close after the helper exit no longer hides the startup artifacts. (fake_agent's .exe handling was already EXE_SUFFIX-correct via ktesio_conformance::fake_agent_bin; the marker flag already existed in the helper.) See AI-38 for the same landing.
     severity: medium
     action: "Epic 2's `_live` dump-observing tests are GATED Linux-only (runtime OsId
       gate): the CLI `secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it`
@@ -566,7 +566,7 @@ action_items:
   - id: AI-37
     epic: 2
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): ci.yml's push trigger now fires for EVERY branch (`branches: ["**"]`, keeping main) so the full job set — 3-OS matrix + coverage included — runs on every feature-branch commit, plus a nightly `schedule` (cron 17 7 * * *) and `workflow_dispatch` for on-demand runs; the per-ref concurrency group collapses repeated pushes. The policy is written down in docs/testing.md's "The CI policy" section (with AI-54), and scripts/test_automation.py pins the trigger shape.
     severity: medium
     action: "Run the 3-OS CI matrix EARLIER than the epic PR (per-story, or nightly/manual
       on feat/* branches). Epic 2's local-only (macOS) verification hid BOTH the coverage
@@ -575,7 +575,7 @@ action_items:
   - id: AI-38
     epic: 2
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11), executing AI-35: the 5 `_live` tests are cross-OS robust (readiness handshake via the fake_agent --marker file, generous adaptive dump deadlines; the CLI test routed through the surviving-engine harness with env injection) and the Linux-only gates are DROPPED — verified running green on macOS locally; the windows leg runs them in CI.
     severity: medium
     action: "Make the _live tests cross-OS robust (executes AI-35): fake_agent .exe
       handling on Windows, a readiness handshake instead of a wall-clock dump-file
@@ -793,7 +793,7 @@ action_items:
   - id: AI-54
     epic: 9
     owner: "Islam / dev-workflow docs"
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): the practice is no longer emergent — ci.yml's triggers now implement it (push to any branch + nightly cron + workflow_dispatch on the EXISTING full 11-job set, per the Epic-9 precedent) and docs/testing.md's "The CI policy: what runs, when" section codifies it in writing (per-commit CI, the nightly, the docs probe, the concurrency dedupe). scripts/test_automation.py pins both.
     severity: medium
     action: "Codify 'full cross-OS + coverage CI on every commit of a feature branch'
       as a written, standing practice (e.g. CONTRIBUTING.md / docs/testing.md), not
@@ -1211,7 +1211,7 @@ action_items:
   - id: AI-71
     epic:
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11) — closed with a MEASURED number, not the stale figure below. The CI-equivalent per-crate split (cargo tarpaulin --engine llvm --skip-clean --timeout 180 -p <pkg> for the exact five ci.yml crates, RUST_TEST_THREADS=1, CARGO_PROFILE_DEV_DEBUG=1, lcov merge --ignore-errors inconsistent, exact-fraction awk gate at >=95) measured on the story branch: 95.1830% (6422/6747 lines) — GATE GREEN. The stale 94.9431%/4675/4924 diagnosis below predates epics 8-11; by 2026-09-11 the workspace had grown to 6747 coverable lines, and the story branch's first honest measurement came in at 94.8718% (6401/6747) — genuinely BELOW the gate — so the story added seven targeted tests (domain/supervisor.rs: the read/observation helpers' documented-but-untested error surfaces: read_events/read_breach_events InvalidName + unreadable-log EngineError::Log mappings, read_agent_log_since's unreadable-generation error, parse_log_lines blank-line skip, read_log_lines_from's missing-vs-obstructed generation contract, Supervisor::default) covering +21 production lines at ZERO denominator cost (test-module lines are not counted), landing 95.1830%. Platform note: measured on macOS arm64; the added tests are pure lib unit tests that run identically under Linux CI, so CI's Linux measurement strictly improves by the same +21 lines (all tests also passed under tarpaulin instrumentation, including the newly un-gated _live tests — no coverage-side re-gating was needed).
     severity: high
     action: "Restore the workspace coverage gate to green: trunk's merged workspace
       coverage is 94.9431% (4675/4924 lines), below the 95% gate that NFR-3 marks
@@ -1364,6 +1364,6 @@ action_items:
       registered page — the CF Pages deploy silently failed for ~2 weeks (Aug 26 -
       Sep 9) leaving 4 pages 404 while repo CI stayed green. [epic-7 retro F2, med]"
     owner: "next CI-touching story"
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): .github/workflows/docs-probe.yml — daily cron (03 6 * * *) + workflow_dispatch, NO needs: coupling to the CI job graph; reads the page list from docs/meta.json at probe time (mirroring docs/lib/source.ts's README→/ and RELEASE_NOTES→/release-notes URL mappings), asserts HTTP 200 per page with every failure NAMED via ::error:: (never fail-fast — one run reports the whole blast radius), and asserts a content marker on the newest page so a 200-from-an-error-page cannot false-pass. Structure pinned by scripts/test_automation.py::test_docs_probe_workflow_watches_every_registered_page. (Live-fire note: at landing, the deployed site was already 404ing /agents again — the probe's first scheduled run will correctly red until the CF Pages deploy is refreshed, which is the watcher working as designed.)
     ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
 

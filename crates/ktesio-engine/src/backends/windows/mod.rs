@@ -841,3 +841,84 @@ pub fn rename_over_target(temp: &std::path::Path, target: &std::path::Path) -> s
     std::thread::sleep(std::time::Duration::from_millis(100));
     std::fs::rename(temp, target)
 }
+
+#[cfg(test)]
+mod tests {
+    //! AI-14 (story 11-5) — the fail-closed spawn arm's HOSTED tests. These run
+    //! only where the Windows backend runs (the `windows-latest` matrix leg of
+    //! the CI `test` job; on a Unix host this whole module is compile-checked
+    //! only, via `cargo check --target x86_64-pc-windows-gnu`). `cfg(test)` plus
+    //! OS cfg are allowed HERE: this file is inside the boundary gate's
+    //! `crates/ktesio-engine/src/backends/` allowlist home. Together the two
+    //! tests close the 11-1 defer: the REAL-child arm proves the production
+    //! spawn's creation-time read works and yields a verified non-zero token,
+    //! and the failed-read path is pinned at the unit seam
+    //! (`process_start_time`) where it is observable without an injected fault.
+
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A `SpawnSpec` for a real child, mirroring the Unix backend test
+    /// module's helper (the capture trio `None` = the narrow don't-care
+    /// fixture; no stdin pipe — this helper never writes to the child).
+    fn spec(exec: &str, args: &[&str]) -> SpawnSpec {
+        SpawnSpec {
+            exec: exec.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: BTreeMap::new(),
+            working_dir: std::env::temp_dir(),
+            log_file: None,
+            attributed_log_path: None,
+            stderr_log_file: None,
+            instance_name: "test".to_string(),
+            pipe_stdin: false,
+        }
+    }
+
+    #[test]
+    fn spawn_of_a_real_child_verifies_a_nonzero_creation_time_and_stops_clean() {
+        // The POSITIVE half of the AI-14 fail-closed spawn arm. The production
+        // `spawn` reads the child's creation time right after the job
+        // assignment and FAILS the spawn when the read cannot be verified — so
+        // a real child's spawn SUCCEEDING is itself the proof that the read
+        // works, and the resulting fingerprint must carry a REAL (non-zero)
+        // token, never the `start_time = 0` sentinel AI-14 forbids. Uses the
+        // conformance `fake_agent` (an engine dev-dependency, off the shipping
+        // graph), lingering long enough to be polled and stopped
+        // deterministically.
+        let backend = WindowsBackend::new();
+        let agent = ktesio_conformance::fake_agent_bin();
+        let mut handle = backend
+            .spawn(&spec(&agent.to_string_lossy(), &["--linger-ms", "600000"]))
+            .expect("spawn of a real child must succeed (the creation-time read must work)");
+        let fp = backend.fingerprint(&handle);
+        assert_eq!(fp.pid, backend.pid(&handle));
+        assert!(
+            fp.start_time != 0,
+            "a spawned handle must carry the VERIFIED creation-time token, never the 0 \
+             sentinel (AI-14 fail-closed contract)"
+        );
+        // Alive now; the later stop terminates the whole job (kill-on-close).
+        assert_eq!(backend.poll(&mut handle).unwrap(), ProcessStatus::Alive);
+        let outcome = backend
+            .stop(&mut handle, Duration::from_secs(5))
+            .expect("stop the lingering agent");
+        assert!(
+            outcome.forced,
+            "a lingering agent needs the forced escalation"
+        );
+        assert!(backend.poll(&mut handle).unwrap().is_exited());
+    }
+
+    #[test]
+    fn start_time_read_fails_closed_for_an_absent_pid() {
+        // The FAILED-READ path of the AI-14 arm, pinned at the unit seam
+        // (`process_start_time`) where it is honestly observable: a pid that
+        // cannot exist on Windows (pids are 4-aligned and live far below the
+        // u32 ceiling) fails the OpenProcess query and returns None — exactly
+        // the reading the spawn arm treats as "cannot verify" and FAILS THE
+        // SPAWN on (after its bounded, spawn-race-absorbing retry), never
+        // recording a `start_time = 0` fingerprint.
+        assert_eq!(process_start_time(0xFFFF_FFFC), None);
+    }
+}

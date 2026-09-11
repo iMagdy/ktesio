@@ -46,21 +46,32 @@ fn force_state_running(state_dir: &Path, name: &str) {
 ///
 /// **`_unix` naming convention (fix pass, H4).** Cross-lifetime survival cannot
 /// be simulated on Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` kills the child
-/// when the helper exits), so every test built on this helper runtime-`return`s
-/// there. A runtime early-return is reported by the test runner as **PASSED**, so
-/// CI shows green on Windows with zero signal that the assertions never ran.
-/// Every such test therefore carries a `_unix` SUFFIX, making the limitation
-/// visible in the test list on all three OSes rather than hiding inside the body.
-/// Anything those tests guard that is genuinely OS-INDEPENDENT — wire shapes,
-/// schema versions, exit codes — must ALSO be asserted by a test that runs
-/// everywhere; the `_unix` test is the additional end-to-end proof, never the
-/// sole guard. (One exception is stated plainly in the story: exit code `5` has
-/// no cross-OS end-to-end path at all, because both routes to it — `pause` and
-/// `send` on an `unsupported` declaration — need a genuinely running child. Its
-/// full diagnostic→code mapping is pinned cross-OS by the `exit_code.rs`
-/// classifier unit tests plus the `map_engine_error`/`map_error` mapper tests in
-/// `cli::agent`, and `main`'s wiring of that classifier to the process status is
-/// pinned cross-OS by codes `0`/`1`/`2`/`3`/`4`.)
+/// when the helper exits), so tests whose assertions REQUIRE a live process from
+/// a previous command's lifetime runtime-`return` there. A runtime early-return
+/// is reported by the test runner as **PASSED**, so CI shows green on Windows
+/// with zero signal that the assertions never ran. Every such test therefore
+/// carries a `_unix` SUFFIX, making the limitation visible in the test list on
+/// all three OSes rather than hiding inside the body. Anything those tests guard
+/// that is genuinely OS-INDEPENDENT — wire shapes, schema versions, exit codes —
+/// must ALSO be asserted by a test that runs everywhere; the `_unix` test is the
+/// additional end-to-end proof, never the sole guard. (One exception is stated
+/// plainly in the story: exit code `5` has no cross-OS end-to-end path at all,
+/// because both routes to it — `pause` and `send` on an `unsupported`
+/// declaration — need a genuinely running child. Its full diagnostic→code
+/// mapping is pinned cross-OS by the `exit_code.rs` classifier unit tests plus
+/// the `map_engine_error`/`map_error` mapper tests in `cli::agent`, and `main`'s
+/// wiring of that classifier to the process status is pinned cross-OS by codes
+/// `0`/`1`/`2`/`3`/`4`.)
+///
+/// **Windows-positive siblings (AI-29, story 11-5).** Since story 11-5 the
+/// pause family is no longer Unix-only in SILENCE: where a Windows-correct
+/// CLI behavior exists it has its own affirmatively-running test
+/// (`pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`
+/// — engine death kills the child via job-close, and a later `pause`
+/// surfaces the honest reconciled-to-`failed` failure, never a fake
+/// `paused`), and where a Windows equivalent is genuinely meaningless
+/// (guaranteed suspension; exit code `5`'s unsupported-capability route) the
+/// skipped test's comment says so.
 fn start_via_surviving_engine(state_dir: &Path, name: &str) {
     let exe = std::env::current_exe().expect("test exe");
     let status = std::process::Command::new(exe)
@@ -791,6 +802,15 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
     // best-effort qualifier. Runtime-skip on Windows (guaranteed pause is
     // Unix-only); NO cfg — data-driven skip.
     //
+    // Per-OS honesty note (AI-29, story 11-5): there is NO Windows sibling
+    // for THIS test because a guaranteed suspension does not exist on Windows
+    // — the backend's cooperative pause is best-effort by design (AD-4), so
+    // "pause a live instance and get an unqualified `paused`" is a Unix-only
+    // guarantee by definition, not a gap. The Windows-correct CLI behavior
+    // that DOES exist in this family — engine death takes the child, and a
+    // later pause fails honestly — is asserted by
+    // `pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`.
+    //
     // NOTE (single-lifetime CLI boundary, story 1-6): each `kt` command is a
     // short-lived engine whose handle Drop kills the process on the command's
     // clean exit (the story-1-4 single-lifetime safety net; durable
@@ -849,6 +869,103 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
 }
 
 #[test]
+fn pause_after_windows_engine_death_reconciles_and_fails_honestly_windows() {
+    // AI-29 (story 11-5) — the Windows-POSITIVE sibling of the two Unix pause
+    // tests in this family, asserting the CORRECT Windows CLI semantics. On
+    // Windows the surviving-engine helper's child is killed the moment the
+    // helper exits (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — cross-lifetime
+    // survival genuinely cannot be simulated), so the one Windows-real pause
+    // scenario is the one that follows an engine death: the `kt agent pause`
+    // command opens an engine over the state dir, adoption finds the gone
+    // process behind the `running` row and reconciles it to `failed` (AI-8),
+    // and the pause then fails fast with the uniform invalid-transition
+    // diagnostic — never a fabricated `paused` on stdout. This is the
+    // end-to-end proof that a Windows pause command can never silently
+    // "pause" an instance whose process no longer exists.
+    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m =
+        fake_agent_manifest_with_pause(&ctx.project_dir, &["--linger-ms", "600000"], "best-effort");
+    run_kt_agent(
+        &["agent", "register", "be", "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Start via the surviving-engine helper; the helper's exit kills the
+    // child (job close), leaving a `running` record whose process is gone.
+    start_via_surviving_engine(state_dir, "be");
+
+    // Deterministic gate (no OS-cfg — data-driven, this body only runs on
+    // Windows): the job-close kill is ASYNCHRONOUS relative to the helper's
+    // exit, so wait until the announced agent pid is actually gone before
+    // invoking pause — otherwise a still-dying process could be adopted and
+    // "paused" best-effort, racing the assertion. Mirrors adoption.rs's
+    // `wait_until_gone` discipline (tasklist is the Windows liveness probe).
+    let log = state_dir
+        .join("agents")
+        .join("be")
+        .join("logs")
+        .join("agent.log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pid = loop {
+        if let Ok(contents) = std::fs::read_to_string(&log) {
+            if let Some(line) = contents.lines().find(|l| l.contains("ready pid=")) {
+                if let Some(idx) = line.find("pid=") {
+                    if let Ok(pid) = line[idx + 4..].trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent pid was never announced in {}",
+            log.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    loop {
+        let alive = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(true);
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the engine-death job-close kill never completed for pid {pid}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    // The pause command must surface the honest reconciled-to-`failed`
+    // invalid transition, on stderr, with a non-zero exit.
+    let paused = run_kt_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
+    assert!(
+        !paused.success,
+        "pause after the reconciled engine death must exit non-zero; stdout={}",
+        paused.stdout
+    );
+    assert!(
+        paused.stderr.contains("cannot pause"),
+        "the uniform invalid-transition diagnostic must be on stderr; stderr={}",
+        paused.stderr
+    );
+    // NEVER a fabricated success: no `paused` result line on stdout.
+    assert!(
+        !paused.stdout.contains("Paused"),
+        "pause must not claim success for a reconciled-dead instance; stdout={}",
+        paused.stdout
+    );
+}
+
+#[test]
 fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
     // outside the backends allowlist). This test drives the story-1-6 cross-
@@ -860,7 +977,11 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     // adoption reconciles the row to `failed` and pause can't run. Cross-lifetime
     // survival genuinely can't be simulated on Windows (consistent with the
     // engine's documented single-lifetime behavior); the pause/resume SEMANTICS
-    // are fully covered on Windows by `crates/ktesio-engine/tests/pause.rs`.
+    // are fully covered on Windows by `crates/ktesio-engine/tests/pause.rs`, and
+    // the Windows-correct CLI sibling in this family — the honest
+    // reconciled-to-`failed` pause failure after an engine death — runs on the
+    // Windows leg
+    // (`pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`).
     if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
         return;
     }
@@ -917,7 +1038,15 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // reconciles the row to `failed` and pause fails with a reconciled-to-failed
     // error instead of the intended UNSUPPORTED diagnostic. Cross-lifetime
     // survival can't be simulated on Windows; the pause semantics (including the
-    // unsupported projection) are covered by `crates/ktesio-engine/tests/pause.rs`.
+    // unsupported projection) are covered by `crates/ktesio-engine/tests/pause.rs`,
+    // and the family's Windows-correct CLI sibling runs on the Windows leg
+    // (`pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`).
+    // Per-OS honesty note (AI-29, story 11-5): there is deliberately NO Windows
+    // sibling for THIS test specifically — exit code `5` requires a genuinely
+    // running child with an unsupported pause declaration, a combination no
+    // Windows CLI invocation can reach; the diagnostic→code mapping stays pinned
+    // cross-OS by the `exit_code.rs` classifier unit tests (the file-level
+    // convention note above).
     if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
         return;
     }
@@ -3728,12 +3857,18 @@ fn run_kt_agent_env(
 }
 
 /// Write a `fake_agent` manifest that (a) dumps its received argv + env to
-/// `dump_path` at startup (`--dump`, the config-mapping observation point) and
-/// (b) maps the unified `model` key into the native env var `MODEL`
+/// `dump_path` at startup (`--dump`, the config-mapping observation point),
+/// (b) drops a readiness `--marker` file at startup (the AI-35/38 readiness
+/// handshake — a test waits for it before polling the dump), and (c) maps the
+/// unified `model` key into the native env var `MODEL`
 /// (`[config.model] env = "MODEL"`, the SHARED builder's config-env chain —
 /// story 10-1). So a `model = "secret:NAME"` leaf, once resolved, lands in the
 /// child's `MODEL` env — captured in the dump as `env=MODEL=<cleartext>`.
-fn fake_agent_manifest_secret_env(dir: &Path, dump_path: &Path) -> std::path::PathBuf {
+fn fake_agent_manifest_secret_env(
+    dir: &Path,
+    dump_path: &Path,
+    marker_path: &Path,
+) -> std::path::PathBuf {
     let m = dir.join("fake-agent-secret-adapter");
     ManifestFixture::fake_agent(
         "fake",
@@ -3742,6 +3877,8 @@ fn fake_agent_manifest_secret_env(dir: &Path, dump_path: &Path) -> std::path::Pa
             "600000",
             "--dump",
             &*dump_path.to_string_lossy(),
+            "--marker",
+            &*marker_path.to_string_lossy(),
         ],
     )
     .config_env("model", "MODEL")
@@ -3780,34 +3917,35 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     //   - `config get --json --reveal` DOES carry the sentinel (AC-C, the sole
     //     un-mask), and the default `--json` carries the mask.
     //
-    // Runtime-gate to Linux only (data-driven OS id, NO `#[cfg]` — this file is
-    // outside the backends allowlist). The no-leak / masking logic this test
-    // proves is OS-AGNOSTIC engine code: `ResolvedValue::display()` masking and
-    // the snapshot / JSON serialization are identical on every OS. The
-    // OS-SPECIFIC secret bit (the 0600 secrets-file permission check) already has
-    // dedicated tests under `backends/{unix,windows}`. The reason this test can't
-    // run everywhere is its POSITIVE-delivery half, which observes the sentinel
-    // in the fake agent's `--dump`: that dump is written only AFTER the one-shot
-    // `kt agent start` exits, and observing a one-shot-spawned agent is unreliable
-    // on macOS + Windows CI. On macOS CI the agent never writes the dump at all
-    // (the one-shot start leaves no observable running agent — regardless of
-    // timeout); on Windows JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills the agent the
-    // instant `kt` exits. The heavier `start_via_surviving_engine` harness isn't
-    // warranted just to re-prove OS-agnostic masking. tarpaulin runs on Linux, so
-    // the test still executes there and coverage is unchanged.
-    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Linux {
-        return;
-    }
+    // Cross-OS (AI-35/AI-38, story 11-5): this test used to be runtime-gated
+    // Linux-only because its POSITIVE-delivery half observed the one-shot
+    // `kt agent start`'s agent — a process that macOS CI never let become
+    // observable and that Windows' kill-on-close reaps the instant `kt`
+    // exits. Both legs now run it, via two commissioned fixes: the start
+    // goes through the `start_via_surviving_engine` harness (the agent is
+    // provably launched by the helper's engine before the helper exits — on
+    // Windows the job-close kill that follows still leaves the startup
+    // artifacts on disk), and the observation is a READINESS HANDSHAKE, not
+    // a wall-clock race: the manifest passes `--marker`, the test waits for
+    // the marker file (written by fake_agent at startup, before its `--dump`)
+    // and THEN for the dump — proceeding as soon as the agent is provably up,
+    // with generous bounded deadlines, on every OS. The no-leak/masking logic
+    // under test is OS-agnostic engine code (`ResolvedValue::display()`,
+    // snapshot + JSON serialization). The resolver env var is set on THIS
+    // process (unique name) so the re-exec'd helper's engine inherits it.
+    let env_key = "KTESIO_CLI_SECRET_E2E_KEY";
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
     // The dump file the agent writes its received env into (outside the state dir,
-    // so the no-leak Agent-Home sweep does not scan the intended-cleartext dump).
+    // so the no-leak Agent-Home sweep does not scan the intended-cleartext dump),
+    // plus the readiness marker the handshake waits on.
     let dump = ctx.project_dir.join("agent-received.dump");
-    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+    let marker = ctx.project_dir.join("agent-ready.marker");
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump, &marker);
 
-    // Register + set `model = secret:MODEL_KEY` (the reference is what is stored).
+    // Register + set `model = secret:NAME` (the reference is what is stored).
     let reg = run_kt_agent(
         &[
             "agent",
@@ -3828,39 +3966,48 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
         .trim()
         .to_string();
     let set = run_kt_agent(
-        &["agent", "config", "set", "sek", "model", "secret:MODEL_KEY"],
+        &[
+            "agent",
+            "config",
+            "set",
+            "sek",
+            "model",
+            &format!("secret:{env_key}"),
+        ],
         &ctx.project_dir,
         state_dir,
     );
     assert!(set.success, "set failed; stderr={}", set.stderr);
 
-    // Start with MODEL_KEY set in the environment → the env resolver resolves the
-    // secret to the sentinel, which apply_config_mapping delivers into env MODEL.
-    let (ok, out, err) = run_kt_agent_env(
-        &["agent", "start", "sek"],
-        &ctx.project_dir,
-        state_dir,
-        "MODEL_KEY",
-        SECRET_SENTINEL,
-    );
-    assert!(ok, "start should succeed; stdout={out} stderr={err}");
-    // Neither start's stdout nor stderr may carry the sentinel.
-    assert!(
-        !out.contains(SECRET_SENTINEL),
-        "start stdout leaked the secret"
-    );
-    assert!(
-        !err.contains(SECRET_SENTINEL),
-        "start stderr leaked the secret"
-    );
+    // Start via the surviving (crashed-engine) helper with the resolver env var
+    // set on THIS process (the helper's engine — and the agent it spawns —
+    // inherits it, resolving the secret to the sentinel, which
+    // apply_config_mapping delivers into env MODEL). The var is restored at the
+    // end of the test (the save/restore idiom the supervisor secret test uses;
+    // under nextest each test is its own process, so even a mid-test failure
+    // cannot leak past it).
+    let env_value = std::env::var_os(env_key);
+    std::env::set_var(env_key, SECRET_SENTINEL);
+    start_via_surviving_engine(state_dir, "sek");
 
     // (POSITIVE) The sentinel REACHED the adapter's native env (the value is usable).
     let dump_text = {
-        // The agent writes the dump at startup; poll briefly for it. This runs
-        // Linux-only (see the gate above), where the one-shot-spawned agent
-        // re-parents to init, survives `kt`'s exit, and reaches this within the
-        // 5 s deadline. It is a wait for the write to APPEAR, not a fixed sleep.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Readiness handshake, not a wall-clock race: wait for the agent's
+        // startup marker first (it is provably up), then for the dump line.
+        // Both bounds are generous for a loaded CI runner; each poll returns
+        // the moment its file appears, so the happy path pays nothing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if marker.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent's readiness marker never appeared at {marker:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Ok(t) = std::fs::read_to_string(&dump) {
                 if t.contains("env=MODEL=") {
@@ -3935,12 +4082,13 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     );
 
     // (REVEAL) `config get --json --reveal` re-resolves LIVE and DOES carry the
-    // sentinel — the sole un-mask (AC-C). Needs MODEL_KEY in the env for the read.
+    // sentinel — the sole un-mask (AC-C). Needs the resolver var in the env for
+    // the read (the explicit single-run env helper sets it for this child).
     let (rok, rout, rerr) = run_kt_agent_env(
         &["agent", "config", "get", "sek", "--json", "--reveal"],
         &ctx.project_dir,
         state_dir,
-        "MODEL_KEY",
+        env_key,
         SECRET_SENTINEL,
     );
     assert!(rok, "get --reveal failed; stderr={rerr}");
@@ -3957,6 +4105,12 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
         serde_json::json!(SECRET_SENTINEL),
         "--reveal must emit the unmasked cleartext; doc={doc}"
     );
+
+    // Restore the resolver env var (the save/restore idiom; see the start above).
+    match env_value {
+        Some(v) => std::env::set_var(env_key, v),
+        None => std::env::remove_var(env_key),
+    }
 }
 
 #[test]
@@ -3968,7 +4122,7 @@ fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
     let dump = ctx.project_dir.join("agent.dump");
-    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump, &dump.with_extension("marker"));
 
     let reg = run_kt_agent(
         &[
@@ -4064,7 +4218,7 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
     let dump = ctx.project_dir.join("agent.dump");
-    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump);
+    let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump, &dump.with_extension("marker"));
 
     let reg = run_kt_agent(
         &[
