@@ -94,6 +94,40 @@ const READINESS_WINDOW: Duration = Duration::from_millis(300);
 /// How often the readiness watch polls the freshly spawned process.
 const READINESS_POLL: Duration = Duration::from_millis(10);
 
+/// AI-12: how many CONSECUTIVE `backend.poll` errors on one held handle the
+/// crash reaper tolerates as "transient, treat as still-alive" before it stops
+/// trusting that reading and treats the handle as a crash signal. At the engine
+/// cadence (~250ms per reaper tick) this bounds a permanently un-pollable
+/// handle at roughly 2.5s of silent non-detection — instead of FOREVER (the old
+/// `Err(_) => None` swallowed every error, so a handle the backend could never
+/// again poll was never crash-detected). A single-digit error burst (a
+/// transient syscall hiccup) stays below it and keeps the historical
+/// tolerate-and-retry behavior.
+const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 10;
+
+/// AI-12 (loop 1): how many characters of the LAST poll error's text the
+/// persistent-poll-failure crash cause carries. Bounded so a pathological
+/// error string cannot bloat the event log; enough to name the actual why
+/// (e.g. the injected fault text, an OS errno message, a procfs failure).
+const POLL_ERROR_CAUSE_MAX_CHARS: usize = 200;
+
+/// AI-12 (loop 2): how many CONSECUTIVE environmental ticks the corroboration
+/// guard tolerates before it stops granting blanket immunity. Corroboration
+/// needs readable peers; two persistently broken (or flaky) handles erroring
+/// together every tick would otherwise defeat crash detection FOREVER — the
+/// exact hole AI-12 closed. At ~250ms per reaper tick, 40 ticks ≈ 10s of
+/// continuous multi-handle failure, after which the per-handle streak path
+/// resumes (and trips `MAX_CONSECUTIVE_POLL_ERRORS` ticks later) with a
+/// diagnostic naming the escalation.
+const MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS: u32 = 40;
+
+/// AI-41 (loop 2): how many consecutive failed drain passes the MidRun cursor
+/// may stay parked at the SAME byte offset before the block is skipped with a
+/// diagnostic. Bounds both the park (a permanently poisoned row cannot wedge
+/// the cursor forever) and the diagnostic noise (≤ one diagnostic per attempt
+/// per offset, then the skip note).
+const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
+
 /// A scheduled restart of a crashed instance (story 1-6, AC4). Returned by
 /// [`Supervisor::poll_once`] for each crashed `on-failure` instance that has not
 /// hit the crash-loop threshold; the engine cadence sleeps [`RestartPlan::delay`]
@@ -118,6 +152,97 @@ struct RestartDecision {
     crash_cause: String,
     /// The restart to schedule, or `None` on a terminal (`never`/crash-loop) outcome.
     plan: Option<RestartPlan>,
+}
+
+/// Truncate a diagnostic string for inclusion in a crash cause (AI-12, loop 1):
+/// the operator gets the actual why (the last poll error's text), bounded so a
+/// pathological message cannot bloat the event log. Pure — unit-tested.
+fn truncate_for_cause(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max_chars).collect();
+    cut.push('…');
+    cut
+}
+
+/// One held handle's SAME-TICK poll result (AI-12, loop 1): every handle is
+/// polled once per reaper pass BEFORE any crash handling, so the pass can
+/// corroborate — a poll error shared by MULTIPLE handles in one tick is an
+/// environmental condition, not a per-handle fault.
+enum PollOutcome {
+    /// `Ok(ProcessStatus::Alive)`.
+    Alive,
+    /// `Ok(ProcessStatus::Exited { code })`.
+    Exited(Option<i32>),
+    /// `Err(_)` — carries the error for the streak decision + the crash cause.
+    Errored(BackendError),
+}
+
+/// The AI-12 verdict for ONE reaper poll of one held handle — what this pass's
+/// `backend.poll` result means for crash detection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PollVerdict {
+    /// A clean `Alive` read: still alive — and the handle's consecutive
+    /// poll-error streak RESETS.
+    Alive,
+    /// The process exited with the given (possibly unknown) code — crash input,
+    /// exactly as before AI-12.
+    Exited(Option<i32>),
+    /// A poll error whose streak stays BELOW [`MAX_CONSECUTIVE_POLL_ERRORS`] —
+    /// tolerated as transient (the historical behavior for a short error burst);
+    /// the next pass re-checks. The streak increments.
+    TransientError,
+    /// A poll error that reached [`MAX_CONSECUTIVE_POLL_ERRORS`] — the handle can
+    /// no longer be trusted as "still alive": CRASH INPUT (the instance is
+    /// reconciled to `failed` with a cause naming the persistent poll failure),
+    /// never a silent `None` forever.
+    PersistentError,
+}
+
+/// Decide what one reaper poll means (AI-12). Pure — no I/O, no locks — so the
+/// streak policy is unit-testable without a backend. `previous_streak` is the
+/// handle's consecutive `backend.poll` error count BEFORE this pass; the returned
+/// pair is the verdict and the streak to store for the next pass.
+///
+/// * `Ok(Alive)` → [`PollVerdict::Alive`], streak reset to 0;
+/// * `Ok(Exited)` → [`PollVerdict::Exited`], streak reset to 0 (the handle is
+///   leaving the map anyway);
+/// * `Err(_)`, `previous_streak + 1 < MAX` → [`PollVerdict::TransientError`]
+///   (streak `previous_streak + 1`);
+/// * `Err(_)`, `previous_streak + 1 >= MAX` → [`PollVerdict::PersistentError`].
+fn poll_verdict(
+    previous_streak: u32,
+    poll: Result<ProcessStatus, BackendError>,
+) -> (PollVerdict, u32) {
+    match poll {
+        Ok(ProcessStatus::Alive) => (PollVerdict::Alive, 0),
+        Ok(ProcessStatus::Exited { code }) => (PollVerdict::Exited(code), 0),
+        Err(_) => {
+            let streak = previous_streak.saturating_add(1);
+            if streak >= MAX_CONSECUTIVE_POLL_ERRORS {
+                (PollVerdict::PersistentError, streak)
+            } else {
+                (PollVerdict::TransientError, streak)
+            }
+        }
+    }
+}
+
+/// The crash input the reaper acts on for one held handle — an observed exit
+/// (with its code, `None` when the backend cannot report one) or, new under
+/// AI-12, a handle that went permanently un-pollable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CrashInput {
+    /// `backend.poll` reported a real exit.
+    Exited(Option<i32>),
+    /// `MAX_CONSECUTIVE_POLL_ERRORS` consecutive poll errors — treated as a
+    /// crash signal even though no exit was observed. `sole_handle` records
+    /// that the failing handle was the ONLY held handle (AI-12, loop 2): its
+    /// errors could never be corroborated against peers, so the cause must say
+    /// a single-handle fleet cannot distinguish a per-handle fault from a
+    /// platform-wide one.
+    PersistentPollFailure { sole_handle: bool },
 }
 
 /// How [`Supervisor::drain_usage_for`] treats the tail of the agent-output log
@@ -367,6 +492,13 @@ struct Supervised {
     /// cursor. Advanced past each block the drain reads, so lines are ingested at
     /// most once from the capture (the DB dedup is the second, authoritative guard).
     usage_cursor: u64,
+    /// AI-41 (loop 2): the MIDRUN park bound — `Some((parked_cursor, attempts))`
+    /// while a store error keeps the cursor parked at `parked_cursor`; `attempts`
+    /// counts consecutive failed drain passes AT THAT OFFSET (any different
+    /// offset resets it). Past [`USAGE_PARK_MAX_ATTEMPTS`] the block is skipped
+    /// with a loud diagnostic, so a permanently poisoned row cannot wedge the
+    /// cursor (and silently strand every later usage event for the Run) forever.
+    usage_park_attempts: Option<(u64, u32)>,
     /// The per-Run breach LATCH (story 3-2 idempotence fix; story 3-3 keyed by
     /// dimension): the set of `(dimension, scope)` pairs that have ALREADY fired a
     /// breach for THIS Run. Enforcement (`enforce_budget`) runs on EVERY committed
@@ -415,6 +547,15 @@ struct Supervised {
     /// which ever sets this flag), so this fix pass changes behavior ONLY
     /// for the specific scenario it targets.
     stop_unconfirmed: bool,
+    /// Whether this handle was ADOPTED (re-acquired by
+    /// [`Supervisor::adopt_orphans`] from a prior engine session) rather than
+    /// spawned by THIS engine (AI-13). An adopted handle is not the engine's
+    /// child, so its exit code is unrecoverable — `Exited { code: None }` for an
+    /// adopted process means "code UNAVAILABLE", and the crash cause must say so
+    /// instead of asserting a signal termination it cannot prove. `false` for a
+    /// freshly spawned process (whose `code: None` genuinely means "terminated by
+    /// a signal" — `try_wait` had the authoritative `ExitStatus`).
+    adopted: bool,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -494,6 +635,50 @@ pub struct Supervisor {
     /// own `Mutex` is contended only by the rare diagnostics — never a hot
     /// path — and installs/rotations serialize with emissions correctly.
     diagnostics: Option<DiagnosticSink>,
+    /// AI-12: the per-instance CONSECUTIVE `backend.poll` error count, kept
+    /// across reaper passes so a PERSISTENT poll failure can trip
+    /// [`MAX_CONSECUTIVE_POLL_ERRORS`] and be treated as a crash signal instead
+    /// of being swallowed forever as "still-alive". A clean poll (or the
+    /// handle's removal) clears the entry; a singleton error streak restarts
+    /// from zero.
+    poll_error_streaks: HashMap<InstanceName, u32>,
+    /// AI-12 (loop 1): the LAST poll error's text per handle (truncated at
+    /// [`POLL_ERROR_CAUSE_MAX_CHARS`]), so the persistent-poll-failure crash
+    /// cause can carry the actual why — not just the bare count. Updated on
+    /// every poll error (handle-specific OR environmental), read when a streak
+    /// trips, cleared wherever the streak clears.
+    poll_last_errors: HashMap<InstanceName, String>,
+    /// AI-12 (loop 2): how many CONSECUTIVE ticks the corroboration guard has
+    /// classified as environmental. Every non-environmental tick resets it.
+    /// Past [`MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS`] the guard stops granting
+    /// blanket immunity (per-handle streak credit resumes), so a persistently
+    /// erroring pair cannot keep crash detection defeated forever.
+    consecutive_environmental_ticks: u32,
+    /// AI-12 (loop 1) — cfg(test) FAULT-INJECTION SEAM at the backend poll
+    /// boundary: a pid listed here fails every `backend.poll` with an injected
+    /// [`BackendError::Control`], driving `poll_once` down its persistent-
+    /// poll-failure path in the lib wiring tests without staging a real
+    /// procfs/sysctl outage. Placement NOTE: the seam fronts the BACKEND's
+    /// poll (the supervisor only ever sees the port), but its state lives on
+    /// the supervisor — the embed-clean audit forbids global cells in the
+    /// engine, and per-supervisor state is test-isolated by construction
+    /// (each test's faults die with its own supervisor). Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    poll_fault_pids: std::collections::HashSet<u32>,
+    /// AI-9 (loop 2) — cfg(test) FAULT-INJECTION SEAM at the backend signal
+    /// boundary: an instance name listed here fails every `signal_backend` for
+    /// it with an injected [`BackendError::Control`], driving the post-commit
+    /// signal-failure branch of `suspend_or_resume` (the transition has already
+    /// committed, so the ledger and the live process diverge) in the lib wiring
+    /// tests without staging a real kill/pgid outage. Placement NOTE: the seam
+    /// fronts the BACKEND's pause/resume (the supervisor only ever sees the
+    /// port), but its state lives on the supervisor — same rationale as
+    /// `poll_fault_pids` above (the embed-clean audit forbids global cells, and
+    /// per-supervisor state is test-isolated by construction). Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    signal_fault_names: std::collections::HashSet<InstanceName>,
 }
 
 impl Supervisor {
@@ -513,6 +698,13 @@ impl Supervisor {
             events: EventBus::new(),
             runtime: None,
             diagnostics: None,
+            poll_error_streaks: HashMap::new(),
+            poll_last_errors: HashMap::new(),
+            consecutive_environmental_ticks: 0,
+            #[cfg(test)]
+            poll_fault_pids: std::collections::HashSet::new(),
+            #[cfg(test)]
+            signal_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -531,6 +723,13 @@ impl Supervisor {
             events: EventBus::new(),
             runtime: Some(runtime),
             diagnostics: None,
+            poll_error_streaks: HashMap::new(),
+            poll_last_errors: HashMap::new(),
+            consecutive_environmental_ticks: 0,
+            #[cfg(test)]
+            poll_fault_pids: std::collections::HashSet::new(),
+            #[cfg(test)]
+            signal_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -549,6 +748,13 @@ impl Supervisor {
             events: EventBus::new(),
             runtime: None,
             diagnostics: None,
+            poll_error_streaks: HashMap::new(),
+            poll_last_errors: HashMap::new(),
+            consecutive_environmental_ticks: 0,
+            #[cfg(test)]
+            poll_fault_pids: std::collections::HashSet::new(),
+            #[cfg(test)]
+            signal_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -1066,6 +1272,9 @@ impl Supervisor {
         let observed_source = observed_listener
             .as_ref()
             .map(|_| ObservedUsageSource::new());
+        // A fresh Run starts from a ZERO poll-error streak (AI-12): a stale entry
+        // from this name's PRIOR handle must never pre-load the new one.
+        self.clear_poll_error_streak(&name);
         self.running.insert(
             name.clone(),
             Supervised {
@@ -1073,6 +1282,7 @@ impl Supervisor {
                 run_id,
                 metering_source,
                 usage_cursor,
+                usage_park_attempts: None,
                 // A fresh Run starts with an EMPTY breach latch (story 3-2): the
                 // run_id was just minted, so no scope has fired for it yet. This is
                 // how the latch RESETS per Run — a persistently-over-cumulative agent
@@ -1083,6 +1293,8 @@ impl Supervisor {
                 observed_source,
                 // A fresh start's stop attempt has not happened yet.
                 stop_unconfirmed: false,
+                // A fresh start (operator or restart) spawned this process itself.
+                adopted: false,
             },
         );
 
@@ -1240,6 +1452,7 @@ impl Supervisor {
                 // condition that made confirmation time out has cleared).
                 // Complete the stuck `stopping -> stopped` transition exactly
                 // as the ordinary path below would have on confirmed death.
+                self.clear_poll_error_streak(&name);
                 self.running.remove(&name);
                 registry
                     .clear_spawn_record(&name)
@@ -1370,6 +1583,7 @@ impl Supervisor {
         self.drain_usage_for(registry, &name, DrainMode::Terminal);
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
+        self.clear_poll_error_streak(&name);
         self.running.remove(&name);
 
         // Clear the write-ahead spawn record (AD-5): a cleanly-stopped instance
@@ -1403,18 +1617,25 @@ impl Supervisor {
     /// Pause a running Agent Instance with honest, per-OS semantics (story 1-5,
     /// AC1/AC2/AC3/AC5 — the "surfaced not silent" HONESTY command).
     ///
-    /// Order mirrors [`Supervisor::stop`], except the middle step DISPATCHES on
-    /// the effective (current-OS) pause `SupportLevel` read from the persisted
-    /// snapshot (AC5), rather than always calling the backend:
+    /// Order mirrors [`Supervisor::stop`] — including the persist-FIRST ordering
+    /// (AI-9: the transition commits before the signal, so a persist failure can
+    /// never leave the process suspended while the ledger says otherwise) —
+    /// except the middle step DISPATCHES on the effective (current-OS) pause
+    /// `SupportLevel` read from the persisted snapshot (AC5), rather than always
+    /// calling the backend:
     /// 1. name → [`InstanceName`]; look up the instance,
     /// 2. transition gate `next_state(state, Pause)?` — an invalid transition
     ///    (e.g. pause on `stopped`/`paused`) rejects HERE with the uniform
     ///    [`LifecycleError::InvalidTransition`] (AC4), before any side effect or
     ///    level read,
     /// 3. read the effective pause level (AC5) and dispatch:
-    ///    * **Guaranteed** → `backend.pause(handle)` (real SIGSTOP suspension on
-    ///      Unix), then persist `running→paused` + a plain
-    ///      [`TransitionCause::Command`] (`"pause"`) — no qualifier,
+    ///    * **Guaranteed** → persist `running→paused` + a plain
+    ///      [`TransitionCause::Command`] (`"pause"`) — no qualifier — THEN
+    ///      `backend.pause(handle)` (real SIGSTOP suspension on Unix). AI-8: when
+    ///      NO in-memory handle is held (nothing can be signalled), the recorded
+    ///      cause is the honest [`TransitionCause::PauseBestEffort`] qualifier
+    ///      naming the missing handle instead of a plain command that would read
+    ///      as a real suspension,
     ///    * **BestEffort** → persist `running→paused` + a
     ///      [`TransitionCause::PauseBestEffort`] qualifier (the machine-readable
     ///      half of "surfaced not silent"); the process may keep running,
@@ -1458,9 +1679,18 @@ impl Supervisor {
     ///   + a plain `resume` command cause,
     /// * **BestEffort** → `paused→running` + a [`TransitionCause::ResumeBestEffort`]
     ///   qualifier,
-    /// * **Unsupported** → fail fast (defensive; a `paused` instance implies pause
-    ///   was allowed, so this is not normally reachable — see the note on the
-    ///   symmetric dispatch below).
+    /// * **Unsupported** → fail fast with the DEDICATED
+    ///   [`EngineError::ResumeUnsupported`] (AI-7 — NOT the bare pause-unsupported
+    ///   error): the instance is already `paused` (the gate above guarantees it),
+    ///   so a diagnostic that merely says "pause is unsupported" would strand the
+    ///   operator with no way forward. The dedicated variant names the state + the
+    ///   adapter's pause declaration and gives the escape hatch — `stop` works
+    ///   without pause support (it never consults the pause level), so
+    ///   `stop` + `start` is a real recovery, and a `resume` on an OS where the
+    ///   declaration supports pause works too. NO state change, NO signal, NO
+    ///   fake success. Not normally reachable within one declaration (a `paused`
+    ///   row implies pause was allowed at some point), but real via
+    ///   declaration/OS drift between the pause and the resume.
     pub fn resume(
         &mut self,
         registry: &Registry,
@@ -1514,22 +1744,135 @@ impl Supervisor {
         // (3) Dispatch on the level.
         match level {
             // FAIL FAST (AC3): no transition, no backend call, nothing persisted.
+            // AI-7: a RESUME under an Unsupported PAUSE declaration gets its OWN
+            // diagnostic (not the bare pause-unsupported error): the instance is
+            // already `paused` (the transition gate above guarantees it), so
+            // telling the operator "cannot pause" strands them. The error names
+            // the state + the declaration and gives the path forward (stop works
+            // without pause support). The PAUSE arm keeps the original
+            // CapabilityUnsupported fail-fast verbatim (AC3).
+            SupportLevel::Unsupported if command == LifecycleCommand::Resume => {
+                Err(EngineError::ResumeUnsupported {
+                    name: name.as_str().to_string(),
+                    os: os.as_str().to_string(),
+                    level: level.as_str().to_string(),
+                })
+            }
             SupportLevel::Unsupported => Err(EngineError::CapabilityUnsupported {
                 name: name.as_str().to_string(),
                 capability: Capability::Pause.as_str().to_string(),
                 os: os.as_str().to_string(),
                 level: level.as_str().to_string(),
             }),
-            // GUARANTEED (AC1): real suspension via the backend, then a plain
+            // GUARANTEED (AC1): a real suspension via the backend, then a plain
             // command-cause transition (no qualifier — it is a true suspension). A
             // story-3-2 budget pause overrides the cause with BudgetExceeded.
+            //
+            // AI-8 + AI-9 (order mirrors `stop_inner`): the HONEST cause is
+            // decided BEFORE anything is signalled or persisted — a guaranteed
+            // command with no in-memory handle signals nothing, so its cause is
+            // the best-effort qualifier naming the missing handle, never a plain
+            // command that would read as a real suspension — and the transition
+            // (persist + log) lands FIRST, then the signal, so a failed persist
+            // can never leave the process suspended while the ledger says
+            // otherwise (the durable state leads, exactly like stop).
             SupportLevel::Guaranteed => {
                 self.ensure_log_dir(registry, &name)?;
-                self.signal_backend(&name, command)?;
-                let cause = cause_override
-                    .clone()
-                    .unwrap_or_else(|| TransitionCause::command(command.as_str()));
+                let has_handle = self.running.contains_key(&name);
+                let cause = match (cause_override.clone(), has_handle) {
+                    // The handle is held: a story-3-2 budget pause overrides the
+                    // cause with BudgetExceeded; a plain command keeps its plain
+                    // command cause (a true suspension).
+                    (Some(cause), true) => cause,
+                    (None, true) => TransitionCause::command(command.as_str()),
+                    // AI-8 (loop 1): NOTHING is held to signal — record the
+                    // honest best-effort posture with the reason (the missing
+                    // handle), never a plain command that would read as a real
+                    // suspension. A `Some(cause_override)` (e.g. BudgetExceeded)
+                    // does NOT win here either: a budget pause that suspended
+                    // nothing must not read as a performed suspension, so the
+                    // override is WRAPPED as the qualifier's detail (the breach
+                    // event itself already carries the budget record).
+                    (override_cause, false) => {
+                        let detail = match override_cause {
+                            Some(cause) => format!(
+                                "no live process handle is held in this engine session for \
+                                 '{name}', so the guaranteed {} signalled nothing; the transition \
+                                 is recorded best-effort — the requested override was:{}",
+                                command.as_str(),
+                                cause_suffix(&cause),
+                            ),
+                            None => format!(
+                                "no live process handle is held in this engine session for \
+                                 '{name}', so the guaranteed {} signalled nothing; the transition \
+                                 is recorded best-effort",
+                                command.as_str(),
+                            ),
+                        };
+                        match command {
+                            LifecycleCommand::Pause => TransitionCause::pause_best_effort(detail),
+                            _ => TransitionCause::resume_best_effort(detail),
+                        }
+                    }
+                };
+                // AI-9: persist FIRST (the durable state leads; a transition
+                // failure aborts BEFORE any signal, so the ledger can never claim
+                // `paused` around a suspension that did not happen — nor the
+                // reverse), THEN signal the held process.
                 self.transition(registry, &name, instance.state, new_state, cause)?;
+                // AI-9 (loop 1): the transition COMMITTED — if the signal now
+                // fails, the ledger and the live process DIVERGE (the row says
+                // paused/running while the process did not transition). The
+                // divergence must never be silent (mirrors `stop_inner`'s
+                // honesty): emit the breadcrumb naming instance + committed
+                // state + signal error + the real recovery, then surface the
+                // error as before.
+                if let Err(err) = self.signal_backend(&name, command) {
+                    // AI-9 (loop 2): the remediation must be budget-safe. When
+                    // the failed pause was breach-driven, the per-Run breach
+                    // latch is ALREADY spent — advising `resume` would leave an
+                    // over-budget agent running for the rest of the Run with no
+                    // re-enforcement — so that case recommends `stop` only.
+                    let breach_driven =
+                        matches!(cause_override, Some(TransitionCause::BudgetExceeded { .. }));
+                    let remediation = match (command, breach_driven) {
+                        // Row says `paused`, process still running: `resume`
+                        // realigns the ledger (the SIGCONT is a harmless no-op
+                        // on a running process); `stop` ends it — but for a
+                        // breach-driven pause, `stop` is the ONLY safe advice.
+                        (LifecycleCommand::Pause, true) => format!(
+                            "kt agent stop {name} (the pause was budget-driven and the \
+                             per-Run breach latch is spent — resuming would leave the \
+                             over-budget run unenforced)"
+                        ),
+                        (LifecycleCommand::Pause, false) => {
+                            format!(
+                                "kt agent resume {name} to realign the ledger, or \
+                                 kt agent stop {name} to end the instance"
+                            )
+                        }
+                        // Row says `running`, process still suspended: only
+                        // `stop` applies (a resume is now the invalid
+                        // transition; stop's escalation reaches a stopped
+                        // process where SIGTERM cannot).
+                        (LifecycleCommand::Resume, _) => {
+                            format!(
+                                "kt agent stop {name} (its escalation reaches a suspended process)"
+                            )
+                        }
+                        (_, _) => format!("kt agent stop {name}"),
+                    };
+                    let signal_failure = format!(
+                        "{}: the committed {} transition says '{}', but the signal failed: {} — \
+                         the ledger and the live process may diverge; recovery: {remediation}",
+                        name.as_str(),
+                        command.as_str(),
+                        new_state.as_str(),
+                        err,
+                    );
+                    self.emit_diagnostic(&signal_failure);
+                    return Err(err);
+                }
                 registry.lookup(&name).map_err(registry_to_engine)
             }
             // BEST-EFFORT (AC2): transition + a VISIBLE qualifier cause, never a
@@ -1568,9 +1911,14 @@ impl Supervisor {
     /// handle IS in the map and this path really signals it. The no-handle branch
     /// now only occurs when the row says `running`/`paused` but adoption found NO
     /// live process — a state adoption would already have reconciled to `failed`;
-    /// so a lingering no-handle case is a best-effort no-op (nothing to signal),
-    /// which still lets the transition proceed. A real held (spawned or adopted)
-    /// process IS signalled.
+    /// so a lingering no-handle case is a best-effort no-op (nothing to signal).
+    /// AI-8: the CALLER records that honesty in the transition cause (the
+    /// best-effort qualifier naming the missing handle — decided in
+    /// [`Supervisor::suspend_or_resume`] BEFORE the persist, via the
+    /// `contains_key` probe) — this method still returns `Ok` (the desired end
+    /// state trivially holds; nothing to signal), never a fake plain-command
+    /// success in the ledger. A real held (spawned or adopted) process IS
+    /// signalled.
     fn signal_backend(
         &mut self,
         name: &InstanceName,
@@ -1579,6 +1927,25 @@ impl Supervisor {
         let Some(supervised) = self.running.get_mut(name) else {
             return Ok(());
         };
+        // AI-9 (loop 2) wiring seam (cfg(test)): the armed instance's signal
+        // fails with an injected error even though its transition has already
+        // committed — the fault-injection front for the backend's pause/resume
+        // (see the `signal_fault_names` field docs). Consulted AFTER the
+        // no-handle probe so an armed name with nothing held keeps the honest
+        // "no handle = harmless no-op" semantics above.
+        #[cfg(test)]
+        if self.signal_fault_names.contains(name) {
+            return Err(EngineError::Backend {
+                name: name.as_str().to_string(),
+                source: BackendError::Control {
+                    op: match command {
+                        LifecycleCommand::Pause => "pause",
+                        _ => "resume",
+                    },
+                    detail: "injected cfg(test) signal fault (AI-9 post-commit seam)".to_string(),
+                },
+            });
+        }
         let result = match command {
             LifecycleCommand::Pause => self.backend.pause(&mut supervised.handle),
             _ => self.backend.resume(&mut supervised.handle),
@@ -1746,6 +2113,48 @@ impl Supervisor {
     /// zero). Held in memory alongside the process handle for this engine lifetime.
     pub fn current_run_id(&self, name: &InstanceName) -> Option<RunId> {
         self.running.get(name).map(|s| s.run_id.clone())
+    }
+
+    /// Clear one instance's consecutive poll-error streak (AI-12). Called at
+    /// EVERY [`Supervisor::poll_once`] `running.remove` site and on every fresh
+    /// handle insert (start / adopt), so a removed — or replaced — handle can
+    /// never bequeath a stale error streak to the instance's next Run.
+    fn clear_poll_error_streak(&mut self, name: &InstanceName) {
+        self.poll_error_streaks.remove(name);
+        self.poll_last_errors.remove(name);
+    }
+
+    /// Arm the cfg(test) poll-fault seam for `pid`: every `backend.poll` of
+    /// the handle with this pid fails with an injected error until this
+    /// supervisor is dropped. Lib-test only.
+    #[cfg(test)]
+    pub(crate) fn arm_poll_fault(&mut self, pid: u32) {
+        assert!(
+            self.poll_fault_pids.insert(pid),
+            "poll fault already armed for pid {pid}"
+        );
+    }
+
+    /// The injected poll error for `pid`, when the seam is armed (cfg(test)).
+    #[cfg(test)]
+    fn injected_poll_fault(&self, pid: u32) -> Option<BackendError> {
+        self.poll_fault_pids
+            .contains(&pid)
+            .then(|| BackendError::Control {
+                op: "poll",
+                detail: "injected cfg(test) poll fault (AI-12 wiring seam)".to_string(),
+            })
+    }
+
+    /// Arm the cfg(test) signal-fault seam for `name`: every `signal_backend`
+    /// for this instance fails with an injected error until this supervisor is
+    /// dropped. Lib-test only.
+    #[cfg(test)]
+    pub(crate) fn arm_signal_fault(&mut self, name: InstanceName) {
+        assert!(
+            self.signal_fault_names.insert(name),
+            "signal fault already armed for this instance"
+        );
     }
 
     /// Read the recorded [`TransitionEvent`]s for an instance from its log
@@ -1929,6 +2338,23 @@ impl Supervisor {
     /// performs NO sleeping itself. Idempotent per exit: once an instance is
     /// moved to `failed` and its handle removed, a later pass will not see it in
     /// `self.running` again.
+    ///
+    /// **Persistent poll errors are crash input (AI-12):** a `backend.poll` error
+    /// is tolerated as transient only while its PER-INSTANCE consecutive streak
+    /// stays below [`MAX_CONSECUTIVE_POLL_ERRORS`] (the
+    /// [`poll_verdict`] pure decision). A clean `Alive` read resets the streak,
+    /// and every handle removal clears it; an error streak that reaches the
+    /// threshold is treated exactly like an observed exit — the instance lands
+    /// `failed` with a cause naming the persistent poll failure plus the LAST
+    /// error's text (truncated; loop 1) and the Restart Policy applies — instead
+    /// of the old silent `Err(_) => None` that could hide a dead handle FOREVER.
+    ///
+    /// **Systemic guard (AI-12, loop 1):** every held handle is polled ONCE per
+    /// tick, up front. An error on MORE THAN ONE handle in the same tick is
+    /// corroborated as environmental (a procfs/sysctl-style outage): no streak
+    /// increment, one diagnostic, handles stay alive — a fleet-wide poll outage
+    /// must never mass-crash running agents through kill-on-drop. Only a handle
+    /// erroring ALONE (its peers read fine) accumulates crash-input credit.
     pub fn poll_once(&mut self, registry: &Registry) -> Vec<RestartPlan> {
         // First, INGEST self-reported usage from every running instance's captured
         // output (story 3-1): the reaper is the natural cadence for draining the
@@ -1947,22 +2373,181 @@ impl Supervisor {
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
 
-        for name in names {
-            // Poll liveness. A poll error is treated as still-alive (transient);
-            // the next pass re-checks. Reap on exit is done inside `poll`.
-            let exited = match self.running.get_mut(&name) {
-                Some(supervised) => match self.backend.poll(&mut supervised.handle) {
-                    Ok(ProcessStatus::Exited { code }) => Some(code),
-                    Ok(ProcessStatus::Alive) => None,
-                    Err(_) => None,
-                },
-                None => continue,
+        // PHASE 1 — poll EVERY held handle in the SAME tick (AI-12, loop 1).
+        // Liveness reads happen up front, BEFORE any crash handling, so the pass
+        // can CORROBORATE: a poll error that shows up on MULTIPLE handles in one
+        // tick is a backend/environment-wide condition (a procfs/sysctl-style
+        // outage), never a per-handle fault — and tripping every streak then
+        // would mass-crash the fleet on kill-on-drop handles (the
+        // graceful-degradation gate forbids it). The chosen guard is same-tick
+        // cross-handle corroboration (the error-classification alternative was
+        // evaluated: the port carries no environment-vs-handle distinction an
+        // OS backend could honestly report, so corroboration is the provable
+        // shape). A single handle erroring alone stays on the streak path: an
+        // un-pollable HANDLE amid readable peers is exactly the crash signal
+        // AI-12 exists to surface.
+        let mut outcomes: Vec<(InstanceName, PollOutcome)> = Vec::with_capacity(names.len());
+        for name in &names {
+            // AI-12 wiring seam (cfg(test)): the armed pid's poll fails with an
+            // injected error — the fault-injection front for the backend's poll
+            // (see the `poll_fault_pids` field docs). The pid read + the seam
+            // probe run on short immutable borrows BEFORE the mutable handle
+            // borrow below.
+            #[cfg(test)]
+            {
+                let pid = self
+                    .running
+                    .get(name)
+                    .map(|supervised| self.backend.pid(&supervised.handle));
+                if let Some(err) = pid.and_then(|pid| self.injected_poll_fault(pid)) {
+                    outcomes.push((name.clone(), PollOutcome::Errored(err)));
+                    continue;
+                }
+            }
+            let Some(supervised) = self.running.get_mut(name) else {
+                continue;
             };
-            let Some(code) = exited else { continue };
-            // The process exited: drain any usage it emitted right before dying, so a
-            // final batch is not lost between "agent printed it" and this reap.
-            // TERMINAL drain — the process is dead, so consume a final newline-less
-            // usage line to end-of-log instead of stranding it (H1).
+            let outcome = match self.backend.poll(&mut supervised.handle) {
+                Ok(ProcessStatus::Alive) => PollOutcome::Alive,
+                Ok(ProcessStatus::Exited { code }) => PollOutcome::Exited(code),
+                Err(err) => PollOutcome::Errored(err),
+            };
+            outcomes.push((name.clone(), outcome));
+        }
+
+        // PHASE 2 — same-tick corroboration (AI-12 amendment a). Count how many
+        // DISTINCT handles errored this tick; more than one ⇒ environmental.
+        let errored = outcomes
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, PollOutcome::Errored(_)))
+            .count();
+        let mut environmental_tick = errored > 1;
+        if environmental_tick {
+            // AI-12 (loop 2): blanket environmental immunity is bounded. A pair
+            // of handles that errors together EVERY tick (one broken, one flaky
+            // — or a real outage that outlives the cap) must not keep crash
+            // detection defeated forever, so past the cap the per-handle streak
+            // path resumes and trips normally a few ticks later. The escalation
+            // diagnostic fires ONCE, on the transition tick.
+            self.consecutive_environmental_ticks =
+                self.consecutive_environmental_ticks.saturating_add(1);
+            if self.consecutive_environmental_ticks > MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS {
+                environmental_tick = false;
+                if self.consecutive_environmental_ticks == MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS + 1 {
+                    let escalation = format!(
+                        "environmental poll failure has persisted for \
+                         {MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS} consecutive ticks — no longer \
+                         treated as a transient environment-wide condition; per-handle \
+                         crash-input credit resumes (an un-pollable handle will be \
+                         crash-detected again)"
+                    );
+                    self.emit_diagnostic(&escalation);
+                }
+            }
+        } else {
+            self.consecutive_environmental_ticks = 0;
+        }
+        if environmental_tick {
+            // Record each error's text (a later, genuinely per-handle streak may
+            // still want it in a crash cause) but grant NO crash-input credit:
+            // every streak stays where it is and every handle stays alive.
+            for (name, outcome) in &outcomes {
+                if let PollOutcome::Errored(err) = outcome {
+                    self.poll_last_errors.insert(
+                        name.clone(),
+                        truncate_for_cause(&err.to_string(), POLL_ERROR_CAUSE_MAX_CHARS),
+                    );
+                }
+            }
+            let errors: Vec<String> = outcomes
+                .iter()
+                .filter_map(|(name, outcome)| match outcome {
+                    PollOutcome::Errored(err) => Some(format!(
+                        "{}: {}",
+                        name.as_str(),
+                        truncate_for_cause(&err.to_string(), POLL_ERROR_CAUSE_MAX_CHARS)
+                    )),
+                    _ => None,
+                })
+                .collect();
+            let environmental = format!(
+                "environmental poll failure: {errored} of {} held handles failed backend.poll \
+                 in the same tick — a backend/environment-wide condition, not a per-handle \
+                 fault; treating every one as transient (no crash-input credit, no streak \
+                 increment, handles stay alive). Errors: {}",
+                outcomes.len(),
+                errors.join("; "),
+            );
+            self.emit_diagnostic(&environmental);
+        }
+
+        // PHASE 3 — per-name handling (unchanged crash semantics, now fed by the
+        // corroborated outcomes). `held_handles` feeds the sole-handle caveat:
+        // a handle that trips with no peers could never be corroborated.
+        let held_handles = names.len();
+        for (name, outcome) in outcomes {
+            // What the reaper treats as the crash input: a real observed exit
+            // (with the code the backend reported, `None` if unknown), or — new
+            // under AI-12 — a persistent poll failure (no exit code exists; the
+            // recorded cause says so). Everything else keeps polling.
+            let crash = match outcome {
+                PollOutcome::Alive => {
+                    self.clear_poll_error_streak(&name);
+                    continue;
+                }
+                PollOutcome::Exited(code) => {
+                    self.clear_poll_error_streak(&name);
+                    CrashInput::Exited(code)
+                }
+                // Environmental tick: this error was already corroborated as
+                // environment-wide above (diagnostic emitted, text recorded) —
+                // grant no crash-input credit and keep the handle alive.
+                PollOutcome::Errored(_) if environmental_tick => continue,
+                PollOutcome::Errored(err) => {
+                    // Record the error's text FIRST (AI-12b): whatever the
+                    // verdict, a later persistent trip must carry this why.
+                    self.poll_last_errors.insert(
+                        name.clone(),
+                        truncate_for_cause(&err.to_string(), POLL_ERROR_CAUSE_MAX_CHARS),
+                    );
+                    // A clean Alive read clears the handle's consecutive
+                    // poll-error streak; an error increments it and, once it
+                    // reaches MAX_CONSECUTIVE_POLL_ERRORS, becomes crash input
+                    // instead of the old silent `Err(_) => None` that swallowed
+                    // every error forever. Reap on exit is done inside `poll`.
+                    let (verdict, streak) = poll_verdict(
+                        self.poll_error_streaks.get(&name).copied().unwrap_or(0),
+                        Err(err),
+                    );
+                    match verdict {
+                        PollVerdict::TransientError => {
+                            self.poll_error_streaks.insert(name.clone(), streak);
+                            continue;
+                        }
+                        PollVerdict::PersistentError => {
+                            self.poll_error_streaks.insert(name.clone(), streak);
+                            CrashInput::PersistentPollFailure {
+                                sole_handle: held_handles == 1,
+                            }
+                        }
+                        // Unreachable by construction: `poll_verdict` maps an
+                        // `Err` input to one of the two error verdicts only.
+                        PollVerdict::Alive | PollVerdict::Exited(_) => {
+                            unreachable!("an Err poll cannot yield a clean verdict")
+                        }
+                    }
+                }
+            };
+            // The process exited (or the handle went permanently un-pollable):
+            // drain any usage it emitted right before dying, so a final batch is
+            // not lost between "agent printed it" and this reap. TERMINAL drain —
+            // the process is dead, so consume a final newline-less usage line to
+            // end-of-log instead of stranding it (H1). On the poll-failure path
+            // the process is not PROVEN dead, but the handle is about to be
+            // dropped (which kills the group), so this is the last chance to
+            // capture the flushed tail; a truncated mid-write line fails the
+            // sentinel parse and is skipped, and the DB dedup key backstops the
+            // rest.
             self.drain_usage_for(registry, &name, DrainMode::Terminal);
             // Drain any final ENGINE-OBSERVED usage still queued before the crashed
             // instance's listener is torn down (story 3-4): a completion parsed just
@@ -1978,6 +2563,7 @@ impl Supervisor {
                 Ok(inst) => inst.state,
                 // The row is gone (removed concurrently) — just drop the handle.
                 Err(_) => {
+                    self.clear_poll_error_streak(&name);
                     self.running.remove(&name);
                     continue;
                 }
@@ -2011,6 +2597,7 @@ impl Supervisor {
                         .running
                         .get(&name)
                         .and_then(|s| self.backend.log_capture(&s.handle));
+                    self.clear_poll_error_streak(&name);
                     self.running.remove(&name);
                     if registry.clear_spawn_record(&name).is_ok() {
                         let _ = self.transition_with_log_capture(
@@ -2029,6 +2616,7 @@ impl Supervisor {
                     }
                     continue;
                 }
+                self.clear_poll_error_streak(&name);
                 self.running.remove(&name);
                 continue;
             }
@@ -2041,14 +2629,59 @@ impl Supervisor {
             // entry below — same reasoning as `stop_inner`'s terminal
             // transition (the default `self.transition(...)` lookup would
             // otherwise miss it).
+            //
+            // AI-13: read the `adopted` flag BEFORE the remove below — an adopted
+            // handle is not the engine's child, so a `code: None` exit means "the
+            // exit code is UNAVAILABLE", and the cause must say so instead of
+            // asserting a signal termination it cannot prove.
+            let adopted = self.running.get(&name).is_some_and(|s| s.adopted);
             let crash_log_capture = self
                 .running
                 .get(&name)
                 .and_then(|s| self.backend.log_capture(&s.handle));
+            // AI-12b: capture the last poll error's text BEFORE the bookkeeping
+            // clear below (the cause build needs it).
+            let last_poll_error = self.poll_last_errors.get(&name).cloned();
+            self.clear_poll_error_streak(&name);
             self.running.remove(&name);
-            let base_detail = match code {
-                Some(c) => format!("process exited unexpectedly with code {c}"),
-                None => "process exited unexpectedly (terminated by signal)".to_string(),
+            let base_detail = match crash {
+                // AI-12: the handle went permanently un-pollable — the recorded
+                // cause names the persistent poll failure, never a fabricated
+                // exit. Loop 1: it also carries the LAST poll error's text
+                // (truncated) so the operator gets the actual why.
+                CrashInput::PersistentPollFailure { sole_handle } => {
+                    let last = last_poll_error
+                        .as_deref()
+                        .unwrap_or("no error text recorded");
+                    // AI-12 (loop 2): a lone held handle's errors could never be
+                    // cross-checked against peers, so the cause says the
+                    // single-handle caveat out loud instead of asserting a
+                    // per-handle fault it cannot prove.
+                    let corroboration = if sole_handle {
+                        " — this was the ONLY held handle, so the error could not be \
+                         corroborated against peers; if it recurs across restarts, check the \
+                         platform's process-table source (procfs/sysctl) before blaming the \
+                         agent"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "persistent poll failure: {MAX_CONSECUTIVE_POLL_ERRORS} consecutive \
+                         backend.poll errors — the handle's liveness could no longer be read, \
+                         so it is not trusted as alive; last error: {last}{corroboration}"
+                    )
+                }
+                CrashInput::Exited(Some(c)) => {
+                    format!("process exited unexpectedly with code {c}")
+                }
+                // AI-13: an adopted process's exit code is unrecoverable (it is
+                // not this engine's child — only a parent gets an ExitStatus).
+                CrashInput::Exited(None) if adopted => "process exited unexpectedly (exit \
+                 code unavailable — adopted process is not this engine's child)"
+                    .to_string(),
+                CrashInput::Exited(None) => {
+                    "process exited unexpectedly (terminated by signal)".to_string()
+                }
             };
             let decision = self.plan_restart(registry, &name, &base_detail);
             if self.ensure_log_dir(registry, &name).is_err() {
@@ -2222,13 +2855,17 @@ impl Supervisor {
                     let metering_source = registry
                         .metering_source(&name)
                         .unwrap_or_else(|_| "self-reported".to_string());
+                    // Clone the Run context into `Supervised` — the AI-44
+                    // enforcement call below borrows the same values afterwards.
+                    self.clear_poll_error_streak(&name);
                     self.running.insert(
-                        name,
+                        name.clone(),
                         Supervised {
                             handle,
-                            run_id,
-                            metering_source,
+                            run_id: run_id.clone(),
+                            metering_source: metering_source.clone(),
                             usage_cursor,
+                            usage_park_attempts: None,
                             // The adopted instance opens a NEW Run (the pre-crash
                             // run_id died with the crashed engine), so its breach latch
                             // starts empty too (story 3-2).
@@ -2255,9 +2892,27 @@ impl Supervisor {
                             // An adopted instance's stop attempt has not
                             // happened yet in THIS engine session.
                             stop_unconfirmed: false,
+                            // AI-13: this handle was re-acquired, not spawned —
+                            // its exit code is unrecoverable.
+                            adopted: true,
                         },
                     );
                     adopted += 1;
+                    // AI-44: re-evaluate budgets for the JUST-ADOPTED instance
+                    // NOW, before returning — the durable ledger survived the
+                    // engine crash, so an instance already past its ceiling must
+                    // be enforced at startup, not left running unconstrained
+                    // until the NEXT usage event happens to arrive (which may be
+                    // never for a quiet agent). This is the SAME AD-7
+                    // enforcement stage `ingest_usage` runs: a live config read,
+                    // the committed per-run + cumulative ledger totals, the pure
+                    // evaluators, record-first-then-act. The fresh Run's breach
+                    // latch is empty (inserted above), so a surviving breach
+                    // fires exactly once here; the action (default pause) goes
+                    // through the normal lifecycle path with the handle just
+                    // re-held. Best-effort by contract: an enforcement error is
+                    // a diagnostic, never an adoption failure.
+                    self.enforce_budget(registry, &name, &run_id, &metering_source);
                 }
                 Ok(None) => {
                     // No live match — reconcile to `failed` HONESTLY (AI-8).
@@ -2568,6 +3223,15 @@ impl Supervisor {
     /// truth, and the next pass retries. Malformed usage lines are skipped inside
     /// the parser (a diagnostic, never fatal — AD-12).
     ///
+    /// **AI-41 (billing honesty): the cursor only advances past DURABLE bytes.**
+    /// Every parsed event is ingested FIRST; the cursor moves past the consumed
+    /// block only when every event committed (or was a recognized duplicate
+    /// replay). A store error parks the cursor where it was — the failed event is
+    /// retried on the next drain, and already-committed neighbors in the same
+    /// block re-drift safely into the DB dedup key (`DuplicateReplay`, never a
+    /// double-count). The pre-fix advance-then-ingest order silently dropped any
+    /// event whose INSERT failed.
+    ///
     /// The `mode` decides how the TAIL is treated (story 3-1 under-count fix, H1):
     /// * [`DrainMode::MidRun`] — the process may still be mid-`writeln!`, so only
     ///   bytes UP TO the last newline are consumed; a partial trailing line waits
@@ -2627,17 +3291,84 @@ impl Supervisor {
             } => {
                 let block = String::from_utf8_lossy(&tail[range]);
                 let parsed = self.usage_source.drain(&block);
-                // Advance the cursor FIRST (to the ABSOLUTE offset past the consumed
-                // tail) so a mid-batch record failure does not re-ingest earlier
-                // lines on the next pass — the DB dedup key is the ultimate guard,
-                // but not re-reading keeps it cheap. `cursor + consumed` equals the
-                // old whole-file path's `new_cursor` (which was `cursor + consumed`)
-                // exactly.
-                if let Some(s) = self.running.get_mut(name) {
-                    s.usage_cursor = cursor + consumed;
+                // AI-41 (billing honesty): ingest FIRST; advance the cursor past
+                // the consumed block ONLY when every parsed event committed (or
+                // was a recognized duplicate replay). The pre-fix code advanced
+                // the cursor BEFORE ingesting, so a store error silently DROPPED
+                // the event(s) behind it — usage that never reached the ledger
+                // and was never retried. Now a store error PARKS the cursor
+                // where it was: the failed event is retried on the next drain,
+                // and any already-committed neighbor in the same block re-drifts
+                // safely into the DB dedup key (`DuplicateReplay` — never a
+                // double-count; see the design note on AI-41's dedup safety).
+                let mut committed_count = 0usize;
+                for usage in &parsed {
+                    if self
+                        .ingest_usage(registry, name, &run_id, &metering_source, usage)
+                        .is_ok()
+                    {
+                        committed_count += 1;
+                    } else {
+                        // Park at the FIRST store error — later events in this
+                        // block are not even attempted, so they cannot leapfrog
+                        // the failed one.
+                        break;
+                    }
                 }
-                for usage in parsed {
-                    self.ingest_usage(registry, name, &run_id, &metering_source, &usage);
+                // `cursor + consumed` equals the old whole-file path's
+                // `new_cursor` (which was `cursor + consumed`) exactly —
+                // reached only when every event behind the advance is durable.
+                if committed_count == parsed.len() {
+                    if let Some(s) = self.running.get_mut(name) {
+                        s.usage_cursor = cursor + consumed;
+                        s.usage_park_attempts = None;
+                    }
+                } else if mode == DrainMode::Terminal {
+                    // AI-41 (loop 1): on the TERMINAL drain there IS no next
+                    // pass — the handle is being removed right after, and with
+                    // it the cursor and the Run context. The park-and-retry
+                    // claim must not silently fail exactly where loss is
+                    // likeliest: say the batch is lost, out loud.
+                    let lost = parsed.len() - committed_count;
+                    let loss = format!(
+                        "{}: {lost} usage event(s) in the final drained block could not be \
+                         committed to the Usage Ledger and were NOT counted — this is the \
+                         terminal drain (the process is dead or the handle is being removed), \
+                         so the batch cannot be retried and is lost",
+                        name.as_str(),
+                    );
+                    self.emit_diagnostic(&loss);
+                } else {
+                    // AI-41 (loop 2): BOUND the park. A permanently failing
+                    // event (a row poisoned beyond what the dedup key covers)
+                    // would otherwise wedge the cursor at this offset forever —
+                    // silently stranding every later usage event for the Run.
+                    // After USAGE_PARK_MAX_ATTEMPTS failed passes AT THE SAME
+                    // offset, skip the block with a loud diagnostic: billing
+                    // honesty cuts both ways — announce the loss, don't strand
+                    // the ledger.
+                    let attempts = match self.running.get(name).and_then(|s| s.usage_park_attempts)
+                    {
+                        Some((parked_cursor, n)) if parked_cursor == cursor => n + 1,
+                        _ => 1,
+                    };
+                    if attempts >= USAGE_PARK_MAX_ATTEMPTS {
+                        let lost = parsed.len() - committed_count;
+                        if let Some(s) = self.running.get_mut(name) {
+                            s.usage_cursor = cursor + consumed;
+                            s.usage_park_attempts = None;
+                        }
+                        let skip = format!(
+                            "{}: {lost} usage event(s) at byte offset {cursor} failed to \
+                             commit on {attempts} consecutive drains and are SKIPPED (not \
+                             counted) — the cursor moves past them so the rest of the Run's \
+                             usage keeps counting; investigate the Usage Ledger store",
+                            name.as_str(),
+                        );
+                        self.emit_diagnostic(&skip);
+                    } else if let Some(s) = self.running.get_mut(name) {
+                        s.usage_park_attempts = Some((cursor, attempts));
+                    }
                 }
             }
             // Nothing to consume this pass (an empty tail, or a MidRun tail with no
@@ -2714,8 +3445,15 @@ impl Supervisor {
         };
         // Ingest each observed event through the SAME single choke point (stamps the
         // Run id + `engine-observed` source + timestamp, records, and enforces).
+        //
+        // AI-41 scope note — deliberately BEST-EFFORT here (the result is
+        // intentionally dropped): unlike the self-reported drain there is no read
+        // cursor to park — the queue has ALREADY been drained above, so a failed
+        // INSERT cannot be re-parked and retried from a byte offset. The failure is
+        // still REPORTED (`ingest_usage` emits the diagnostic), never silent; the
+        // event's loss is bounded to this one observed completion.
         for usage in &minted {
-            self.ingest_usage(registry, name, &run_id, &metering_source, usage);
+            let _ = self.ingest_usage(registry, name, &run_id, &metering_source, usage);
         }
     }
 
@@ -2729,10 +3467,15 @@ impl Supervisor {
     /// re-delivered batch is classified [`RecordOutcome::DuplicateReplay`] by the
     /// DB `UNIQUE` index and is a no-op (AC-A no-double-count). On a fresh insert it
     /// builds the AD-14 [`UsageUpdateEvent`] (the wire shape frozen in 3-1;
-    /// delivered on the event bus since story 7-2). A store error is a
-    /// best-effort diagnostic — usage
-    /// ingestion must never crash the supervisor or a lifecycle op (the ledger is
-    /// advisory to the RUN, not gating it this story).
+    /// delivered on the event bus since story 7-2).
+    ///
+    /// **AI-41 — a store error is REPORTED, never silently dropped:** the method
+    /// returns the failure (`Err`) so the self-reported drain can PARK its cursor
+    /// and retry the event on the next pass (the observed drain reports + skips —
+    /// it has no cursor). A diagnostic is emitted through the AD-12 sink either
+    /// way, so dropped usage is always VISIBLE. Usage ingestion still never
+    /// crashes the supervisor or a lifecycle op (the ledger is advisory to the
+    /// RUN, not gating it) — honest reporting, not a panic.
     ///
     /// **The AD-7 single-writer invariant lives here:** no other code path may call
     /// `record_usage_event`.
@@ -2759,7 +3502,7 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
         parsed: &ParsedUsage,
-    ) -> Option<UsageUpdateEvent> {
+    ) -> Result<Option<UsageUpdateEvent>, super::error::RegistryError> {
         let event = assemble_usage_event(
             parsed,
             name.as_str(),
@@ -2792,17 +3535,30 @@ impl Supervisor {
                 // (see the `domain::bus` caller-enforced invariant).
                 self.publish(EngineEvent::UsageUpdate(update.clone()));
                 self.enforce_budget(registry, name, run_id, metering_source);
-                Some(update)
+                Ok(Some(update))
             }
             // A recognized replay — no double-count, no event emitted (nothing new
             // was committed). This is the AC-A guarantee in action; the evaluator is
             // NOT run (AC5 — no new total, no new breach).
-            Ok(RecordOutcome::DuplicateReplay) => None,
-            // A store error: usage ingestion is best-effort — do not crash the
-            // supervisor. The ledger is the source of truth for what WAS recorded;
-            // a transient write failure just means this event is not counted (the
-            // agent may re-send it, and the dedup key keeps that safe).
-            Err(_) => None,
+            Ok(RecordOutcome::DuplicateReplay) => Ok(None),
+            // AI-41: a store error must never SILENTLY drop the event. Report it
+            // (diagnostic + Err) so the self-reported drain parks its cursor and
+            // retries this exact event on the next pass; the observed drain
+            // reports + skips (it has no cursor). Never a supervisor crash.
+            Err(err) => {
+                // Caller-factual (AI-41, loop 1): this text states only the fact
+                // (not counted). It must NOT claim a retry — the observed-channel
+                // caller has no cursor and never retries; the self-reported
+                // MidRun drain's park-and-retry is behavior, and its Terminal
+                // case emits its own explicit loss note below.
+                let failure = format!(
+                    "{}: a usage event could not be committed to the Usage Ledger: {err} — \
+                     it was NOT counted",
+                    name.as_str(),
+                );
+                self.emit_diagnostic(&failure);
+                Err(err)
+            }
         }
     }
 
@@ -5958,5 +6714,836 @@ mod tests {
         // `write_stdin_bounded`'s docs) unblocks with EPIPE and exits on its
         // own; this test does not wait for it.
         let _ = sup.stop(&registry, "stuck", Some(Duration::from_millis(200)));
+    }
+
+    // ---- Epic 11 / story 11-1 tests (AI-9, AI-12, AI-41) ----
+
+    /// Write a `fake_agent` manifest declaring GUARANTEED pause for the CURRENT
+    /// OS (the lib-test sibling of `tests/pause.rs`'s `write_pause_manifest`).
+    fn write_pause_guaranteed_manifest(dir: &Path, kind: &str, args: &[&str]) {
+        let bin = ktesio_conformance::fake_agent_bin();
+        let args_toml = args
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let os = match OsId::current() {
+            OsId::Linux => "linux",
+            OsId::Macos => "macos",
+            OsId::Windows => "windows",
+            OsId::Other => "other",
+        };
+        let body = format!(
+            "contract_version = \"1.0.0\"\n\n\
+             [adapter]\nkind = \"{kind}\"\n\n\
+             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n\n\
+             [capabilities.pause]\n{os} = \"guaranteed\"\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"self-reported\"\n",
+            exec = bin.to_string_lossy(),
+        );
+        std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    }
+
+    /// Count `heartbeat <n>` lines in an agent-output log (0 when absent).
+    fn heartbeat_lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|c| c.lines().filter(|l| l.starts_with("heartbeat ")).count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn poll_verdict_tolerates_transient_errors_and_trips_at_the_threshold() {
+        // AI-12 pure decision fn: a clean `Alive` resets the streak; an error
+        // below MAX_CONSECUTIVE_POLL_ERRORS stays transient (the streak
+        // increments — the historical tolerate-and-retry for a short error
+        // burst); the error AT the threshold turns into crash input; a real
+        // observed exit passes its code through (streak reset — the handle
+        // leaves the map anyway).
+        let poll_err = || BackendError::Control {
+            op: "poll",
+            detail: "boom".to_string(),
+        };
+        // Below the threshold: transient, streak grows one per error.
+        for streak in 0..MAX_CONSECUTIVE_POLL_ERRORS - 1 {
+            assert_eq!(
+                poll_verdict(streak, Err(poll_err())),
+                (PollVerdict::TransientError, streak + 1),
+                "error {}/{MAX_CONSECUTIVE_POLL_ERRORS} must stay transient",
+                streak + 1
+            );
+        }
+        // AT the threshold: the streak stops being tolerated — crash input.
+        assert_eq!(
+            poll_verdict(MAX_CONSECUTIVE_POLL_ERRORS - 1, Err(poll_err())),
+            (PollVerdict::PersistentError, MAX_CONSECUTIVE_POLL_ERRORS)
+        );
+        // Beyond (defensive; saturating): still crash input.
+        assert_eq!(
+            poll_verdict(MAX_CONSECUTIVE_POLL_ERRORS, Err(poll_err())),
+            (
+                PollVerdict::PersistentError,
+                MAX_CONSECUTIVE_POLL_ERRORS + 1
+            )
+        );
+        // Clean reads reset the streak to 0.
+        assert_eq!(
+            poll_verdict(MAX_CONSECUTIVE_POLL_ERRORS - 1, Ok(ProcessStatus::Alive)),
+            (PollVerdict::Alive, 0)
+        );
+        assert_eq!(
+            poll_verdict(9, Ok(ProcessStatus::Exited { code: Some(3) })),
+            (PollVerdict::Exited(Some(3)), 0)
+        );
+        assert_eq!(
+            poll_verdict(0, Ok(ProcessStatus::Exited { code: None })),
+            (PollVerdict::Exited(None), 0)
+        );
+    }
+
+    #[test]
+    fn poll_error_streaks_clear_when_a_handle_is_removed() {
+        // AI-12 streak hygiene: a clean poll leaves no streak entry (Ok(Alive)
+        // clears), and once a REAL crash is reaped the removed handle's entry is
+        // gone — no stale streak can pre-load the instance's next Run.
+        let (_state, _manifest, registry) = setup_fake("streak", &["--crash-after-ms", "450"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "streak").unwrap();
+        // Clean passes: no entry may survive.
+        sup.poll_once(&registry);
+        assert!(
+            sup.poll_error_streaks.is_empty(),
+            "clean polls leave no streak entry: {:?}",
+            sup.poll_error_streaks
+        );
+        // The crash is reaped; the removed handle leaves no entry behind.
+        let _ = wait_for_crash(&mut sup, &registry);
+        assert!(
+            sup.poll_error_streaks.is_empty(),
+            "a removed handle must leave no streak entry: {:?}",
+            sup.poll_error_streaks
+        );
+    }
+
+    /// An in-memory `Write` sink capturing engine diagnostics (the story-10-2
+    /// `DiagnosticSink`), so tests can assert a diagnostic reaches the sink.
+    #[derive(Clone)]
+    struct SharedCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Install a capturing diagnostic sink on `sup`; returns the shared buffer.
+    fn install_capture_sink(sup: &mut Supervisor) -> Arc<Mutex<Vec<u8>>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        sup.install_diagnostics(Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(
+            &buffer,
+        ))))));
+        buffer
+    }
+
+    /// The sink's captured text so far.
+    fn sink_text(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Register TWO `fake_agent`-backed instances in ONE state dir (the
+    /// cross-handle corroboration tests need multiple live handles in one
+    /// supervisor). Returns the (state dir, manifest dir, registry).
+    fn setup_two_fakes(
+        names: [&str; 2],
+        args: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        for name in names {
+            let dir = manifest.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_fake_manifest(&dir, name, args);
+            registry
+                .register_with_adapter(name, &AdapterRef::Manifest(dir))
+                .unwrap();
+        }
+        (state, manifest, registry)
+    }
+
+    #[test]
+    fn truncate_for_cause_preserves_short_text_and_bounds_long_text() {
+        // AI-12 (loop 1) helper: short text passes through untouched; long text
+        // is cut to the bound plus the ellipsis.
+        assert_eq!(
+            truncate_for_cause("boom", POLL_ERROR_CAUSE_MAX_CHARS),
+            "boom"
+        );
+        let long = "x".repeat(500);
+        let cut = truncate_for_cause(&long, 200);
+        assert_eq!(cut.chars().count(), 201, "200 chars plus the ellipsis");
+        assert!(cut.ends_with('…'), "the cut is marked: {cut}");
+    }
+
+    #[test]
+    fn poll_once_handle_specific_poll_failure_wiring_lands_failed_and_removes_the_handle() {
+        // AI-12 wiring (loop 1, amendment c) — the HANDLE-SPECIFIC direction,
+        // through the cfg(test) backend fault seam: ONE handle's persistent
+        // poll failure drives the REAL `poll_once` crash path end to end — the
+        // instance lands `failed` with the persistent-poll-failure cause
+        // carrying the LAST error's text, the handle is removed (its Drop
+        // kills the un-pollable group), and no stale streak/error bookkeeping
+        // survives. A regression to the old silent `Err(_) => None` leaves the
+        // instance `running` forever and fails this test.
+        let (_state, _manifest, registry) = setup_fake("wired", &["--linger-ms", "600000"]);
+        registry
+            .set_restart_policy(&InstanceName::new("wired").unwrap(), RestartPolicy::Never)
+            .unwrap();
+        let name = InstanceName::new("wired").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "wired").unwrap();
+
+        // Arm the seam: every poll of THIS handle now errors.
+        let pid = sup.backend.pid(&sup.running.get(&name).unwrap().handle);
+        sup.arm_poll_fault(pid);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let plans = sup.poll_once(&registry);
+            if state_of(&registry, "wired") == LifecycleState::Failed {
+                assert!(
+                    plans.is_empty(),
+                    "a `never` policy must not schedule a restart on the poll-failure crash"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the persistent poll failure never landed the instance failed"
+            );
+        }
+        assert!(
+            sup.running.is_empty(),
+            "the un-pollable handle must be removed from the supervisor"
+        );
+        assert!(
+            sup.poll_error_streaks.is_empty() && sup.poll_last_errors.is_empty(),
+            "the removed handle leaves no streak or last-error entry behind"
+        );
+        // The crash cause carries the full story: the persistent failure AND
+        // the last error's text.
+        let events = Supervisor::read_events(&registry, "wired").unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.new_state, LifecycleState::Failed);
+        let cause = serde_json::to_string(&last.cause).unwrap();
+        assert!(cause.contains("persistent poll failure"), "cause={cause}");
+        assert!(cause.contains("last error:"), "cause={cause}");
+        assert!(
+            cause.contains("injected cfg(test) poll fault"),
+            "the last poll error's text must reach the cause (AI-12b): {cause}"
+        );
+    }
+
+    #[test]
+    fn poll_once_multi_handle_same_tick_failure_is_environmental_and_keeps_handles_alive() {
+        // AI-12 wiring (loop 1, amendment a) — the ENVIRONMENTAL direction: two
+        // handles erroring in the SAME tick corroborate as a backend/
+        // environment-wide condition (the procfs/sysctl-outage shape). Past the
+        // crash threshold many times over: NO streak may grow, NO handle may be
+        // crashed (kill-on-drop would kill RUNNING agents), and the
+        // environmental diagnostic must reach the diagnostic sink.
+        let (_state, _manifest, registry) =
+            setup_two_fakes(["enva", "envb"], &["--linger-ms", "600000"]);
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "enva").unwrap();
+        sup.start(&registry, "envb").unwrap();
+        let sink = install_capture_sink(&mut sup);
+
+        let pid_a = sup.backend.pid(
+            &sup.running
+                .get(&InstanceName::new("enva").unwrap())
+                .unwrap()
+                .handle,
+        );
+        let pid_b = sup.backend.pid(
+            &sup.running
+                .get(&InstanceName::new("envb").unwrap())
+                .unwrap()
+                .handle,
+        );
+        sup.arm_poll_fault(pid_a);
+        sup.arm_poll_fault(pid_b);
+
+        for _ in 0..(MAX_CONSECUTIVE_POLL_ERRORS + 2) {
+            sup.poll_once(&registry);
+        }
+
+        assert_eq!(
+            sup.running.len(),
+            2,
+            "an environmental failure must keep every handle alive"
+        );
+        assert_eq!(state_of(&registry, "enva"), LifecycleState::Running);
+        assert_eq!(state_of(&registry, "envb"), LifecycleState::Running);
+        assert!(
+            sup.poll_error_streaks.is_empty(),
+            "no streak may grow on an environmental tick: {:?}",
+            sup.poll_error_streaks
+        );
+        let text = sink_text(&sink);
+        assert!(
+            text.contains("environmental poll failure"),
+            "the environmental diagnostic must reach the sink: {text}"
+        );
+        assert!(
+            text.contains("handles stay alive"),
+            "the diagnostic must say what the guard did: {text}"
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9() {
+        // AI-9 (order mirrors `stop_inner`), the loop-1 extended failure-
+        // injection proof (mirrors
+        // `snapshot_write_failure_rejects_the_start_before_the_starting_transition`),
+        // three legs + the guaranteed RESUME leg, all on one live instance:
+        //
+        // * Leg A (NOTHING commits): make the LOGS DIRECTORY un-creatable (a
+        //   file stands where `logs/` must be) so the pause fails at
+        //   `ensure_log_dir` — BEFORE any persist. The ledger must still read
+        //   `running` (the transition truly did not commit) and no signal may
+        //   fire.
+        // * Leg B (persist commits, append fails): replace instance.log with a
+        //   DIRECTORY so the transition's event append fails. The durable state
+        //   LEADS (persist-first): the ledger reads `paused`, and the process
+        //   keeps running — no signal was sent.
+        // * Resume leg (persist-first for SIGCONT): with the process genuinely
+        //   SUSPENDED (a real pause in between) and the append sabotaged again,
+        //   resume fails at the append AFTER committing `paused → running` —
+        //   and the heartbeat must stay FROZEN: no SIGCONT was delivered. The
+        //   pre-AI-9 signal-first order would have woken the agent behind an
+        //   errored resume.
+        let (_state, _manifest, registry) =
+            setup_pause_guaranteed("pz", &["--heartbeat-ms", "50", "--linger-ms", "600000"]);
+        let name = InstanceName::new("pz").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "pz").unwrap();
+        assert_eq!(state_of(&registry, "pz"), LifecycleState::Running);
+        let agent_log = registry.agent_output_log_path(&name);
+        let log_dir = registry.instance_log_dir(&name);
+        let log_path = registry.instance_log_path(&name);
+        let held_dir = log_dir.with_extension("ai9-held");
+        let wait_heartbeat = |at_least: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if heartbeat_lines(&agent_log) >= at_least {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "heartbeat never reached {at_least}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_heartbeat(2);
+
+        // ---- Leg A: the pause fails BEFORE any persist. ----
+        std::fs::rename(&log_dir, &held_dir).unwrap();
+        std::fs::write(&log_dir, b"not a directory").unwrap();
+        let a_err = sup.pause(&registry, "pz").unwrap_err();
+        assert!(
+            matches!(&a_err, EngineError::Log { .. }),
+            "the ensure_log_dir failure must surface as a typed Log error, got {a_err:?}"
+        );
+        assert_eq!(
+            state_of(&registry, "pz"),
+            LifecycleState::Running,
+            "with the whole transition rejected, the ledger must still read running"
+        );
+        std::fs::remove_file(&log_dir).unwrap();
+        std::fs::rename(&held_dir, &log_dir).unwrap();
+        let a_before = heartbeat_lines(&agent_log);
+        std::thread::sleep(Duration::from_millis(400));
+        let a_after = heartbeat_lines(&agent_log);
+        assert!(
+            a_after > a_before,
+            "a pause rejected before any persist must NOT have signalled SIGSTOP: heartbeat {a_before} -> {a_after}"
+        );
+
+        // ---- Leg B: the persist commits, the event append fails. ----
+        let b_before = heartbeat_lines(&agent_log);
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::create_dir(&log_path).unwrap();
+        let b_err = sup.pause(&registry, "pz").unwrap_err();
+        assert!(
+            matches!(&b_err, EngineError::Log { .. }),
+            "the append failure must surface as a typed Log error, got {b_err:?}"
+        );
+        // Persist-first: the durable state LEADS — the ledger reads `paused`
+        // even though the append (the event record) failed.
+        assert_eq!(
+            state_of(&registry, "pz"),
+            LifecycleState::Paused,
+            "persist-first: the committed transition must be visible in the ledger"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        let b_after = heartbeat_lines(&agent_log);
+        assert!(
+            b_after > b_before,
+            "a pause whose persist committed but errored must NOT have signalled SIGSTOP: heartbeat {b_before} -> {b_after}"
+        );
+        std::fs::remove_dir(&log_path).unwrap();
+
+        // Realign: Leg B's persist committed `paused`, so a real resume (the
+        // remediation the AI-9 diagnostic names) brings the ledger back to
+        // `running` — the SIGCONT is a harmless no-op on the still-running
+        // process.
+        sup.resume(&registry, "pz").unwrap();
+        assert_eq!(state_of(&registry, "pz"), LifecycleState::Running);
+
+        // ---- The genuine suspension (so the resume leg proves SIGCONT). ----
+        sup.pause(&registry, "pz").unwrap();
+        assert_eq!(state_of(&registry, "pz"), LifecycleState::Paused);
+        std::thread::sleep(Duration::from_millis(200));
+        let frozen_before = heartbeat_lines(&agent_log);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            heartbeat_lines(&agent_log),
+            frozen_before,
+            "the probe: a successful guaranteed pause really suspends (heartbeat frozen)"
+        );
+
+        // ---- Resume leg: persist commits, append fails, NO SIGCONT. ----
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::create_dir(&log_path).unwrap();
+        let r_err = sup.resume(&registry, "pz").unwrap_err();
+        assert!(
+            matches!(&r_err, EngineError::Log { .. }),
+            "the resume append failure must surface as a typed Log error, got {r_err:?}"
+        );
+        assert_eq!(
+            state_of(&registry, "pz"),
+            LifecycleState::Running,
+            "persist-first resume: the committed paused-to-running transition must be visible"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            heartbeat_lines(&agent_log),
+            frozen_before,
+            "a resume whose persist committed but errored must NOT have signalled SIGCONT: the process stays suspended"
+        );
+        std::fs::remove_dir(&log_path).unwrap();
+
+        // Teardown: the process is SIGSTOPped (SIGTERM would only pend), so the
+        // stop's forced escalation is the honest way down.
+        sup.stop(&registry, "pz", Some(Duration::from_millis(600)))
+            .unwrap();
+    }
+
+    /// Register a `fake_agent`-backed instance whose manifest declares GUARANTEED
+    /// pause for the current OS. Returns the (state dir, manifest dir, registry).
+    fn setup_pause_guaranteed(
+        name: &str,
+        args: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_pause_guaranteed_manifest(manifest.path(), name, args);
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry
+            .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+            .unwrap();
+        (state, manifest, registry)
+    }
+
+    /// Append usage sentinel lines (`(sequence, input, output)` triples) to the
+    /// instance's agent-output log — the drain's input.
+    fn append_usage_lines(path: &Path, lines: &[(u64, u64, u64)]) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        for (seq, input, output) in lines {
+            f.write_all(
+                format!(
+                    "KTESIO_USAGE {{\"sequence\":{seq},\"input_tokens\":{input},\"output_tokens\":{output}}}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// The (row count, summed input tokens) of `name`'s committed ledger rows,
+    /// via a direct connection to the state DB.
+    fn ledger_totals(state: &Path, name: &str) -> (i64, i64) {
+        let conn = rusqlite::Connection::open(state.join("state.db")).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0) FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
+        // AI-41 (billing honesty), loop-1 repaired + extended: a usage event
+        // whose INSERT fails must NOT have the drain cursor advanced past it
+        // (the pre-fix code advanced FIRST, silently dropping the event). Four
+        // proofs in one flow:
+        //   (1) a whole-table fault parks the cursor and the failure diagnostic
+        //       reaches the story-10-2 sink;
+        //   (2) the repair restores the FULL schema — the table AND every index
+        //       including the UNIQUE(instance_id, run_id, sequence) dedup index
+        //       (the loop-0 restore lost the dedup invariant);
+        //   (3) the retry commits each event EXACTLY once;
+        //   (4) a PARTIAL failure (a trigger fails only the SECOND insert of a
+        //       block) parks the cursor, and the re-drift proves the dedup key:
+        //       the already-committed first event comes back as `DuplicateReplay`
+        //       (no double-count) while the failed second commits.
+        let (state, _manifest, registry) = setup_fake("ledger", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("ledger").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "ledger").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        let log = registry.agent_output_log_path(&name);
+        let db = state.path().join("state.db");
+
+        // (1) Whole-table fault: the drain parks, the diagnostic is audible.
+        append_usage_lines(&log, &[(0, 10, 20), (1, 11, 22)]);
+        let cursor_before = sup.running.get(&name).unwrap().usage_cursor;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // The FULL schema of `usage_events` — the table AND every index (the
+        // dedup index is its own sqlite_master row), tables first.
+        let mut schema: Vec<(String, String)> = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, sql FROM sqlite_master \
+                 WHERE tbl_name = 'usage_events' AND sql IS NOT NULL \
+                 ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        for row in rows {
+            schema.push(row.unwrap());
+        }
+        drop(stmt);
+        assert!(
+            schema
+                .iter()
+                .any(|(t, sql)| t == "index" && sql.contains("CREATE UNIQUE INDEX")),
+            "the fixture premise: a UNIQUE dedup index exists on usage_events"
+        );
+        conn.execute("DROP TABLE usage_events", []).unwrap();
+        drop(conn);
+
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            sup.running.get(&name).unwrap().usage_cursor,
+            cursor_before,
+            "a failed INSERT must park the drain cursor (AI-41: no silent drop)"
+        );
+        assert!(
+            sink_text(&sink).contains("could not be committed to the Usage Ledger"),
+            "the ingest-failure diagnostic must reach the diagnostic sink"
+        );
+
+        // (2) Restore the FULL schema — table first, then every index.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (_kind, sql) in &schema {
+            conn.execute(sql, []).unwrap();
+        }
+        let unique_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND tbl_name = 'usage_events' AND sql LIKE 'CREATE UNIQUE INDEX%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(
+            unique_indexes >= 1,
+            "the repair must restore the UNIQUE dedup index, not only the table"
+        );
+
+        // (3) The retry commits both events, each exactly once.
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "ledger"),
+            (2, 21),
+            "the retried events must commit exactly once (10 + 11 input tokens)"
+        );
+        let log_len = std::fs::metadata(&log).unwrap().len();
+        assert_eq!(
+            sup.running.get(&name).unwrap().usage_cursor,
+            log_len,
+            "the cursor advances past the block only once every event committed"
+        );
+
+        // (4) PARTIAL failure: the FIRST insert of a block commits, the SECOND
+        // fails (a trigger RAISEs once the table already holds 3 rows). The
+        // cursor parks; after the fault is repaired, the re-drift must classify
+        // the committed event as a DuplicateReplay (the UNIQUE dedup key — no
+        // double-count) while the failed one finally commits.
+        append_usage_lines(&log, &[(2, 1, 2), (3, 3, 4)]);
+        let parked_at = sup.running.get(&name).unwrap().usage_cursor;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TRIGGER ai41_fail_second_insert BEFORE INSERT ON usage_events \
+             WHEN (SELECT COUNT(*) FROM usage_events) >= 3 \
+             BEGIN SELECT RAISE(ABORT, 'injected second-insert fault'); END;",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "ledger"),
+            (3, 22),
+            "the first event of the block commits (10+11+1), the second fails"
+        );
+        assert_eq!(
+            sup.running.get(&name).unwrap().usage_cursor,
+            parked_at,
+            "the partial failure must park the cursor before the block (re-drift both)"
+        );
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TRIGGER ai41_fail_second_insert", [])
+            .unwrap();
+        drop(conn);
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        // If the dedup index were missing, the re-drifted sequence-2 line would
+        // insert AGAIN (4 rows / 23 input) — (4, 25) proves DuplicateReplay.
+        assert_eq!(
+            ledger_totals(state.path(), "ledger"),
+            (4, 25),
+            "the re-drifted committed event must be a DuplicateReplay (no double-count); \
+             the failed event commits on retry"
+        );
+        assert_eq!(
+            sup.running.get(&name).unwrap().usage_cursor,
+            std::fs::metadata(&log).unwrap().len(),
+            "the cursor advances only once every event is durable"
+        );
+        // Teardown.
+        sup.stop(&registry, "ledger", Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_post_commit_signal_failure_emits_the_divergence_breadcrumb_and_returns_err() {
+        // AI-9 (loop 2) — the post-commit signal-failure branch, executed END TO
+        // END through the cfg(test) signal-fault seam: persist-first commits the
+        // `running → paused` transition, THEN the seam makes `signal_backend`
+        // fail with an injected error, so the ledger (now `paused`) and the live
+        // process DIVERGE. The branch must (a) still surface the error, (b) emit
+        // the divergence breadcrumb — instance + committed state + signal error
+        // + the real recovery — to the story-10-2 sink, and (c) leave the
+        // committed row `paused` (the durable state leads). A regression to a
+        // silent swallow, or a breadcrumb that loses any quarter of the story,
+        // fails here. The budget-driven leg proves the loop-2 remediation split:
+        // a breach-driven pause must recommend `stop` ONLY (the latch is spent —
+        // `resume` would leave an over-budget run unenforced), never `resume`.
+        let (state, _manifest, registry) =
+            setup_pause_guaranteed("sigfault", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("sigfault").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "sigfault").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        sup.arm_signal_fault(name.clone());
+
+        // (a) The command fails with the backend error ...
+        let err = sup.pause(&registry, "sigfault").unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Backend { .. }),
+            "the post-commit signal failure must surface as the Backend error, got {err:?}"
+        );
+        // (b) ... and the divergence breadcrumb reaches the sink: the committed
+        // state, the divergence claim, the recovery, and the injected why.
+        let text = sink_text(&sink);
+        assert!(
+            text.contains("says 'paused'"),
+            "the breadcrumb must name the COMMITTED state: {text}"
+        );
+        assert!(
+            text.contains("may diverge"),
+            "the breadcrumb must state the divergence: {text}"
+        );
+        assert!(
+            text.contains("kt agent resume sigfault"),
+            "a plain-command pause remediation must offer `resume` to realign: {text}"
+        );
+        assert!(
+            text.contains("injected cfg(test) signal fault"),
+            "the breadcrumb must carry the signal error's text: {text}"
+        );
+        // (c) The transition COMMITTED before the signal failed: the row reads
+        // `paused` even though the command errored.
+        assert_eq!(
+            state_of(&registry, "sigfault"),
+            LifecycleState::Paused,
+            "persist-first: the committed transition must survive the signal failure"
+        );
+
+        // Budget-driven leg (AI-9 loop 2): with the cause_override
+        // BudgetExceeded the per-Run breach latch is ALREADY spent — the
+        // remediation must recommend `stop` only, never `resume`.
+        {
+            let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+            let n = conn
+                .execute(
+                    "UPDATE agent_instances SET state = 'running' WHERE name = 'sigfault'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+        let breach = TransitionCause::budget_exceeded(BreachScope::Cumulative, 15, 30);
+        let text_before = sink_text(&sink).len();
+        sup.pause_with_cause(&registry, &name, breach).unwrap_err();
+        let tail = &sink_text(&sink)[text_before..];
+        assert!(
+            tail.contains("the pause was budget-driven"),
+            "the breach-driven remediation must say WHY stop is the only advice: {tail}"
+        );
+        assert!(
+            tail.contains("kt agent stop sigfault"),
+            "the breach-driven remediation must lead with `stop`: {tail}"
+        );
+        assert!(
+            !tail.contains("kt agent resume"),
+            "a breach-driven pause must NEVER advise `resume` (the latch is spent): {tail}"
+        );
+
+        // Teardown: the process was never suspended (both signals failed), so a
+        // normal stop lands (stop does not consult `signal_backend`).
+        sup.stop(&registry, "sigfault", Some(Duration::from_millis(600)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_budget_driven_pause_with_no_in_memory_handle_wraps_the_override_in_the_qualifier() {
+        // AI-8 (loop 2) — the override honesty wrap: a BUDGET-DRIVEN pause that
+        // reaches `suspend_or_resume` with NO in-memory handle held (the row
+        // says `running`; e.g. enforcement re-evaluating a run this engine
+        // session does not hold) must record `pause-best-effort` whose detail
+        // WRAPS the override ("the requested override was: ...") — never the
+        // bare `budget-exceeded` cause (which would read as a performed
+        // suspension of a process nothing signalled) and never a plain command.
+        let (_state, _manifest, registry) =
+            setup_pause_guaranteed("ovrwrap", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("ovrwrap").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "ovrwrap").unwrap();
+        // Drop the ONLY held handle (its kill-on-drop ends the process; the row
+        // still says `running`) — the AI-8 premise: a pause with nothing held
+        // to signal.
+        sup.running.remove(&name);
+        let cause = TransitionCause::budget_exceeded(BreachScope::Cumulative, 15, 30);
+        sup.pause_with_cause(&registry, &name, cause).unwrap();
+        assert_eq!(state_of(&registry, "ovrwrap"), LifecycleState::Paused);
+        let events = Supervisor::read_events(&registry, "ovrwrap").unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.new_state, LifecycleState::Paused);
+        let cause_json = serde_json::to_string(&last.cause).unwrap();
+        assert!(
+            cause_json.contains("\"kind\":\"pause-best-effort\""),
+            "a budget pause with no in-memory handle must record the best-effort \
+             qualifier, not the bare override: {cause_json}"
+        );
+        assert!(
+            !cause_json.contains("\"kind\":\"budget-exceeded\""),
+            "the override must be WRAPPED, never recorded as a performed budget \
+             suspension: {cause_json}"
+        );
+        assert!(
+            cause_json.contains("no live process handle"),
+            "the qualifier must name the missing handle (the honest why): {cause_json}"
+        );
+        assert!(
+            cause_json.contains("the requested override was:")
+                && cause_json.contains("breach: cumulative"),
+            "the qualifier's detail must wrap the requested BudgetExceeded override: \
+             {cause_json}"
+        );
+        // No teardown `stop`: no handle is held (removed above; its Drop already
+        // ended the process) — a stop here would be a handle-less no-op
+        // transition, not a real teardown.
+    }
+
+    #[test]
+    fn a_failed_terminal_drain_announces_the_lost_batch_to_the_sink() {
+        // AI-41 (loop 2) — the Terminal-drain loss notice, EXECUTED: on the
+        // TERMINAL drain there IS no next pass (the handle is being removed
+        // right after), so a store failure there must announce the batch LOST —
+        // with the count — to the story-10-2 sink, never reuse the MidRun
+        // park-and-retry story (a lie exactly where loss is likeliest). Mirrors
+        // the MidRun park test's full-schema sabotage below.
+        let (state, _manifest, registry) = setup_fake("tdrain", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("tdrain").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "tdrain").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        let log = registry.agent_output_log_path(&name);
+        append_usage_lines(&log, &[(0, 10, 20), (1, 11, 22)]);
+        let cursor_before = sup.running.get(&name).unwrap().usage_cursor;
+        let db = state.path().join("state.db");
+
+        // Sabotage the ledger (drop the table; the full schema is restored
+        // below so the stop's own terminal drain sees a real ledger).
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut schema: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE tbl_name = 'usage_events' AND sql IS NOT NULL \
+                     ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            for row in rows {
+                schema.push(row.unwrap());
+            }
+        }
+        conn.execute("DROP TABLE usage_events", []).unwrap();
+        drop(conn);
+
+        sup.drain_usage_for(&registry, &name, DrainMode::Terminal);
+        let text = sink_text(&sink);
+        assert!(
+            text.contains("terminal drain (the process is dead"),
+            "the terminal-drain loss notice must reach the sink: {text}"
+        );
+        assert!(
+            text.contains("cannot be retried and is lost"),
+            "the notice must say the batch is lost, not parked for retry: {text}"
+        );
+        assert!(
+            text.contains("2 usage event(s)"),
+            "the notice must name the lost COUNT: {text}"
+        );
+        assert_eq!(
+            sup.running.get(&name).unwrap().usage_cursor,
+            cursor_before,
+            "a terminal drain that commits nothing must not advance the cursor"
+        );
+
+        // Repair the store, then tear down (the stop's own terminal drain now
+        // sees a real ledger).
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for sql in &schema {
+            conn.execute(sql, []).unwrap();
+        }
+        drop(conn);
+        sup.stop(&registry, "tdrain", Some(Duration::from_millis(200)))
+            .unwrap();
     }
 }

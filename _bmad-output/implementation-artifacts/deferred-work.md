@@ -110,3 +110,13 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: A RATIFIED subscriber-active budget is future work. NFR-4 is measured (and gated) with ZERO subscribers, while Epic 7 ships a subscription surface; the perf harness now MEASURES the subscriber-active overhead (one active subscriber; CPU/RSS per instance + read p99, with deltas vs the unsubscribed baseline in the report's `subscriber_overhead` block) but REPORTS it without gating — there is no ratified budget to gate against. A future spec should propose the budget (e.g. a bounded delta vs the unsubscribed figures) and flip the block from reported to gated.
   evidence: Epic-7 adversarial review (2026-09-09): the figures are now collected every run (so a future budget lands with historical data already recorded), but gating a number nobody ratified would be a silent budget invention — the same anti-pattern the 7-5 gate-math pins exist to prevent.
   resolved: story 10-3 ratified the budgets from the observed 2026-09-10 local run (CPU Δ −0.015 pts, RSS Δ +0.01 MiB, read-p99 Δ +0.7 ms) at 0.25 pct-points / 2 MiB / 100 ms with the CPU gate's tolerance shape (strict locally, ×1.5 on CI) — three hard gates appended to `evaluate_gates`, pinned by the example's gate-math tests, recorded in docs/testing.md's budget table (2026-09-10)
+
+- source_spec: `spec-11-1-engine-robustness-batch.md`
+  summary: Windows adopted-process exit-code retrieval — AI-13's "exit code unavailable" rationale is Unix-specific; on Windows the HANDLE opened at adoption could yield the code via GetExitCodeProcess.
+  evidence: Blind-hunter finding from the 11-1 review (2026-09-11); belongs in the cross-platform batch (11-5).
+- source_spec: `spec-11-1-engine-robustness-batch.md`
+  summary: Windows AI-14 fail-closed spawn arm has no runtime test on any host (compile-checked + clippy-clean on x86_64-pc-windows-gnu only).
+  evidence: Blind-hunter + verification-gap findings from the 11-1 review (2026-09-11); needs a Windows CI leg → 11-5 (AI-29/35/38/54 batch).
+- source_spec: `spec-11-1-engine-robustness-batch.md`
+  summary: Engine-observed usage channel remains lossy under store failure (drain_observed_for is deliberately best-effort; no cursor, no retry) — governance/billing durability incomplete for un-cooperative agents.
+  evidence: Blind-hunter finding from the 11-1 review (2026-09-11); durability design for the observed channel needs a product/ops call → 11-6.

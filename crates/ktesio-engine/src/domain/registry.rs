@@ -268,16 +268,24 @@ impl Registry {
     ///
     /// Ensures the state dir exists and opens (creating + migrating) the DB.
     pub fn open(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
-        // Preserve the offending base (if one was supplied) so the diagnostic
-        // can name it instead of showing a blank path.
-        let offending = base
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("<default via {}>", crate::paths::STATE_DIR_ENV));
-        let paths = EnginePaths::new(base).map_err(|e| RegistryError::Io {
-            name: "<state-dir>".to_string(),
-            path: offending,
-            source: std::io::Error::other(e.to_string()),
+        let paths = EnginePaths::new(base).map_err(|e| {
+            // AI-4: name the ACTUAL path that failed. A rejected relative
+            // `KTESIO_STATE_DIR` carries the offending value itself — not the
+            // `<default via …>` placeholder, which describes a resolution mode,
+            // not the path the operator typed. Only the genuinely path-less
+            // failure (no env var and no platform data dir) keeps the
+            // placeholder, because there is no concrete path to name.
+            let path = match &e {
+                crate::paths::PathError::RelativeStateDir { value } => value.clone(),
+                crate::paths::PathError::NoStateDir => {
+                    format!("<default via {}>", crate::paths::STATE_DIR_ENV)
+                }
+            };
+            RegistryError::Io {
+                name: "<state-dir>".to_string(),
+                path,
+                source: std::io::Error::other(e.to_string()),
+            }
         })?;
         // Create the state base (and thus its parent chain) before opening the
         // DB — a fresh install has no directory yet (AC1 "fresh state").
@@ -1761,11 +1769,14 @@ mod tests {
 
     #[test]
     fn open_maps_path_resolution_failure_and_names_the_base() {
-        // F8: when EnginePaths::new fails (here: a relative KTESIO_STATE_DIR),
-        // Registry::open must surface RegistryError::Io whose `path` names the
-        // offending base rather than being blank. Save/restore the shared env.
+        // F8 + AI-4: when EnginePaths::new fails (here: a relative
+        // KTESIO_STATE_DIR), Registry::open must surface RegistryError::Io whose
+        // `path` names the OFFENDING VALUE the operator supplied — not blank and
+        // not the `<default via KTESIO_STATE_DIR>` placeholder, which would hide
+        // the actual path that failed. Save/restore the shared env.
+        const OFFENDING: &str = "relative/base";
         let prev = std::env::var_os(crate::paths::STATE_DIR_ENV);
-        std::env::set_var(crate::paths::STATE_DIR_ENV, "relative/base");
+        std::env::set_var(crate::paths::STATE_DIR_ENV, OFFENDING);
         let result = Registry::open(None);
         std::env::set_var(crate::paths::STATE_DIR_ENV, ""); // neutralize before restore
         match prev {
@@ -1780,9 +1791,9 @@ mod tests {
         };
         match err {
             RegistryError::Io { path, .. } => {
-                // The diagnostic names the default-resolution context, not blank.
-                assert!(!path.is_empty(), "path must be populated (F8)");
-                assert!(path.contains(crate::paths::STATE_DIR_ENV));
+                // AI-4: the diagnostic names the actual relative path that was
+                // rejected (the source error still carries the full context).
+                assert_eq!(path, OFFENDING, "path must name the offending value");
             }
             other => panic!("expected Io from a relative env base, got {other:?}"),
         }

@@ -870,7 +870,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // in the new shape): each fragment must match EXACTLY ONE site, so a
     // removed or reworded diagnostic route — or a second direct stderr writer
     // sneaking past the print scan above — fails here. ----
-    let sink_pins: [(&str, &str, &str); 4] = [
+    let sink_pins: [(&str, &str, &str); 8] = [
         // The ONE diagnostic emission choke point (both diagnostics route
         // through it; the `[ktesio] ` prefix + terminating newline live here).
         (
@@ -887,11 +887,50 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         ),
         // The enforcement breadcrumb's route into the sink (a breach action
         // that could not be honored, or a breach record that failed to append
-        // — an operator breadcrumb, never the record).
+        // — an operator breadcrumb, never the record). The marker is the
+        // whole single-line call, so it stays distinct from the AI-41 site
+        // below (a multi-line `format!` whose call line carries no args).
         (
             "domain/supervisor.rs",
             "self.emit_diagnostic(&format!(",
             "the enforcement breadcrumb's route into the sink",
+        ),
+        // AI-41 (story 11-1): a usage event whose ledger INSERT failed — the
+        // event was NOT counted and the drain will retry it. A NEW third
+        // diagnostic route, routed through the same `emit_diagnostic` choke
+        // point; the count was consciously re-reviewed and this site pinned
+        // by its own route line (distinct from the enforcement breadcrumb's
+        // single-line `format!` call above).
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&failure);",
+            "the AI-41 usage-commit-failure report's route into the sink",
+        ),
+        // AI-9 (story 11-1, loop 1): the SIGNAL-FAILURE breadcrumb — the
+        // transition committed but the pause/resume signal failed, so the
+        // ledger and the live process may diverge; the divergence is
+        // announced, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&signal_failure);",
+            "the AI-9 signal-failure divergence breadcrumb's route into the sink",
+        ),
+        // AI-12 (story 11-1, loop 1): the ENVIRONMENTAL poll-failure notice —
+        // multiple handles failing in the same tick corroborate as a
+        // backend/environment-wide condition; the no-mass-crash guard's
+        // decision is announced, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&environmental);",
+            "the AI-12 environmental poll-failure notice's route into the sink",
+        ),
+        // AI-41 (story 11-1, loop 1): the TERMINAL-drain loss notice — a
+        // still-failing INSERT on the final drain cannot be retried (the
+        // handle is being removed), so the loss is announced, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&loss);",
+            "the AI-41 terminal-drain loss notice's route into the sink",
         ),
         // The stderr DEFAULT arm: with no sink installed the diagnostics go
         // to stderr byte-identically to the pre-sink engine (pinned

@@ -101,6 +101,12 @@ const STILL_ACTIVE: u32 = 259;
 /// How often the graceful-stop wait polls for the process to exit.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// AI-14 (loop 2): how many times the spawn path attempts the creation-time
+/// read before failing closed, and how long it waits between attempts — enough
+/// to absorb the spawn-race window without masking a genuine platform outage.
+const START_TIME_READ_ATTEMPTS: usize = 3;
+const START_TIME_READ_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// A running process on Windows.
 ///
 /// For a FRESHLY SPAWNED process, `child` is `Some` and `job` owns the process
@@ -122,6 +128,16 @@ pub struct WindowsProcess {
     adopted: HANDLE,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
+    /// The verified process creation-time token (spine AD-5) — the write-ahead
+    /// fingerprint's PID-reuse guard. AI-14: captured + VERIFIED at spawn (a
+    /// failed read FAILS the spawn, so the engine's own paths never record the
+    /// `0` sentinel) or at adoption (`adopt` returns `None` when it cannot read
+    /// one). Windows adopted-handle liveness uses the opened process HANDLE (no
+    /// start-time re-check needed — parity with the Unix backend's spawned-path
+    /// reasoning), so this field exists to make [`WindowsBackend::fingerprint`]
+    /// return exactly the token the spawn/adopt verified, never a second,
+    /// separately-fallible read that could silently produce `0`.
+    start_time: u64,
     /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
     /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
     /// SPAWNED process whose declared `Capability::Interaction` was
@@ -350,6 +366,59 @@ impl ProcessBackend for WindowsBackend {
             });
         }
 
+        // AI-14: verify the child's creation-time token NOW — a failed read
+        // FAILS the spawn (fail closed) instead of recording the
+        // `start_time = 0` sentinel, which would silently downgrade every later
+        // orphan adoption to a pid-only match. Placed BEFORE the job guard
+        // release: on failure the guard's Drop closes the job, and
+        // KILL_ON_JOB_CLOSE reaps the just-spawned child — no orphan, no
+        // unrecorded process. Loop 2: a read that fails because the pid is
+        // ALREADY GONE is surfaced as an instant agent exit (not a platform
+        // failure), and the few-attempt retry absorbs the spawn-race window.
+        let start_time = {
+            let mut token = None;
+            for attempt in 0..START_TIME_READ_ATTEMPTS {
+                match process_start_time(pid) {
+                    Some(t) => {
+                        token = Some(t);
+                        break;
+                    }
+                    None if attempt + 1 < START_TIME_READ_ATTEMPTS => {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        std::thread::sleep(START_TIME_READ_RETRY_DELAY);
+                    }
+                    None => {}
+                }
+            }
+            match token {
+                Some(t) => t,
+                None => {
+                    let exited_instantly = matches!(child.try_wait(), Ok(Some(_)));
+                    let detail = if exited_instantly {
+                        format!(
+                            "the spawned agent exited immediately, before its process \
+                             creation time could be read for pid {pid} — the agent failed \
+                             at startup (check its logs); this is not a platform \
+                             start-time-source failure"
+                        )
+                    } else {
+                        format!(
+                            "could not read the process creation time for the spawned pid \
+                             {pid} — no usable process start-time source on this platform; \
+                             cannot guarantee pid-reuse safety, so refusing to record a \
+                             start-time-less fingerprint (sentinel 0): the write-ahead \
+                             spawn record needs the real token for orphan adoption"
+                        )
+                    };
+                    return Err(BackendError::Spawn {
+                        exec: spec.exec.clone(),
+                        detail,
+                    });
+                }
+            }
+        };
         // Assignment succeeded — hand the job handle to the process struct.
         let job = job_guard.into_inner();
         // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
@@ -381,6 +450,7 @@ impl ProcessBackend for WindowsBackend {
             job,
             adopted: std::ptr::null_mut(),
             pid,
+            start_time,
             stdin,
             log_capture,
         })
@@ -472,10 +542,12 @@ impl ProcessBackend for WindowsBackend {
     }
 
     fn fingerprint(&self, handle: &Self::Handle) -> ProcessFingerprint {
-        // Creation time via GetProcessTimes; a read failure falls back to 0 (a
-        // degraded but honest fingerprint — the pid is still recorded).
-        let start_time = process_start_time(handle.pid).unwrap_or(0);
-        ProcessFingerprint::new(handle.pid, start_time)
+        // The handle's OWN creation-time token — VERIFIED at spawn (AI-14: the
+        // spawn FAILS when the read fails, so a spawned handle always carries a
+        // real, non-zero token) or at adoption (`adopt` returns `None` when it
+        // cannot read one). No second, separately-fallible read that could
+        // silently produce a `0` sentinel on the write-ahead record.
+        ProcessFingerprint::new(handle.pid, handle.start_time)
     }
 
     fn adopt(
@@ -531,6 +603,7 @@ impl ProcessBackend for WindowsBackend {
             job: std::ptr::null_mut(),
             adopted: h,
             pid: fingerprint.pid,
+            start_time: live_start,
             stdin: StdinState::NoPipe,
             log_capture: None,
         }))

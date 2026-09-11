@@ -29,8 +29,8 @@ use crate::error::{
     AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
     AgentManifestNotFound, AgentManifestUnreadable, AgentMemoryHotSwap, AgentMemoryKindConflict,
     AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
-    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
-    AgentUnknownKind,
+    AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore,
+    AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -414,19 +414,16 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Without this, `show --json` and the human `show` — which validates
         // inside `effective_capabilities` — disagreed on the same input.
         validate_instance_name(name)?;
-        // Reuse the SAME composition as `list --json` and pick the named entry, so
-        // the `show` object is byte-identical to that instance's `list` row. A
-        // missing name is the uniform not-found diagnostic (to stderr).
-        let entry = facade
-            .fleet()
-            .map_err(map_error)?
-            .into_iter()
-            .find(|e| e.name.as_str() == name)
-            .ok_or_else(|| {
-                map_error(RegistryError::NotFound {
-                    name: name.to_string(),
-                })
-            })?;
+        // AI-15: the SINGLE-INSTANCE registry lookup (`Engine::fleet_entry`) —
+        // an O(1) keyed lookup whose errors surface directly, instead of reading
+        // the whole Fleet and scanning it here (which also inherited a full
+        // Fleet read's degradations just to find one row). The entry is still
+        // composed by the same `fleet_entry_for` the list rows use, so the
+        // `show` object remains byte-identical to that instance's `list` row; a
+        // missing name surfaces the engine's own `RegistryError::NotFound` —
+        // the SAME uniform not-found diagnostic (to stderr) the old path
+        // synthesized.
+        let entry = facade.fleet_entry(name).map_err(map_error)?;
         let json = show_json(entry)?;
         println!("{json}");
         // The metering note rides on stderr (AD-12), keeping stdout pure JSON.
@@ -2212,6 +2209,22 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // AI-7: `resume` targeted a PAUSED instance whose adapter declares PAUSE
+        // unsupported on this OS — the engine cannot signal the suspension awake,
+        // and the bare pause-unsupported diagnostic would strand an operator whose
+        // instance is ALREADY `paused`. Name the state + the declaration and give
+        // the real escape hatch (stop works without pause support) instead.
+        EngineError::ResumeUnsupported { name, os, level } => AgentResumeUnsupported {
+            message: format!(
+                "Agent Instance '{name}' is paused, but this agent declares pause '{level}' \
+                 on {os}, so resume cannot signal the suspension awake. Recovery: \
+                 kt agent stop {name} && kt agent start {name}. The same resume does work on \
+                 hosts where the adapter declares pause support (informational — this CLI \
+                 cannot change this host's OS). Inspect the Capability Declaration with: \
+                 kt agent show {name}"
+            ),
+        }
+        .into(),
         EngineError::AdapterUnresolved { name, detail } => AgentLaunchFailed {
             message: format!(
                 "Could not resolve the adapter to start Agent Instance '{name}': {detail}."
@@ -2662,6 +2675,17 @@ mod tests {
                 EngineError::CapabilityUnsupported {
                     name: "un".to_string(),
                     capability: "pause".to_string(),
+                    os: "linux".to_string(),
+                    level: "unsupported".to_string(),
+                },
+                ExitCode::Unsupported,
+            ),
+            (
+                // AI-7: the dedicated resume-under-unsupported-pause diagnostic —
+                // the same capability-unsupported class (5), never a demotion.
+                "ResumeUnsupported",
+                EngineError::ResumeUnsupported {
+                    name: "pz".to_string(),
                     os: "linux".to_string(),
                     level: "unsupported".to_string(),
                 },
@@ -3190,6 +3214,54 @@ mod tests {
         }
         list(true).unwrap();
         list(false).unwrap();
+        unsafe {
+            std::env::remove_var("KTESIO_STATE_DIR");
+        }
+    }
+
+    #[test]
+    fn show_json_uses_single_instance_lookup() {
+        // AI-15: `show --json` resolves through the single-instance facade
+        // method (`Engine::fleet_entry`) — an O(1) keyed registry lookup whose
+        // errors surface directly — not a scan over the whole `fleet()`. A known
+        // name yields the SAME versioned document (the row `list` would emit);
+        // an unknown name surfaces the ENGINE's `RegistryError::NotFound`
+        // (mapped to the exit-3 diagnostic), exactly like the human path — not a
+        // silent Ok and not a usage error. Drives the real engine in-process,
+        // mirroring the list/show cover test above (holds the shared env lock).
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK; set the state dir the CLI resolves.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+        }
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            engine.blocking().register("solo", "mock").unwrap();
+        }
+        // Known name: the full CLI --json path succeeds.
+        show("solo", true).unwrap();
+        // The facade method itself: one row for the known name, the engine's
+        // typed NotFound for an unknown one (the exit-3 contract's source).
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            let facade = engine.blocking();
+            let entry = facade.fleet_entry("solo").unwrap();
+            assert_eq!(entry.name.as_str(), "solo", "one entry, the requested one");
+            assert_eq!(entry.kind, "mock");
+            let err = facade.fleet_entry("ghost").unwrap_err();
+            assert!(
+                matches!(err, RegistryError::NotFound { ref name } if name == "ghost"),
+                "an unknown name must surface the engine's NotFound, got {err:?}"
+            );
+            // A malformed name is the registry's InvalidName (the exit-2 path),
+            // NOT a synthesized NotFound — the M2 contract, now from the engine.
+            let err = facade.fleet_entry("Bad Name").unwrap_err();
+            assert!(
+                matches!(err, RegistryError::InvalidName { .. }),
+                "a malformed name must surface InvalidName, got {err:?}"
+            );
+        }
         unsafe {
             std::env::remove_var("KTESIO_STATE_DIR");
         }
