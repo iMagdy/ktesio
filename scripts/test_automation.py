@@ -432,9 +432,12 @@ class ReleaseDocsTests(unittest.TestCase):
             ci,
         )
         # Semver gate: lazy install inside the armed branch, transient skip.
-        self.assertIn("cargo +stable install cargo-semver-checks --locked --force", ci)
-        self.assertIn("cargo +stable semver-checks check-release", ci)
-        self.assertIn("000|429|5[0-9][0-9]", ci)
+        # (AI-17, story 11-7: these three pins moved OUT of this file-wide
+        # test into the semver-job-scoped assertions inside
+        # test_ci_enforces_workspace_boundary_and_semver_gates below —
+        # file-wide matches let a dropped baseline-pinned gate pass via
+        # another job's site. The transient-skip regex appears exactly once
+        # in ci.yml (the semver job), so the scoped pin loses no coverage.)
         # Semver gate caches the source-installed binary so it is not rebuilt
         # (~10 min) on every fresh runner (AI-1). AI-3 (story 6-6): the cache
         # key names the RESOLVED cargo-semver-checks version (content, never a
@@ -515,6 +518,42 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn(
             "git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit}", ci
         )
+        # AI-17 (story 11-7): the semver gate's OWN pins, scoped to the semver
+        # job's text (this test — test_ci_enforces_workspace_boundary_and_semver_
+        # gates — owns the semver_job slice). A file-wide match would let a
+        # dropped baseline-pinned gate pass via an unrelated invocation.
+        # (1) The check-release invocations: EXACTLY three armed sites in THIS
+        # job, counted with comments stripped so prose cannot inflate the count.
+        import re as _re
+
+        code_only = _re.sub(r"(?m)^\s*#.*$", "", semver_job)
+        check_release_sites = code_only.count(
+            "cargo +stable semver-checks check-release"
+        )
+        self.assertEqual(
+            check_release_sites,
+            3,
+            "the semver job must retain all three armed check-release gates "
+            f"(baseline, in-repo, forward-compat); found {check_release_sites}",
+        )
+        # (2) The lazy install is GUARDED and ORDERED: the `command -v` probe
+        # precedes the plain install (a cache hit must never pay a ~10-min
+        # source rebuild), and the version-validated install form also exists.
+        self.assertIn("if ! command -v cargo-semver-checks >/dev/null 2>&1; then", semver_job)
+        self.assertIn(
+            "cargo +stable install cargo-semver-checks --locked --force\n", semver_job
+        )
+        self.assertIn(
+            'cargo +stable install cargo-semver-checks --locked --force --version "$version"',
+            semver_job,
+        )
+        self.assertLess(
+            semver_job.index("if ! command -v cargo-semver-checks >/dev/null 2>&1; then"),
+            semver_job.index("cargo +stable install cargo-semver-checks --locked --force"),
+            "the cache-hit probe must precede the plain install (AI-1's guard)",
+        )
+        # (3) The transient-skip regex is the semver job's own retry predicate.
+        self.assertIn("000|429|5[0-9][0-9]", semver_job)
 
     def test_ci_builds_and_runs_the_embedding_quickstart(self) -> None:
         # Story 7-4: the embedding quickstart (the publish capstone's host

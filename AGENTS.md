@@ -72,3 +72,29 @@ the authoritative wording lives in
   no model budget), not from memory of what was "about to happen"; (2) resume
   with that recovered context loaded; (3) author large files incrementally in
   small writes, so a cut-off loses minutes, not the artifact.
+- **Two-pass review covers the release surface (AI-55).** The two-pass default
+  (primary + independent adversarial pass) that Epic 3 scoped to
+  money/ledger/enforcement/network code extends to PUBLIC RELEASE-SURFACE
+  changes: version bumps, `RELEASE_NOTES.md`/changelog entries, and crates.io
+  package metadata (description/keywords). A wrong ledger figure and a wrong
+  one-line install command fail the same way — publicly, and hard to retract
+  once `cargo publish` has run (the story 9-2 lesson: one proportionate pass
+  nearly shipped a mis-described binary).
+- **Resume interrupted subagents — never restart them (AI-57).** When a
+  subagent run is cut off (usage limit, API error) after it may have written
+  artifacts: (1) re-derive true state from the durable record (task tracker,
+  ticked spec checkboxes, `git status`/diff, CI status) — never from the
+  agent's claimed report; (2) resume the NAMED agent with an explicit
+  "here is exactly where you stopped" briefing; (3) restarting from zero is
+  the last resort, not the default. (The subagent-level sibling of the
+  away-mode drill above: that one recovers the SESSION, this one recovers the
+  AGENT's work.) Proven: story 3-2's rate-limit cutoff and story 9-2's review
+  pass surviving a ~10-hour session interruption with zero rework.
+- **Architecture corrections are draft-then-ratify (AI-58).** An
+  architecture-decision correction follows three steps: (1) the architect
+  drafts a COMPLETE proposal (all options concrete, trade-offs stated)
+  touching ZERO real planning artifacts; (2) the human picks from the bounded
+  options; (3) the agent applies the ratified choice verbatim to the real
+  artifacts. Never edit the spine first and ask forgiveness after. Provenance:
+  the AD-16 / Epic-8 re-scope (story 9-3 Part B, ratified 2026-07-14;
+  `epics.md` + issue #95).
