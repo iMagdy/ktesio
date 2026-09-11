@@ -38,7 +38,8 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 ## Deferred from: code review of 5-2-delegate-to-native-memory-with-an-explicit-boundary (2026-08-24)
 
 - DC-3 detach/status wording not extended to name the delegation sentence — deferred to Epic 6's status surface: detach is kind-blind metadata removal and the story's ratified human surface is attach-only (NFR-7 sentences live in attach confirmations + docs).
-- Reverse conflict direction (filesystem requested over an attached native backing) untested at both registry and CLI layers — one symmetric `!=` comparison; forward direction (native over filesystem) is covered at both. Candidate: a symmetry test with AI-63(b) work.
+- Reverse conflict direction (filesystem requested over an attached native backing) was untested at the REGISTRY layer only — one symmetric `!=` comparison with no registry-level test; the CLI-level reverse was proven in story 5-1. Forward direction (native over filesystem) is covered at both layers. Candidate: a symmetry test with AI-63(b) work.
+  resolved: story 11-3 (memory robustness batch) 2026-09-11 — `attaching_filesystem_over_an_attached_native_backing_is_rejected_symmetrically` in `crates/ktesio-engine/src/domain/registry.rs` pins the registry-level reverse conflict (`MemoryBackingKindConflict { attached: "native", requested: "filesystem" }`, row and managed-dir state untouched).
 
 ## Deferred from: one-shot blind-hunter pass on the round-1 triage fixes (2026-08-30)
 

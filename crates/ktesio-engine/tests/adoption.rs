@@ -17,12 +17,16 @@
 //! probes are accurate). The parent test then opens a NEW engine over the SAME
 //! state dir and asserts adoption / honest reconcile.
 
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ktesio_engine::{
-    AdapterRef, Engine, FleetEntry, LifecycleState, RemoveDisposition, RestartPolicy,
+    AdapterRef, DiagnosticSink, Engine, FleetEntry, LifecycleState, RemoveDisposition,
+    RestartPolicy,
 };
 use tempfile::TempDir;
 
@@ -57,6 +61,50 @@ windows = "guaranteed"
 
 [metering]
 source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+    );
+    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+}
+
+/// The engine-observed variant of [`write_fake_manifest`] (the
+/// `observed_metering.rs` shape, copied here as this file's ONE additional
+/// manifest writer — the deferred-work-noted duplication is not grown further):
+/// `[metering] source = "engine-observed"` plus the `[config."metering.base_url"]
+/// env = "OPENAI_BASE_URL"` mapping the engine's loopback injection targets.
+fn write_observed_manifest(dir: &Path, kind: &str, args: &[&str]) {
+    let bin = ktesio_conformance::fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "{kind}"
+
+[lifecycle.start]
+exec = {exec:?}
+args = [{args_toml}]
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "engine-observed"
+
+[config."metering.base_url"]
+env = "OPENAI_BASE_URL"
 "#,
         exec = bin.to_string_lossy(),
     );
@@ -447,6 +495,29 @@ fn adoption_helper_subprocess() {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
+            std::process::exit(0);
+        }
+        // AI-46: start `obssurv` as an ENGINE-OBSERVED instance (engine 1 binds
+        // its loopback forward listener), then crash. The listener dies with
+        // this engine while the agent survives with its injected `base_url`
+        // still pointing at the now-dead port — the stranded-listener
+        // condition the next engine's adoption must surface.
+        "observed_survivor" => {
+            facade
+                .register_with_adapter("obssurv", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            // A valid-shaped (dead) upstream: the listener needs a URL to
+            // start; the agent makes no calls (no `--observed-calls`), so
+            // nothing ever forwards to it.
+            let dead_upstream = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let addr = l.local_addr().unwrap();
+                format!("http://{addr}")
+            };
+            facade
+                .set_config("obssurv", "metering.upstream_base_url", &dead_upstream)
+                .unwrap();
+            facade.start("obssurv").unwrap();
             std::process::exit(0);
         }
         // Start `clean`, then STOP it cleanly (clears the record), then exit
@@ -1086,6 +1157,109 @@ fn ai44_adopting_an_over_budget_warn_run_records_the_breach_without_a_transition
         .stop("budgeted", Some(Duration::from_secs(5)))
         .unwrap();
     wait_until_gone(pid, "stop must terminate the adopted over-budget process");
+}
+
+/// A `Write` adapter delegating into a shared buffer (the `diagnostic_sink.rs`
+/// shape) so the test can read the sink's captured bytes while the engine owns
+/// the boxed writer.
+struct SinkCapture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SinkCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Build the engine-named sink handle over a shared capture buffer.
+fn make_sink(shared: &Arc<Mutex<Vec<u8>>>) -> DiagnosticSink {
+    Arc::new(Mutex::new(Box::new(SinkCapture(Arc::clone(shared)))))
+}
+
+#[test]
+fn ai46_adopting_an_engine_observed_instance_surfaces_the_stranded_listener() {
+    // AI-46 (story 11-3): adopting a live ENGINE-OBSERVED orphan must SAY the
+    // stranding out loud. The adopted agent's injected `base_url` still points
+    // at the PREVIOUS engine's loopback listener, which died with that engine —
+    // the engine cannot rewrite the running child's already-injected
+    // environment, so the honest fix is a diagnostic (through the story-10-2
+    // sink channel) naming the stranded observed listener and the stop→start
+    // remediation. The adoption semantics are otherwise EXACTLY unchanged: the
+    // row stays `running`, the process is re-held, and a stop still terminates
+    // it. Runs where the siblings run (Unix survival harness; same CI
+    // mitigation).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_observed_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1 (crash semantics): start the observed instance — its loopback
+    // listener dies with this process — and leave the agent alive.
+    run_engine1("observed_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "obssurv"));
+    assert!(pid_alive(pid), "the observed agent must survive the crash");
+
+    // Engine 2 with the sink installed FROM THE FIRST MOMENT
+    // (`open_with_diagnostics` installs BEFORE orphan adoption runs), so the
+    // adoption-time diagnostic lands in the capture, never on stderr.
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&captured))
+            .unwrap();
+    let facade = engine.blocking();
+
+    // State semantics unchanged: the orphan is ADOPTED as `running`.
+    let status = facade.instance_status("obssurv").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "a live orphan must be adopted as running (unchanged by AI-46)"
+    );
+
+    // The diagnostic reached the sink and names the condition: the instance,
+    // the stranded observed listener, and the stop→start remediation.
+    // (Adoption runs inside Engine::open, so by the time the open returned the
+    // line is already out; the bounded poll only guards reordering.)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let bytes = captured.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.contains("obssurv")
+            && text.contains("stranded observed listener")
+            && text.contains("stop the instance and start it again")
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stranded-listener diagnostic never reached the sink (captured: {text})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        text.contains("[ktesio] obssurv:"),
+        "the diagnostic is a [ktesio]-prefixed engine line: {text}"
+    );
+
+    // Supervision itself has no strand: the adopted process is alive and a
+    // stop lands cleanly.
+    assert!(pid_alive(pid));
+    facade
+        .stop("obssurv", Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until_gone(pid, "stop must terminate the adopted observed process");
 }
 
 #[test]

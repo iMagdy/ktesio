@@ -48,7 +48,7 @@
 //!    The audit's TWO historical print-site allowlist entries — the best-effort
 //!    stderr diagnostics in `domain/supervisor.rs` (the DC-10 memory-delivery
 //!    notice and the enforcement breadcrumb, both citing spine AD-12) — were
-//!    CLOSED by story 10-2, not allowlisted forever: both diagnostics now
+//!    CLOSED by story 10-2, not allowlisted forever: the pinned diagnostics now
 //!    route through the host-provided diagnostic sink (`Supervisor::
 //!    emit_diagnostic`; stderr survives only as the no-sink DEFAULT, which the
 //!    `diagnostic_sink.rs` suite proves byte-identical). The print-site
@@ -870,8 +870,8 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // in the new shape): each fragment must match EXACTLY ONE site, so a
     // removed or reworded diagnostic route — or a second direct stderr writer
     // sneaking past the print scan above — fails here. ----
-    let sink_pins: [(&str, &str, &str); 8] = [
-        // The ONE diagnostic emission choke point (both diagnostics route
+    let sink_pins: [(&str, &str, &str); 9] = [
+        // The ONE diagnostic emission choke point (every pinned diagnostic routes
         // through it; the `[ktesio] ` prefix + terminating newline live here).
         (
             "domain/supervisor.rs",
@@ -931,6 +931,15 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
             "domain/supervisor.rs",
             "self.emit_diagnostic(&loss);",
             "the AI-41 terminal-drain loss notice's route into the sink",
+        ),
+        // AI-46 (story 11-3): the STRANDED-LISTENER adoption notice — an
+        // adopted engine-observed orphan whose injected `base_url` still
+        // points at the PREVIOUS engine's dead listener; the condition and the
+        // stop→start remediation are announced at adoption, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&strand);",
+            "the AI-46 stranded-listener adoption notice's route into the sink",
         ),
         // The stderr DEFAULT arm: with no sink installed the diagnostics go
         // to stderr byte-identically to the pre-sink engine (pinned

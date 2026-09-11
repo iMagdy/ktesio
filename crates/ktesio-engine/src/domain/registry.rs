@@ -3035,6 +3035,48 @@ source = "self-reported"
     }
 
     #[test]
+    fn attaching_filesystem_over_an_attached_native_backing_is_rejected_symmetrically() {
+        // A5 (story 11-3): the REVERSE conflict direction — a `native` backing
+        // attached, `filesystem` requested. Symmetric to the forward case
+        // above: the same typed error naming attached/requested, and NOTHING
+        // mutates — the native row stands and the rejected request creates no
+        // managed directory (the side effects run only after every fallible
+        // check passes).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        reg.attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap();
+        let err = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap_err();
+        match &err {
+            RegistryError::MemoryBackingKindConflict {
+                name,
+                attached,
+                requested,
+            } => {
+                assert_eq!(name, "demo");
+                assert_eq!(attached, "native");
+                assert_eq!(requested, "filesystem");
+            }
+            other => panic!("expected MemoryBackingKindConflict, got {other:?}"),
+        }
+        // The original attachment stands untouched ...
+        assert_eq!(
+            reg.memory_status("demo").unwrap().unwrap().kind,
+            MemoryBackingKind::Native
+        );
+        // ... and no managed directory was created by the rejected request.
+        assert!(
+            !reg.paths()
+                .agent_home(&InstanceName::new("demo").unwrap())
+                .join(crate::paths::MEMORY_DIR)
+                .exists(),
+            "a rejected conflict must not create the managed directory"
+        );
+    }
+
+    #[test]
     fn native_attach_persists_the_row_without_a_directory_and_status_reports_delegation() {
         // Story 5-2, AC1 + DC-1/DC-2: the registry round-trip for `native` —
         // metadata only. The row persists (visible on the public read), NO

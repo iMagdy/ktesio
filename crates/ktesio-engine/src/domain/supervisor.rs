@@ -1079,7 +1079,7 @@ impl Supervisor {
         // so NEITHER injected value is persisted as "what applied" — honest
         // provenance (3-4's rule; 5-1's CORRECTION extends it: `memory.dir` is a
         // delivery mechanism, not operator configuration).
-        let mapping_effective = match invocation_overrides(
+        let mut mapping_effective = match invocation_overrides(
             observed_listener.as_ref().map(ObservedListener::base_url),
             memory_dir.as_deref(),
         ) {
@@ -1088,6 +1088,21 @@ impl Supervisor {
                 .map_err(|e| config_to_engine(&name, e))?,
             None => effective.clone(),
         };
+        // (2b-memory-spoof, the override branch — story 11-3, A1) The re-fold
+        // above re-derives the config from EVERY layer, so a hand-set reserved
+        // key RESURRECTS here: the base strip above removed it from
+        // `effective`, but this fresh fold never saw that strip. A hand-set
+        // `memory.dir` must not ride the re-fold into the mapping application.
+        // When the engine injected NO managed dir (no filesystem backing), any
+        // `memory.dir` in the fold is exactly such a hand-set resurrection —
+        // strip it, exactly like the base path. When the engine DID inject the
+        // dir, its own override leaf is the fold's winner (the invocation layer
+        // is the strongest, AD-9) and MUST survive the strip — a hand-set
+        // lower-layer value cannot beat it, so stripping there would only
+        // break the engine's own delivery.
+        if memory_dir.is_none() {
+            let _ = mapping_effective.remove(super::config::MEMORY_DIR_KEY);
+        }
 
         // (2b-memory-delivery) DC-10 honesty (AD-11 Delivery clause): when a
         // `filesystem` backing is attached but the resolved mapping declares NO
@@ -2852,9 +2867,24 @@ impl Supervisor {
                     // includes the run id, so even an overlapping sequence is safe.
                     let run_id = RunId::mint();
                     let usage_cursor = self.agent_log_len(registry, &name);
-                    let metering_source = registry
-                        .metering_source(&name)
-                        .unwrap_or_else(|_| "self-reported".to_string());
+                    let metering_source = registry.metering_source(&name).unwrap_or_else(|err| {
+                        // AI-46 (review loop 1): a registry read hiccup must
+                        // not SILENCE the stranded-listener diagnostic —
+                        // defaulting to `self-reported` here would skip the
+                        // one announcement an actually-observed orphan
+                        // needs. Announce the ambiguity loudly, then use
+                        // the neutral fallback for bookkeeping.
+                        let unclear = format!(
+                            "{}: the adopted instance's metering source could not be \
+                                 read ({err}); if it is engine-observed, its injected \
+                                 'metering.base_url' points at the PREVIOUS engine's dead \
+                                 loopback listener — stop the instance and start it again \
+                                 to re-anchor the listener",
+                            name.as_str(),
+                        );
+                        self.emit_diagnostic(&unclear);
+                        "self-reported".to_string()
+                    });
                     // Clone the Run context into `Supervised` — the AI-44
                     // enforcement call below borrows the same values afterwards.
                     self.clear_poll_error_streak(&name);
@@ -2898,6 +2928,38 @@ impl Supervisor {
                         },
                     );
                     adopted += 1;
+                    // AI-46 (story 11-3): an adopted ENGINE-OBSERVED instance is
+                    // stranded — the paragraph on `observed_listener: None`
+                    // above documents it, but until now the engine said it
+                    // NOWHERE an operator could hear. The engine cannot rewrite
+                    // the already-running child's injected `base_url` (the env
+                    // went in at the previous engine's spawn), so the honest
+                    // fix is to ANNOUNCE the condition: name the instance, the
+                    // stranded observed listener, and the stop→start
+                    // remediation. The diagnostic names the CONDITION without
+                    // the dead port number: the spawn record carries no launch
+                    // facts (the write-ahead record is
+                    // {fingerprint, policy, count, cause} only), and the
+                    // registration snapshot's launch predates the start-time
+                    // injection, so no base_url host/port is recoverable here.
+                    // Semantics are untouched: the instance stays marked
+                    // un-observed exactly as below, and no process is
+                    // relaunched (adoption keeps-them-running).
+                    if metering_source == "engine-observed" {
+                        let strand = format!(
+                            "{}: adopted an engine-observed instance; its injected \
+                             'metering.base_url' still points at the PREVIOUS engine's \
+                             loopback forward listener, which died with that engine — this \
+                             engine holds NO listener for the adopted process, so its model \
+                             calls hit the dead port and fail with connection errors \
+                             (stranded observed listener). The already-injected environment \
+                             of a running process cannot be rewritten. Remediation: stop \
+                             the instance and start it again; the fresh start binds a new \
+                             listener and re-injects a live base_url.",
+                            name.as_str(),
+                        );
+                        self.emit_diagnostic(&strand);
+                    }
                     // AI-44: re-evaluate budgets for the JUST-ADOPTED instance
                     // NOW, before returning — the durable ledger survived the
                     // engine crash, so an instance already past its ceiling must
