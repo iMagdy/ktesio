@@ -1471,18 +1471,29 @@ fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &st
 /// Instance config layer (story 2-1, AC-B/AC10, AD-12).
 ///
 /// Validated at WRITE time by the engine: a known unified key or an `agent.*`
-/// pass-through key is accepted and persisted to the instance `config.toml`
-/// through path authority; an unknown key OUTSIDE `agent.*` is REJECTED before
-/// anything is written (the on-disk config is byte-unchanged) and a miette
-/// diagnostic naming the offending key + the nearest valid key goes to STDERR
-/// with a non-zero exit. On success `ui::success` confirms to stdout. The value
-/// is stored verbatim — a `secret:NAME` REFERENCE is what is persisted here
-/// (story 2-4 resolves + masks it at start/read, FR-14; this write neither
-/// resolves nor echoes a secret).
+/// pass-through key is accepted and persisted (ATOMICALLY since story 11-2 —
+/// temp file + rename, so a crash mid-write cannot truncate the config) to the
+/// instance `config.toml` through path authority; an unknown key OUTSIDE
+/// `agent.*` is REJECTED before anything is written (the on-disk config is
+/// byte-unchanged) and a miette diagnostic naming the offending key + the
+/// nearest valid key goes to STDERR with a non-zero exit. On success `ui::success`
+/// confirms to stdout — and any WARN-ONLY steering warnings the engine attached
+/// (story 11-2, AI-33: today, a `secret:NAME` value on a FLAG-targeted key) are
+/// printed to STDERR first (AD-12: results → stdout, warnings → stderr); the
+/// command still exits 0 (warn-only, never a rejection). The value is stored
+/// verbatim — a `secret:NAME` REFERENCE is what is persisted here (story 2-4
+/// resolves + masks it at start/read, FR-14; this write neither resolves nor
+/// echoes a secret).
 pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     match engine.blocking().set_config(name, key, value) {
-        Ok(()) => {
+        Ok(warnings) => {
+            // Story 11-2 (AI-33): the WARN-ONLY secret→flag steering rides the
+            // engine's return value (the registry has no diagnostic sink, and
+            // this synchronous CLI path prints it directly). stderr; exit 0.
+            for warning in warnings {
+                ui::warning(warning);
+            }
             ui::success(format!(
                 "Set {} = {} on Agent Instance {} (instance layer)",
                 key,

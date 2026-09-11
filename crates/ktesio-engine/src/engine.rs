@@ -1040,10 +1040,23 @@ impl Engine {
     ///
     /// Validates at WRITE time first (an unknown key outside the `agent.*`
     /// pass-through namespace is rejected with the nearest key suggested), THEN
-    /// persists to the Agent Home `config.toml` through path authority. A rejected
-    /// write persists NOTHING (the instance config is byte-unchanged — AC-B). Runs
-    /// on the blocking pool like the other mutations.
-    pub async fn set_config(&self, name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
+    /// persists ATOMICALLY (story 11-2, AI-24 — temp file + rename, so a crash
+    /// mid-write cannot truncate the instance `config.toml`) to the Agent Home
+    /// `config.toml` through path authority. A rejected write persists NOTHING
+    /// (the instance config is byte-unchanged — AC-B). Runs on the blocking pool
+    /// like the other mutations.
+    ///
+    /// On success the returned vec carries ZERO OR MORE WARN-ONLY steering
+    /// warnings (story 11-2, AI-33 — today: a `secret:NAME` value set on a
+    /// FLAG-targeted key). A Host should render each entry on ITS diagnostic
+    /// surface (`kt` prints them to stderr); the vec is empty on the common
+    /// path, and the write is never rejected for a warned combination.
+    pub async fn set_config(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<String>, ConfigError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let key = key.to_string();
@@ -1490,8 +1503,15 @@ impl Blocking<'_> {
     }
 
     /// Blocking [`Engine::set_config`] (story 2-1, AC-B/AC10). The write
-    /// `kt agent config set` uses.
-    pub fn set_config(&self, name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
+    /// `kt agent config set` uses. On success carries the ZERO OR MORE
+    /// WARN-ONLY steering warnings (story 11-2, AI-33) the caller renders on
+    /// its own stderr — empty on the common path.
+    pub fn set_config(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<String>, ConfigError> {
         self.engine
             .rt
             .block_on(self.engine.set_config(name, key, value))

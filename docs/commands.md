@@ -120,7 +120,7 @@ Start a registered Agent Instance.
 kt agent start my-agent
 ```
 
-On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr.
+On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr. Before the process spawns, the start seam can emit one-line engine diagnostics on stderr (or the host sink): a report of every launch environment variable the config mapping **overwrote** (the config value wins), and a warn-only report of config keys whose `secret:` cleartext was delivered into a **flag** target (visible on the process argv) — neither ever rejects the start.
 
 A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits (a note is printed to stderr). Durable supervision across separate CLI invocations is future work.
 
@@ -304,6 +304,12 @@ kt agent config set demo agent.api_key secret:OPENAI_KEY
 ```
 
 A known unified key or an `agent.*` pass-through key is accepted and persisted; an unknown key **outside** `agent.*` is rejected before anything is written, with the nearest valid key suggested. The value is stored verbatim — a `secret:NAME` reference is stored as-is and resolved + masked at start/read (never resolved or echoed by this write). Setting config on a **running** instance is allowed and never touches the live process: the change takes effect on the next start (budget/cost keys are an exception — they are re-read on each usage ingestion and apply immediately).
+
+The write is **atomic**: the updated `config.toml` is written to a temporary file in the Agent Home and renamed into place, so a crash mid-write always leaves either the complete old or the complete new bytes — never a truncated file.
+
+The `<value>` position accepts a leading-dash value (e.g. `-x`, `--model-x`) **literally** — no `--` separator is required (the separator still works for callers who prefer it).
+
+**Warning (warn-only).** Setting a `secret:NAME` value on a key the agent's adapter maps to a **flag** target succeeds, but prints a warning to stderr: the resolved cleartext would ride the agent's command line, where argv is readable by other local users (`ps`, `/proc/<pid>/cmdline`). Prefer an **env** or **file** target for secret-carrying keys (see Architecture — Secrets); at **start** the same fact is reported as a one-line engine diagnostic.
 
 ## `kt agent config get <name> [<key>] [--json] [--reveal]`
 

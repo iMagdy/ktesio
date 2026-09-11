@@ -1133,8 +1133,66 @@ impl Supervisor {
         let secrets = registry
             .resolve_secrets(&mapping_effective)
             .map_err(|e| secret_to_engine(&name, e))?;
-        adapter::apply_config_mapping(&mut launch, &mapping, &mapping_effective, &secrets, &home)
-            .map_err(|e| config_apply_to_engine(&name, e))?;
+        // (AI-27 shadow capture) The pre-apply launch env, snapshotted BEFORE
+        // the mapping application mutates `launch.env` (whatever the persisted
+        // registration snapshot carried): an env-targeted mapping whose name
+        // already exists here OVERWRITES that variable (documented precedence —
+        // config wins, last-write-wins, untouched), and the value diff below
+        // makes that shadow VISIBLE instead of silent (story 11-2).
+        let base_env: std::collections::BTreeMap<String, String> = launch.env.clone();
+        let mapping_report = adapter::apply_config_mapping(
+            &mut launch,
+            &mapping,
+            &mapping_effective,
+            &secrets,
+            &home,
+        )
+        .map_err(|e| config_apply_to_engine(&name, e))?;
+
+        // (AI-27 shadow visibility) ONE diagnostic naming every launch env var
+        // the config mapping overwrote — deliberately NOT worded "base-launch":
+        // the pre-apply `launch.env` is whatever the persisted registration
+        // snapshot carried (the manifest `[lifecycle.start]` env or the
+        // code-declared launch), a set this diagnostic must not over-claim. The
+        // start still SUCCEEDS — the precedence is unchanged (the config value
+        // won in `launch.env`) and has always been the documented behavior; only
+        // the silence was the bug. Routed through `emit_diagnostic` (story 10-2:
+        // stderr by default, the host's sink when installed), like the
+        // memory-delivery notice above. The message is formatted into a local
+        // first, exactly like that notice (the embed-clean audit pins the inline
+        // `emit_diagnostic(&format!(` shape to the ONE breadcrumb route).
+        let shadowed = shadowed_env_keys(&base_env, &launch.env);
+        if !shadowed.is_empty() {
+            let shadow_notice = format!(
+                "{}: the config mapping overwrote launch environment variable(s) {} — \
+                 the config value wins for this start (documented precedence). Rename the \
+                 env target or unset the config key if the original value was intended.",
+                name.as_str(),
+                shadowed.join(", "),
+            );
+            self.emit_diagnostic(&shadow_notice);
+        }
+
+        // (AI-39 runtime) ONE warn-only diagnostic naming the config keys whose
+        // resolved SECRET cleartext was delivered into FLAG targets — i.e. the
+        // keys now on the process argv, world-readable cross-user. This is the
+        // runtime half of the steering the set-time warning starts (story 11-2):
+        // the argv boundary itself stays ACCEPTED (documented; no rejection
+        // semantics were ever ratified) — the diagnostic rides the same
+        // `emit_diagnostic` channel as the notices above, so operators (and the
+        // existing audit trail) see it on every start that delivers one. The
+        // message is formatted into a local first (see the shadow notice above).
+        if !mapping_report.secret_flag_keys.is_empty() {
+            let flag_notice = format!(
+                "{}: secret-carrying config key(s) [{}] resolve into FLAG targets — their \
+                 cleartext is passed on the agent's command line, where argv is readable \
+                 by other local users (ps, /proc/<pid>/cmdline). Prefer an env or file \
+                 target for these keys.",
+                name.as_str(),
+                mapping_report.secret_flag_keys.join(", "),
+            );
+            self.emit_diagnostic(&flag_notice);
+        }
 
         // (2c) Persist the effective-config snapshot into the Agent Home (story
         // 2-3, spine AD-9 "start resolves to an EffectiveConfig snapshot persisted
@@ -4100,6 +4158,34 @@ fn memory_delivery_notice(
     ))
 }
 
+/// The AI-27 shadow diff (story 11-2): the env keys the mapping application
+/// OVERWROTE — present in the pre-apply launch env (`before`, snapshotted from
+/// `launch.env` ahead of the application, i.e. whatever the persisted
+/// registration snapshot carried) whose value in the post-apply env (`after`)
+/// has CHANGED. The application only inserts, never removes, so
+/// presence-in-both alone proves nothing (every base var survives the apply);
+/// a changed VALUE is exactly "the config mapping replaced the pre-apply
+/// value". A mapping that re-writes the identical value is not reported — the
+/// start is observably unchanged, and the quiet path must stay quiet. Pure +
+/// deterministic (sorted by the BTreeMap key iteration — the diagnostic is
+/// stable); unit-tested next to the other start-seam decision fns. The caller
+/// formats the ONE diagnostic and routes it through `emit_diagnostic`.
+/// Precedence is deliberately UNCHANGED (the config value wins — the
+/// last-write-wins insert); this helper exists only so the overwrite is named
+/// on stderr instead of passing silently.
+fn shadowed_env_keys(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter_map(|(key, base_value)| {
+            let new_value = after.get(key)?;
+            (new_value != base_value).then(|| key.clone())
+        })
+        .collect()
+}
+
 /// A best-effort, HUMAN-READABLE one-line rendering of a [`TransitionEvent`]
 /// for the `engine`-attributed capture line (story 4-2, Task 4) — the
 /// RECOMMENDED default: mirror every `TransitionEvent` (start/stop/pause/
@@ -4513,6 +4599,209 @@ mod tests {
             Some("gpt-4"),
             "the documented model key must land in the mock's declared env target"
         );
+    }
+
+    // ---- Story 11-2: AI-27 (env-shadow visibility) + AI-39 (secret→flag runtime) ----
+
+    /// Story 11-2: write a manifest whose `[lifecycle.start]` declares a BASE
+    /// env var (`BASEVAR`) and whose exec is a guaranteed-missing binary — so
+    /// the spawn (which happens AFTER the diagnostic emissions) fails on EVERY
+    /// OS, keeping the emission proofs OS-agnostic (no live process needed,
+    /// mirroring the `_live` gates' rationale).
+    fn write_manifest_with_base_env(dir: &Path, kind: &str, config_toml: &str) {
+        let body = format!(
+            "contract_version = \"1.0.0\"\n\n\
+             [adapter]\nkind = \"{kind}\"\n\n\
+             [lifecycle.start]\nexec = \"ktesio-definitely-missing-binary\"\nargs = []\nenv = {{ BASEVAR = \"base-value\" }}\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"self-reported\"\n\n\
+             {config_toml}"
+        );
+        std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    }
+
+    /// Register an instance from [`Self::write_manifest_with_base_env`].
+    fn setup_base_env_instance(
+        name: &str,
+        config_toml: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_manifest_with_base_env(manifest.path(), name, config_toml);
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry
+            .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+            .unwrap();
+        (state, manifest, registry)
+    }
+
+    #[test]
+    fn shadowed_env_keys_names_only_the_overwritten_base_vars() {
+        // The pure AI-27 diff: an apply only INSERTS, so every base var survives
+        // into the post-apply env — a base var counts as shadowed exactly when
+        // its VALUE changed. A new-name target and an identical re-write yield
+        // NOTHING (the quiet path must stay quiet).
+        let base: std::collections::BTreeMap<String, String> = [
+            ("SHADOWED".to_string(), "old".to_string()),
+            ("KEPT".to_string(), "untouched".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut after = base.clone();
+        after.insert("SHADOWED".to_string(), "new".to_string());
+        after.insert("NEWVAR".to_string(), "fresh".to_string());
+
+        assert_eq!(
+            shadowed_env_keys(&base, &after),
+            vec!["SHADOWED".to_string()],
+            "exactly the value-changed base var is named, deterministically sorted"
+        );
+        // A mapping that re-writes the identical value is not a shadow.
+        let mut same_value = base.clone();
+        same_value.insert("SHADOWED".to_string(), "old".to_string());
+        same_value.insert("NEWVAR".to_string(), "fresh".to_string());
+        assert!(shadowed_env_keys(&base, &same_value).is_empty());
+        // An empty base (no [lifecycle.start] env) can never shadow.
+        let empty = std::collections::BTreeMap::new();
+        assert!(shadowed_env_keys(&empty, &after).is_empty());
+    }
+
+    #[test]
+    fn start_emits_one_diagnostic_when_a_mapped_env_target_shadows_a_base_var() {
+        // AI-27 end-to-end: the manifest launches with BASEVAR=base-value; the
+        // config maps `model` → env BASEVAR. The start's launch carries the
+        // CONFIG value (precedence untouched — the insert won), and exactly ONE
+        // diagnostic names the shadowed variable. The spawn itself fails (the
+        // exec is deliberately missing) — AFTER the emission, proving the
+        // diagnostic rides the start path regardless of launch outcome.
+        let (_state, _manifest, registry) =
+            setup_base_env_instance("shdw", "[config.model]\nenv = \"BASEVAR\"\n");
+        let name = InstanceName::new("shdw").unwrap();
+        registry.set_config(&name, "model", "config-value").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let buffer = install_capture_sink(&mut sup);
+        let err = sup.start(&registry, "shdw").unwrap_err();
+        assert!(
+            matches!(err, EngineError::LaunchFailed { .. }),
+            "the missing-binary spawn fails, but only AFTER the emissions; got {err:?}"
+        );
+
+        let captured = sink_text(&buffer);
+        let lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly ONE diagnostic must be emitted; got {lines:?}"
+        );
+        assert!(
+            lines[0].contains("shdw") && lines[0].contains("BASEVAR"),
+            "the diagnostic names the instance + the shadowed var: {}",
+            lines[0]
+        );
+        // Review-1 patch 6: the wording must NOT claim the shadowed vars are
+        // "base-launch"/template vars (the snapshot may carry other launch env).
+        assert!(
+            lines[0].contains("launch environment variable(s)")
+                && !lines[0].contains("base-launch"),
+            "the diagnostic must say 'launch environment variable(s)' without the \
+             base-launch claim: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn start_stays_quiet_when_mapped_env_targets_are_all_new_names() {
+        // AI-27's clean path: the mapping targets a var the base launch does
+        // NOT carry — no diagnostic at all (an empty capture). Same failing-exec
+        // manifest so the only difference IS the shadow.
+        let (_state, _manifest, registry) =
+            setup_base_env_instance("quiet", "[config.model]\nenv = \"NEWVAR\"\n");
+        let name = InstanceName::new("quiet").unwrap();
+        registry.set_config(&name, "model", "config-value").unwrap();
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let buffer = install_capture_sink(&mut sup);
+        let _ = sup.start(&registry, "quiet");
+
+        assert!(
+            sink_text(&buffer).is_empty(),
+            "a non-shadowing start must emit NOTHING; got {}",
+            sink_text(&buffer)
+        );
+    }
+
+    /// Restore-on-drop guard for a process-global env var a test set (review-1
+    /// patch 7): the match-prev/restore tail the sibling tests use is skipped
+    /// when an assertion panics, leaking the sentinel into sibling tests on the
+    /// shared process env — the guard restores even on failure.
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self(key, prev)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn start_emits_one_diagnostic_when_a_secret_resolves_into_a_flag_target() {
+        // AI-39 runtime end-to-end: a `model = secret:KEY` leaf mapped to a FLAG
+        // target resolves and delivers cleartext into argv (the accepted
+        // boundary), and the start emits exactly ONE warn-only diagnostic naming
+        // the key. The SET-TIME half is pinned on the same shape: the registry
+        // set succeeded AND returned the steering warning (warn-only, exit 0).
+        const SENTINEL: &str = "flag-steering-sentinel";
+        let env_key = "KTESIO_SUP_FLAG_STEERING_KEY";
+        let _env = EnvGuard::set(env_key, SENTINEL);
+
+        let (_state, _manifest, registry) =
+            setup_base_env_instance("flgrt", "[config.model]\nflag = \"--model\"\n");
+        let name = InstanceName::new("flgrt").unwrap();
+        let warnings = registry
+            .set_config(&name, "model", &format!("secret:{env_key}"))
+            .unwrap();
+        assert_eq!(warnings.len(), 1, "the set-time warning fires (AI-33)");
+        assert!(warnings[0].contains("model"), "{}", warnings[0]);
+
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let buffer = install_capture_sink(&mut sup);
+        let _ = sup.start(&registry, "flgrt");
+
+        let captured = sink_text(&buffer);
+        let lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly ONE runtime diagnostic must be emitted; got {lines:?}"
+        );
+        assert!(
+            lines[0].contains("flgrt") && lines[0].contains("model"),
+            "the diagnostic names the instance + the key: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("FLAG"),
+            "the diagnostic names the flag-target argv fact: {}",
+            lines[0]
+        );
+        // NEVER the resolved value — the diagnostic names the fact, not the key.
+        assert!(
+            !lines[0].contains(SENTINEL),
+            "the diagnostic must not leak the cleartext: {}",
+            lines[0]
+        );
+        // The EnvGuard restores the env var even on a failed assertion.
     }
 
     // ---- The launch-snapshot fix (hosted-runner arg-loss): start uses the

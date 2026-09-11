@@ -3147,6 +3147,201 @@ fn config_set_agent_pass_through_key_round_trips_verbatim() {
 }
 
 #[test]
+fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
+    // Story 11-2 (AI-26): a leading-hyphen VALUE used to die at the clap parse
+    // layer (exit 2, "unexpected argument"). With `allow_hyphen_values` on the
+    // `value` positional (mirroring `send`'s `text`), `config set svc key -x`
+    // round-trips the value VERBATIM — and the explicit `--` separator form
+    // still works for callers who prefer it.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_kt_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+
+    // Bare leading-dash value: no `--` needed.
+    let set = run_kt_agent(
+        &["agent", "config", "set", "demo", "agent.dash_flag", "-x"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "a leading-dash value must exit 0, not a clap parse error; stdout={} stderr={}",
+        set.stdout, set.stderr
+    );
+    assert!(
+        !set.stderr.contains("unexpected argument"),
+        "must not be rejected as a clap parse error; stderr={}",
+        set.stderr
+    );
+    let get = run_kt_agent(
+        &["agent", "config", "get", "demo", "agent.dash_flag"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get.stdout.lines().any(|l| l.trim() == "-x"),
+        "the leading-dash value must round-trip verbatim; stdout={}",
+        get.stdout
+    );
+
+    // A double-dash VALUE also parses literally now.
+    let set2 = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "agent.dash_flag2",
+            "--model-x",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set2.success,
+        "a `--`-prefixed value must exit 0; stdout={} stderr={}",
+        set2.stdout, set2.stderr
+    );
+    let get2 = run_kt_agent(
+        &["agent", "config", "get", "demo", "agent.dash_flag2"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get2.stdout.lines().any(|l| l.trim() == "--model-x"),
+        "the `--`-prefixed value must round-trip verbatim; stdout={}",
+        get2.stdout
+    );
+
+    // The classic `--` separator form still works.
+    let set3 = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "agent.dash_flag3",
+            "--",
+            "-y",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set3.success,
+        "the `--` separator form must still work; stdout={} stderr={}",
+        set3.stdout, set3.stderr
+    );
+    let get3 = run_kt_agent(
+        &["agent", "config", "get", "demo", "agent.dash_flag3"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        get3.stdout.lines().any(|l| l.trim() == "-y"),
+        "the `--`-separated value must round-trip verbatim; stdout={}",
+        get3.stdout
+    );
+}
+
+#[test]
+fn config_set_secret_on_a_flag_targeted_key_warns_on_stderr_but_exits_zero() {
+    // Story 11-2 (AI-33): a `secret:NAME` value set on a FLAG-targeted key
+    // SUCCEEDS (warn-only — never a rejection) AND prints a steering warning to
+    // STDERR naming the key, the argv leak risk, and the env/file alternative
+    // (the stdout success line is unchanged). Needs a manifest adapter whose
+    // `[config.model]` maps onto a flag — the native `mock` maps env (quiet).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let manifest_body = format!("{VALID_MANIFEST}\n[config.model]\nflag = \"--model\"\n");
+    let m = manifest_dir(&ctx.project_dir, &manifest_body);
+    let reg = run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "flg",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        reg.success,
+        "manifest register should exit 0; stderr={}",
+        reg.stderr
+    );
+
+    let set = run_kt_agent(
+        &["agent", "config", "set", "flg", "model", "secret:MY_SECRET"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        set.success,
+        "the secret→flag set must still SUCCEED (warn-only); stdout={} stderr={}",
+        set.stdout, set.stderr
+    );
+    assert!(
+        set.stderr.contains("model"),
+        "the stderr warning must name the key; stderr={}",
+        set.stderr
+    );
+    assert!(
+        set.stderr.contains("FLAG"),
+        "the stderr warning must name the flag-target leak risk; stderr={}",
+        set.stderr
+    );
+    assert!(
+        set.stderr.contains("env") && set.stderr.contains("file"),
+        "the stderr warning must name the env/file alternative; stderr={}",
+        set.stderr
+    );
+    // Result → stdout, warning → stderr (AD-12): the success line is untouched.
+    assert!(
+        set.stdout.contains("Set"),
+        "stdout keeps the success confirmation; stdout={}",
+        set.stdout
+    );
+
+    // The quiet control: the same secret on an ENV-targeted (mock's `model`)
+    // instance warns NOTHING.
+    run_kt_agent(
+        &["agent", "register", "envq", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let quiet = run_kt_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "envq",
+            "model",
+            "secret:MY_SECRET",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        quiet.success,
+        "the env-target set must exit 0; stderr={}",
+        quiet.stderr
+    );
+    assert!(
+        !quiet.stderr.contains("flag"),
+        "an env-targeted secret must not warn; stderr={}",
+        quiet.stderr
+    );
+}
+
+#[test]
 fn config_get_unknown_instance_exits_nonzero() {
     // A `get` on an unregistered instance is the uniform not-found diagnostic on
     // stderr with a non-zero exit.

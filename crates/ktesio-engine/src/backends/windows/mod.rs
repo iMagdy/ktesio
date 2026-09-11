@@ -810,3 +810,34 @@ pub fn check_secrets_file_permissions(_path: &std::path::Path) -> Result<(), Sec
     // Never a false pass framed as a Unix-grade check; never a hard failure.
     Ok(())
 }
+
+/// "Copy" an existing target file's permissions onto the freshly written `temp`
+/// before the atomic rename (story 11-2 review-1, patch 3). Windows carries no
+/// Unix mode bits — the SAME documented portable posture as
+/// [`check_secrets_file_permissions`] above: no Unix-style check, and the fresh
+/// file takes the creating process's DEFAULT per-user-profile ACLs (the state
+/// dir lives under the user's profile, which Windows protects per-user by
+/// default). Always `Ok`; never a false pass framed as a Unix-grade copy. The
+/// `_target` is accepted for signature symmetry with the Unix backend.
+pub fn preserve_target_mode(
+    _target: &std::path::Path,
+    _temp: &std::path::Path,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Rename the temp over the atomic-write target (story 11-2 review-1, patch 4).
+/// Windows' `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` FAILS with a sharing
+/// violation while another process holds the target open WITHOUT
+/// `FILE_SHARE_DELETE` (editors, AV scanners, indexers). One short backoff +
+/// a single retry rides out the transient window; a PERSISTENT hold surfaces
+/// the honest error — the atomic write fails with the target untouched,
+/// where the old in-place `fs::write` would have silently overwritten (or
+/// half-written) the bytes under the reader.
+pub fn rename_over_target(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    if let Ok(()) = std::fs::rename(temp, target) {
+        return Ok(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::fs::rename(temp, target)
+}

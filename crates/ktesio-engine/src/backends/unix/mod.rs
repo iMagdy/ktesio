@@ -852,6 +852,41 @@ pub fn check_secrets_file_permissions(path: &std::path::Path) -> Result<(), Secr
     }
 }
 
+/// Copy an EXISTING target file's Unix permissions onto the freshly written
+/// `temp` BEFORE the atomic rename (story 11-2 review-1, patch 3) — so an
+/// operator-tightened mode (e.g. a hand-chmod'ed `0600 config.toml`) survives
+/// every overwrite instead of silently widening back to the process default.
+/// A target that does not exist (the first write) is a no-op — the temp keeps
+/// the process-default mode. Stat/permission ERRORS are surfaced (a failed
+/// mode copy must not silently publish a widened or narrowed file); they run
+/// before the rename, so a failure leaves the previous target untouched.
+///
+/// Lives here (the sole allowlisted `#[cfg]` home) because the mode-bit APIs
+/// are `std::os::unix`-only; the caller ([`crate::paths::write_atomic_via`])
+/// stays cfg-free. Re-exported cfg-selected from `backends/mod.rs`, exactly
+/// like [`check_secrets_file_permissions`].
+pub fn preserve_target_mode(target: &std::path::Path, temp: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(target) {
+        Ok(meta) => std::fs::set_permissions(
+            temp,
+            std::fs::Permissions::from_mode(meta.permissions().mode()),
+        ),
+        // First write: no previous mode to preserve.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rename the temp over the atomic-write target (story 11-2 review-1, patch 4).
+/// POSIX `rename` replaces ANY existing non-directory target atomically and is
+/// never blocked by another process holding the target open (an open fd does
+/// not share-block a rename), so there is nothing transient to retry — errors
+/// surface immediately.
+pub fn rename_over_target(temp: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
